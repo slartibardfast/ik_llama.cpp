@@ -24,6 +24,10 @@
 #include <future>
 #include <thread>
 
+#if !defined(_MSC_VER)
+#include <unistd.h>  // dup(), close() for dmabuf fd handling
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -374,6 +378,10 @@ struct vk_device_struct {
 
     bool coopmat2;
 
+    // dmabuf zero-copy cross-device transfer
+    bool dmabuf_support {};
+    PFN_vkGetMemoryFdKHR pfn_vkGetMemoryFdKHR {};
+
     size_t idx;
 
     bool mul_mat_l[GGML_TYPE_COUNT];
@@ -517,13 +525,23 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
-    // Cross-device staging pool (Phase 8: double-buffered staging)
+    // Cross-device staging pool (double-buffered)
     struct xdev_staging_slot {
         vk_buffer buffer;
         vk::Fence fence;
         bool in_use = false;
     };
     std::vector<xdev_staging_slot> xdev_staging_pool;
+
+    // dmabuf zero-copy cross-device staging
+    struct dmabuf_shared_staging {
+        vk_buffer src_buffer;   // exportable buffer on this (source) device
+        vk_buffer dst_buffer;   // imported buffer on peer (destination) device
+        int fd = -1;            // dmabuf file descriptor
+        size_t size = 0;
+        vk::Fence fence;        // fence on source device
+    };
+    std::unordered_map<size_t, dmabuf_shared_staging> dmabuf_peers;  // key: dst device idx
 
     ggml_backend_buffer_type buffer_type;
 
@@ -540,6 +558,15 @@ struct vk_device_struct {
 
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
+
+        // cleanup dmabuf peer staging
+        for (auto& [idx, peer] : dmabuf_peers) {
+            if (peer.fd >= 0) close(peer.fd);
+            device.destroyFence(peer.fence);
+            peer.src_buffer.reset();
+            peer.dst_buffer.reset();
+        }
+        dmabuf_peers.clear();
 
         device.destroyFence(fence);
 
@@ -1054,6 +1081,7 @@ struct vk_pending_xdev_copy {
     vk_buffer dst_buf;          // destination buffer
     size_t dst_offset;          // offset into destination buffer
     size_t nbytes;              // size of the copy
+    vk_buffer dmabuf_dst_buffer; // non-null when using dmabuf zero-copy
 };
 
 struct ggml_backend_vk_context {
@@ -1087,10 +1115,10 @@ struct ggml_backend_vk_context {
     // node currently being processed
     int num_additional_fused_ops {};
 
-    // Pending cross-device copies (Phase 7: async pipeline)
+    // Pending cross-device copies (async pipeline)
     std::vector<vk_pending_xdev_copy> pending_xdev_copies;
 
-    // Phase 10: async graph compute state
+    // async graph compute state
     bool compute_pending {};              // true when graph_compute submitted but not yet synchronized
     vk_context pending_compute_exit_ctx;  // deferred exit context holding out_memcpys
 };
@@ -1731,6 +1759,187 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
 
     return buf;
 }
+
+// Create a buffer with exportable dmabuf memory
+#if !defined(_MSC_VER)
+static vk_buffer ggml_vk_create_dmabuf_exportable_buffer(vk_device& device, size_t size) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    VkExternalMemoryBufferCreateInfo ext_buf_info = {};
+    ext_buf_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    ext_buf_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    vk::BufferCreateInfo buffer_create_info;
+    buffer_create_info.setPNext(&ext_buf_info);
+    buffer_create_info.setSize(size);
+    buffer_create_info.setUsage(vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst);
+    buffer_create_info.setSharingMode(vk::SharingMode::eExclusive);
+
+    buf->buffer = device->device.createBuffer(buffer_create_info);
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+
+    // Find device-local memory type
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    uint32_t memory_type_index = UINT32_MAX;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((mem_req.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            memory_type_index = i;
+            break;
+        }
+    }
+    if (memory_type_index == UINT32_MAX) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    VkExportMemoryAllocateInfo export_info = {};
+    export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.setPNext(&export_info);
+    alloc_info.setAllocationSize(mem_req.size);
+    alloc_info.setMemoryTypeIndex(memory_type_index);
+
+    buf->device_memory = device->device.allocateMemory(alloc_info);
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    buf->ptr = nullptr;
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+
+    buf->device = device;
+    buf->size = size;
+    return buf;
+}
+
+// Import a dmabuf fd as a buffer on a different device
+static vk_buffer ggml_vk_import_dmabuf_buffer(vk_device& device, int fd, size_t size) {
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+
+    VkExternalMemoryBufferCreateInfo ext_buf_info = {};
+    ext_buf_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    ext_buf_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    vk::BufferCreateInfo buffer_create_info;
+    buffer_create_info.setPNext(&ext_buf_info);
+    buffer_create_info.setSize(size);
+    buffer_create_info.setUsage(vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst);
+    buffer_create_info.setSharingMode(vk::SharingMode::eExclusive);
+
+    buf->buffer = device->device.createBuffer(buffer_create_info);
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+
+    // Query compatible memory types for this imported fd
+    PFN_vkGetMemoryFdPropertiesKHR pfn = (PFN_vkGetMemoryFdPropertiesKHR)
+        vkGetDeviceProcAddr(device->device, "vkGetMemoryFdPropertiesKHR");
+    if (!pfn) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    VkMemoryFdPropertiesKHR fd_props = {};
+    fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+    if (pfn(device->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fd_props) != VK_SUCCESS) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    uint32_t memory_type_index = UINT32_MAX;
+    uint32_t compatible_bits = mem_req.memoryTypeBits & fd_props.memoryTypeBits;
+    for (uint32_t i = 0; i < 32; i++) {
+        if (compatible_bits & (1u << i)) {
+            memory_type_index = i;
+            break;
+        }
+    }
+    if (memory_type_index == UINT32_MAX) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    // dup the fd because vkAllocateMemory takes ownership
+    int import_fd = dup(fd);
+    if (import_fd < 0) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    VkImportMemoryFdInfoKHR import_info = {};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import_info.fd = import_fd;
+
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.setPNext(&import_info);
+    alloc_info.setAllocationSize(mem_req.size);
+    alloc_info.setMemoryTypeIndex(memory_type_index);
+
+    try {
+        buf->device_memory = device->device.allocateMemory(alloc_info);
+    } catch (...) {
+        device->device.destroyBuffer(buf->buffer);
+        return nullptr;
+    }
+
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    buf->ptr = nullptr;
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+
+    buf->device = device;
+    buf->size = size;
+    return buf;
+}
+
+// Get or create dmabuf shared staging between two devices
+static vk_device_struct::dmabuf_shared_staging* ggml_vk_get_dmabuf_staging(
+    vk_device& src_dev, vk_device& dst_dev, size_t size)
+{
+    if (!src_dev->dmabuf_support || !dst_dev->dmabuf_support) {
+        return nullptr;
+    }
+
+    auto it = src_dev->dmabuf_peers.find(dst_dev->idx);
+    if (it != src_dev->dmabuf_peers.end() && it->second.size >= size) {
+        return &it->second;
+    }
+
+    // Destroy old if resizing
+    if (it != src_dev->dmabuf_peers.end()) {
+        if (it->second.fd >= 0) close(it->second.fd);
+        src_dev->device.destroyFence(it->second.fence);
+        src_dev->dmabuf_peers.erase(it);
+    }
+
+    // Create exportable buffer on source device
+    vk_buffer src_buf = ggml_vk_create_dmabuf_exportable_buffer(src_dev, size);
+    if (!src_buf) return nullptr;
+
+    // Export fd
+    VkMemoryGetFdInfoKHR get_fd_info = {};
+    get_fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    get_fd_info.memory = src_buf->device_memory;
+    get_fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    int fd = -1;
+    if (src_dev->pfn_vkGetMemoryFdKHR(src_dev->device, &get_fd_info, &fd) != VK_SUCCESS || fd < 0) {
+        return nullptr;
+    }
+
+    // Import on destination device
+    vk_buffer dst_buf = ggml_vk_import_dmabuf_buffer(dst_dev, fd, size);
+    if (!dst_buf) {
+        close(fd);
+        return nullptr;
+    }
+
+    vk::Fence fence = src_dev->device.createFence({});
+
+    src_dev->dmabuf_peers[dst_dev->idx] = { src_buf, dst_buf, fd, size, fence };
+    GGML_LOG_DEBUG("ggml_vulkan: dmabuf P2P staging created: %s -> %s (%zu bytes)\n",
+                   src_dev->name.c_str(), dst_dev->name.c_str(), size);
+    return &src_dev->dmabuf_peers[dst_dev->idx];
+}
+#endif // !_MSC_VER
 
 static void ggml_vk_destroy_buffer(vk_buffer& buf) {
     if (buf == nullptr) {
@@ -3081,6 +3290,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->coopmat_support = false;
         device->integer_dot_product = false;
         bool bfloat16_support = false;
+#if !defined(_MSC_VER)
+        bool has_external_memory_fd = false;
+        bool has_external_memory_dma_buf = false;
+#endif
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -3121,7 +3334,37 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 bfloat16_support = true;
 #endif
             }
+#if !defined(_MSC_VER)
+            else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                has_external_memory_fd = true;
+            } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
+                has_external_memory_dma_buf = true;
+            }
+#endif
         }
+
+        // Probe dmabuf compatibility
+#if !defined(_MSC_VER)
+        device->dmabuf_support = has_external_memory_fd && has_external_memory_dma_buf;
+        if (device->dmabuf_support) {
+            VkPhysicalDeviceExternalBufferInfo ext_buf_info = {};
+            ext_buf_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
+            ext_buf_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            ext_buf_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+            VkExternalBufferProperties ext_buf_props = {};
+            ext_buf_props.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
+
+            vkGetPhysicalDeviceExternalBufferProperties(device->physical_device, &ext_buf_info, &ext_buf_props);
+
+            auto& compat = ext_buf_props.externalMemoryProperties;
+            device->dmabuf_support =
+                (compat.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+                (compat.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+        }
+#else
+        device->dmabuf_support = false;
+#endif
 
         vk::PhysicalDeviceProperties2 props2;
         vk::PhysicalDeviceMaintenance3Properties props3;
@@ -3568,6 +3811,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 #endif
 #endif
+        // Enable dmabuf extensions
+#if !defined(_MSC_VER)
+        if (device->dmabuf_support) {
+            device_extensions.push_back("VK_KHR_external_memory");
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+            device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+        }
+#endif
+
         device->name = GGML_VK_NAME + std::to_string(idx);
 
         device_create_info = {
@@ -3578,6 +3830,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         };
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+        // Load dmabuf function pointer
+#if !defined(_MSC_VER)
+        if (device->dmabuf_support) {
+            device->pfn_vkGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)
+                vkGetDeviceProcAddr(device->device, "vkGetMemoryFdKHR");
+            if (!device->pfn_vkGetMemoryFdKHR) {
+                device->dmabuf_support = false;
+            }
+        }
+#endif
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
@@ -3681,6 +3944,10 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     bool coopmat_support = false;
     bool coopmat2_support = false;
     bool integer_dot_product = false;
+#if !defined(_MSC_VER)
+    bool has_external_memory_fd = false;
+    bool has_external_memory_dma_buf = false;
+#endif
 
     for (auto properties : ext_props) {
         if (strcmp("VK_KHR_16bit_storage", properties.extensionName) == 0) {
@@ -3701,6 +3968,12 @@ static void ggml_vk_print_gpu_info(size_t idx) {
         } else if (strcmp("VK_KHR_shader_integer_dot_product", properties.extensionName) == 0 &&
                     !getenv("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT")) {
             integer_dot_product = true;
+#endif
+#if !defined(_MSC_VER)
+        } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+            has_external_memory_fd = true;
+        } else if (strcmp("VK_EXT_external_memory_dma_buf", properties.extensionName) == 0) {
+            has_external_memory_dma_buf = true;
 #endif
         }
     }
@@ -3788,9 +4061,14 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     std::string matrix_cores = coopmat2_support ? "NV_coopmat2" : coopmat_support ? "KHR_coopmat" : "none";
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_INFO("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+    [[maybe_unused]] bool dmabuf_supported = false;
+#if !defined(_MSC_VER)
+    dmabuf_supported = has_external_memory_fd && has_external_memory_dma_buf;
+#endif
+    GGML_LOG_INFO("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s | dmabuf: %d\n",
               idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16, subgroup_size,
-              props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
+              props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str(),
+              (int)dmabuf_supported);
 
     if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
         GGML_LOG_WARN("ggml_vulkan: Warning: Device type is CPU. This is probably not the device you want.\n");
@@ -9761,7 +10039,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
 
         if (use_fence) {
-            // Phase 10: defer exit tensor fence wait to synchronize()
+            // Defer exit tensor fence wait to synchronize()
             if (tensor_idx != subctx->exit_tensor_idx) {
                 ggml_vk_wait_for_fence(ctx);
             }
@@ -9772,7 +10050,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 
     if (tensor_idx == subctx->exit_tensor_idx) {
-        // Phase 10: defer out_memcpys to synchronize() — GPU work may not be complete
+        // Defer out_memcpys to synchronize() — GPU work may not be complete
         ctx->pending_compute_exit_ctx = subctx;
         subctx->in_memcpys.clear();
     }
@@ -9814,7 +10092,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_set_idx = 0;
 }
 
-// Phase 10: Wait for pending async graph_compute and clean up
+// Wait for pending async graph_compute and clean up
 static void ggml_vk_sync_compute(ggml_backend_vk_context * ctx) {
     if (!ctx->compute_pending) return;
 
@@ -10210,7 +10488,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         if (ggml_backend_is_vk(backend_src)) {
             ggml_backend_vk_context * ctx_src = (ggml_backend_vk_context *)backend_src->context;
 
-            // Phase 10: ensure source device's compute is complete before reading
+            // Ensure source device's compute is complete before reading
             ggml_vk_sync_compute(ctx_src);
             vk_buffer src_buf = src_buf_ctx->dev_buffer;
             vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
@@ -10232,6 +10510,40 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                 return true;
             }
 
+            // Try dmabuf zero-copy path
+#if !defined(_MSC_VER)
+            {
+                vk_device& src_dev = ctx_src->device;
+                auto* dmabuf = ggml_vk_get_dmabuf_staging(src_dev, ctx_dst->device, nbytes);
+                if (dmabuf) {
+                    std::lock_guard<std::recursive_mutex> guard(src_dev->mutex);
+
+                    // GPU A: copy src device-local -> shared exportable buffer
+                    vk_context src_xfer = ggml_vk_create_temporary_context(src_dev, src_dev->transfer_queue.cmd_pool);
+                    ggml_vk_ctx_begin(src_dev, src_xfer);
+                    ggml_vk_sync_buffers(src_xfer);
+                    VkBufferCopy region = { src_offset, 0, nbytes };
+                    vkCmdCopyBuffer(src_xfer->s->buffer, src_buf->buffer, dmabuf->src_buffer->buffer, 1, &region);
+                    ggml_vk_ctx_end(src_xfer);
+                    ggml_vk_submit(src_xfer, dmabuf->fence);
+
+                    // Record pending dmabuf copy — fence wait deferred to dst synchronize()
+                    ctx_dst->pending_xdev_copies.push_back({
+                        src_dev,
+                        src_xfer,
+                        nullptr,           // no host staging
+                        dmabuf->fence,
+                        dst_buf,
+                        dst_offset,
+                        nbytes,
+                        dmabuf->dst_buffer,
+                    });
+                    return true;
+                }
+            }
+#endif
+
+            // Fallback: host-staging async pipeline
             // Submit async read on source device's transfer queue
             {
                 std::lock_guard<std::recursive_mutex> guard(ctx_src->device->mutex);
@@ -10293,10 +10605,10 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    // Phase 10: complete pending async graph_compute
+    // Complete pending async graph_compute
     ggml_vk_sync_compute(ctx);
 
-    // Process pending cross-device copies (Phase 7: async pipeline)
+    // Process pending cross-device copies (async pipeline)
     // Source reads were submitted async in cpy_tensor_async; now wait and complete
     if (!ctx->pending_xdev_copies.empty()) {
         // Ensure we have a transfer context for destination writes
@@ -10310,25 +10622,35 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
         }
 
         for (auto& xdev : ctx->pending_xdev_copies) {
-            // Wait for this copy's fence (per-copy, not shared)
+            // Wait for source device fence (GPU A finished writing to staging/dmabuf buffer)
             VK_CHECK(xdev.src_device->device.waitForFences({ xdev.fence }, true, UINT64_MAX),
                      "xdev copy waitForFences");
             xdev.src_device->device.resetFences({ xdev.fence });
 
-            // Execute deferred staging memcpys from source read
-            for (auto& cpy : xdev.src_transfer_ctx->out_memcpys) {
-                memcpy(cpy.dst, cpy.src, cpy.n);
-            }
+#if !defined(_MSC_VER)
+            if (xdev.dmabuf_dst_buffer) {
+                // dmabuf zero-copy path
+                // GPU A already wrote to exportable buffer; GPU B reads from imported view
+                ggml_vk_buffer_copy_async(transfer_ctx, xdev.dst_buf, xdev.dst_offset,
+                                          xdev.dmabuf_dst_buffer, 0, xdev.nbytes);
+            } else
+#endif
+            {
+                // Host-staging path: execute deferred staging memcpys from source read
+                for (auto& cpy : xdev.src_transfer_ctx->out_memcpys) {
+                    memcpy(cpy.dst, cpy.src, cpy.n);
+                }
 
-            // Write from per-copy staging to destination device
-            ggml_vk_buffer_write_async(transfer_ctx, xdev.dst_buf, xdev.dst_offset,
-                                       xdev.staging->ptr, xdev.nbytes);
+                // Write from per-copy staging to destination device
+                ggml_vk_buffer_write_async(transfer_ctx, xdev.dst_buf, xdev.dst_offset,
+                                           xdev.staging->ptr, xdev.nbytes);
 
-            // Return staging slot to pool
-            for (auto& s : xdev.src_device->xdev_staging_pool) {
-                if (s.buffer == xdev.staging && s.fence == xdev.fence) {
-                    s.in_use = false;
-                    break;
+                // Return staging slot to pool
+                for (auto& s : xdev.src_device->xdev_staging_pool) {
+                    if (s.buffer == xdev.staging && s.fence == xdev.fence) {
+                        s.in_use = false;
+                        break;
+                    }
                 }
             }
         }
@@ -10396,7 +10718,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    // Phase 10: ensure previous async compute is complete before starting new work
+    // Ensure previous async compute is complete before starting new work
     ggml_vk_sync_compute(ctx);
 
     if (vk_instance.debug_utils_support) {
@@ -10559,7 +10881,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->device->perf_logger->print_timings();
         ggml_vk_graph_cleanup(ctx);
     } else {
-        // Phase 10: defer fence wait and cleanup to synchronize()
+        // Defer fence wait and cleanup to synchronize()
         ctx->compute_pending = true;
     }
 

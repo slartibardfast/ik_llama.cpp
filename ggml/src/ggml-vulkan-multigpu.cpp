@@ -171,7 +171,7 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
         auto bs = tt.blck_size;
         auto ts = tt.type_size;
 
-        // Phase 1: prepare per-device host data (sequential, CPU-bound)
+        // Prepare per-device host data (sequential, CPU-bound)
         std::vector<pending_upload> uploads;
         int ne = 0;
         for (int i = 0; i < extra->n_device; ++i) {
@@ -198,13 +198,13 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
             uploads.push_back({split, std::move(host_buffer), nullptr, upload_size});
             ne += split->ne[0];
         }
-        // Phase 2: parallel upload (PCIe-bound)
+        // Parallel upload (PCIe-bound)
         parallel_upload(uploads);
     }
     else if (extra->split_dim == 1) {
         if (tensor->ne[2] > 1) {
             auto row_size = ggml_row_size(tensor->type, tensor->ne[0]);
-            // Phase 1: prepare per-device host data
+            // Prepare per-device host data
             std::vector<pending_upload> uploads;
             int ne1 = 0;
             for (int i = 0; i < extra->n_device; ++i) {
@@ -220,7 +220,7 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
                 uploads.push_back({split, std::move(host_buffer), nullptr, split_size});
                 ne1 += split->ne[1];
             }
-            // Phase 2: parallel upload
+            // Parallel upload
             parallel_upload(uploads);
         } else {
             int n_interleave = 1;
