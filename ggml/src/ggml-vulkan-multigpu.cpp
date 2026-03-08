@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <map>
+#include <thread>
 #include <vector>
 
 #define VK_MATRIX_ROW_PADDING 512
@@ -118,28 +119,60 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
     auto extra = (ggml_split_tensor_t *)tensor->extra;
     GGML_ASSERT(extra->n_device <= ggml_backend_vk_get_device_count());
 
+    // Helper: submit uploads to all devices in parallel
+    struct pending_upload {
+        ggml_tensor * split;
+        std::vector<char> host_data;   // owned copy (for interleaved data)
+        const void * direct_ptr;       // direct pointer into source (no copy needed)
+        size_t nbytes;
+    };
+
+    auto parallel_upload = [](std::vector<pending_upload> & uploads) {
+        if (uploads.size() <= 1) {
+            // single device — no threading overhead
+            for (auto & u : uploads) {
+                const void * src = u.direct_ptr ? u.direct_ptr : u.host_data.data();
+                u.split->buffer->iface.set_tensor(u.split->buffer, u.split, src, 0, u.nbytes);
+            }
+            return;
+        }
+        std::vector<std::thread> threads;
+        threads.reserve(uploads.size());
+        for (auto & u : uploads) {
+            threads.emplace_back([&u]() {
+                const void * src = u.direct_ptr ? u.direct_ptr : u.host_data.data();
+                u.split->buffer->iface.set_tensor(u.split->buffer, u.split, src, 0, u.nbytes);
+            });
+        }
+        for (auto & t : threads) t.join();
+    };
+
     if (extra->split_dim < 0) {
         // replicated across all devices
         GGML_ASSERT(ggml_is_contiguous(tensor));
         auto nbytes = ggml_nbytes(tensor);
+        std::vector<pending_upload> uploads;
         for (int i = 0; i < extra->n_device; ++i) {
             auto split = extra->splits[i];
             if (!split) continue;
             GGML_ASSERT(split->type == tensor->type);
             GGML_ASSERT(ggml_are_same_shape(tensor, split));
             GGML_ASSERT(ggml_nbytes(split) == nbytes);
-            split->buffer->iface.set_tensor(split->buffer, split, data, 0, nbytes);
+            uploads.push_back({split, {}, data, nbytes});
         }
+        parallel_upload(uploads);
     }
     else if (extra->split_dim == 0) {
         int n_interleave = 1;
         if (auto it = k_map.find(tensor->type); it != k_map.end()) n_interleave = it->second;
         auto tt = ggml_internal_get_type_traits(tensor->type);
-        std::vector<char> host_buffer;
         GGML_ASSERT(ggml_is_contiguous(tensor));
         int nrows = ggml_nrows(tensor);
         auto bs = tt.blck_size;
         auto ts = tt.type_size;
+
+        // Phase 1: prepare per-device host data (sequential, CPU-bound)
+        std::vector<pending_upload> uploads;
         int ne = 0;
         for (int i = 0; i < extra->n_device; ++i) {
             auto split = extra->splits[i];
@@ -150,7 +183,8 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
             GGML_ASSERT(split->ne[0] % bs == 0);
             auto source_offset = n_interleave * (tt.row_meta_size + (ne / bs) * ts);
             auto split_row_size = ggml_row_size(split->type, split->ne[0]);
-            if (host_buffer.size() < (size_t)(nrows * split_row_size)) host_buffer.resize(nrows * split_row_size);
+            auto upload_size = (size_t)(nrows * split_row_size);
+            std::vector<char> host_buffer(upload_size);
             for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
                 for (int64_t i01 = 0; i01 < split->ne[1]; i01 += n_interleave) {
                     auto dst = host_buffer.data() + (i02 * split->ne[1] + i01) * split_row_size;
@@ -161,31 +195,37 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
                     memcpy(dst + tt.row_meta_size * n_interleave, src + source_offset, n_interleave * (split_row_size - tt.row_meta_size));
                 }
             }
-            split->buffer->iface.set_tensor(split->buffer, split, host_buffer.data(), 0, nrows * split_row_size);
+            uploads.push_back({split, std::move(host_buffer), nullptr, upload_size});
             ne += split->ne[0];
         }
+        // Phase 2: parallel upload (PCIe-bound)
+        parallel_upload(uploads);
     }
     else if (extra->split_dim == 1) {
         if (tensor->ne[2] > 1) {
             auto row_size = ggml_row_size(tensor->type, tensor->ne[0]);
-            std::vector<char> host_buffer;
+            // Phase 1: prepare per-device host data
+            std::vector<pending_upload> uploads;
             int ne1 = 0;
             for (int i = 0; i < extra->n_device; ++i) {
                 auto split = extra->splits[i];
                 if (!split) continue;
                 auto split_size = ggml_nbytes(split);
-                if (host_buffer.size() < split_size) host_buffer.resize(split_size);
+                std::vector<char> host_buffer(split_size);
                 for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
                     auto dst = host_buffer.data() + i02 * split->ne[1] * row_size;
                     auto src = (const char *)data + i02 * tensor->nb[2] + ne1 * tensor->nb[1];
                     memcpy(dst, src, split->ne[1] * row_size);
                 }
-                split->buffer->iface.set_tensor(split->buffer, split, host_buffer.data(), 0, split_size);
+                uploads.push_back({split, std::move(host_buffer), nullptr, split_size});
                 ne1 += split->ne[1];
             }
+            // Phase 2: parallel upload
+            parallel_upload(uploads);
         } else {
             int n_interleave = 1;
             if (auto it = k_map.find(tensor->type); it != k_map.end()) n_interleave = it->second;
+            std::vector<pending_upload> uploads;
             size_t cur_offset = 0;
             for (int i = 0; i < extra->n_device; ++i) {
                 auto split = extra->splits[i];
@@ -193,9 +233,10 @@ GGML_CALL static void ggml_backend_vk_split_buffer_set_tensor([[maybe_unused]] g
                 GGML_ASSERT(split->ne[1] % n_interleave == 0);
                 auto split_size = ggml_nbytes(split);
                 const char * buf_host = (const char *)data + cur_offset;
-                split->buffer->iface.set_tensor(split->buffer, split, buf_host, 0, split_size);
+                uploads.push_back({split, {}, buf_host, split_size});
                 cur_offset += split_size;
             }
+            parallel_upload(uploads);
         }
     }
     else {
