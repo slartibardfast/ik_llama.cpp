@@ -258,6 +258,9 @@ endif()
 
 set (GGML_SOURCES_IQK iqk/iqk_quantize.cpp iqk/iqk_cpu_ops.cpp)
 set (GGML_HEADERS_IQK iqk/iqk_config.h iqk/iqk_cpu_ops.h)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT DEFINED __AVX2__)
+    set_source_files_properties(iqk/iqk_quantize.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -mf16c")
+endif()
 if (GGML_IQK_MUL_MAT)
     message(STATUS "Using optimized iqk matrix multiplications")
     add_compile_definitions(GGML_USE_IQK_MULMAT)
@@ -849,7 +852,7 @@ if (GGML_VULKAN)
         )
 
         set(GGML_HEADERS_VULKAN ${CMAKE_CURRENT_SOURCE_DIR}/../include/ggml-vulkan.h ${_ggml_vk_header})
-        set(GGML_SOURCES_VULKAN ggml-vulkan.cpp ${_ggml_vk_source})
+        set(GGML_SOURCES_VULKAN ggml-vulkan.cpp ggml-vulkan-multigpu.cpp ${_ggml_vk_source})
 
         set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS} Vulkan::Vulkan)
         set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${CMAKE_CURRENT_BINARY_DIR})

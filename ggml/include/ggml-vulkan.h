@@ -23,6 +23,8 @@ GGML_API GGML_CALL void ggml_backend_vk_get_device_memory(int device, size_t * f
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
+// split buffer type for distributing tensors across multiple Vulkan devices
+GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_split_buffer_type(const float * tensor_split);
 
 #ifdef  __cplusplus
 }
