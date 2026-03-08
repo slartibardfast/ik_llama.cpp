@@ -1037,6 +1037,15 @@ private:
     std::map<std::string, std::vector<uint64_t>> timings;
 };
 
+// Pending cross-device copy: source read submitted async, waiting for completion
+struct vk_pending_xdev_copy {
+    vk_device src_device;       // source device (to wait on its fence)
+    vk_context src_transfer_ctx; // source transfer context (holds the async read)
+    vk_buffer dst_buf;          // destination buffer
+    size_t dst_offset;          // offset into destination buffer
+    size_t nbytes;              // size of the copy
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1067,6 +1076,9 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+
+    // Pending cross-device copies (Phase 7: async pipeline)
+    std::vector<vk_pending_xdev_copy> pending_xdev_copies;
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -10162,32 +10174,50 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             return true;
         }
 
-        // Cross-device: route through host staging (GPU A -> host -> GPU B)
-        // This is synchronous, matching the scheduler's barrier model
+        // Cross-device: async pipeline (GPU A -> staging -> GPU B)
+        // Source read is submitted async; completion deferred to synchronize()
         if (ggml_backend_is_vk(backend_src)) {
-            size_t nbytes = ggml_nbytes(src);
-            // Use a thread-local staging buffer to avoid repeated allocation
-            thread_local std::vector<char> staging;
-            if (staging.size() < nbytes) {
-                staging.resize(nbytes);
-            }
-
-            // Read from source device to host
+            ggml_backend_vk_context * ctx_src = (ggml_backend_vk_context *)backend_src->context;
             vk_buffer src_buf = src_buf_ctx->dev_buffer;
-            ggml_vk_buffer_read(src_buf, vk_tensor_offset(src) + src->view_offs, staging.data(), nbytes);
+            vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+            size_t nbytes = ggml_nbytes(src);
+            size_t src_offset = vk_tensor_offset(src) + src->view_offs;
+            size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
 
-            // Write to destination device (async, batched with other transfers)
-            vk_context transfer_ctx;
-            if (ctx_dst->transfer_ctx.expired()) {
-                transfer_ctx = ggml_vk_create_context(ctx_dst, ctx_dst->transfer_cmd_pool);
-                ctx_dst->transfer_ctx = transfer_ctx;
-                ggml_vk_ctx_begin(ctx_dst->device, transfer_ctx);
-            } else {
-                transfer_ctx = ctx_dst->transfer_ctx.lock();
+            // Host-visible source (e.g. lavapipe): direct memcpy, no async needed
+            if (src_buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+                vk_context transfer_ctx;
+                if (ctx_dst->transfer_ctx.expired()) {
+                    transfer_ctx = ggml_vk_create_context(ctx_dst, ctx_dst->transfer_cmd_pool);
+                    ctx_dst->transfer_ctx = transfer_ctx;
+                    ggml_vk_ctx_begin(ctx_dst->device, transfer_ctx);
+                } else {
+                    transfer_ctx = ctx_dst->transfer_ctx.lock();
+                }
+                ggml_vk_buffer_write_async(transfer_ctx, dst_buf, dst_offset, (const char *)src_buf->ptr + src_offset, nbytes);
+                return true;
             }
 
-            vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
-            ggml_vk_buffer_write_async(transfer_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, staging.data(), nbytes);
+            // Submit async read on source device's transfer queue
+            {
+                std::lock_guard<std::recursive_mutex> guard(ctx_src->device->mutex);
+                ggml_vk_ensure_sync_staging_buffer(ctx_src->device, nbytes);
+
+                vk_context src_xfer = ggml_vk_create_temporary_context(ctx_src->device, ctx_src->device->transfer_queue.cmd_pool);
+                ggml_vk_ctx_begin(ctx_src->device, src_xfer);
+                ggml_vk_buffer_read_async(src_xfer, src_buf, src_offset, ctx_src->device->sync_staging->ptr, nbytes, true);
+                ggml_vk_ctx_end(src_xfer);
+                ggml_vk_submit(src_xfer, ctx_src->device->fence);
+
+                // Record pending copy — fence wait deferred to dst synchronize()
+                ctx_dst->pending_xdev_copies.push_back({
+                    ctx_src->device,
+                    src_xfer,
+                    dst_buf,
+                    dst_offset,
+                    nbytes,
+                });
+            }
             return true;
         }
     }
@@ -10198,6 +10228,38 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // Process pending cross-device copies (Phase 7: async pipeline)
+    // Source reads were submitted async in cpy_tensor_async; now wait and complete
+    if (!ctx->pending_xdev_copies.empty()) {
+        // Ensure we have a transfer context for destination writes
+        vk_context transfer_ctx;
+        if (ctx->transfer_ctx.expired()) {
+            transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+            ctx->transfer_ctx = transfer_ctx;
+            ggml_vk_ctx_begin(ctx->device, transfer_ctx);
+        } else {
+            transfer_ctx = ctx->transfer_ctx.lock();
+        }
+
+        for (auto& xdev : ctx->pending_xdev_copies) {
+            // Wait for source device's async read to complete
+            VK_CHECK(xdev.src_device->device.waitForFences({ xdev.src_device->fence }, true, UINT64_MAX),
+                     "xdev copy waitForFences");
+            xdev.src_device->device.resetFences({ xdev.src_device->fence });
+
+            // Execute deferred staging memcpys from source read
+            for (auto& cpy : xdev.src_transfer_ctx->out_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+
+            // Write from source staging to destination device
+            ggml_vk_buffer_write_async(transfer_ctx, xdev.dst_buf, xdev.dst_offset,
+                                       xdev.src_device->sync_staging->ptr, xdev.nbytes);
+        }
+        ctx->pending_xdev_copies.clear();
+    }
+
     if(ctx->transfer_ctx.expired()) {
         return;
     }
