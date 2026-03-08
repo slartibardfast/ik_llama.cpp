@@ -438,30 +438,20 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
 #else
 
-bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int type_mask, [[maybe_unused]] float max_bias,
-                            [[maybe_unused]] int neq3, [[maybe_unused]] int neq2, [[maybe_unused]] long nbq3, [[maybe_unused]] long nbq2,
-                            [[maybe_unused]] int nek3, [[maybe_unused]] int nek2, [[maybe_unused]] long nbk3, [[maybe_unused]] long nbk2,
-                            [[maybe_unused]] int nev3, [[maybe_unused]] int nev2, [[maybe_unused]] long nbv3, [[maybe_unused]] long nbv2,
-                            [[maybe_unused]] int ne2,  [[maybe_unused]] int ne1,  [[maybe_unused]] long nb1,
-                            [[maybe_unused]] int type_k,             // type of k
-                            [[maybe_unused]] int type_v,             // type of v
-                            [[maybe_unused]] int Dk,                 // K head size
-                            [[maybe_unused]] int Dv,                 // V head size
-                            [[maybe_unused]] int nq,                 // number of columns in q
-                            [[maybe_unused]] int nk,                 // number of rows in k
-                            [[maybe_unused]] int stride_q,           // distance between q columns in bytes
-                            [[maybe_unused]] int stride_k,           // distance between k rows in bytes
-                            [[maybe_unused]] int stride_v,           // distance between v rows in bytes
-                            [[maybe_unused]] int stride_m,           // distance between mask rows (in bytes
-                            [[maybe_unused]] const void  * q,        // q matrix.
-                            [[maybe_unused]] const void  * k,        // k matrix. Assumed to be fp16, nq x nk elements
-                            [[maybe_unused]] const void  * v,        // v matrix. Assumed to be fp16, nq x nk elements
-                            [[maybe_unused]] const void  * mask,     // mask. If not null, assumed to be fp16. nq x nk elements
-                            [[maybe_unused]] float         scale,    // scale applied before softmax
-                            [[maybe_unused]] float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
-                            [[maybe_unused]] float       * qkv,      // v*softmax(scale*(k*q))
-                            [[maybe_unused]] void * work_buffer, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
-                            [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa) {
+IQK_API size_t iqk_fa_work_buffer_size(const struct ggml_tensor *, int) {
+    return 0;
+}
+
+IQK_API bool iqk_flash_attn_noalibi(int, int, float,
+                            int, int, long, long,
+                            int, int, long, long,
+                            int, int, long, long,
+                            int, int, long,
+                            int, int, int, int, int, int, int, int, int, int,
+                            const void *, const void *, const void *, const void *, const void *,
+                            float, float, float *,
+                            void *, barrier_t, void *,
+                            int, int, int) {
     return false;
 }
 

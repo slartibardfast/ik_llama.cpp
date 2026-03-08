@@ -762,67 +762,26 @@ void quantize_row_q8_0_x4(const float * x, void * vy, int64_t k) {
         }
     }
 #else
+    // Scalar fallback for non-AVX2 x86
     for (int i = 0; i < nb; i++) {
         int i4 = i/4, ir = i%4;
-        // Load elements into 4 AVX vectors
-        __m256 v0 = _mm256_loadu_ps( x );
-        __m256 v1 = _mm256_loadu_ps( x + 8 );
-        __m256 v2 = _mm256_loadu_ps( x + 16 );
-        __m256 v3 = _mm256_loadu_ps( x + 24 );
+        float amax = 0;
+        for (int j = 0; j < 32; ++j) {
+            float ax = fabsf(x[j]);
+            if (ax > amax) amax = ax;
+        }
+        const float d = amax / 127.f;
+        if (i < nb4) y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+        else y[i].d = GGML_FP32_TO_FP16(d);
+        const float id = (amax != 0.0f) ? 127.f / amax : 0.0f;
+        int8_t * qs = (i < nb4) ? (y4[i4].qs + 32*ir) : y[i].qs;
+        for (int j = 0; j < 32; ++j) {
+            int v = (int)roundf(x[j] * id);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            qs[j] = (int8_t)v;
+        }
         x += 32;
-
-        const __m256 signBit = _mm256_set1_ps( -0.0f );
-        __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
-
-        __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
-        max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
-        max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
-        const float maxScalar = _mm_cvtss_f32( max4 );
-
-        const float d = maxScalar / 127.f;
-        if (i < nb4) {
-            y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
-        } else {
-            y[i].d = GGML_FP32_TO_FP16(d);
-        }
-        const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
-        const __m256 mul = _mm256_set1_ps( id );
-
-        v0 = _mm256_mul_ps( v0, mul );
-        v1 = _mm256_mul_ps( v1, mul );
-        v2 = _mm256_mul_ps( v2, mul );
-        v3 = _mm256_mul_ps( v3, mul );
-
-        v0 = _mm256_round_ps( v0, _MM_ROUND_NEAREST );
-        v1 = _mm256_round_ps( v1, _MM_ROUND_NEAREST );
-        v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
-        v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
-
-        __m256i i0 = _mm256_cvtps_epi32( v0 );
-        __m256i i1 = _mm256_cvtps_epi32( v1 );
-        __m256i i2 = _mm256_cvtps_epi32( v2 );
-        __m256i i3 = _mm256_cvtps_epi32( v3 );
-
-        // Convert int32 to int16
-        i0 = _mm256_packs_epi32( i0, i1 );  // 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
-        i2 = _mm256_packs_epi32( i2, i3 );  // 16, 17, 18, 19,  24, 25, 26, 27,  20, 21, 22, 23, 28, 29, 30, 31
-                                            // Convert int16 to int8
-        i0 = _mm256_packs_epi16( i0, i2 );  // 0, 1, 2, 3,  8, 9, 10, 11,  16, 17, 18, 19,  24, 25, 26, 27,  4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31
-
-        // We got our precious signed bytes, but the order is now wrong
-        // These AVX2 pack instructions process 16-byte pieces independently
-        // The following instruction is fixing the order
-        const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
-        i0 = _mm256_permutevar8x32_epi32( i0, perm );
-
-        if (i < nb4) {
-            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, i0);
-        } else {
-            _mm256_storeu_si256((__m256i *)y[i].qs, i0);
-        }
     }
 #endif
 }
@@ -896,100 +855,42 @@ void quantize_row_q8_1_x4_T(const float * x, Block * y, int64_t k) {
         }
     }
 #else
+    // Scalar fallback for non-AVX2 x86
     for (int i = 0; i < nb; i++) {
         int i4 = i/4, ir = i%4;
-        // Load elements into 4 AVX vectors
-        __m256 v0 = _mm256_loadu_ps( x );
-        __m256 v1 = _mm256_loadu_ps( x + 8 );
-        __m256 v2 = _mm256_loadu_ps( x + 16 );
-        __m256 v3 = _mm256_loadu_ps( x + 24 );
-        x += 32;
-
-        // Compute max(abs(e)) for the block
-        const __m256 signBit = _mm256_set1_ps( -0.0f );
-        __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
-        maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
-
-        __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
-        max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
-        max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
-        const float max_scalar = _mm_cvtss_f32( max4 );
-
-        // Quantize these floats
-        float d = max_scalar / 127.f;
+        float amax = 0;
+        for (int j = 0; j < 32; ++j) {
+            float ax = fabsf(x[j]);
+            if (ax > amax) amax = ax;
+        }
+        float d = amax / 127.f;
         if constexpr (std::is_same_v<Block, block_q8_1>) {
-            if (i < nb4) {
-                y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
-            } else {
-                y[i].d = GGML_FP32_TO_FP16(d);
-            }
+            if (i < nb4) y4[i4].d[ir] = GGML_FP32_TO_FP16(d);
+            else y[i].d = GGML_FP32_TO_FP16(d);
         } else {
             auto t = GGML_FP32_TO_BF16(d);
             d = ggml_bf16_to_fp32(t);
-            if (i < nb4) {
-                y4[i4].d[ir] = t.bits;
-            } else {
-                y[i].d = t.bits;
-            }
+            if (i < nb4) y4[i4].d[ir] = t.bits;
+            else y[i].d = t.bits;
         }
-        const float id = d > 0 ? 1/d : 0.f;
-        const __m256 mul = _mm256_set1_ps( id );
-
-        // Apply the multiplier
-        v0 = _mm256_mul_ps( v0, mul );
-        v1 = _mm256_mul_ps( v1, mul );
-        v2 = _mm256_mul_ps( v2, mul );
-        v3 = _mm256_mul_ps( v3, mul );
-
-        // Round to nearest integer
-        v0 = _mm256_round_ps( v0, _MM_ROUND_NEAREST );
-        v1 = _mm256_round_ps( v1, _MM_ROUND_NEAREST );
-        v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
-        v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
-
-        // Convert floats to integers
-        __m256i i0 = _mm256_cvtps_epi32( v0 );
-        __m256i i1 = _mm256_cvtps_epi32( v1 );
-        __m256i i2 = _mm256_cvtps_epi32( v2 );
-        __m256i i3 = _mm256_cvtps_epi32( v3 );
-
-        // Compute the sum of the quants and set y[i].s
-        int isum = hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+        const float id = d > 0 ? 1.f/d : 0.f;
+        int isum = 0;
+        int8_t * qs = (i < nb4) ? (y4[i4].qs + QK8_1*ir) : y[i].qs;
+        for (int j = 0; j < 32; ++j) {
+            int v = (int)roundf(x[j] * id);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            qs[j] = (int8_t)v;
+            isum += v;
+        }
         if constexpr (std::is_same_v<Block, block_q8_1>) {
-            if (i < nb4) {
-                y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d * isum);
-            } else {
-                y[i].s = GGML_FP32_TO_FP16(d * isum);
-            }
+            if (i < nb4) y4[i4].d[ir+4] = GGML_FP32_TO_FP16(d * isum);
+            else y[i].s = GGML_FP32_TO_FP16(d * isum);
         } else {
-            if (i < nb4) {
-                auto i16 = (int16_t *)y4[i4].d;
-                i16[ir+4] = isum;
-            } else {
-                auto i16 = (int16_t *)&y[i].s;
-                i16[0] = isum;
-            }
+            if (i < nb4) { auto i16 = (int16_t *)y4[i4].d; i16[ir+4] = isum; }
+            else { auto i16 = (int16_t *)&y[i].s; i16[0] = isum; }
         }
-
-        // Convert int32 to int16
-        i0 = _mm256_packs_epi32( i0, i1 );  // 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
-        i2 = _mm256_packs_epi32( i2, i3 );  // 16, 17, 18, 19,  24, 25, 26, 27,  20, 21, 22, 23, 28, 29, 30, 31
-                                            // Convert int16 to int8
-        i0 = _mm256_packs_epi16( i0, i2 );  // 0, 1, 2, 3,  8, 9, 10, 11,  16, 17, 18, 19,  24, 25, 26, 27,  4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31
-
-        // We got our precious signed bytes, but the order is now wrong
-        // These AVX2 pack instructions process 16-byte pieces independently
-        // The following instruction is fixing the order
-        const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
-        i0 = _mm256_permutevar8x32_epi32( i0, perm );
-
-        if (i < nb4) {
-            _mm256_storeu_si256((__m256i *)y4[i4].qs + ir, i0);
-        } else {
-            _mm256_storeu_si256((__m256i *)y[i].qs, i0);
-        }
+        x += 32;
     }
 #endif
 }
@@ -6735,13 +6636,9 @@ static void repack_q8_KV(int nrows, int n_per_row, const char * cx, char * cy, [
             vst1q_s8_x2(qy + 64 + 128*ib, m2);
             vst1q_s8_x2(qy + 96 + 128*ib, m3);
 #else
-            // TODO
-            for (int l = 0; l < 4; ++l) {
-                for (int k = 0; k < 8; ++k) for (int i = 0; i < 4; ++i) {
-                    y[ib].qs[32*l+4*k+i+  0] = x8[k][ib].qs[i+4*l+ 0];
-                    y[ib].qs[32*l+4*k+i+128] = x8[k][ib].qs[i+4*l+16];
-                }
-            }
+            // TODO: scalar fallback not implemented
+            (void)qy;
+            GGML_ABORT("q8_KV_R8 interleave not implemented for this architecture");
 #endif
 
         }

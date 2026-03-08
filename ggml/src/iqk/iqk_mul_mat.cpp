@@ -1683,7 +1683,6 @@ bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_ty
 #include "ggml-impl.h"
 
 extern "C" IQK_API bool iqk_mul_mat(int, long, long, long, int, const void *, long, int, const void *, long, float *, long, int, int) {
-    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
 
@@ -1693,13 +1692,11 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long /*Nx*/, long /*Ny*/, long /*ne00*/,
         int /*typeA*/, const void * /*A*/, long /*strideA*/,
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
         float * /*C*/, long /*stride_C*/, int /*ith*/, int /*nth*/) {
-    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
 
 extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
         const void *, int, int) {
-    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
 
@@ -1707,11 +1704,13 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long /*Nx*/, long /*Ny*/, long /*n
         int /*typeA*/, const void * /*Aup*/, const void * /*Agate*/, long /*strideA*/,
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
         float * /*C*/, long /*nb1*/, long /*nb2*/, const void * /*vrow_mapping*/, float, int /*ith*/, int /*nth*/) {
-    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
 
-bool iqk_fused_delta_net(int, int, int, int, int, int,
+extern "C" IQK_API void iqk_topk_moe(int, int, int, const float *, float *, int32_t *, int, int) {
+}
+
+extern "C" IQK_API bool iqk_fused_delta_net(int, int, int, int, int, int,
         const float *, const float *, const float *, const float *, const float *,
         const float *, float *, float *, int, int) {
     return false;

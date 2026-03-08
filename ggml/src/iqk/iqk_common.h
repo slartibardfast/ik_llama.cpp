@@ -932,6 +932,8 @@ inline void static_for(T&&f) {
     }
 }
 
+#include <cstdint>
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #include <intrin.h>
