@@ -514,6 +514,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_fused_mul_silu[2];
     vk_pipeline pipeline_fused_mul_relu[2];
     vk_pipeline pipeline_multi_add_f32;
+    vk_matmul_pipeline2 pipeline_fused_up_gate[GGML_TYPE_COUNT];
 
     // ============================== ik_llama.cpp pipelines end ========================================
 
@@ -655,6 +656,17 @@ struct vk_mat_mat_push_constants {
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
+};
+struct vk_fused_up_gate_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t k_split;
+    uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+    uint32_t padded_N;
+    uint32_t unary_op;
+    float limit;
+    uint32_t batch_stride_a_gate;
 };
 struct vk_mat_vec_push_constants {
     uint32_t ncols; uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
@@ -3236,6 +3248,34 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_multi_add_f32, "multi_add_f32", multi_add_f32_len, multi_add_f32_data,
             "main", 2, sizeof(vk_op_multiadd_push_constants), {512, 1, 1}, {}, 1);
+
+    // Fused up-gate dual-matmul pipelines (one per quant type, 4 bindings: up, b, dst, gate)
+#define CREATE_FUG(TYPE, NAMELC) \
+    if (device->mul_mat_l[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->l, #NAMELC "_l", NAMELC ## _len, NAMELC ## _data, "main", 4, sizeof(vk_fused_up_gate_push_constants), l_mmq_wg_denoms, l_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 4, sizeof(vk_fused_up_gate_push_constants), l_mmq_wg_denoms, l_warptile_mmq, l_align); \
+    } \
+    if (device->mul_mat_m[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->m, #NAMELC "_m", NAMELC ## _len, NAMELC ## _data, "main", 4, sizeof(vk_fused_up_gate_push_constants), m_mmq_wg_denoms, m_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->a_m, #NAMELC "_aligned_m", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 4, sizeof(vk_fused_up_gate_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align); \
+    } \
+    if (device->mul_mat_s[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->s, #NAMELC "_s", NAMELC ## _len, NAMELC ## _data, "main", 4, sizeof(vk_fused_up_gate_push_constants), s_mmq_wg_denoms, s_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate[TYPE].f32acc->a_s, #NAMELC "_aligned_s", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 4, sizeof(vk_fused_up_gate_push_constants), s_mmq_wg_denoms, s_warptile_mmq, s_align); \
+    }
+
+    CREATE_FUG(GGML_TYPE_Q4_0, matmul_fused_up_gate_q4_0_f32)
+    CREATE_FUG(GGML_TYPE_Q4_1, matmul_fused_up_gate_q4_1_f32)
+    CREATE_FUG(GGML_TYPE_Q5_0, matmul_fused_up_gate_q5_0_f32)
+    CREATE_FUG(GGML_TYPE_Q5_1, matmul_fused_up_gate_q5_1_f32)
+    CREATE_FUG(GGML_TYPE_Q8_0, matmul_fused_up_gate_q8_0_f32)
+    CREATE_FUG(GGML_TYPE_Q2_K, matmul_fused_up_gate_q2_k_f32)
+    CREATE_FUG(GGML_TYPE_Q3_K, matmul_fused_up_gate_q3_k_f32)
+    CREATE_FUG(GGML_TYPE_Q4_K, matmul_fused_up_gate_q4_k_f32)
+    CREATE_FUG(GGML_TYPE_Q5_K, matmul_fused_up_gate_q5_k_f32)
+    CREATE_FUG(GGML_TYPE_Q6_K, matmul_fused_up_gate_q6_k_f32)
+    CREATE_FUG(GGML_TYPE_IQ4_NL, matmul_fused_up_gate_iq4_nl_f32)
+#undef CREATE_FUG
     //
     // ================================ ik_llama.cpp pipelines end =========================================
 
@@ -6066,6 +6106,111 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, dryrun);
     }
+}
+
+static void ggml_vk_fused_up_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * up   = dst->src[0];  // quantized weight [K, N, 1, 1]
+    const ggml_tensor * gate = dst->src[1];  // quantized weight [K, N, 1, 1]
+    const ggml_tensor * b    = dst->src[2];  // input F32 [K, M, 1, 1]
+
+    GGML_ASSERT(ggml_is_quantized(up->type));
+    GGML_ASSERT(up->type == gate->type);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+
+    const uint64_t ne00 = up->ne[0];   // K
+    const uint64_t ne01 = up->ne[1];   // N (weight rows = output dim 0)
+    const uint64_t ne02 = up->ne[2];
+    const uint64_t ne03 = up->ne[3];
+
+    const uint64_t ne20 = b->ne[0];    // K
+    const uint64_t ne21 = b->ne[1];    // M (batch = output dim 1)
+    const uint64_t ne22 = b->ne[2];
+    const uint64_t ne23 = b->ne[3];
+
+    const uint64_t r2 = ne22 / ne02;
+    const uint64_t r3 = ne23 / ne03;
+
+    // Get pipeline for this quant type
+    vk_matmul_pipeline mmp = ctx->device->pipeline_fused_up_gate[up->type].f32acc;
+    GGML_ASSERT(mmp != nullptr);
+
+    const uint32_t kpad = ggml_vk_align_size(ne00, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne21, up->type, GGML_TYPE_F32));
+    const bool aligned = ne00 == kpad && ne01 > 8 && ne21 > 8;
+
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne21, aligned, up->type, GGML_TYPE_F32);
+
+    const uint32_t padded_n = (uint32_t)ne21;
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    // Get buffers
+    ggml_backend_vk_buffer_context * up_buf_ctx   = (ggml_backend_vk_buffer_context *)up->buffer->context;
+    ggml_backend_vk_buffer_context * gate_buf_ctx = (ggml_backend_vk_buffer_context *)gate->buffer->context;
+    ggml_backend_vk_buffer_context * b_buf_ctx    = (ggml_backend_vk_buffer_context *)b->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    vk_buffer d_up   = up_buf_ctx->dev_buffer;
+    vk_buffer d_gate = gate_buf_ctx->dev_buffer;
+    vk_buffer d_b    = b_buf_ctx->dev_buffer;
+    vk_buffer d_D    = dst_buf_ctx->dev_buffer;
+
+    const uint64_t up_buf_offset   = vk_tensor_offset(up) + up->view_offs;
+    const uint64_t gate_buf_offset = vk_tensor_offset(gate) + gate->view_offs;
+    const uint64_t b_buf_offset    = vk_tensor_offset(b) + b->view_offs;
+    const uint64_t d_buf_offset    = vk_tensor_offset(dst) + dst->view_offs;
+
+    const uint64_t up_sz   = ggml_type_size(up->type) * ne00 * ne01 / ggml_blck_size(up->type);
+    const uint64_t gate_sz = ggml_type_size(gate->type) * gate->ne[0] * gate->ne[1] / ggml_blck_size(gate->type);
+    const uint64_t b_sz    = sizeof(float) * ne20 * ne21;
+    const uint64_t d_sz    = sizeof(float) * ne01 * ne21;
+
+    // Read op params: unary_op and limit
+    const int32_t unary_op_ggml = dst->op_params[0];
+    const float limit = *(const float *)(dst->op_params + 1);
+
+    uint32_t shader_unary_op;
+    switch (unary_op_ggml) {
+    case GGML_UNARY_OP_SILU: shader_unary_op = 0; break;
+    case GGML_UNARY_OP_GELU: shader_unary_op = 1; break;
+    case GGML_UNARY_OP_RELU: shader_unary_op = 2; break;
+    default:
+        GGML_ABORT("unsupported activation in fused_up_gate");
+    }
+
+    const uint32_t batch = (uint32_t)(ne22 * ne23);
+
+    const vk_fused_up_gate_push_constants pc = {
+        (uint32_t)ne01,                             // M
+        (uint32_t)ne21,                             // N
+        (uint32_t)ne00,                             // K
+        (uint32_t)ne00,                             // stride_a
+        (uint32_t)ne20,                             // stride_b
+        (uint32_t)(dst->ne[0]),                     // stride_d
+        (uint32_t)(ne00 * ne01),                    // batch_stride_a
+        (uint32_t)(ne20 * ne21),                    // batch_stride_b
+        (uint32_t)(dst->ne[0] * dst->ne[1]),        // batch_stride_d
+        1,                                           // k_split (forced to 1)
+        (uint32_t)ne02, (uint32_t)ne22,             // ne02, ne12
+        (uint32_t)r2, (uint32_t)r3,                 // broadcast2, broadcast3
+        padded_n,
+        shader_unary_op,
+        limit,
+        (uint32_t)(gate->ne[0] * gate->ne[1]),     // batch_stride_a_gate
+    };
+
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            vk_subbuffer{ d_up,   up_buf_offset,   up_sz * ne02 * ne03 },
+            vk_subbuffer{ d_b,    b_buf_offset,    b_sz * ne22 * ne23 },
+            vk_subbuffer{ d_D,    d_buf_offset,    d_sz * ne22 * ne23 },
+            vk_subbuffer{ d_gate, gate_buf_offset, gate_sz * ne02 * ne03 },
+        },
+        pc,
+        { (uint32_t)ne01, (uint32_t)ne21, batch });
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, bool dryrun = false) {
@@ -9546,6 +9691,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_LEAKY_RELU:
     case GGML_OP_FLASH_ATTN_EXT:
     //case GGML_OP_OPT_STEP_ADAMW:
+    case GGML_OP_FUSED_UP_GATE:
         break;
     default:
         std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(node->op) << std::endl;
@@ -9848,6 +9994,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FUSED_UP_GATE:
+        ggml_vk_fused_up_gate(ctx, compute_ctx, node, dryrun);
+
+        break;
+
     //case GGML_OP_RWKV_WKV6:
     //    ggml_vk_rwkv_wkv6(ctx, compute_ctx, node, dryrun);
 
@@ -9999,6 +10150,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_MUL_MAT:
     case GGML_OP_MUL_MAT_ID:
     case GGML_OP_FLASH_ATTN_EXT:
+    case GGML_OP_FUSED_UP_GATE:
         buf = tensor->buffer;
 
         break;
@@ -11175,6 +11327,24 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_RMS_NORM:
         case GGML_OP_FUSED_RMS_NORM:
             return true;
+        case GGML_OP_FUSED_UP_GATE:
+            {
+                const ggml_tensor * up = op->src[0];
+                const ggml_tensor * gate = op->src[1];
+                const ggml_tensor * b = op->src[2];
+                if (!up || !gate || !b) return false;
+                if (!ggml_is_quantized(up->type)) return false;
+                if (up->type != gate->type) return false;
+                if (b->type != GGML_TYPE_F32) return false;
+                if (!ggml_are_same_shape(up, gate)) return false;
+                // Check we have a pipeline for this quant type
+                ggml_backend_vk_context * vk_ctx = (ggml_backend_vk_context *)backend->context;
+                auto & dev = vk_ctx->device;
+                if (!dev->pipeline_fused_up_gate[up->type].f32acc->s &&
+                    !dev->pipeline_fused_up_gate[up->type].f32acc->m &&
+                    !dev->pipeline_fused_up_gate[up->type].f32acc->l) return false;
+                return true;
+            }
         case GGML_OP_NORM:
         case GGML_OP_GROUP_NORM:
         //case GGML_OP_L2_NORM:
