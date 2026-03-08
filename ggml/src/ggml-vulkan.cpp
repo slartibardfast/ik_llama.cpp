@@ -1089,6 +1089,10 @@ struct ggml_backend_vk_context {
 
     // Pending cross-device copies (Phase 7: async pipeline)
     std::vector<vk_pending_xdev_copy> pending_xdev_copies;
+
+    // Phase 10: async graph compute state
+    bool compute_pending {};              // true when graph_compute submitted but not yet synchronized
+    vk_context pending_compute_exit_ctx;  // deferred exit context holding out_memcpys
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -9757,7 +9761,10 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
 
         if (use_fence) {
-            ggml_vk_wait_for_fence(ctx);
+            // Phase 10: defer exit tensor fence wait to synchronize()
+            if (tensor_idx != subctx->exit_tensor_idx) {
+                ggml_vk_wait_for_fence(ctx);
+            }
         }
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
@@ -9765,12 +9772,9 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 
     if (tensor_idx == subctx->exit_tensor_idx) {
-        // Do staging buffer copies
-        for (auto& cpy : subctx->out_memcpys) {
-            memcpy(cpy.dst, cpy.src, cpy.n);
-        }
+        // Phase 10: defer out_memcpys to synchronize() — GPU work may not be complete
+        ctx->pending_compute_exit_ctx = subctx;
         subctx->in_memcpys.clear();
-        subctx->out_memcpys.clear();
     }
 
     return true;
@@ -9808,6 +9812,23 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->gc.contexts.clear();
     ctx->pipeline_descriptor_set_requirements = 0;
     ctx->descriptor_set_idx = 0;
+}
+
+// Phase 10: Wait for pending async graph_compute and clean up
+static void ggml_vk_sync_compute(ggml_backend_vk_context * ctx) {
+    if (!ctx->compute_pending) return;
+
+    ggml_vk_wait_for_fence(ctx);
+
+    if (ctx->pending_compute_exit_ctx) {
+        for (auto& cpy : ctx->pending_compute_exit_ctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        ctx->pending_compute_exit_ctx.reset();
+    }
+
+    ggml_vk_graph_cleanup(ctx);
+    ctx->compute_pending = false;
 }
 
 // Clean up on backend free
@@ -10188,6 +10209,9 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         // Source read is submitted async; completion deferred to synchronize()
         if (ggml_backend_is_vk(backend_src)) {
             ggml_backend_vk_context * ctx_src = (ggml_backend_vk_context *)backend_src->context;
+
+            // Phase 10: ensure source device's compute is complete before reading
+            ggml_vk_sync_compute(ctx_src);
             vk_buffer src_buf = src_buf_ctx->dev_buffer;
             vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
             size_t nbytes = ggml_nbytes(src);
@@ -10268,6 +10292,9 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // Phase 10: complete pending async graph_compute
+    ggml_vk_sync_compute(ctx);
 
     // Process pending cross-device copies (Phase 7: async pipeline)
     // Source reads were submitted async in cpy_tensor_async; now wait and complete
@@ -10368,6 +10395,9 @@ static bool ggml_vk_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, st
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // Phase 10: ensure previous async compute is complete before starting new work
+    ggml_vk_sync_compute(ctx);
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -10499,6 +10529,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (vk_perf_logger_enabled) {
+        // Perf logger needs GPU done — sync compute fence before reading timestamps
+        ggml_vk_wait_for_fence(ctx);
+        if (ctx->pending_compute_exit_ctx) {
+            for (auto& cpy : ctx->pending_compute_exit_ctx->out_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            ctx->pending_compute_exit_ctx.reset();
+        }
+
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
@@ -10518,9 +10557,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         ctx->device->perf_logger->print_timings();
+        ggml_vk_graph_cleanup(ctx);
+    } else {
+        // Phase 10: defer fence wait and cleanup to synchronize()
+        ctx->compute_pending = true;
     }
-
-    ggml_vk_graph_cleanup(ctx);
 
     return GGML_STATUS_SUCCESS;
 
