@@ -177,11 +177,6 @@ struct vk_command_pool {
     vk_queue *q;
 };
 
-// Prevent simultaneous submissions to the same queue.
-// This could be per vk_queue if we stopped having two vk_queue structures
-// sharing the same vk::Queue.
-static std::mutex queue_mutex;
-
 struct vk_queue {
     uint32_t queue_family_index;
     vk::Queue queue;
@@ -330,6 +325,7 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
+    std::mutex queue_mutex;  // per-device mutex for queue submissions
 
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
@@ -948,6 +944,7 @@ struct vk_context_struct {
     std::vector<vk_staging_memcpy> out_memcpys;
 
     vk_command_pool * p {};
+    vk_device device {};
 };
 typedef std::shared_ptr<vk_context_struct> vk_context;
 typedef std::weak_ptr<vk_context_struct> vk_context_ref;
@@ -1379,7 +1376,7 @@ static vk::CommandBuffer ggml_vk_create_cmd_buffer(vk_device& device, vk_command
 static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
         if (fence) {
-            std::lock_guard<std::mutex> guard(queue_mutex);
+            std::lock_guard<std::mutex> guard(ctx->device->queue_mutex);
             ctx->p->q->queue.submit({}, fence);
         }
         return;
@@ -1449,7 +1446,7 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
-    std::lock_guard<std::mutex> guard(queue_mutex);
+    std::lock_guard<std::mutex> guard(ctx->device->queue_mutex);
     ctx->p->q->queue.submit(submit_infos, fence);
 
     ctx->seqs.clear();
@@ -1520,13 +1517,15 @@ static vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_comma
     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
     ctx->gc.contexts.emplace_back(result);
     result->p = &p;
+    result->device = ctx->device;
     return result;
 }
 
-static vk_context ggml_vk_create_temporary_context(vk_command_pool& p) {
+static vk_context ggml_vk_create_temporary_context(vk_device& device, vk_command_pool& p) {
     vk_context result = std::make_shared<vk_context_struct>();
     VK_LOG_DEBUG("ggml_vk_create_temporary_context(" << result << ")");
     result->p = &p;
+    result->device = device;
     return result;
 }
 
@@ -3977,6 +3976,34 @@ static void ggml_vk_instance_init() {
     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
         ggml_vk_print_gpu_info(i);
     }
+
+    // Multi-GPU topology logging
+    if (vk_instance.device_indices.size() > 1) {
+        std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+        GGML_LOG_INFO("ggml_vulkan: Multi-GPU topology (%zu devices):\n", vk_instance.device_indices.size());
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            vk::PhysicalDevice dev = devices[vk_instance.device_indices[i]];
+            vk::PhysicalDeviceProperties props = dev.getProperties();
+            vk::PhysicalDeviceMemoryProperties mem = dev.getMemoryProperties();
+            size_t vram = 0;
+            for (uint32_t j = 0; j < mem.memoryHeapCount; j++) {
+                if (mem.memoryHeaps[j].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    vram = mem.memoryHeaps[j].size;
+                    break;
+                }
+            }
+            const char * type_str = "unknown";
+            switch (props.deviceType) {
+                case vk::PhysicalDeviceType::eDiscreteGpu:   type_str = "discrete"; break;
+                case vk::PhysicalDeviceType::eIntegratedGpu: type_str = "integrated"; break;
+                case vk::PhysicalDeviceType::eCpu:           type_str = "cpu (lavapipe)"; break;
+                case vk::PhysicalDeviceType::eVirtualGpu:    type_str = "virtual"; break;
+                default: break;
+            }
+            GGML_LOG_INFO("ggml_vulkan:   %zu: %s | type: %s | VRAM: %.0f MiB\n",
+                i, props.deviceName.data(), type_str, vram / (1024.0 * 1024.0));
+        }
+    }
 }
 
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
@@ -4588,10 +4615,13 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
 
 static void ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t width, size_t height, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d_async(" << width << ", " << height << ")");
-    // Buffer is already mapped
+    // Buffer is already mapped (e.g. lavapipe CPU device) - do synchronous memcpy
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
-        std::cerr << "ggml_vulkan: buffer_write_async dst buffer is host_visible. Use synchronous write." << std::endl;
-        GGML_ABORT("fatal error");
+        GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        for (size_t row = 0; row < height; row++) {
+            memcpy((uint8_t *)dst->ptr + offset + row * width, (const uint8_t *)src + row * spitch, width);
+        }
+        return;
     }
     // Check if src is pinned memory
     vk_buffer buf = nullptr;
@@ -4665,7 +4695,7 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
-        vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue.cmd_pool);
+        vk_context subctx = ggml_vk_create_temporary_context(dst->device, dst->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(dst->device, subctx);
         ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, width, height, true);
         ggml_vk_ctx_end(subctx);
@@ -4691,6 +4721,15 @@ static void ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     GGML_ASSERT(width > 0);
     GGML_ASSERT(height > 0);
     GGML_ASSERT(src != nullptr);
+
+    // Buffer is already mapped (e.g. lavapipe CPU device) - do synchronous memcpy
+    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        for (size_t i = 0; i < height; i++) {
+            memcpy((uint8_t *)dst + i * dpitch, (const uint8_t *)src->ptr + offset + i * spitch, width);
+        }
+        return;
+    }
 
     // TODO: staging_offset is not used
 
@@ -4756,7 +4795,7 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
-        vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue.cmd_pool);
+        vk_context subctx = ggml_vk_create_temporary_context(src->device, src->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         ggml_vk_buffer_read_async(subctx, src, offset, dst, size, true);
         ggml_vk_ctx_end(subctx);
@@ -4787,7 +4826,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         VK_LOG_DEBUG("ggml_vk_buffer_copy(SINGLE_DEVICE, " << size << ")");
         // Copy within the device
-        vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue.cmd_pool);
+        vk_context subctx = ggml_vk_create_temporary_context(src->device, src->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
         ggml_vk_ctx_end(subctx);
@@ -4820,7 +4859,7 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     VK_LOG_DEBUG("ggml_vk_buffer_memset(" << offset << ", " << c << ", " << size << ")");
 
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
-    vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue.cmd_pool);
+    vk_context subctx = ggml_vk_create_temporary_context(dst->device, dst->device->transfer_queue.cmd_pool);
     ggml_vk_ctx_begin(dst->device, subctx);
     subctx->s->buffer.fillBuffer(dst->buffer, offset, size, c);
     ggml_vk_ctx_end(subctx);
@@ -10093,29 +10132,64 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_vk_buffer_read_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
-static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async()");
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if ((dst->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || dst->buffer->buft == ggml_backend_vk_host_buffer_type()) && ggml_backend_buffer_is_vk(src->buffer)) {
+    ggml_backend_vk_context * ctx_dst = (ggml_backend_vk_context *)backend_dst->context;
+
+    if (!ggml_backend_buffer_is_vk(src->buffer)) {
+        return false;
+    }
+
+    if (dst->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend_dst) || dst->buffer->buft == ggml_backend_vk_host_buffer_type()) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
         ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
 
-        vk_context transfer_ctx;
+        // Check if src and dst are on the same VkDevice
+        if (src_buf_ctx->dev_buffer->device == dst_buf_ctx->dev_buffer->device) {
+            // Same device: direct buffer copy
+            vk_context transfer_ctx;
+            if (ctx_dst->transfer_ctx.expired()) {
+                transfer_ctx = ggml_vk_create_context(ctx_dst, ctx_dst->transfer_cmd_pool);
+                ctx_dst->transfer_ctx = transfer_ctx;
+                ggml_vk_ctx_begin(ctx_dst->device, transfer_ctx);
+            } else {
+                transfer_ctx = ctx_dst->transfer_ctx.lock();
+            }
 
-        if (ctx->transfer_ctx.expired()) {
-            // Initialize new transfer context
-            transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
-            ctx->transfer_ctx = transfer_ctx;
-            ggml_vk_ctx_begin(ctx->device, transfer_ctx);
-        } else {
-            transfer_ctx = ctx->transfer_ctx.lock();
+            vk_buffer src_buf = src_buf_ctx->dev_buffer;
+            vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+            ggml_vk_buffer_copy_async(transfer_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
+            return true;
         }
 
-        vk_buffer src_buf = src_buf_ctx->dev_buffer;
-        vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+        // Cross-device: route through host staging (GPU A -> host -> GPU B)
+        // This is synchronous, matching the scheduler's barrier model
+        if (ggml_backend_is_vk(backend_src)) {
+            size_t nbytes = ggml_nbytes(src);
+            // Use a thread-local staging buffer to avoid repeated allocation
+            thread_local std::vector<char> staging;
+            if (staging.size() < nbytes) {
+                staging.resize(nbytes);
+            }
 
-        ggml_vk_buffer_copy_async(transfer_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
-        return true;
+            // Read from source device to host
+            vk_buffer src_buf = src_buf_ctx->dev_buffer;
+            ggml_vk_buffer_read(src_buf, vk_tensor_offset(src) + src->view_offs, staging.data(), nbytes);
+
+            // Write to destination device (async, batched with other transfers)
+            vk_context transfer_ctx;
+            if (ctx_dst->transfer_ctx.expired()) {
+                transfer_ctx = ggml_vk_create_context(ctx_dst, ctx_dst->transfer_cmd_pool);
+                ctx_dst->transfer_ctx = transfer_ctx;
+                ggml_vk_ctx_begin(ctx_dst->device, transfer_ctx);
+            } else {
+                transfer_ctx = ctx_dst->transfer_ctx.lock();
+            }
+
+            vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+            ggml_vk_buffer_write_async(transfer_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, staging.data(), nbytes);
+            return true;
+        }
     }
 
     return false;
@@ -10677,7 +10751,14 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
 
 }
 
+// defined in ggml-vulkan-multigpu.cpp
+extern bool ggml_backend_buft_is_vk_split(ggml_backend_buffer_type_t buft);
+
 static bool ggml_backend_vk_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    if (ggml_backend_buft_is_vk_split(buft)) {
+        return true;
+    }
+
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
     }
@@ -10697,15 +10778,122 @@ static bool ggml_backend_vk_offload_op(ggml_backend_t backend, const ggml_tensor
     UNUSED(backend);
 }
 
-// TODO: enable async and synchronize
+// Event context: wraps a timeline semaphore for cross-backend synchronization
+struct ggml_backend_vk_event_context {
+    vk::Device device;
+    vk::Semaphore semaphore;
+    uint64_t value;  // current timeline value
+};
+
+static ggml_backend_event_t ggml_backend_vk_event_new(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo ci{};
+    ci.setPNext(&tci);
+    vk::Semaphore semaphore = ctx->device->device.createSemaphore(ci);
+
+    auto * event_ctx = new ggml_backend_vk_event_context {
+        ctx->device->device,
+        semaphore,
+        0,
+    };
+
+    return new ggml_backend_event {
+        /* .backend = */ backend,
+        /* .context = */ event_ctx,
+    };
+}
+
+static void ggml_backend_vk_event_free(ggml_backend_event_t event) {
+    auto * event_ctx = (ggml_backend_vk_event_context *)event->context;
+    event_ctx->device.destroySemaphore(event_ctx->semaphore);
+    delete event_ctx;
+    delete event;
+}
+
+static void ggml_backend_vk_event_record(ggml_backend_event_t event) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)event->backend->context;
+    auto * event_ctx = (ggml_backend_vk_event_context *)event->context;
+
+    // Increment timeline value; the next queue submit will signal this value
+    event_ctx->value++;
+
+    // Submit any pending transfer work with a signal on this semaphore
+    if (!ctx->transfer_ctx.expired()) {
+        vk_context transfer_ctx = ctx->transfer_ctx.lock();
+        ggml_vk_ctx_end(transfer_ctx);
+
+        for (auto& cpy : transfer_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        // Add signal semaphore to the last submission
+        if (!transfer_ctx->seqs.empty() && !transfer_ctx->seqs.back().empty()) {
+            transfer_ctx->seqs.back().back().signal_semaphores.push_back({
+                event_ctx->semaphore, event_ctx->value
+            });
+        }
+
+        ggml_vk_submit(transfer_ctx, ctx->fence);
+        // Don't wait for fence here — that's what synchronize is for
+
+        for (auto& cpy : transfer_ctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        ctx->transfer_ctx.reset();
+    } else {
+        // No pending transfer work; do a lightweight signal via empty submit
+        vk::TimelineSemaphoreSubmitInfo tl_info{};
+        tl_info.signalSemaphoreValueCount = 1;
+        tl_info.pSignalSemaphoreValues = &event_ctx->value;
+
+        vk::SubmitInfo si{};
+        si.setPNext(&tl_info);
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &event_ctx->semaphore;
+
+        std::lock_guard<std::mutex> lock(ctx->device->queue_mutex);
+        ctx->device->compute_queue.queue.submit(si, {});
+    }
+}
+
+static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    // Cross-device wait: timeline semaphores are per-VkDevice, so we must wait on the host
+    auto * event_ctx = (ggml_backend_vk_event_context *)event->context;
+
+    vk::SemaphoreWaitInfo wait_info{};
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &event_ctx->semaphore;
+    wait_info.pValues = &event_ctx->value;
+
+    vk::Result result = event_ctx->device.waitSemaphores(wait_info, UINT64_MAX);
+    GGML_ASSERT(result == vk::Result::eSuccess);
+
+    UNUSED(backend);
+}
+
+static void ggml_backend_vk_event_synchronize(ggml_backend_event_t event) {
+    auto * event_ctx = (ggml_backend_vk_event_context *)event->context;
+
+    vk::SemaphoreWaitInfo wait_info{};
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &event_ctx->semaphore;
+    wait_info.pValues = &event_ctx->value;
+
+    vk::Result result = event_ctx->device.waitSemaphores(wait_info, UINT64_MAX);
+    GGML_ASSERT(result == vk::Result::eSuccess);
+}
+
 static ggml_backend_i ggml_backend_vk_interface = {
     /* .get_name                = */ ggml_backend_vk_name,
     /* .free                    = */ ggml_backend_vk_free,
     /* .get_default_buffer_type = */ ggml_backend_vk_get_default_buffer_type,
-    /* .set_tensor_async        = */ NULL,  // ggml_backend_vk_set_tensor_async,
-    /* .get_tensor_async        = */ NULL,  // ggml_backend_vk_get_tensor_async,
-    /* .cpy_tensor_async        = */ NULL,  // ggml_backend_vk_cpy_tensor_async,
-    /* .synchronize             = */ NULL,  // ggml_backend_vk_synchronize,
+    /* .set_tensor_async        = */ ggml_backend_vk_set_tensor_async,
+    /* .get_tensor_async        = */ ggml_backend_vk_get_tensor_async,
+    /* .cpy_tensor_async        = */ ggml_backend_vk_cpy_tensor_async,
+    /* .synchronize             = */ ggml_backend_vk_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
@@ -10714,11 +10902,11 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .supports_op             = */ ggml_backend_vk_supports_op,
     /* .supports_buft           = */ ggml_backend_vk_supports_buft,
     /* .offload_op              = */ ggml_backend_vk_offload_op,
-    /* .event_new               = */ NULL,
-    /* .event_free              = */ NULL,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
-    /* .event_synchronize       = */ NULL,
+    /* .event_new               = */ ggml_backend_vk_event_new,
+    /* .event_free              = */ ggml_backend_vk_event_free,
+    /* .event_record            = */ ggml_backend_vk_event_record,
+    /* .event_wait              = */ ggml_backend_vk_event_wait,
+    /* .event_synchronize       = */ ggml_backend_vk_event_synchronize,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

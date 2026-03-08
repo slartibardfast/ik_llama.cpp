@@ -481,6 +481,12 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_mo
     }
 #endif
 
+#ifdef GGML_USE_VULKAN
+    if (ggml_backend_vk_get_device_count() > 1) {
+        buft = ggml_backend_vk_split_buffer_type(model.splits.data());
+    }
+#endif
+
 #ifdef GGML_USE_SYCL
     if (ggml_backend_sycl_get_device_count() > 1) {
         buft = ggml_backend_sycl_split_buffer_type(model.splits.data());
@@ -4947,8 +4953,8 @@ struct llama_context * llama_init_from_model(
             }
         }
 #elif defined(GGML_USE_VULKAN)
-        if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
-            LLAMA_LOG_ERROR("%s: split mode 'graph' or 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
+        if (model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
+            LLAMA_LOG_ERROR("%s: split mode 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
             llama_free(ctx);
             return nullptr;
         }

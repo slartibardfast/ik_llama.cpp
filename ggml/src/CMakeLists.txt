@@ -852,7 +852,7 @@ if (GGML_VULKAN)
         )
 
         set(GGML_HEADERS_VULKAN ${CMAKE_CURRENT_SOURCE_DIR}/../include/ggml-vulkan.h ${_ggml_vk_header})
-        set(GGML_SOURCES_VULKAN ggml-vulkan.cpp ${_ggml_vk_source})
+        set(GGML_SOURCES_VULKAN ggml-vulkan.cpp ggml-vulkan-multigpu.cpp ${_ggml_vk_source})
 
         set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS} Vulkan::Vulkan)
         set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${CMAKE_CURRENT_BINARY_DIR})
