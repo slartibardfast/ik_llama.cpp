@@ -517,6 +517,14 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
+    // Cross-device staging pool (Phase 8: double-buffered staging)
+    struct xdev_staging_slot {
+        vk_buffer buffer;
+        vk::Fence fence;
+        bool in_use = false;
+    };
+    std::vector<xdev_staging_slot> xdev_staging_pool;
+
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
@@ -1041,6 +1049,8 @@ private:
 struct vk_pending_xdev_copy {
     vk_device src_device;       // source device (to wait on its fence)
     vk_context src_transfer_ctx; // source transfer context (holds the async read)
+    vk_buffer staging;          // per-copy staging buffer (owned, returned to pool after use)
+    vk::Fence fence;            // per-copy fence (owned, returned to pool after use)
     vk_buffer dst_buf;          // destination buffer
     size_t dst_offset;          // offset into destination buffer
     size_t nbytes;              // size of the copy
@@ -10201,18 +10211,48 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             // Submit async read on source device's transfer queue
             {
                 std::lock_guard<std::recursive_mutex> guard(ctx_src->device->mutex);
-                ggml_vk_ensure_sync_staging_buffer(ctx_src->device, nbytes);
 
-                vk_context src_xfer = ggml_vk_create_temporary_context(ctx_src->device, ctx_src->device->transfer_queue.cmd_pool);
-                ggml_vk_ctx_begin(ctx_src->device, src_xfer);
-                ggml_vk_buffer_read_async(src_xfer, src_buf, src_offset, ctx_src->device->sync_staging->ptr, nbytes, true);
+                // Acquire a staging slot from pool (or create one)
+                vk_device& src_dev = ctx_src->device;
+                vk_device_struct::xdev_staging_slot * slot = nullptr;
+                for (auto& s : src_dev->xdev_staging_pool) {
+                    if (!s.in_use) {
+                        // Ensure buffer is large enough
+                        if (s.buffer == nullptr || s.buffer->size < nbytes) {
+                            ggml_vk_destroy_buffer(s.buffer);
+                            s.buffer = ggml_vk_create_buffer_check(src_dev, nbytes,
+                                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+                        }
+                        slot = &s;
+                        break;
+                    }
+                }
+                if (!slot) {
+                    // All slots in use — create a new one
+                    src_dev->xdev_staging_pool.push_back({
+                        ggml_vk_create_buffer_check(src_dev, nbytes,
+                            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent),
+                        src_dev->device.createFence({}),
+                        false,
+                    });
+                    slot = &src_dev->xdev_staging_pool.back();
+                }
+                slot->in_use = true;
+
+                vk_context src_xfer = ggml_vk_create_temporary_context(src_dev, src_dev->transfer_queue.cmd_pool);
+                ggml_vk_ctx_begin(src_dev, src_xfer);
+                ggml_vk_buffer_read_async(src_xfer, src_buf, src_offset, slot->buffer->ptr, nbytes, true);
                 ggml_vk_ctx_end(src_xfer);
-                ggml_vk_submit(src_xfer, ctx_src->device->fence);
+                ggml_vk_submit(src_xfer, slot->fence);
 
                 // Record pending copy — fence wait deferred to dst synchronize()
                 ctx_dst->pending_xdev_copies.push_back({
-                    ctx_src->device,
+                    src_dev,
                     src_xfer,
+                    slot->buffer,
+                    slot->fence,
                     dst_buf,
                     dst_offset,
                     nbytes,
@@ -10243,19 +10283,27 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
         }
 
         for (auto& xdev : ctx->pending_xdev_copies) {
-            // Wait for source device's async read to complete
-            VK_CHECK(xdev.src_device->device.waitForFences({ xdev.src_device->fence }, true, UINT64_MAX),
+            // Wait for this copy's fence (per-copy, not shared)
+            VK_CHECK(xdev.src_device->device.waitForFences({ xdev.fence }, true, UINT64_MAX),
                      "xdev copy waitForFences");
-            xdev.src_device->device.resetFences({ xdev.src_device->fence });
+            xdev.src_device->device.resetFences({ xdev.fence });
 
             // Execute deferred staging memcpys from source read
             for (auto& cpy : xdev.src_transfer_ctx->out_memcpys) {
                 memcpy(cpy.dst, cpy.src, cpy.n);
             }
 
-            // Write from source staging to destination device
+            // Write from per-copy staging to destination device
             ggml_vk_buffer_write_async(transfer_ctx, xdev.dst_buf, xdev.dst_offset,
-                                       xdev.src_device->sync_staging->ptr, xdev.nbytes);
+                                       xdev.staging->ptr, xdev.nbytes);
+
+            // Return staging slot to pool
+            for (auto& s : xdev.src_device->xdev_staging_pool) {
+                if (s.buffer == xdev.staging && s.fence == xdev.fence) {
+                    s.in_use = false;
+                    break;
+                }
+            }
         }
         ctx->pending_xdev_copies.clear();
     }
