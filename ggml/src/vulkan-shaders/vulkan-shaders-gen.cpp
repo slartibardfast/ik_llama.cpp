@@ -667,6 +667,38 @@ void process_shaders() {
     string_to_spv("fused_mul_relu_f32",   "fused_mul_relu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+
+    // fused_up_gate: dual matmul + activation for GGML_OP_FUSED_UP_GATE
+    // Generate fp16 and fp32 compute variants (matching matmul_shaders pattern)
+    for (const bool fug_fp16 : {false, true}) {
+        std::map<std::string, std::string> fug_base_dict = {{"FLOAT_TYPE", fug_fp16 ? "float16_t" : "float"}, {"ACC_TYPE", "float"}};
+        if (fug_fp16) {
+            fug_base_dict["FLOAT16"] = "1";
+        }
+
+        const std::string fug_source = "mul_mm_fused_up_gate.comp";
+        const std::string load_vec = fug_fp16 ? "8" : "4";
+        const std::string aligned_b_type = fug_fp16 ? "mat2x4" : "vec4";
+
+        // Only quant types (fused op only created for quantized weights)
+        const std::vector<std::string> fug_types = {
+            "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
+            "q2_k", "q3_k", "q4_k", "q5_k", "q6_k",
+            "iq4_nl",
+        };
+        for (const auto& tname : fug_types) {
+            std::string load_vec_quant = "2";
+            if ((tname == "q4_0") || (tname == "q4_1"))
+                load_vec_quant = "8";
+            else if ((tname == "q5_0") || (tname == "q5_1") || (tname == "q8_0") || (tname == "iq4_nl"))
+                load_vec_quant = "4";
+
+            std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+
+            string_to_spv("matmul_fused_up_gate_" + tname + "_f32",         fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_quant},                          {"B_TYPE", "float"},      {"D_TYPE", "float"}}), fug_fp16);
+            string_to_spv("matmul_fused_up_gate_" + tname + "_f32_aligned", fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_quant}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fug_fp16);
+        }
+    }
     //
     // ============================== end ik_llama.cpp
 
