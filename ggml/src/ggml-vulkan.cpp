@@ -9703,6 +9703,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     //case GGML_OP_OPT_STEP_ADAMW:
     case GGML_OP_FUSED_UP_GATE:
         break;
+    case GGML_OP_REDUCE:
+        // Handled in graph_compute before build_graph is called
+        return false;
     default:
         std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(node->op) << std::endl;
         GGML_ABORT("fatal error");
@@ -10876,12 +10879,78 @@ static bool ggml_vk_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, st
     return true;
 }
 
+// Cross-device REDUCE: read remote partial sums via host staging, add on CPU, write back.
+// REDUCE splits are always single-node graphs created by the scheduler.
+static ggml_status ggml_vk_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
+    GGML_ASSERT(node->op == GGML_OP_REDUCE);
+    GGML_ASSERT((ggml_op)node->op_params[0] == GGML_OP_ADD);
+
+    if (node->op_params[3] == 1) {
+        // Reduce op turned off (container-only mode)
+        return GGML_STATUS_SUCCESS;
+    }
+
+    const int n = node->op_params[1];
+    const size_t nbytes = ggml_nbytes(node);
+
+    GGML_ASSERT(node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(node));
+
+    // Result is a VIEW of view_src — its buffer already holds the local partial sum.
+    ggml_backend_buffer_t dst_buffer = node->buffer ? node->buffer : node->view_src->buffer;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_buffer->context;
+    const uint64_t dst_offset = vk_tensor_offset(node) + node->view_offs;
+
+    std::vector<uint8_t> result(nbytes);
+    ggml_vk_buffer_read(dst_buf_ctx->dev_buffer, dst_offset, result.data(), nbytes);
+
+    std::vector<uint8_t> remote(nbytes);
+
+    for (int j = 0; j < n; ++j) {
+        if (!node->src[j] || node->src[j] == node->view_src) {
+            continue;
+        }
+
+        ggml_backend_vk_buffer_context * src_buf_ctx =
+            (ggml_backend_vk_buffer_context *)node->src[j]->buffer->context;
+        const uint64_t src_offset = vk_tensor_offset(node->src[j]) + node->src[j]->view_offs;
+        ggml_vk_buffer_read(src_buf_ctx->dev_buffer, src_offset, remote.data(), nbytes);
+
+        // Element-wise add on CPU
+        if (node->type == GGML_TYPE_F32) {
+            float * r = (float *)result.data();
+            const float * s = (const float *)remote.data();
+            const size_t nelem = nbytes / sizeof(float);
+            for (size_t k = 0; k < nelem; k++) {
+                r[k] += s[k];
+            }
+        } else {
+            ggml_fp16_t * r = (ggml_fp16_t *)result.data();
+            const ggml_fp16_t * s = (const ggml_fp16_t *)remote.data();
+            const size_t nelem = nbytes / sizeof(ggml_fp16_t);
+            for (size_t k = 0; k < nelem; k++) {
+                r[k] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(r[k]) + GGML_FP16_TO_FP32(s[k]));
+            }
+        }
+    }
+
+    // Write accumulated result back to local buffer
+    ggml_vk_buffer_write(dst_buf_ctx->dev_buffer, dst_offset, result.data(), nbytes);
+
+    return GGML_STATUS_SUCCESS;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     // Ensure previous async compute is complete before starting new work
     ggml_vk_sync_compute(ctx);
+
+    // Handle REDUCE early — requires cross-device CPU-mediated transfer, no GPU shaders
+    if (cgraph->n_nodes == 1 && cgraph->nodes[0]->op == GGML_OP_REDUCE) {
+        return ggml_vk_reduce(ctx, cgraph->nodes[0]);
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -11090,6 +11159,8 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             break;
         case GGML_OP_MULTI_ADD:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
+        case GGML_OP_REDUCE:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
         //case GGML_OP_GLU:
         //    switch (ggml_get_glu_op(op)) {
         //        case GGML_GLU_OP_GEGLU:
