@@ -949,6 +949,52 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_FUSED_RMS_NORM
+struct test_fused_rms_norm : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, eps);
+    }
+
+    test_fused_rms_norm(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 10, 10, 10},
+            float eps = 1e-6f)
+        : type(type), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * out = ggml_fused_rms_norm(ctx, a, b, eps);
+        return out;
+    }
+};
+
+// GGML_OP_FUSED_MUL_UNARY
+struct test_fused_mul_unary : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    ggml_unary_op uop;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, uop);
+    }
+
+    test_fused_mul_unary(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {128, 10, 10, 1},
+            ggml_unary_op uop = GGML_UNARY_OP_SILU)
+        : type(type), ne(ne), uop(uop) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * out = ggml_fused_mul_unary(ctx, a, b, uop);
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -2508,7 +2554,21 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     for (float eps : {1e-6f, 1e-5f, 1e-3f, 1e-1f}) {
         test_cases.emplace_back(new test_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
+        test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
     }
+    // FUSED_RMS_NORM: additional dimension coverage
+    test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {128,  1,  1, 1}));
+    test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {3072, 4,  1, 1}));
+    test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {5120, 32, 1, 1}));
+
+    // FUSED_MUL_UNARY: activation(a) * b
+    for (ggml_unary_op uop : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU, GGML_UNARY_OP_RELU}) {
+        test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {128, 10, 10, 1}, uop));
+        test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {3072, 4,  1, 1}, uop));
+    }
+    test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {1, 10, 10, 1}, GGML_UNARY_OP_SILU));
+    test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {5120, 1, 1, 1}, GGML_UNARY_OP_SILU));
+    // F16 FUSED_MUL_UNARY not tested: CPU backend only supports F32
 
 #if 1
     for (ggml_type type_a : base_types) {
