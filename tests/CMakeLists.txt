@@ -128,6 +128,10 @@ if (NOT WIN32)
     # llama_target_and_test(test-double-float.cpp) # SLOW
 endif()
 
+add_executable(test-backend-ops test-backend-ops.cpp)
+target_link_libraries(test-backend-ops PRIVATE ggml)
+install(TARGETS test-backend-ops RUNTIME)
+
 llama_target_and_test(test-chat-parser.cpp)
 #llama_target_and_test(test-chat-template.cpp)
 llama_target_and_test(test-json-partial.cpp)

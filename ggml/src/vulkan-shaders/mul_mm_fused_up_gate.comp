@@ -787,7 +787,9 @@ void main() {
                 }
             }
             [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
-                // cache_b already loaded for this i iteration
+                [[unroll]] for (uint j = 0; j < TN; j++) {
+                    cache_b[j] = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + j) * SHMEM_STRIDE + i];
+                }
                 [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                     [[unroll]] for (uint cc = 0; cc < TN; cc++) {
                         [[unroll]] for (uint cr = 0; cr < TM; cr++) {
