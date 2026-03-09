@@ -7616,6 +7616,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         }
     }
 
+    // MULTI_ADD reads nadd blocks of ne0 elements via strided view — the shader
+    // accesses data beyond the view's logical extent into the underlying buffer.
+    if (op == GGML_OP_MULTI_ADD) {
+        uint32_t nadd = (uint32_t)dst->op_params[0];
+        x_sz = (ne01 > 1 ? src0->nb[1] * (ne01 - 1) : 0) + ggml_type_size(src0->type) * ne00 * nadd;
+        if (x_buf_offset + x_sz >= d_X->size) {
+            x_sz = VK_WHOLE_SIZE;
+        }
+    }
+
     std::array<uint32_t, 3> elements;
 
     // Single call if dimension 2 is contiguous
@@ -11032,9 +11042,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->device->perf_logger->print_timings();
         ggml_vk_graph_cleanup(ctx);
-    } else {
+    } else if (submit_count > 0) {
         // Defer fence wait and cleanup to synchronize()
         ctx->compute_pending = true;
+    } else {
+        // No GPU work was submitted (e.g. graph contained only empty/view ops).
+        // Do not set compute_pending — the fence was never signaled.
+        ggml_vk_graph_cleanup(ctx);
     }
 
     return GGML_STATUS_SUCCESS;
