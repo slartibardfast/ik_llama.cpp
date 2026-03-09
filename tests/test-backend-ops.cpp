@@ -1471,11 +1471,12 @@ struct test_soft_max : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const bool mask;
+    const ggml_type mask_type;
     const float scale;
     const float max_bias;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, mask, scale, max_bias);
+        return VARS_TO_STR6(type, ne, mask, mask_type, scale, max_bias);
     }
 
     // the 1024 test with bias occasionally fails:
@@ -1488,14 +1489,15 @@ struct test_soft_max : public test_case {
             std::array<int64_t, 4> ne = {10, 10, 10, 10},
             bool mask = false,
             float scale = 1.0f,
-            float max_bias = 0.0f)
-        : type(type), ne(ne), mask(mask), scale(scale), max_bias(max_bias) {}
+            float max_bias = 0.0f,
+            ggml_type mask_type = GGML_TYPE_F32)
+        : type(type), ne(ne), mask(mask), mask_type(mask_type), scale(scale), max_bias(max_bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_tensor * mask = nullptr;
         if (this->mask) {
-            mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            mask = ggml_new_tensor_2d(ctx, mask_type, ne[0], ne[1]);
         }
         ggml_tensor * out = ggml_soft_max_ext(ctx, a, mask, scale, max_bias);
         return out;
@@ -2511,6 +2513,14 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     }
 
     test_cases.emplace_back(new test_cont());
+    // CONT: F16 and Nemotron-relevant shapes
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {10, 10, 10, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {128, 32, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {128, 32, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {3072, 4, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {3072, 4, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {128, 1, 1, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {5120, 32, 1, 1}));
 
     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr) {
         for (auto op : {ggml_add, ggml_mul, ggml_div}) {
@@ -2713,6 +2723,20 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, false, 0.1f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {32, 2, 32, 1}, true,  0.1f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {32, 2, 32, 1}, true,  0.1f, 8.0f));
+
+    // SOFT_MAX: wg512 path (ncols > 1024)
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {2048, 16, 1, 1}, true, 0.1f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {2048, 16, 1, 1}, true, 1.0f, 8.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4,  1, 1}, true, 0.088f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {1025, 8,  1, 1}, true, 0.1f, 0.0f));
+    // SOFT_MAX: Nemotron attention dimensions (head_dim=128, multi-head)
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {128, 128, 32, 1}, true, 0.088f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {128, 1,   32, 1}, true, 0.088f, 0.0f));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {512, 512,  4, 1}, true, 0.088f, 0.0f));
+    // SOFT_MAX: F16 mask (used by flash attention non-causal path)
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {128, 128, 1, 1}, true, 0.088f, 0.0f, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {2048, 16, 1, 1}, true, 0.1f,   0.0f, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16,   16, 1, 1}, true, 1.0f,   0.0f, GGML_TYPE_F16));
 
     {
         bool all = true;
