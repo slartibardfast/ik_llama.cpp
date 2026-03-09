@@ -1169,13 +1169,6 @@ struct test_fused_up_gate {
         ggml_backend_tensor_get(ref_out, f_ref.data(), 0, nelements * sizeof(float));
         ggml_backend_tensor_get(vk_out,  f_vk.data(),  0, nelements * sizeof(float));
 
-        // Debug: print first few values
-        printf("\n    ref[0..4]: ");
-        for (size_t i = 0; i < std::min(nelements, (size_t)5); i++) printf("%.4f ", f_ref[i]);
-        printf("\n     vk[0..4]: ");
-        for (size_t i = 0; i < std::min(nelements, (size_t)5); i++) printf("%.4f ", f_vk[i]);
-        printf("\n    ");
-
         // NMSE comparison
         double sum_diff2 = 0, sum_ref2 = 0;
         for (size_t i = 0; i < nelements; i++) {
@@ -1231,25 +1224,107 @@ struct test_mul_multi_add : public test_case {
     }
 };
 
-// GGML_OP_MULTI_ADD
-struct test_multi_add : public test_case {
-    const int64_t ne0;
-    const int64_t ne1;
+// GGML_OP_MULTI_ADD — uses custom eval (like test_fused_up_gate) because
+// the op expects a strided view_2d input that the standard test framework
+// doesn't initialize correctly.
+struct test_multi_add {
+    const int64_t ne0;       // n_embd
+    const int64_t ne1;       // n_tokens
     const int n_experts;
-
-    std::string vars() override {
-        return VARS_TO_STR3(ne0, ne1, n_experts);
-    }
 
     test_multi_add(int64_t ne0 = 128, int64_t ne1 = 4, int n_experts = 6)
         : ne0(ne0), ne1(ne1), n_experts(n_experts) {}
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        // a: [ne0, ne1 * n_experts]  (expert outputs concatenated along dim1)
-        // dst: same shape as a, sums n_experts slices
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1 * n_experts);
-        ggml_tensor * out = ggml_multi_add(ctx, a, n_experts);
-        return out;
+    bool eval(ggml_backend_t backend_vk, ggml_backend_t backend_cpu) {
+        printf("  MULTI_ADD(ne0=%lld,ne1=%lld,n_experts=%d): ",
+               (long long)ne0, (long long)ne1, n_experts);
+        fflush(stdout);
+
+        // Both backends get the same graph: experts[ne0, n_experts, ne1] → view_2d → multi_add
+        auto make_graph = [&](ggml_context * ctx, ggml_tensor ** p_experts, ggml_tensor ** p_out) {
+            *p_experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, n_experts, ne1);
+            ggml_set_name(*p_experts, "experts");
+            ggml_tensor * a = ggml_view_2d(ctx, *p_experts, ne0, ne1, (*p_experts)->nb[2], 0);
+            *p_out = ggml_multi_add(ctx, a, n_experts);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, *p_out);
+            return gf;
+        };
+
+        // CPU graph
+        ggml_init_params params_cpu = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+        ggml_context * ctx_cpu = ggml_init(params_cpu);
+        ggml_tensor * experts_cpu = nullptr, * out_cpu = nullptr;
+        ggml_cgraph * gf_cpu = make_graph(ctx_cpu, &experts_cpu, &out_cpu);
+
+        if (!ggml_backend_supports_op(backend_cpu, out_cpu)) {
+            printf("not supported [%s]\n", ggml_backend_name(backend_cpu));
+            ggml_free(ctx_cpu);
+            return true;
+        }
+
+        ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
+        if (!buf_cpu) { printf("alloc fail (cpu)\n"); ggml_free(ctx_cpu); return false; }
+
+        // VK graph
+        ggml_init_params params_vk = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+        ggml_context * ctx_vk = ggml_init(params_vk);
+        ggml_tensor * experts_vk = nullptr, * out_vk = nullptr;
+        ggml_cgraph * gf_vk = make_graph(ctx_vk, &experts_vk, &out_vk);
+
+        if (!ggml_backend_supports_op(backend_vk, out_vk)) {
+            printf("not supported [%s]\n", ggml_backend_name(backend_vk));
+            ggml_free(ctx_vk); ggml_backend_buffer_free(buf_cpu); ggml_free(ctx_cpu);
+            return true;
+        }
+
+        ggml_backend_buffer_t buf_vk = ggml_backend_alloc_ctx_tensors(ctx_vk, backend_vk);
+        if (!buf_vk) { printf("alloc fail (vk)\n"); ggml_free(ctx_vk); ggml_backend_buffer_free(buf_cpu); ggml_free(ctx_cpu); return false; }
+
+        // Initialize experts with identical random data on both backends
+        size_t nbytes = ggml_nbytes(experts_cpu);
+        std::vector<float> data(ne0 * n_experts * ne1);
+        std::default_random_engine rng(42);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto & v : data) v = dist(rng);
+
+        ggml_backend_tensor_set(experts_cpu, data.data(), 0, nbytes);
+        ggml_backend_tensor_set(experts_vk,  data.data(), 0, nbytes);
+
+        // Compute
+        ggml_backend_graph_compute(backend_cpu, gf_cpu);
+        ggml_backend_graph_compute(backend_vk,  gf_vk);
+        ggml_backend_synchronize(backend_vk);
+
+        // Compare outputs
+        size_t nelements = ggml_nelements(out_cpu);
+        std::vector<float> f_cpu(nelements), f_vk(nelements);
+        ggml_backend_tensor_get(out_cpu, f_cpu.data(), 0, nelements * sizeof(float));
+        ggml_backend_tensor_get(out_vk,  f_vk.data(),  0, nelements * sizeof(float));
+
+        double sum_diff2 = 0, sum_ref2 = 0;
+        for (size_t i = 0; i < nelements; i++) {
+            if (std::isnan(f_cpu[i]) || std::isnan(f_vk[i])) {
+                printf("NaN at %zu\n\033[1;31mFAIL\033[0m\n", i);
+                ggml_backend_buffer_free(buf_vk); ggml_free(ctx_vk);
+                ggml_backend_buffer_free(buf_cpu); ggml_free(ctx_cpu);
+                return false;
+            }
+            double d = (double)f_cpu[i] - (double)f_vk[i];
+            sum_diff2 += d * d;
+            sum_ref2  += (double)f_cpu[i] * (double)f_cpu[i];
+        }
+        double nmse = (sum_ref2 > 0) ? sum_diff2 / sum_ref2 : sum_diff2;
+
+        ggml_backend_buffer_free(buf_vk); ggml_free(ctx_vk);
+        ggml_backend_buffer_free(buf_cpu); ggml_free(ctx_cpu);
+
+        if (nmse > 1e-6) {
+            printf("NMSE = %.9f > 1e-6 \033[1;31mFAIL\033[0m\n", nmse);
+            return false;
+        }
+        printf("\033[1;32mOK\033[0m (NMSE=%.2e)\n", nmse);
+        return true;
     }
 };
 
@@ -2528,12 +2603,15 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_mul_multi_add(128,  6, 32));  // larger batch
     test_cases.emplace_back(new test_mul_multi_add(256,  8,  1));  // 8 experts
     test_cases.emplace_back(new test_mul_multi_add(5120, 6,  1));  // GLM hidden dim
+    test_cases.emplace_back(new test_mul_multi_add(128,  1,  1));  // single expert, single token (degenerate)
+    test_cases.emplace_back(new test_mul_multi_add(128,  2,  1));  // 2 experts
+    test_cases.emplace_back(new test_mul_multi_add(128, 16,  4));  // many experts
+    test_cases.emplace_back(new test_mul_multi_add(3072, 6,  1));  // Nemotron hidden dim
+    test_cases.emplace_back(new test_mul_multi_add(3072, 6,  8));  // Nemotron batch
+    test_cases.emplace_back(new test_mul_multi_add(  1,  6,  1));  // minimal ne0
+    test_cases.emplace_back(new test_mul_multi_add(128,  6, 64));  // large batch
 
-    // GGML_OP_MULTI_ADD
-    test_cases.emplace_back(new test_multi_add(128,  4, 6));  // 6 experts, 4 tokens
-    test_cases.emplace_back(new test_multi_add(128,  1, 6));  // single token
-    test_cases.emplace_back(new test_multi_add(256,  4, 8));  // 8 experts
-    test_cases.emplace_back(new test_multi_add(5120, 1, 6));  // large hidden dim
+    // GGML_OP_MULTI_ADD — tested below in custom eval section (uses strided view)
 
     test_cases.emplace_back(new test_sqr());
     test_cases.emplace_back(new test_sqrt());
@@ -2682,8 +2760,13 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         if (op_name == nullptr || std::string(op_name) == "FUSED_UP_GATE") {
             printf("\n  === FUSED_UP_GATE (decomposed CPU ref vs fused Vulkan) ===\n");
             size_t fug_ok = 0, fug_total = 0;
-            for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
-                // K must be a multiple of the quant block size
+
+            // All 11 supported quant types
+            for (ggml_type type_a : {
+                    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                    GGML_TYPE_Q8_0,
+                    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                    GGML_TYPE_IQ4_NL}) {
                 int64_t blk = ggml_blck_size(type_a);
                 int64_t k_small = std::max((int64_t)32, blk);
                 int64_t k_large = std::max((int64_t)128, blk * 2);
@@ -2696,14 +2779,70 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
                     }
                 }
             }
+
+            // Edge cases: M=1 (single output row) — use K>=64 so the single
+            // output element has enough signal for a stable NMSE comparison.
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 1, 1, 64, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q4_K, 1, 4, 256, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+
+            // Edge cases: large N (batch)
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 64, 16, 64, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 64, 32, 64, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+
+            // Edge cases: M not multiple of tile size (non-aligned)
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 17, 1, 32, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 33, 3, 64, GGML_UNARY_OP_GELU).eval(backend, backend_cpu)) fug_ok++;
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q4_0, 127, 1, 32, GGML_UNARY_OP_RELU).eval(backend, backend_cpu)) fug_ok++;
+
             // Larger realistic dims
             fug_total++;
             if (test_fused_up_gate(GGML_TYPE_Q8_0, 512, 1, 256, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
             fug_total++;
             if (test_fused_up_gate(GGML_TYPE_Q8_0, 512, 8, 256, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 1024, 1, 256, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
+
+            // Nemotron-3-Nano dims (intermediate=9216, hidden=3072)
+            fug_total++;
+            if (test_fused_up_gate(GGML_TYPE_Q8_0, 9216, 1, 3072, GGML_UNARY_OP_SILU).eval(backend, backend_cpu)) fug_ok++;
 
             printf("  FUSED_UP_GATE: %zu/%zu passed\n", fug_ok, fug_total);
             if (fug_ok != fug_total) {
+                n_ok = 0; // force overall failure
+            }
+        }
+
+        // MULTI_ADD: uses strided view_2d, needs custom eval
+        if (op_name == nullptr || std::string(op_name) == "MULTI_ADD") {
+            printf("\n  === MULTI_ADD (strided view_2d, CPU ref vs Vulkan) ===\n");
+            size_t ma_ok = 0, ma_total = 0;
+            struct { int64_t ne0; int64_t ne1; int n_experts; } ma_cases[] = {
+                {128,    4,  6},  // 6 experts, 4 tokens
+                {128,    1,  6},  // single token
+                {256,    4,  8},  // 8 experts
+                {5120,   1,  6},  // GLM hidden dim
+                {128,    1,  1},  // single expert (identity)
+                {128,    1,  2},  // 2 experts
+                {128,   32,  6},  // large batch
+                {128,    4, 16},  // many experts
+                {  1,    4,  6},  // minimal ne0
+                {3072,   1,  6},  // Nemotron hidden dim
+                {3072,   8,  6},  // Nemotron batch
+                {128,    4, 32},  // many experts, batch
+            };
+            for (auto & c : ma_cases) {
+                ma_total++;
+                if (test_multi_add(c.ne0, c.ne1, c.n_experts).eval(backend, backend_cpu)) ma_ok++;
+            }
+            printf("  MULTI_ADD: %zu/%zu passed\n", ma_ok, ma_total);
+            if (ma_ok != ma_total) {
                 n_ok = 0; // force overall failure
             }
         }
