@@ -7627,6 +7627,19 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         }
     }
 
+    // SUM_ROWS/SUM shader reads data_a[row*KX + col] where row spans all rows (ne01*ne02*ne03).
+    // Default x_sz/d_sz only cover ne00*ne01 elements — must extend to the full tensor.
+    if (op == GGML_OP_SUM_ROWS || op == GGML_OP_SUM) {
+        x_sz = ggml_nbytes(src0);
+        d_sz = ggml_nbytes(dst);
+        if (x_buf_offset + x_sz >= d_X->size) {
+            x_sz = VK_WHOLE_SIZE;
+        }
+        if (d_buf_offset + d_sz >= d_D->size) {
+            d_sz = VK_WHOLE_SIZE;
+        }
+    }
+
     // MULTI_ADD reads nadd blocks of ne0 elements via strided view — the shader
     // accesses data beyond the view's logical extent into the underlying buffer.
     if (op == GGML_OP_MULTI_ADD) {
@@ -8523,7 +8536,7 @@ static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 static void ggml_vk_sum_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_SUM_ROWS, { (uint32_t)src0->ne[0], 0, 0.0f, 0.0f }, dryrun);
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_SUM_ROWS, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), 0.0f, 0.0f }, dryrun);
 }
 
 static void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
