@@ -534,6 +534,11 @@ struct vk_device_struct {
     };
     std::vector<xdev_staging_slot> xdev_staging_pool;
 
+    // GPU-accelerated REDUCE via dmabuf + ADD shader
+    vk_buffer reduce_temp_buffer;       // temp buffer on this device for imported dmabuf data
+    vk::DescriptorPool reduce_descriptor_pool;
+    vk::DescriptorSet reduce_descriptor_set;
+
     // dmabuf zero-copy cross-device staging
     struct dmabuf_shared_staging {
         vk_buffer src_buffer;   // exportable buffer on this (source) device
@@ -559,6 +564,12 @@ struct vk_device_struct {
 
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
+
+        // cleanup reduce resources
+        ggml_vk_destroy_buffer(reduce_temp_buffer);
+        if (reduce_descriptor_pool) {
+            device.destroyDescriptorPool(reduce_descriptor_pool);
+        }
 
         // cleanup dmabuf peer staging
         for (auto& [idx, peer] : dmabuf_peers) {
@@ -10881,30 +10892,27 @@ static bool ggml_vk_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, st
 
 // Cross-device REDUCE: read remote partial sums via host staging, add on CPU, write back.
 // REDUCE splits are always single-node graphs created by the scheduler.
+// GPU-accelerated REDUCE: dmabuf copy from remote device + ADD shader on local device.
+// Falls back to CPU-mediated path when dmabuf is unavailable.
 static ggml_status ggml_vk_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
     GGML_ASSERT(node->op == GGML_OP_REDUCE);
     GGML_ASSERT((ggml_op)node->op_params[0] == GGML_OP_ADD);
 
     if (node->op_params[3] == 1) {
-        // Reduce op turned off (container-only mode)
         return GGML_STATUS_SUCCESS;
     }
 
     const int n = node->op_params[1];
     const size_t nbytes = ggml_nbytes(node);
+    const size_t nelem = ggml_nelements(node);
 
     GGML_ASSERT(node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16);
     GGML_ASSERT(ggml_is_contiguous(node));
 
-    // Result is a VIEW of view_src — its buffer already holds the local partial sum.
     ggml_backend_buffer_t dst_buffer = node->buffer ? node->buffer : node->view_src->buffer;
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_buffer->context;
     const uint64_t dst_offset = vk_tensor_offset(node) + node->view_offs;
-
-    std::vector<uint8_t> result(nbytes);
-    ggml_vk_buffer_read(dst_buf_ctx->dev_buffer, dst_offset, result.data(), nbytes);
-
-    std::vector<uint8_t> remote(nbytes);
+    vk_device& dst_dev = ctx->device;
 
     for (int j = 0; j < n; ++j) {
         if (!node->src[j] || node->src[j] == node->view_src) {
@@ -10914,28 +10922,133 @@ static ggml_status ggml_vk_reduce(ggml_backend_vk_context * ctx, ggml_tensor * n
         ggml_backend_vk_buffer_context * src_buf_ctx =
             (ggml_backend_vk_buffer_context *)node->src[j]->buffer->context;
         const uint64_t src_offset = vk_tensor_offset(node->src[j]) + node->src[j]->view_offs;
-        ggml_vk_buffer_read(src_buf_ctx->dev_buffer, src_offset, remote.data(), nbytes);
+        vk_device& src_dev = src_buf_ctx->dev_buffer->device;
 
-        // Element-wise add on CPU
+#if !defined(_MSC_VER)
+        // Try dmabuf + ADD shader path
+        auto* dmabuf = ggml_vk_get_dmabuf_staging(src_dev, dst_dev, nbytes);
+        if (dmabuf) {
+            // Step 1: GPU A copies remote partial → dmabuf export buffer
+            {
+                std::lock_guard<std::recursive_mutex> guard(src_dev->mutex);
+                vk_context src_xfer = ggml_vk_create_temporary_context(src_dev, src_dev->transfer_queue.cmd_pool);
+                ggml_vk_ctx_begin(src_dev, src_xfer);
+                VkBufferCopy region = { src_offset, 0, nbytes };
+                vkCmdCopyBuffer(src_xfer->s->buffer, src_buf_ctx->dev_buffer->buffer, dmabuf->src_buffer->buffer, 1, &region);
+                ggml_vk_ctx_end(src_xfer);
+                ggml_vk_submit(src_xfer, dmabuf->fence);
+                VK_CHECK(src_dev->device.waitForFences({ dmabuf->fence }, true, UINT64_MAX), "reduce dmabuf src waitForFences");
+                src_dev->device.resetFences({ dmabuf->fence });
+            }
+
+            // Step 2: GPU B copies dmabuf import → temp, then dispatches ADD shader
+            {
+                std::lock_guard<std::recursive_mutex> guard(dst_dev->mutex);
+
+                // Ensure temp buffer exists and is large enough
+                if (!dst_dev->reduce_temp_buffer || dst_dev->reduce_temp_buffer->size < nbytes) {
+                    ggml_vk_destroy_buffer(dst_dev->reduce_temp_buffer);
+                    dst_dev->reduce_temp_buffer = ggml_vk_create_buffer_check(dst_dev, nbytes,
+                        vk::MemoryPropertyFlagBits::eDeviceLocal);
+                }
+
+                // Ensure descriptor pool and set exist
+                if (!dst_dev->reduce_descriptor_pool) {
+                    vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT);
+                    vk::DescriptorPoolCreateInfo pool_info({}, 1, pool_size);
+                    dst_dev->reduce_descriptor_pool = dst_dev->device.createDescriptorPool(pool_info);
+
+                    vk::DescriptorSetAllocateInfo alloc_info(dst_dev->reduce_descriptor_pool, 1, &dst_dev->dsl);
+                    dst_dev->reduce_descriptor_set = dst_dev->device.allocateDescriptorSets(alloc_info)[0];
+                }
+
+                // Select ADD pipeline: [src0_f16][src1_f16][dst_f16]
+                const bool is_f16 = (node->type == GGML_TYPE_F16);
+                vk_pipeline pipeline = dst_dev->pipeline_add_norepeat[is_f16][is_f16][is_f16];
+
+                // Build push constants for contiguous same-shape ADD
+                const uint32_t type_size = is_f16 ? 2 : 4;
+                vk_op_binary_push_constants pc = {};
+                pc.ne = (uint32_t)nelem;
+                pc.ne00 = (uint32_t)nelem; pc.ne01 = 1; pc.ne02 = 1; pc.ne03 = 1;
+                pc.nb00 = 1; pc.nb01 = (uint32_t)nelem; pc.nb02 = (uint32_t)nelem; pc.nb03 = (uint32_t)nelem;
+                pc.ne10 = pc.ne00; pc.ne11 = 1; pc.ne12 = 1; pc.ne13 = 1;
+                pc.nb10 = 1; pc.nb11 = (uint32_t)nelem; pc.nb12 = (uint32_t)nelem; pc.nb13 = (uint32_t)nelem;
+                pc.ne20 = pc.ne00; pc.ne21 = 1; pc.ne22 = 1; pc.ne23 = 1;
+                pc.nb20 = 1; pc.nb21 = (uint32_t)nelem; pc.nb22 = (uint32_t)nelem; pc.nb23 = (uint32_t)nelem;
+                pc.misalign_offsets = 0;
+
+                // Record command buffer: copy dmabuf → temp, barrier, ADD dispatch
+                vk_context compute_ctx = ggml_vk_create_temporary_context(dst_dev, dst_dev->compute_queue.cmd_pool);
+                ggml_vk_ctx_begin(dst_dev, compute_ctx);
+
+                // Copy from dmabuf import buffer to temp
+                VkBufferCopy copy_region = { 0, 0, nbytes };
+                vkCmdCopyBuffer(compute_ctx->s->buffer, dmabuf->dst_buffer->buffer, dst_dev->reduce_temp_buffer->buffer, 1, &copy_region);
+
+                // Barrier: transfer → compute
+                VkMemoryBarrier barrier = {};
+                barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(compute_ctx->s->buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+                // Bind and dispatch ADD shader
+                // Descriptors: binding 0 = dst (src0, local partial), binding 1 = temp (src1, remote), binding 2 = dst (output)
+                vk::DescriptorBufferInfo buf_a(dst_buf_ctx->dev_buffer->buffer, dst_offset, nbytes);
+                vk::DescriptorBufferInfo buf_b(dst_dev->reduce_temp_buffer->buffer, 0, nbytes);
+                vk::DescriptorBufferInfo buf_d(dst_buf_ctx->dev_buffer->buffer, dst_offset, nbytes);
+
+                vk::WriteDescriptorSet write_ds(dst_dev->reduce_descriptor_set, 0, 0, 3,
+                    vk::DescriptorType::eStorageBuffer, nullptr, &buf_a);
+                // WriteDescriptorSet with count=3 uses contiguous array — need separate writes
+                vk::DescriptorBufferInfo bufs[3] = { buf_a, buf_b, buf_d };
+                write_ds = vk::WriteDescriptorSet(dst_dev->reduce_descriptor_set, 0, 0, 3,
+                    vk::DescriptorType::eStorageBuffer, nullptr, bufs);
+                dst_dev->device.updateDescriptorSets({ write_ds }, {});
+
+                compute_ctx->s->buffer.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute,
+                    0, sizeof(pc), &pc);
+                compute_ctx->s->buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+                compute_ctx->s->buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                    pipeline->layout, 0, { dst_dev->reduce_descriptor_set }, {});
+
+                uint32_t wg_x = ((uint32_t)nelem + 511) / 512;
+                compute_ctx->s->buffer.dispatch(wg_x, 1, 1);
+
+                ggml_vk_ctx_end(compute_ctx);
+                ggml_vk_submit(compute_ctx, dst_dev->fence);
+                VK_CHECK(dst_dev->device.waitForFences({ dst_dev->fence }, true, UINT64_MAX), "reduce ADD waitForFences");
+                dst_dev->device.resetFences({ dst_dev->fence });
+            }
+            continue;
+        }
+#endif
+
+        // Fallback: CPU-mediated path (no dmabuf support)
+        std::vector<uint8_t> local_data(nbytes);
+        std::vector<uint8_t> remote_data(nbytes);
+        ggml_vk_buffer_read(dst_buf_ctx->dev_buffer, dst_offset, local_data.data(), nbytes);
+        ggml_vk_buffer_read(src_buf_ctx->dev_buffer, src_offset, remote_data.data(), nbytes);
+
         if (node->type == GGML_TYPE_F32) {
-            float * r = (float *)result.data();
-            const float * s = (const float *)remote.data();
-            const size_t nelem = nbytes / sizeof(float);
+            float * r = (float *)local_data.data();
+            const float * s = (const float *)remote_data.data();
             for (size_t k = 0; k < nelem; k++) {
                 r[k] += s[k];
             }
         } else {
-            ggml_fp16_t * r = (ggml_fp16_t *)result.data();
-            const ggml_fp16_t * s = (const ggml_fp16_t *)remote.data();
-            const size_t nelem = nbytes / sizeof(ggml_fp16_t);
+            ggml_fp16_t * r = (ggml_fp16_t *)local_data.data();
+            const ggml_fp16_t * s = (const ggml_fp16_t *)remote_data.data();
             for (size_t k = 0; k < nelem; k++) {
                 r[k] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(r[k]) + GGML_FP16_TO_FP32(s[k]));
             }
         }
-    }
 
-    // Write accumulated result back to local buffer
-    ggml_vk_buffer_write(dst_buf_ctx->dev_buffer, dst_offset, result.data(), nbytes);
+        ggml_vk_buffer_write(dst_buf_ctx->dev_buffer, dst_offset, local_data.data(), nbytes);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -10947,7 +11060,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Ensure previous async compute is complete before starting new work
     ggml_vk_sync_compute(ctx);
 
-    // Handle REDUCE early — requires cross-device CPU-mediated transfer, no GPU shaders
+    // Handle REDUCE early — cross-device sum via dmabuf + ADD shader (CPU fallback if no dmabuf)
     if (cgraph->n_nodes == 1 && cgraph->nodes[0]->op == GGML_OP_REDUCE) {
         return ggml_vk_reduce(ctx, cgraph->nodes[0]);
     }
