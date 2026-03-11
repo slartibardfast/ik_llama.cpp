@@ -2628,6 +2628,18 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         }
     }
 
+    // Large-M tests (output/lm_head matmul dimensions)
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K}) {
+        // m=vocab_size, n=1 (token gen), k=hidden_dim
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 32000, 1, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128256, 1, 256, {1, 1}, {1, 1}));
+        // Realistic K dimensions (hidden_dim)
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128256, 1, 3072, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 151936, 1, 1536, {1, 1}, {1, 1}));
+        // Prompt eval (n>1)
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128256, 6, 3072, {1, 1}, {1, 1}));
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,   64, { 8,  1}, {4, 1}));

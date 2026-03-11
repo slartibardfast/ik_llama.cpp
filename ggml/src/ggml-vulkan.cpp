@@ -1144,6 +1144,12 @@ struct ggml_backend_vk_context {
     // async graph compute state
     bool compute_pending {};              // true when graph_compute submitted but not yet synchronized
     vk_context pending_compute_exit_ctx;  // deferred exit context holding out_memcpys
+
+    // Deferred host-visible memcpys: for rBAR/SAM buffers, get_tensor_async
+    // cannot do a direct memcpy because compute may still be in flight.
+    // These are processed in synchronize() after sync_compute waits for the
+    // compute fence.
+    std::vector<vk_staging_memcpy> pending_host_memcpys;
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -10403,7 +10409,7 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
 }
 
 GGML_CALL static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")"); 
+    VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
     vk_buffer buf = buf_ctx->dev_buffer;
@@ -10639,6 +10645,16 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    // For host-visible non-UMA buffers (rBAR/SAM), buffer_read_async would do
+    // a synchronous memcpy from the mapped GPU pointer.  But get_tensor_async
+    // is called BEFORE synchronize(), so compute may still be in flight.
+    // Defer the copy to pending_host_memcpys which is processed in
+    // synchronize() after sync_compute waits for the compute fence.
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && !buf->device->uma) {
+        deferred_memcpy(data, (const uint8_t *)buf->ptr + vk_tensor_offset(tensor) + tensor->view_offs + offset, size, &ctx->pending_host_memcpys);
+        return;
+    }
+
     ggml_vk_buffer_read_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -10796,6 +10812,16 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
 
     // Complete pending async graph_compute
     ggml_vk_sync_compute(ctx);
+
+    // Process deferred host-visible memcpys (rBAR/SAM buffers).
+    // These were recorded by get_tensor_async and must execute after
+    // sync_compute ensures GPU writes are complete and visible.
+    if (!ctx->pending_host_memcpys.empty()) {
+        for (auto& cpy : ctx->pending_host_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        ctx->pending_host_memcpys.clear();
+    }
 
     // Process pending cross-device copies (async pipeline)
     // Source reads were submitted async in cpy_tensor_async; now wait and complete
