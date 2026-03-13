@@ -2659,6 +2659,48 @@ void iqk_convert_iq3_s_q8_0_r8(int n, const void * vx, size_t bx, void * vy, int
     }
 }
 
+// Scalar iq3_xxs mul_mat for non-AVX512 systems where the SIMD kernel has precision issues.
+template <int nrc_y>
+static void mul_mat_iq3_xxs_q8_K_scalar(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const block_iq3_xxs * x = (const block_iq3_xxs *)((const char *)vx + ix * bx);
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            const block_q8_K * y = (const block_q8_K *)info.src1_row(iy);
+            float sumf = 0;
+            for (int ibl = 0; ibl < nb; ++ibl) {
+                const float d = GGML_FP16_TO_FP32(x[ibl].d) * y[ibl].d;
+                const uint8_t * q3 = x[ibl].qs;
+                const uint8_t * gas = x[ibl].qs + QK_K/4;
+                const int8_t * q8 = y[ibl].qs;
+                int32_t bsum = 0;
+                for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+                    uint32_t aux32;
+                    memcpy(&aux32, gas, sizeof(uint32_t)); gas += sizeof(uint32_t);
+                    const uint32_t ls = 2*(aux32 >> 28) + 1;
+                    int32_t sumi = 0;
+                    for (int l = 0; l < 4; ++l) {
+                        const uint8_t * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*l+0]);
+                        const uint8_t * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*l+1]);
+                        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
+                        for (int j = 0; j < 4; ++j) {
+                            sumi += grid1[j] * q8[j+0] * (signs & kmask_iq2xs[j+0] ? -1 : 1);
+                            sumi += grid2[j] * q8[j+4] * (signs & kmask_iq2xs[j+4] ? -1 : 1);
+                        }
+                        q8 += 8;
+                    }
+                    q3 += 8;
+                    bsum += sumi * ls;
+                }
+                sumf += d * bsum;
+            }
+            info.store(ix, iy, 0.25f * sumf);
+        }
+    }
+}
+
 template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
     funcs[0] = mul_mat_qX_K_q8_K_IQ<Dequantizer, 1>;
     funcs[1] = mul_mat_qX_K_q8_K_IQ<Dequantizer, 2>;
@@ -2746,7 +2788,11 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             set_functions<DequantizerIQ2S>(kernels);
             break;
         case GGML_TYPE_IQ3_XXS:
+#ifdef HAVE_FANCY_SIMD
             set_functions<DequantizerIQ3XXS>(kernels);
+#else
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq3_xxs_q8_K_scalar, kernels)
+#endif
             break;
         case GGML_TYPE_IQ3_S:
             set_functions<DequantizerIQ3S>(kernels);

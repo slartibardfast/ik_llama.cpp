@@ -13,7 +13,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
     const uint y2_idx = y1_idx + 128;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint ib0 = a_offset / QUANT_K + (first_row+n)*num_blocks_per_row;
+        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
         vec2 d = vec2(data_a[ib0 + i].d);
         const FLOAT_TYPE dall = FLOAT_TYPE(d.x);
         const FLOAT_TYPE dmin = FLOAT_TYPE(d.y);

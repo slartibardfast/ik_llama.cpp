@@ -2,6 +2,8 @@
 
 #ifdef IQK_IMPLEMENT
 
+#include <type_traits>
+#include <cstring>
 #include "ggml-impl.h"
 
 #define GGML_COMMON_IMPL_C
@@ -514,22 +516,75 @@ void set_mul_mat_bf16_r16(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
 }
 #endif
 
+// Scalar bf16 mul_mat for small ne00 (below SIMD threshold).
+// Handles arbitrary ne00 including ne00=1. Not performance-critical —
+// only used when ne00 < QFBase::k_step (8 on AVX2, 16 on AVX512).
+template <typename FloatY, int nrc_y>
+static void mul_mat_bf16_scalar(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    const char * cx = (const char *)vx;
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const ggml_bf16_t * ax = (const ggml_bf16_t *)(cx + ix * bx);
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            const FloatY * by = (const FloatY *)info.src1_row(iy);
+            float sum = 0;
+            for (int k = 0; k < n; ++k) {
+                // Convert bf16 to f32: shift left 16 bits
+                uint32_t bits = (uint32_t)ax[k].bits << 16;
+                float a_val;
+                memcpy(&a_val, &bits, sizeof(float));
+                float b_val;
+                if constexpr (std::is_same_v<FloatY, float>) {
+                    b_val = by[k];
+                } else if constexpr (std::is_same_v<FloatY, ggml_bf16_t>) {
+                    uint32_t b_bits = (uint32_t)by[k].bits << 16;
+                    memcpy(&b_val, &b_bits, sizeof(float));
+                } else {
+                    // ggml_half (f16)
+                    b_val = GGML_FP16_TO_FP32(by[k]);
+                }
+                sum += a_val * b_val;
+            }
+            info.store(ix, iy, sum);
+        }
+    }
+}
+
+template <typename FloatY>
+void set_mul_mat_bf16_scalar(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
+    for (auto& f : funcs) f = nullptr;
+    funcs[0] = mul_mat_bf16_scalar<FloatY, 1>;
+    funcs[1] = mul_mat_bf16_scalar<FloatY, 2>;
+    funcs[2] = mul_mat_bf16_scalar<FloatY, 3>;
+    funcs[3] = mul_mat_bf16_scalar<FloatY, 4>;
+    funcs[4] = mul_mat_bf16_scalar<FloatY, 5>;
+}
+
 } // namespace
 
 bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels) {
 
     if (typeA == GGML_TYPE_BF16) {
-        if (ne00 % 32) return false;
-        switch (typeB) {
 #ifdef __AVX512BF16__
-            case GGML_TYPE_BF16: set_mul_mat_bf16(kernels); break;
-#else
-            case GGML_TYPE_BF16: set_mul_mat_f<ggml_bf16_t, ggml_bf16_t>(kernels); break;
-            case GGML_TYPE_F32:  set_mul_mat_f<ggml_bf16_t, float>(kernels);       break;
+        // Native bf16 dot product path (requires ne00 % 32)
+        if (ne00 % 32 == 0 && typeB == GGML_TYPE_BF16) {
+            set_mul_mat_bf16(kernels);
+            return true;
+        }
 #endif
+        // Generic SIMD path (requires ne00 % k_step)
+        if (ne00 % QFBase::k_step == 0) {
+            switch (typeB) {
+                case GGML_TYPE_BF16: set_mul_mat_f<ggml_bf16_t, ggml_bf16_t>(kernels); return true;
+                case GGML_TYPE_F32:  set_mul_mat_f<ggml_bf16_t, float>(kernels);       return true;
+                default: return false;
+            }
+        }
+        // Scalar fallback for small ne00 (below SIMD width)
+        switch (typeB) {
+            case GGML_TYPE_BF16: set_mul_mat_bf16_scalar<ggml_bf16_t>(kernels); return true;
+            case GGML_TYPE_F32:  set_mul_mat_bf16_scalar<float>(kernels);       return true;
             default: return false;
         }
-        return true;
     }
 
     if (typeA == GGML_TYPE_BF16_R16) {

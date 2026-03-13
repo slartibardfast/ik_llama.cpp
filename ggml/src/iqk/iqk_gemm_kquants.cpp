@@ -1771,6 +1771,43 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
     }
 }
 
+// Scalar iq4_xs mul_mat for non-AVX512 systems where the SIMD kernel has issues.
+static const int8_t k_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+template <int nrc_y>
+static void mul_mat_iq4_xs_q8_K_scalar(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const block_iq4_xs * x = (const block_iq4_xs *)((const char *)vx + ix * bx);
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            const block_q8_K * y = (const block_q8_K *)info.src1_row(iy);
+            float sumf = 0;
+            for (int ibl = 0; ibl < nb; ++ibl) {
+                const float d = GGML_FP16_TO_FP32(x[ibl].d) * y[ibl].d;
+                const uint8_t * qs = x[ibl].qs;
+                const int8_t * q8 = y[ibl].qs;
+                uint16_t sh = x[ibl].scales_h;
+                int sumi = 0;
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    const int ls = (((x[ibl].scales_l[ib/2] >> (4*(ib%2))) & 0xf) | (((sh >> (2*ib)) & 3) << 4)) - 32;
+                    int block_sum = 0;
+                    for (int j = 0; j < 16; ++j) {
+                        block_sum += k_iq4nl_values[qs[j] & 0xf] * q8[j];
+                        block_sum += k_iq4nl_values[qs[j] >> 4] * q8[j + 16];
+                    }
+                    sumi += ls * block_sum;
+                    qs += 16;
+                    q8 += 32;
+                }
+                sumf += d * sumi;
+            }
+            info.store(ix, iy, sumf);
+        }
+    }
+}
+
 template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
 #ifdef HAVE_FANCY_SIMD
     if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS>) {
@@ -1780,7 +1817,9 @@ template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX
         funcs[0] = mul_mat_qX_K_q8_K_AVX512_1<Dequantizer>;
     }
 #else
-    if constexpr (std::is_same_v<Dequantizer, DequantizerQ2K> ||
+    if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS>) {
+        IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq4_xs_q8_K_scalar, funcs)
+    } else if constexpr (std::is_same_v<Dequantizer, DequantizerQ2K> ||
                   std::is_same_v<Dequantizer, DequantizerQ3K> ||
                   std::is_same_v<Dequantizer, DequantizerQ6K>) {
         IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qY_K_q8_K_T, Dequantizer, funcs)
