@@ -143,3 +143,5 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+ggml-vulkan-shaders.cpp
+ggml-vulkan-shaders.hpp

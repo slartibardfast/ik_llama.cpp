@@ -480,6 +480,25 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        // MMVQ (integer dot product) variants — quantized A × Q8_1 B
+        // Only legacy quants (q4_0..q8_0) and K-quants (q2_k..q6_k) have MMVQ implementations.
+        // IQ types lack mmvq_dot_product; IQ1 also needs iq1s_grid_gpu not yet ported.
+        bool is_legacy = (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0");
+        bool is_kquant = string_ends_with(tname, "_k");
+        if (is_legacy || is_kquant) {
+            std::map<std::string, std::string> mmvq_dict = {
+                {data_a_key, "1"},
+                {"MMQ", "1"},
+                {"B_TYPE", "block_q8_1_x4"},
+                {"D_TYPE", "float"},
+                {"FLOAT_TYPE", "float"},
+                {"FLOAT_TYPE_VEC2", "vec2"},
+                {"ACC_TYPE", "float"},
+            };
+            string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, mmvq_dict));
+            string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, merge_maps(mmvq_dict, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}})));
+        }
+
         // Dequant shaders
         if (tname != "f16" && tname != "bf16") {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
@@ -558,6 +577,7 @@ void process_shaders() {
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
+    string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
