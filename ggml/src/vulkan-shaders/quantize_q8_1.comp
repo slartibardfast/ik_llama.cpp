@@ -37,16 +37,16 @@ void quantize() {
 #ifdef QBLOCK_X4
     const uint ibx4_outer = ib / 4;
     const uint ibx4_inner = ib % 4;
-
-    const uint required_x4_blocks = (p.ne + 127) / 128;
-    if (ibx4_outer >= required_x4_blocks) {
-        return;
-    }
+    const bool x4_active = ibx4_outer < (p.ne + 127) / 128;
 #endif
 
     const uint a_idx = ib * 8 + iqs;
 
-    vec4 vals = a_idx < p.ne ? data_a[a_idx] : vec4(0.0f);
+#ifdef QBLOCK_X4
+    vec4 vals = x4_active && a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+#else
+    vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+#endif
     const vec4 abs_vals = abs(vals);
 
     // Find absolute max for each block
@@ -67,7 +67,9 @@ void quantize() {
 #ifndef QBLOCK_X4
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
 #else
-    data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
+    if (x4_active) {
+        data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
+    }
 #endif
 
     barrier();
@@ -87,7 +89,9 @@ void quantize() {
 #ifndef QBLOCK_X4
         data_b[ib].ds = f16vec2(vec2(d, sum * d));
 #else
-        data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
+        if (x4_active) {
+            data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
+        }
 #endif
     }
 }
