@@ -113,6 +113,7 @@ enum e_model {
     MODEL_80B_A13B,
     MODEL_100B_A6B,
     MODEL_106B_A12B,
+    MODEL_119B_A6B,
     MODEL_122B_A10B,
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
@@ -156,6 +157,11 @@ struct llama_layer {
     struct ggml_tensor * attn_norm_cross = nullptr;
     struct ggml_tensor * attn_norm_enc = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    struct ggml_tensor * ffn_post_norm_1 = nullptr; // gemma4
+    struct ggml_tensor * ffn_post_norm_2 = nullptr; // gemma4
+    struct ggml_tensor * ffn_pre_norm_2  = nullptr; // gemma4
+    struct ggml_tensor * ffn_gate_inp_s  = nullptr; // gemma4
+
 
     // attention
     struct ggml_tensor * wq = nullptr;
@@ -212,6 +218,18 @@ struct llama_layer {
     llama_split_tensor split_sinks;
     llama_split_tensor split_wqkv_gate;
 
+    llama_split_tensor split_ssm_wqkv;
+    llama_split_tensor split_ssm_wqkv_gate;
+    llama_split_tensor split_ssm_in;
+    llama_split_tensor split_ssm_conv1d;
+    llama_split_tensor split_ssm_dt;
+    llama_split_tensor split_ssm_a;
+    llama_split_tensor split_ssm_beta_alpha;
+    llama_split_tensor split_ssm_beta;
+    llama_split_tensor split_ssm_alpha;
+    llama_split_tensor split_ssm_norm;
+    llama_split_tensor split_ssm_out;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b = nullptr;
     struct ggml_tensor * attn_rel_b_enc = nullptr;
@@ -238,6 +256,7 @@ struct llama_layer {
     llama_split_tensor split_ffn_gate;
     llama_split_tensor split_ffn_down;
     llama_split_tensor split_ffn_norm;
+    llama_split_tensor split_ffn_up_gate;
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp = nullptr;
@@ -250,6 +269,7 @@ struct llama_layer {
     llama_split_tensor split_ffn_up_exps;
     llama_split_tensor split_ffn_gate_exps;
     llama_split_tensor split_ffn_down_exps;
+    llama_split_tensor split_ffn_up_gate_exps;
 
     // ff MoE bias
     struct ggml_tensor * ffn_gate_inp_b = nullptr;
@@ -260,6 +280,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps_b_dup = nullptr;
     struct ggml_tensor * ffn_down_exps_b_dup = nullptr;
     struct ggml_tensor * ffn_up_exps_b_dup = nullptr;
+    struct ggml_tensor * ffn_down_exps_s = nullptr;
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
@@ -276,6 +297,7 @@ struct llama_layer {
     llama_split_tensor split_ffn_gate_exps_b;
     llama_split_tensor split_ffn_down_exps_b;
     llama_split_tensor split_ffn_up_exps_b;
+    llama_split_tensor split_ffn_up_gate_exps_b;
 
     // ff bias
     struct ggml_tensor * ffn_gate_b = nullptr;
@@ -289,6 +311,11 @@ struct llama_layer {
     llama_split_tensor split_ffn_up_b;
     llama_split_tensor split_ffn_act;
     llama_split_tensor split_ffn_exp_probs_b;
+
+    // misc
+    struct ggml_tensor * per_layer_inp_gate;
+    struct ggml_tensor * per_layer_proj;
+    struct ggml_tensor * per_layer_post_norm;
 
     // mamba proj
     struct ggml_tensor * ssm_in = nullptr;
@@ -331,6 +358,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_scale = nullptr;
     struct ggml_tensor * ffn_up_scale = nullptr;
     struct ggml_tensor * ffn_down_scale = nullptr;
+    struct ggml_tensor * out_scale = nullptr; // gemma4 layer output scale
 
     struct llama_layer_nextn nextn;
 
@@ -345,6 +373,8 @@ struct rpc_device {
     std::string endpoint;
     uint32_t device;
 };
+
+struct llama_cparams;
 
 struct llama_model {
     e_model     type  = MODEL_UNKNOWN;
@@ -361,6 +391,10 @@ struct llama_model {
     struct ggml_tensor * pos_embd;
     struct ggml_tensor * tok_norm;
     struct ggml_tensor * tok_norm_b;
+
+    struct ggml_tensor * tok_embd_per_layer = nullptr;
+    struct ggml_tensor * per_layer_model_proj = nullptr;
+    struct ggml_tensor * per_layer_proj_norm = nullptr;
 
     struct ggml_tensor * output_norm;
     struct ggml_tensor * output_norm_b;
@@ -440,6 +474,8 @@ struct llama_model {
     bool has_tensor_overrides() const {
         return tensor_overrides;
     }
+
+    size_t cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
 
     void set_tensor_overrides(const llama_model_params& params);
 

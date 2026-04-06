@@ -198,7 +198,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat_partial() {
     }
 
     for (const auto& diff : oaicompat_msg_diffs) {
-        add_delta(common_chat_msg_diff_to_json_oaicompat<json>(diff));
+        add_delta(common_chat_msg_diff_to_json_oaicompat(diff));
     }
 
     if (!deltas.empty()) {
@@ -363,7 +363,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_final() {
     json choice{
         {"finish_reason", finish_reason},
         {"index", 0},
-        {"message", msg.to_json_oaicompat<json>()},
+        {"message", msg.to_json_oaicompat()},
     };
 
     if (!stream && probs_output.size() > 0) {
@@ -413,7 +413,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
                 json {
                     {"finish_reason", nullptr},
                     {"index", 0},
-                    {"delta", common_chat_msg_diff_to_json_oaicompat<json>(diff)},
+                    {"delta", common_chat_msg_diff_to_json_oaicompat(diff)},
                 },
             })},
             {"created", t},
@@ -719,15 +719,13 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
-    bool has_thinking = !oaicompat_msg.reasoning_content.empty();
-    bool has_text = !oaicompat_msg.content.empty();
     size_t num_tool_calls = oaicompat_msg.tool_calls.size();
 
     size_t thinking_block_index = 0;
-    size_t text_block_index = has_thinking ? 1 : 0;
+    size_t text_block_index = anthropic_thinking_block_started ? 1 : 0;
 
-    bool thinking_block_started = false;
-    bool text_block_started = false;
+    bool thinking_block_started = anthropic_thinking_block_started;
+    bool text_block_started = anthropic_text_block_started;
     std::set<size_t> tool_calls_started;
 
     for (const auto& diff : oaicompat_msg_diffs) {
@@ -790,7 +788,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         }
 
         if (diff.tool_call_index != std::string::npos) {
-            size_t content_block_index = (has_thinking ? 1 : 0) + (has_text ? 1 : 0) + diff.tool_call_index;
+            size_t content_block_index = (thinking_block_started ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index;
 
             if (tool_calls_started.find(diff.tool_call_index) == tool_calls_started.end()) {
                 const auto& full_tool_call = oaicompat_msg.tool_calls[diff.tool_call_index];
@@ -826,7 +824,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
         }
     }
 
-    if (has_thinking) {
+    if (thinking_block_started) {
         events.push_back({
             {"event", "content_block_delta"},
             {"data", {
@@ -847,7 +845,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             });
     }
 
-    if (has_text) {
+    if (text_block_started) {
         events.push_back({
             {"event", "content_block_stop"},
             {"data", {
@@ -858,7 +856,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
     }
 
     for (size_t i = 0; i < num_tool_calls; i++) {
-        size_t content_block_index = (has_thinking ? 1 : 0) + (has_text ? 1 : 0) + i;
+        size_t content_block_index = (thinking_block_started ? 1 : 0) + (text_block_started ? 1 : 0) + i;
         events.push_back({
             {"event", "content_block_stop"},
             {"data", {
@@ -1081,12 +1079,12 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
     server_tokens prompt_tokens;
     server_tokens tokens_new_ex;
     if (think_tokens.exclude) {
-        prompt_tokens = server_tokens(prompt.tokens.get_text_tokens_exclude_think(ctx, think_tokens), false);
-        tokens_new_ex = server_tokens(tokens_new.get_text_tokens_exclude_think(ctx, think_tokens), false);
+        prompt_tokens = prompt.tokens.get_tokens_exclude_think(ctx, think_tokens);
+        tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
     }
     else {
-        prompt_tokens = std::move(prompt.tokens); //server_tokens(prompt.tokens.get_text_tokens(), false);
-        tokens_new_ex = server_tokens(tokens_new.get_text_tokens(), false);
+        prompt_tokens = std::move(prompt.tokens); 
+        tokens_new_ex = tokens_new.clone();
     }
     const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
     float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
@@ -1099,7 +1097,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
     for (auto it = states.begin(); it != states.end(); ++it) {
         server_tokens tokens;
         if (think_tokens.exclude) {
-            tokens = server_tokens(it->tokens.get_text_tokens_exclude_think(ctx, think_tokens), false);
+            tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
         }
         else {
             tokens = std::move(it->tokens);
@@ -1136,7 +1134,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
 server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t state_size) {
     for (auto it = states.begin(); it != states.end();) {
-        auto tokens_ctx_shift = server_tokens(prompt.tokens.get_text_tokens(), false); // copy cache tokens
+        auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
         tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
         auto prefix = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
         const size_t len = prefix.first;
@@ -1177,7 +1175,7 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
     // TODO: for some reason we can't copy server_tokens, so we have to do this workaround
     auto& cur = states.emplace_back();
     cur = {
-        /*.tokens          =*/ server_tokens(prompt.tokens.get_text_tokens(), false),
+        /*.tokens          =*/ prompt.tokens.clone(),
         /*.n_keep          =*/ prompt.n_kept_prompt,
         /*.n_discarded_prompt     =*/ prompt.n_discarded_prompt,
         /*.think_tokens                   =*/ prompt.think_tokens,

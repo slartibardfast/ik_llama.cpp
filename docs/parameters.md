@@ -37,7 +37,7 @@ Some often used terms.
 | Term | Meaning |
 | - | - |
 | LLM/model | Large Language Model, language model trained with machine learning on a vast amount of text. |
-| Tensors | The foundational part of an model, is just a multi-dimensional array of numbers (Scalar, Vector, Matrix, Higher Dimensions). |
+| Tensors | The foundational part of a model, are just a multi-dimensional array of numbers (Scalar, Vector, Matrix, Higher Dimensions). |
 | Layers | Modular units that perform specific computations on the tensors. A neural network is essentially a stack of layers, each transforming the data in some way. |
 | Weights | Numerical values associated with the connections between tensors in the layers. |
 | Activations | Output of a layer after it has performed its computations. |
@@ -60,6 +60,9 @@ Some often used terms.
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-h, --help, --usage` | Print usage and exit | - | - |
+| `--fit` | Automatically fit to available VRAM | off | Loads as many tensors to the GPU(s) as available VRAM will permit. [PR 1501](https://github.com/ikawrakow/ik_llama.cpp/pull/1501) [PR 1504](https://github.com/ikawrakow/ik_llama.cpp/pull/1504) |
+| `--fit-margin N` | Safety VRAM margin in MiB when using `--fit` | 1024 | Increase this value in case of CUDA OOM when loading the model. Decrease to less than 1024 if the model loads successfully and you feel that too much VRAM has been left unused |  
+| `-wgt, --worst-graph-tokens N` | Number of tokens to use for worst-case graph | - | Control compute buffer sizes for large batches. Provided "as is" for users that understand the limitations, please don't open issues when using this. [PR 1560](https://github.com/ikawrakow/ik_llama.cpp/pull/1560) |
 | `-t, --threads N` | Number of threads to use during generation | 4 | Try to match the number of physical CPU cores. Avoid odd numbers (e.g. 1,3,...). |
 | `-tb, --threads-batch N` | Number of threads to use during batch and prompt processing | Same as `--threads` | Same as `--threads` When doing full GPU offload, use a lower number (e.g. 2) |
 | `-c, --ctx-size N` | Size of the prompt context | 0 (loaded from model) | Influences the size of KV size (memory) therefore look for a value that fits your system then increase as needed (2048, 4096,…). If you use parallel slots, this context size will be split across the slots. |
@@ -68,6 +71,8 @@ Some often used terms.
 | `-ub, --ubatch-size N` | Physical maximum batch size | 512 | Safe to leave default. Similar to `--batch-size N` |
 | `--keep N` | Number of tokens to keep from the initial prompt | 0 | -1 = all |
 | `--chunks N` | Max number of chunks to process | -1 (all) |  |
+| `-dr, --dry-run` | Skip loading tensors in the files | - | Skips loading files, yet still report OOM error and print memory usage correctly, which is helpful for manually tuning of very large models. |
+| `--minilog` | Print important information | - | For `llama-server`, log request message for completions/response/anthropic and response. The prompt in the json format and the text response are saved in the log file and printed to the console. [PR 1477](https://github.com/ikawrakow/ik_llama.cpp/pull/1477) |
 | `-fa, --flash-attn` | Enables Flash Attention | on | auto / on / off Improves t/s and reduces memory usage. |
 | `--no-fa, --no-flash-attn` | Disable Flash Attention |  | Alternative parameter to turn of FA. See `--flash-attn` |
 | `-mla, --mla-use` | Enable MLA | 3 | 0 / 1 / 2 / 3 For DeepSeek models, and other recent models that are using MLA. [PR 188](https://github.com/ikawrakow/ik_llama.cpp/pull/188) [PR 205](https://github.com/ikawrakow/ik_llama.cpp/pull/205) [PR 235](https://github.com/ikawrakow/ik_llama.cpp/pull/235) [PR 243](https://github.com/ikawrakow/ik_llama.cpp/pull/243) [PR 252](https://github.com/ikawrakow/ik_llama.cpp/pull/252) [PR 253](https://github.com/ikawrakow/ik_llama.cpp/pull/253) [PR 273](https://github.com/ikawrakow/ik_llama.cpp/pull/273) [PR 386](https://github.com/ikawrakow/ik_llama.cpp/pull/386) [PR 497](https://github.com/ikawrakow/ik_llama.cpp/pull/497) [PR 943](https://github.com/ikawrakow/ik_llama.cpp/pull/943)|
@@ -81,8 +86,9 @@ Some often used terms.
 | `--no-gr, --no-graph-reuse` | Disable graph reuse | Disabled | Option to turn off graph reuse. [PR 1094](https://github.com/ikawrakow/ik_llama.cpp/pull/1094) |
 | `-ser, --smart-expert-reduction` | Experts reduction Kmin,t | -1, 0 | Use a custom number of active experts. Powerful, basically REAP from just command line. If we set t = 1, we use a fixed number of experts  K_min (`-ser 1,6` will use 6 experts instead of the model default). [PR 239](https://github.com/ikawrakow/ik_llama.cpp/pull/239) |
 | `-mqkv, --merge-qkv` | Merge Q,K,V | 0 | Downside: mmap cannot be used. [PR 878](https://github.com/ikawrakow/ik_llama.cpp/pull/878) [PR 892](https://github.com/ikawrakow/ik_llama.cpp/pull/892) |
-| `-muge, --merge-up-gate-experts` | Merge ffn_up/gate_exps | 0 | Speed up on some models. [PR 1137](https://github.com/ikawrakow/ik_llama.cpp/pull/1137) [PR 1139](https://github.com/ikawrakow/ik_llama.cpp/pull/1139) |
+| `-muge, --merge-up-gate-experts` | Merge ffn_up/gate_exps | 0 | Speed up on some models. [PR 1137](https://github.com/ikawrakow/ik_llama.cpp/pull/1137) [PR 1139](https://github.com/ikawrakow/ik_llama.cpp/pull/1139) [PR 1403](https://github.com/ikawrakow/ik_llama.cpp/pull/1403) [PR 1413](https://github.com/ikawrakow/ik_llama.cpp/pull/1413)|
 | `-khad, --k-cache-hadamard` | Use Hadamard transform for K-cache | 0 | May improve KV quality when heavily quantized. [PR 1033](https://github.com/ikawrakow/ik_llama.cpp/pull/1033) [PR 1034](https://github.com/ikawrakow/ik_llama.cpp/pull/1034) |
+| `-vhad, --v-cache-hadamard` | Use Hadamard transform for V-cache | 0 | May improve KV quality when heavily quantized. [PR 1527](https://github.com/ikawrakow/ik_llama.cpp/pull/1527) |
 | `-sas, --scheduler_async` | Async evaluation of compute graphs | 0 | [PR 1089](https://github.com/ikawrakow/ik_llama.cpp/pull/1089) |
 | `-vq, --validate-quants` | Validate quantized data while loading the model | 0 | If there are NaNs in the model, you will get info about the tensors containing NaNs. [PR 977](https://github.com/ikawrakow/ik_llama.cpp/pull/977) |
 | `-sp, --special` | Special tokens output enabled | false |  |
@@ -90,6 +96,8 @@ Some often used terms.
 | `--mlock` | Force system to keep model in RAM rather than swapping or compressing | - |  |
 | `--no-mmap` | Do not memory-map model (slower load but may reduce pageouts) | - |  |
 | `-rtr, --run-time-repack` | Repack tensors if interleaved variant is available | - | May improve performance on some systems. [PR 147](https://github.com/ikawrakow/ik_llama.cpp/pull/147) |
+| `--ctx-checkpoints` | set the number of checkpoints per slot | - | enable checkpoint for recurrent models Qwen3-Next and Qwen3.5-MoE. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
+| `--ctx-checkpoints-interval` |  minimum number of tokens between each context checkpoint. | - |  If you want to create the checkpoint more frequently, set it to a small value. If it's set to positive number, it saves checkpoints during TG at this interval. During PP, it can only save checkpoint every batch size, so it becomes minimum number of tokens between each context checkpoint. [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) |
 
 ## Speculative Decoding
 
@@ -110,6 +118,10 @@ Check the details [here](./speculative.md).
 | `--spec-ngram-size-m N` | ngram size M for ngram-simple/ngram-map speculative decoding, length of draft m-gram | 48 | [PR 1261](https://github.com/ikawrakow/ik_llama.cpp/pull/1261) |
 | `--spec-ngram-min-hits N` | minimum hits for ngram-map speculative decoding | 1 | [PR 1261](https://github.com/ikawrakow/ik_llama.cpp/pull/1261) |
 | `--spec-type Name` | Comma-separated list of draft model parameters | - | none / ngram - cache / ngram - simple / ngram - map - k / ngram - map - k4v / ngram - mod [PR 1261](https://github.com/ikawrakow/ik_llama.cpp/pull/1261) |
+| `-mtp, --multi-token-prediction` |  | - | MTP decoding for GLM-4.x MoE [1270](https://github.com/ikawrakow/ik_llama.cpp/pull/1270) |
+| `-no-mtp, --no-multi-token-prediction` |  | - | MTP decoding for GLM-4.x MoE [1270](https://github.com/ikawrakow/ik_llama.cpp/pull/1270) |
+| `--draft-max` |  | - | MTP decoding for GLM-4.x MoE [1270](https://github.com/ikawrakow/ik_llama.cpp/pull/1270) |
+| `--draft-p-min` |  | - | MTP decoding for GLM-4.x MoE [1270](https://github.com/ikawrakow/ik_llama.cpp/pull/1270) |
 
 ## Cache Prompt to Host Memory
 
@@ -132,7 +144,7 @@ Good overview on [kalomaze/llm_samplers_explained.md](https://gist.github.com/ka
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `--samplers SAMPLERS` | Samplers used for generation in order, separated by `;` | dry;top_k;tfs_z;typical_p;top_p;min_p;xtc;top_n_sigma;temperature;adaptive_p | Powerful option to customize samplers. Try to keep the default order otherwise effects will be minimized. Example to use only min_p and temperature: `--samplers min_p;temperature` |
-| `--sampling-seq SEQUENCE` | Simplified sequence for samplers | dkfypmxntw | Same as `--samplers` , just shorter format. |
+| `--sampling-seq SEQUENCE` | Simplified sequence for samplers | dkfypmxntw | Same as `--samplers`, just shorter format. |
 | `--banned-string-file` | File path of the list of banned strings on each line |  |  |
 | `--banned-n` | Number of tokens banned in the phrase during rewind. | -1 | -1 means all tokens [PR 1185](https://github.com/ikawrakow/ik_llama.cpp/pull/1185) |
 
@@ -149,6 +161,7 @@ Incorrect prompt template or it's format may break the model output.
 | `--chat-template-kwargs JSON` | Sets additional params for the json template parser | - | Example for gpt-oss: `--chat-template-kwargs '{"reasoning_effort": "medium"}'` |
 | `--reasoning-budget N` | Controls the amount of thinking allowed | -1 (unrestricted) | 0 (disable thinking) |
 | `--reasoning-tokens FORMAT` | Exclude reasoning tokens to select the slot more accurately | auto |  |
+| `--peg` | Use peg parser for qwen3.5 models. | - | Force Qwen3.5 model to use peg parser to process tool calls, which fixes the crash when the model calls the non existing function. [PR 1490](https://github.com/ikawrakow/ik_llama.cpp/pull/1490) |
 
 ## Context Hacking
 
@@ -164,6 +177,7 @@ The context (a.k.a. KV cache) is stored on the device where the associated atten
 | `-nkvo, --no-kv-offload` | Disable KV offload | - | Keep KV on CPU. |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K | f16 | Reduces K size in KV which improves speed and reduces memory requirements, but may reduce output quality. |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V | f16 | See: `-ctk` |
+| `--mtmd-kq-type type` | Define the type used for the `K*Q` matrix multiplication | - | Use une of `f16`/`bf16` instead of `f32` to improve speed up multimodal |
 | `--no-context-shift` | Disable context-shift | - |  |
 | `--context-shift` | Set context-shift | on | auto / on / off / 0 / 1 [PR 973](https://github.com/ikawrakow/ik_llama.cpp/pull/973) |
 
@@ -175,7 +189,7 @@ Some frontends, like the included Webui, can use this feature to allow user star
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-np, --parallel N` | Number of parallel sequences to decode | 1 | Useful when fronted support it. See `--ctx-size` |
+| `-np, --parallel N` | Number of parallel sequences to decode | 1 | Useful when frontend support it. See `--ctx-size` |
 
 ## GPU Offload
 
@@ -185,14 +199,16 @@ Therefore, the "offloading" term is used when sending some processing to another
 
 As the GPUs (including their VRAM) are more powerful for LLM specific processing than CPU+RAM, the aim is to offload as much as possible to the GPU.
 
-Beside the improved quants (better quality and performance at the same size; usable low BPW), superior performance (faster PP ang TG), ik_llama.cpp really shines at:
-- Providing a big collection of parameters to tweak offloading (what/where runs: processing, tensors, KV cache, operations, etc.).
+Beside the improved quants (better quality and performance at the same size; usable low BPW), superior performance (faster PP ang TG), ik_llama.cpp really shines at providing:
+- Detailed output log which e.g. includes layers and buffers sizes to support offload calculations.
+- A big collection of parameters to tweak offloading (what/where runs: processing, tensors, KV cache, operations, etc.).
 - Split mode `graph` when multiple GPUs are available, including mixes of different GPU types, various VRAM sizes.
 - Many KV cache options, including Hadamard, which allows squeezing every GB of memory.
+- Highly optimized algorithm to automatically load as many tensors to the GPU(s) `--fit`.
 
 A. **Find the model size** in GB
 
-Ideally, it should fit entirely in the VRAM (`-ngl 999`). It uses the size of the model file plus the size of KV cache which depends by length (`--ctx-size 4096`).
+Ideally, it should fit entirely in the VRAM (`-ngl 999`). It needs the size of the model file plus the size of KV cache (which depends by the context length `--ctx-size 4096`) and some buffers.
 
 Note that the model size influences the speed as well, with smaller sizes being faster (less data to move around and calculate).
 
@@ -219,7 +235,7 @@ Some tradeoffs are required.
  - IQ2_XXS
 
 Notes:
-- Note: the `i` quants are a category, they are not related to imatrix. Use of imatrix is optional (but generally recommend) and is supported by *all quant types* (`legacy`, `k`, `i`, `iqk`) except bitnet.
+- The `i` quants are a category, they are not related to imatrix. Use of imatrix is optional (but generally recommend) and is supported by *all quant types* (`legacy`, `k`, `i`, `iqk`) except bitnet.
 - Look in the logs to see the quant types used by the loaded model:
 ```
 llama_model_loader: - type  f32:  113 tensors
@@ -243,22 +259,27 @@ llama_kv_cache_init:        CPU KV buffer size =    59.50 MiB
 llama_new_context_with_model: KV self size  =   59.50 MiB, K (q8_0):   29.75 MiB, V (q8_0):   29.75 MiB
 ```
 
-- To have access to more quant types, build with GGML_IQK_FA_ALL_QUANTS=ON, otherwise only F16, Q8_0, Q6_0, and, if the CPU provides native BF16 support, BF16 FA kernels will be included.
-- K-cache may needs better quant than V-cache to reduce quality loss, they can be specified separately `--cache-type-k q8_0 --cache-type-v q8_0`
+- To have access to more quant types, build with `GGML_IQK_FA_ALL_QUANTS=ON`, otherwise only `F16`, `Q8_0`, `Q6_0`, and, if the CPU provides native `BF16` support, `BF16` FA kernels will be included. After [PR 1549](https://github.com/ikawrakow/ik_llama.cpp/pull/1549), on **CPU** are enabled as well `Q4_1`, `IQ4_NL`, `Q4_0` by default to allow people experiment; use `GGML_IQK_FA_ALL_QUANTS=OFF` to reduce build time if those quants are not needed.
+- K-cache may need better quant than V-cache to reduce quality loss, they can be specified separately `--cache-type-k q8_0 --cache-type-v q8_0`
 - It needs FA `--flash-attn` flag, which is already turned on by default.
 - Fast quant type Q8_KV `-ctk q8_KV` [PR 208](https://github.com/ikawrakow/ik_llama.cpp/pull/208)
-- Using `--k-cache-hadamard` on quants lower thank Q6_0 may give better results.
+- Using `--k-cache-hadamard` on quants lower than `Q6_0` may give better results. Additionally, `ik_llama.cpp` provides `--v-cache-hadamard` for the V-cache. Example: `--cache-type-k q6_0 --k-cache-hadamard --cache-type-v q6_0 --v-cache-hadamard`
+- `Q4_0` achieves low perplexity even without Hadamard.
 
 3. Offload less to the GPU. Try to find a mix of parameters that better suits your system that default.
 
+- Try `--fit`. `ik_llama.cpp` automatically determine which tensors to offload to the GPUs based on the available VRAM.
+
 - Use `--no-kv-offload` to keep KV cache on CPU. This is provided for flexibility, and practically not desired as reduces the prompt processing speed.
 
-- Identify tensors, how many layers (also shape and more metadata) by opening the GGUF model file on browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. For the split models, look to each file part.
+- Identify tensors, how many layers (also shape and more metadata) by opening the GGUF model file on the Web browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. For the split models, look to each file part.
 
 Or, if you already have the quant locally you can just run `gguf_dump.py`:
 ```
 python3 gguf-py/scripts/gguf_dump.py /models/Qwen_Qwen3-0.6B-IQ4_NL.gguf
 ```
+
+- Use `--dry-run` to observe the memory usage.
 
 - `-ngl`, `-ot`, `--cpu-moe`, `--n-cpu-moe N`
    - For MoE models, use a number greater than the number of model layers with `-ngl`. If unsure, use a large number like `-ngl 999`.
@@ -267,11 +288,11 @@ python3 gguf-py/scripts/gguf_dump.py /models/Qwen_Qwen3-0.6B-IQ4_NL.gguf
    - For models with shared experts (like GPT-OSS), they should end up on GPU.
    - In some quants the layers aren't uniform so it can be better to skip larger layers if more smaller blocks will fit without empty space where nothing fits.
    - You put anything that says "exps" in your slowest memory, and anything else in your fastest memory (VRAM). Those ffn "exps" are the sparse experts tensors, the ones that get actually used only 2-5% of the times (depending on the model). If then you have extra VRAM to spare, you start putting some of the exps into VRAM too, for some improvements.
-   - Some layers (layers are called blk.n in gguf), are different in some models. For example [GLM5](https://huggingface.co/ubergarm/GLM-5-GGUF/blob/main/IQ3_KS/GLM-5-IQ3_KS-00002-of-00008.gguf) the first three layers are different (blk.0(14), blk.1(14), blk.2(14) vs. blk.10(19), blk.11(19),...), they don't have exps, they have dense ffn, so they should all go in VRAM. Dense layers are very good to speed up mixed inference systems, as a much larger share of active parameters is fixed, and hence you know which to put in faster VRAM. Also the layers from the 4th onwards have shared exps, "shexp", those too go to VRAM as they are always active.
+   - Some layers (layers are called `blk.n` in gguf), are different in some models. For example [GLM5](https://huggingface.co/ubergarm/GLM-5-GGUF/blob/main/IQ3_KS/GLM-5-IQ3_KS-00002-of-00008.gguf) the first three layers are different (blk.0(14), blk.1(14), blk.2(14) vs. blk.10(19), blk.11(19),...), they don't have exps, they have dense ffn, so they should all go in VRAM. Dense layers are very good to speed up mixed inference systems, as a much larger share of active parameters is fixed, and hence you know which to put in faster VRAM. Also the layers from the 4th onwards have shared exps, "shexp", those too go to VRAM as they are always active.
    - For MoE models you can play with `--cpu-moe`, `--n-cpu-moe N`, `-ooae`/`-no-ooae` before moving to `-ot`.
    - In general, in a single GPU + CPU system, you just do something like this:
 
-   `-ngl 999` To put all layers in vram by default
+   `-ngl 999` To put all layers in VRAM by default
    
    `-ot "blk.(?:[0-9]|[1-7][0-9]|[8][0-7]).ffn._exps.=CPU"` To create exceptions and put back in ram anything that has "ffn" and "_exps" in its name, and that sits in layers called "blk.n", where "n" (the lawyer number) is any match between 0 and 9, or between 1 to 7 + 0 to 9 (aka a number between 10 and 79), or 8 + 0 to 7 (aka a number between 80 and 87).
    Basically a complicated way of saying put all experts from layer 0 to 87 in ram. Experts from layer 88 to 93 (there's 93 layers in qwen3vl 235b) can sit in VRAM still. (Thats all I can load on a 5090).
@@ -283,7 +304,7 @@ WIP
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
-| `-ngl, --gpu-layers N` | Number of layers to store in VRAM | - | For better speed you aim to offload the entire model in GPU memory. To identify how many layers (also shape and more metadata) open the GGUF model file on browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. Use a number higher than the numbers of model layers to full offload (`--gpu-layers` 99, for a model with less than 99 layers). See `--ctx-size` and reduce it to the minimum needed. If model fails to load due to the insufficient GPU memory, reduce the number of layers (`--gpu-layers 20`, for a model with 40 layers will offload only the first 20 layers). |
+| `-ngl, --gpu-layers N` | Number of layers to store in VRAM | - | For better speed you aim to offload the entire model in GPU memory. To identify how many layers (also shape and more metadata) open the GGUF model file on the Web browser [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf) then scroll down to the Tensors table. Use a number higher than the numbers of model layers to fully offload (`--gpu-layers` 99, for a model with less than 99 layers). See `--ctx-size` and reduce it to the minimum needed. If model fails to load due to the insufficient GPU memory, reduce the number of layers (`--gpu-layers 20`, for a model with 40 layers will offload only the first 20 layers). |
 | `-ngld, --gpu-layers-draft N` | Number of layers to store in VRAM for the draft model | - | For draft model, see `--gpu-layers` |
 | `--cpu-moe` | Keep all MoE weights in CPU memory | - | Simple offload mode for MoE. [PR 841](https://github.com/ikawrakow/ik_llama.cpp/pull/841) |
 | `--n-cpu-moe N` | Keep MoE weights of the first N layers in CPU memory | - | Similar to `--cpu-moe` but when some GPU memory is available to store some layers. |
@@ -342,7 +363,8 @@ llama-sweep-bench -m /models/model.gguf -c 12288 -ub 512 -rtr -fa -ctk q8_0 -ctv
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-nrep N, --n-repetitions N` | Define the number of repetitions used at zero context | - | [PR 1176](https://github.com/ikawrakow/ik_llama.cpp/pull/1176) |
-| `-n` | Specifies he number of TG tokens  | - | If not specified, it is set to u-batch/4 [PR 897](https://github.com/ikawrakow/ik_llama.cpp/pull/897) | 
+| `-n` | Specifies he number of TG tokens  | - | If not specified, it is set to u-batch/4 [PR 897](https://github.com/ikawrakow/ik_llama.cpp/pull/897) |
+| `--minilog` | Reduce the verbosity | - | [PR 1468](https://github.com/ikawrakow/ik_llama.cpp/pull/1468) |
 
 ### llama-bench
 
@@ -355,6 +377,8 @@ llama-bench -tgb 4,16 -p 512 -n 128 other_arguments
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-tgb (or --threads-gen-batch)` | Enable having different number of threads for generation and batch processing | - | [PR 284](https://github.com/ikawrakow/ik_llama.cpp/pull/284) |
+| `--fit` | Automatically fit to available VRAM | 0 | 0 / 1 [PR 1542](https://github.com/ikawrakow/ik_llama.cpp/pull/1542) |
+| `--fit-margin N` | Safety VRAM margin in MiB when using `--fit` | 1024 |  |
 
 ### Imatrix
 
@@ -368,6 +392,10 @@ llama-imatrix -m /models/model-bf16.gguf -f /models/calibration_data_v5_rc.txt -
 | - | - | - | - |
 | `--layer-similarity or -lsim` | Collect statistics about activations change caused by a layer using cosine similarity | - | [PR 328](https://github.com/ikawrakow/ik_llama.cpp/pull/328) |
 | `--hide-imatrix` | Store "top_secret" in the imatrix data file name | - | And in calibration dataset fields, and zeros in the batch size and number of chunks used to compute the imatrix. [PR 329](https://github.com/ikawrakow/ik_llama.cpp/pull/329) |
+
+Notes:
+- Use `convert_imatrix_gguf_to_dat.py` to convert the "new" GGUF imatrix files to the format supported here. [PR 1405](https://github.com/ikawrakow/ik_llama.cpp/pull/1405)
+- imatrix calculation for models with merged ffn_up/gate_exps tensors is supported, see [PR 1418](https://github.com/ikawrakow/ik_llama.cpp/pull/1418) [PR 1419](https://github.com/ikawrakow/ik_llama.cpp/pull/1419)
 
 ### Quantization
 
@@ -386,6 +414,8 @@ llama-gguf-split --split --split-max-size 1G --no-tensor-first-split /models/mod
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `--custom-q` | Custom quantization rules with regular expressions | - | Example: `llama-quantize --imatrix some_imatrix --custom-q "regex1=typ1,regex2=type2..." some_model some_output_file some_base_quant` [PR 244](https://github.com/ikawrakow/ik_llama.cpp/pull/244) |
+| `--dry-run` | Prints the tensor types and resulting tensor sizes, but does not run the quantization, so it is very fast. | - | Useful for experimenting with --custom-q before running the actual quantization. [PR 1309](https://github.com/ikawrakow/ik_llama.cpp/pull/1309) |
+| `--partial-requant` | quantize only missing split files in the split quantized .gguf destination directory | - | - |
 
 ### Build Arguments
 
@@ -420,6 +450,7 @@ CUDA_VISIBLE_DEVICES=0,2 llama-server -m /models/model-bf16.gguf
 | Name | Notes/Examples |
 | - | - |
 | CUDA_VISIBLE_DEVICES | Use only specified GPUs. Example: Use first and 3rd `CUDA_VISIBLE_DEVICES=0,2` |
+| GGML_CUDA_NO_PINNED | Do not use pinned memory |
 
 ## Unique parameters
 
