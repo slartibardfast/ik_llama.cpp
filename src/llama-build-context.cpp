@@ -775,7 +775,16 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             if (input->op != GGML_OP_REDUCE) {
                 cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
             }
-            cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
+            // For token gen (N=1), the matrix-matrix tile in fused_up_gate wastes
+            // ~98% of the B tile. Fall back to per-device 2x mat_vec + fused_mul_unary
+            // — much faster on Vulkan, equivalent semantics.
+            if (cur->ne[1] == 1) {
+                auto tmp_u = llm_build_lora_mm(lctx, ctx, split_u, cur);
+                cur = llm_build_lora_mm(lctx, ctx, split_g, cur);
+                cur = ggml_fused_mul_unary(ctx, cur, tmp_u, unary_op);
+            } else {
+                cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
+            }
             cb(cur, "ffn_up_gate", il_cb);
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 //printf("%s(%d): limits = %g\n", __func__, il, lctx.model.hparams.swiglu_limits[il]);
@@ -831,7 +840,13 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
+    // FUSED_UP_GATE uses a matrix-matrix tile shader (BM=64, BN=64) which wastes
+    // ~98% of the B tile when N=1 (token generation). On Vulkan, the unfused path
+    // (2x mat_vec + ggml_fused_mul_unary) is several times faster for N=1 because
+    // mat_vec is geometry-optimized for narrow workloads. Fusion remains beneficial
+    // for prompt processing (N>1) where the matrix-matrix tile pays off.
     if (lctx.cparams.fused_up_gate &&
+        cur->ne[1] > 1 &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1153,7 +1168,11 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+    // For token gen (n_tokens=1), the fused MoE up_gate uses matrix-matrix tile
+    // geometry per expert that wastes the B tile when only 1 token activates each
+    // expert. Fall through to the unfused path (2x mul_mat_id + fused_mul_unary)
+    // which uses geometry-optimized mat_vec_id for narrow workloads.
+    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && n_tokens > 1 && up_exps->type == gate_exps->type) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
