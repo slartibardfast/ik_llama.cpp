@@ -225,12 +225,18 @@ static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
     OTHER,
-    AMD_GCN,
+    AMD_GCN3,    // Sea Islands, Volcanic Islands, Polaris (gfx7/gfx8) — wave64, no FP16 compute
+    AMD_GCN5,    // Vega 10, Vega II (gfx900/gfx906) — wave64, FP16 compute (Rapid Packed Math), HBM2
     AMD_RDNA1,
     AMD_RDNA2,
     AMD_RDNA3,
     INTEL_XE2,
 };
+
+// Helper for code paths that should match BOTH GCN3 and GCN5 (any wave64-only AMD).
+static inline bool is_amd_gcn(vk_device_architecture arch) {
+    return arch == AMD_GCN3 || arch == AMD_GCN5;
+}
 
 // HSK x HSV
 enum FaHeadSizes {
@@ -283,7 +289,20 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         device.getProperties2(&props2);
 
         if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 64) {
-            return vk_device_architecture::AMD_GCN;
+            // Wave64-only: GCN-class. Distinguish Vega (GCN5) from Polaris/older
+            // (GCN3/4) by FP16 compute extension presence. Vega 10 supports
+            // VK_KHR_shader_float16_int8 (and exposes Rapid Packed Math via
+            // f16vec2 ops); Polaris only has VK_KHR_16bit_storage (FP16 storage).
+            bool has_fp16_compute = false;
+            for (const auto& properties : ext_props) {
+                if (strcmp("VK_KHR_shader_float16_int8", properties.extensionName) == 0) {
+                    has_fp16_compute = true;
+                    break;
+                }
+            }
+            return has_fp16_compute
+                ? vk_device_architecture::AMD_GCN5
+                : vk_device_architecture::AMD_GCN3;
         }
         if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 32) {
             // RDNA
@@ -2180,7 +2199,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 
 struct GpuPipelineConfig {
     // GPU architecture identifier.
-    // Example: vk_device_architecture::AMD_GCN
+    // Example: vk_device_architecture::AMD_GCN5
     vk_device_architecture arch;
 
     // Mapping of pipeline names to their specific subgroup sizes.
@@ -2326,7 +2345,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         s_warptile_mmq_int = { subgroup_size_32, 32, 32, 32, 32,       32, 2, 2, 1, 1, subgroup_size_8 };
 
         // chip specific tuning
-        if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
+        if (is_amd_gcn(device->architecture) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         }
 
@@ -2912,7 +2931,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     uint32_t rm_stdq = 1;
     uint32_t rm_kq = 2;
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
-        if (device->architecture == AMD_GCN) {
+        if (is_amd_gcn(device->architecture)) {
             rm_stdq = 2;
             rm_kq = 4;
         }
