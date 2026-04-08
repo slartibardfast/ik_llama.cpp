@@ -9,6 +9,42 @@
 
 #include <unordered_set>
 #include <algorithm>
+#include <vector>
+
+// Phase 20f: filtered cross-device reduce helper.
+//
+// Multi-GPU graph-split mode allocates per-device result vectors of size
+// `n_device` and conditionally fills only the entries for devices that
+// actually own the relevant slice. The unfilled slots stay nullptr. The raw
+// `ggml_reduce` API at ggml.c:6125 asserts `nhave > 1` (the count of non-NULL
+// inputs), which is correct: a reduce of 0 or 1 tensors is meaningless.
+//
+// When expert routing or weight assignment concentrates all useful work on a
+// single device (which happens for Qwen3.5-35B-A3B and similar MoE / split
+// attention models on heterogeneous rigs), the array contains exactly one
+// non-NULL tensor. This helper compacts the array, then either passes the
+// single tensor through directly (the no-op reduce case) or forwards the
+// filtered, contiguous array to `ggml_reduce`. The semantics are unchanged for
+// the multi-tensor case.
+//
+// Used by every multi-device cross-reduce call site in this file (MoE FFN,
+// shared-expert FFN, split attention, plus the dense FFN combiner).
+static ggml_tensor * filtered_reduce(
+        ggml_context * ctx,
+        ggml_tensor ** results,
+        int n_device,
+        ggml_op op) {
+    std::vector<ggml_tensor *> filtered;
+    filtered.reserve(n_device);
+    for (int i = 0; i < n_device; ++i) {
+        if (results[i]) filtered.push_back(results[i]);
+    }
+    GGML_ASSERT(!filtered.empty());
+    if (filtered.size() == 1) {
+        return filtered[0];
+    }
+    return ggml_reduce(ctx, filtered.data(), (int)filtered.size(), op);
+}
 
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
     uint32_t n_slots = 0;
@@ -821,7 +857,7 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             ffn[id_last] = ggml_add(ctx, ffn[id_last], add_extra);
             cb(ffn[id_last], "ffn_with_inp", il);
         }
-        auto cur = ggml_reduce(ctx, ffn.data(), u->n_device, GGML_OP_ADD);
+        auto cur = filtered_reduce(ctx, ffn.data(), u->n_device, GGML_OP_ADD);
         cb(cur, "ffn_combined", il);
         ggml_build_forward_expand(graph, cur);
         return cur;
@@ -1396,7 +1432,7 @@ llm_expert_gating_func_type   gating_op,
                     results[id] = shared_out;
                 }
                 GGML_ASSERT(!results.empty());
-                cur = ggml_reduce(ctx, results.data(), split_up_shexp->n_device, GGML_OP_ADD);
+                cur = filtered_reduce(ctx, results.data(), split_up_shexp->n_device, GGML_OP_ADD);
                 cb(cur, "ffn_out", il);
             } else {
                 auto shared_out = llm_build_ffn(ctx, lctx, nullptr, cur,
@@ -1521,7 +1557,7 @@ llm_expert_gating_func_type   gating_op,
         cb(results[last_id], "ffn_inp_added", il);
     }
 
-    auto cur = ggml_reduce(ctx, results.data(), n_device, GGML_OP_ADD);
+    auto cur = filtered_reduce(ctx, results.data(), n_device, GGML_OP_ADD);
     cb(cur, "moe_ffn_combined", il);
     ggml_build_forward_expand(graph, cur);
 
@@ -9680,7 +9716,7 @@ ggml_cgraph* llm_build_context::build_minimaxm2() {
                 attn[id] = cur;
             }
 
-            cur = ggml_reduce(ctx0, attn.data(), n_device, GGML_OP_ADD);
+            cur = filtered_reduce(ctx0, attn.data(), n_device, GGML_OP_ADD);
             ggml_build_forward_expand(gf, cur);
             cb(cur, "attn_combined", il);
 
@@ -10534,7 +10570,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cb(attn[last_id], "attn_out_with_input", il);
             }
 
-            auto cur = ggml_reduce(ctx0, attn.data(), wq->n_device, GGML_OP_ADD);
+            auto cur = filtered_reduce(ctx0, attn.data(), wq->n_device, GGML_OP_ADD);
             ggml_build_forward_expand(gf, cur);
             cb(cur, "attn_combined", il);
             return cur;
