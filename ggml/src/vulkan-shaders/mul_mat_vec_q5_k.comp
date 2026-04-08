@@ -27,14 +27,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
         const vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
 
-        const FLOAT_TYPE sc0 = scale_0_4_l_f.x;
-        const FLOAT_TYPE sc1 = scale_0_4_l_f.y;
-        const FLOAT_TYPE sc2 = scale_0_4_l_f.z;
-        const FLOAT_TYPE sc3 = scale_0_4_l_f.w;
-        const FLOAT_TYPE sc4 = scale8_f.x;
-        const FLOAT_TYPE sc5 = scale8_f.y;
-        const FLOAT_TYPE sc6 = scale8_f.z;
-        const FLOAT_TYPE sc7 = scale8_f.w;
+        const FLOAT_TYPE sc0 = FLOAT_TYPE(scale_0_4_l_f.x);
+        const FLOAT_TYPE sc1 = FLOAT_TYPE(scale_0_4_l_f.y);
+        const FLOAT_TYPE sc2 = FLOAT_TYPE(scale_0_4_l_f.z);
+        const FLOAT_TYPE sc3 = FLOAT_TYPE(scale_0_4_l_f.w);
+        const FLOAT_TYPE sc4 = FLOAT_TYPE(scale8_f.x);
+        const FLOAT_TYPE sc5 = FLOAT_TYPE(scale8_f.y);
+        const FLOAT_TYPE sc6 = FLOAT_TYPE(scale8_f.z);
+        const FLOAT_TYPE sc7 = FLOAT_TYPE(scale8_f.w);
 
         const uint32_t qs0_16_u32 = uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 8]) << 16);
         const uint32_t qs64_80_u32 = uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 32]) | (uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 40]) << 16);
@@ -61,22 +61,22 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const vec4 qs0_16_hi4 = vec4(unpack8(qs0_16_u32_hi4));
         const vec4 qs64_80_hi4 = vec4(unpack8(qs64_80_u32_hi4));
 
-        const FLOAT_TYPE q4_0  = qs0_16_lo4.x;
-        const FLOAT_TYPE q4_1  = qs0_16_lo4.y;
-        const FLOAT_TYPE q4_2  = qs0_16_lo4.z;
-        const FLOAT_TYPE q4_3  = qs0_16_lo4.w;
-        const FLOAT_TYPE q4_4  = qs0_16_hi4.x;
-        const FLOAT_TYPE q4_5  = qs0_16_hi4.y;
-        const FLOAT_TYPE q4_6  = qs0_16_hi4.z;
-        const FLOAT_TYPE q4_7  = qs0_16_hi4.w;
-        const FLOAT_TYPE q4_8  = qs64_80_lo4.x;
-        const FLOAT_TYPE q4_9  = qs64_80_lo4.y;
-        const FLOAT_TYPE q4_10 = qs64_80_lo4.z;
-        const FLOAT_TYPE q4_11 = qs64_80_lo4.w;
-        const FLOAT_TYPE q4_12 = qs64_80_hi4.x;
-        const FLOAT_TYPE q4_13 = qs64_80_hi4.y;
-        const FLOAT_TYPE q4_14 = qs64_80_hi4.z;
-        const FLOAT_TYPE q4_15 = qs64_80_hi4.w;
+        const FLOAT_TYPE q4_0  = FLOAT_TYPE(qs0_16_lo4.x);
+        const FLOAT_TYPE q4_1  = FLOAT_TYPE(qs0_16_lo4.y);
+        const FLOAT_TYPE q4_2  = FLOAT_TYPE(qs0_16_lo4.z);
+        const FLOAT_TYPE q4_3  = FLOAT_TYPE(qs0_16_lo4.w);
+        const FLOAT_TYPE q4_4  = FLOAT_TYPE(qs0_16_hi4.x);
+        const FLOAT_TYPE q4_5  = FLOAT_TYPE(qs0_16_hi4.y);
+        const FLOAT_TYPE q4_6  = FLOAT_TYPE(qs0_16_hi4.z);
+        const FLOAT_TYPE q4_7  = FLOAT_TYPE(qs0_16_hi4.w);
+        const FLOAT_TYPE q4_8  = FLOAT_TYPE(qs64_80_lo4.x);
+        const FLOAT_TYPE q4_9  = FLOAT_TYPE(qs64_80_lo4.y);
+        const FLOAT_TYPE q4_10 = FLOAT_TYPE(qs64_80_lo4.z);
+        const FLOAT_TYPE q4_11 = FLOAT_TYPE(qs64_80_lo4.w);
+        const FLOAT_TYPE q4_12 = FLOAT_TYPE(qs64_80_hi4.x);
+        const FLOAT_TYPE q4_13 = FLOAT_TYPE(qs64_80_hi4.y);
+        const FLOAT_TYPE q4_14 = FLOAT_TYPE(qs64_80_hi4.z);
+        const FLOAT_TYPE q4_15 = FLOAT_TYPE(qs64_80_hi4.w);
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             vec2 by10 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2     ]);
@@ -88,6 +88,51 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
             vec2 by232 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 16]);
             vec2 by248 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 24]);
 
+#if defined(USE_F16ACC)
+            // RPM path: each 4-wide dot becomes two paired f16vec2 fma's.
+            // Inputs arrive as vec2 pairs already, so build f16vec2 by pairing
+            // adjacent by*[lo|hi].x/.y halves with consecutive q4_* scalars.
+            const f16vec2 by10_h  = f16vec2(by10);
+            const f16vec2 by116_h = f16vec2(by116);
+            const f16vec2 by132_h = f16vec2(by132);
+            const f16vec2 by148_h = f16vec2(by148);
+            const f16vec2 by20_h  = f16vec2(by20);
+            const f16vec2 by216_h = f16vec2(by216);
+            const f16vec2 by232_h = f16vec2(by232);
+            const f16vec2 by248_h = f16vec2(by248);
+
+            f16vec2 sx_acc = by10_h  * f16vec2(q4_0, q4_1);
+            sx_acc = fma(by116_h, f16vec2(q4_2, q4_3), sx_acc);
+            const FLOAT_TYPE sx = sx_acc.x + sx_acc.y;
+
+            f16vec2 sy_acc = by132_h * f16vec2(q4_4, q4_5);
+            sy_acc = fma(by148_h, f16vec2(q4_6, q4_7), sy_acc);
+            const FLOAT_TYPE sy = sy_acc.x + sy_acc.y;
+
+            f16vec2 sz_acc = by20_h  * f16vec2(q4_8, q4_9);
+            sz_acc = fma(by216_h, f16vec2(q4_10, q4_11), sz_acc);
+            const FLOAT_TYPE sz = sz_acc.x + sz_acc.y;
+
+            f16vec2 sw_acc = by232_h * f16vec2(q4_12, q4_13);
+            sw_acc = fma(by248_h, f16vec2(q4_14, q4_15), sw_acc);
+            const FLOAT_TYPE sw = sw_acc.x + sw_acc.y;
+
+            // smin = sc2*(sum by10+by116) + sc3*(sum by132+by148) + sc6*(sum by20+by216) + sc7*(sum by232+by248)
+            const f16vec2 bymin10 = by10_h  + by116_h;
+            const f16vec2 bymin32 = by132_h + by148_h;
+            const f16vec2 bymin20 = by20_h  + by216_h;
+            const f16vec2 bymin32b = by232_h + by248_h;
+            const f16vec2 sum1032 = f16vec2(bymin10.x + bymin10.y, bymin32.x + bymin32.y);
+            const f16vec2 sum2032 = f16vec2(bymin20.x + bymin20.y, bymin32b.x + bymin32b.y);
+            f16vec2 smin_acc = sum1032 * f16vec2(sc2, sc3);
+            smin_acc = fma(sum2032, f16vec2(sc6, sc7), smin_acc);
+            const FLOAT_TYPE smin = smin_acc.x + smin_acc.y;
+
+            f16vec2 d_acc = f16vec2(sx, sy) * f16vec2(sc0, sc1);
+            d_acc = fma(f16vec2(sz, sw), f16vec2(sc4, sc5), d_acc);
+            const FLOAT_TYPE d_sum = d_acc.x + d_acc.y;
+            temp[j][n] = fma(dall, d_sum, fma(-dmin, smin, temp[j][n]));
+#else
             const FLOAT_TYPE sx =
               fma(FLOAT_TYPE(by10.x), q4_0,
               fma(FLOAT_TYPE(by10.y), q4_1,
@@ -114,6 +159,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
               fma(FLOAT_TYPE(by20.x) + FLOAT_TYPE(by20.y) + FLOAT_TYPE(by216.x) + FLOAT_TYPE(by216.y), sc6,
                   (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y) + FLOAT_TYPE(by248.x) + FLOAT_TYPE(by248.y)) * sc7)));
             temp[j][n] = fma(dall, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dmin, smin, temp[j][n]));
+#endif
         }
     }
 }

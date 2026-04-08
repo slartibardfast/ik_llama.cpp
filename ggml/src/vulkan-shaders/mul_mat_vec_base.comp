@@ -1,8 +1,14 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
+// Required for the _f16acc variants where FLOAT_TYPE = float16_t. No-op for the
+// existing _f32_f32 variants which use FLOAT_TYPE = float.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #if defined(USE_SUBGROUP_ADD) || defined(USE_SUBGROUP_ADD_NO_SHMEM)
 #extension GL_KHR_shader_subgroup_arithmetic : require
+// subgroupAdd(float16_t) requires the extended types extension on top of basic
+// arithmetic — needed by the _f16acc subgroup variants.
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
 #endif
 
 #ifdef MUL_MAT_ID

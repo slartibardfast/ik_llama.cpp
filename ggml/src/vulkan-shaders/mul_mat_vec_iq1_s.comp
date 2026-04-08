@@ -14,8 +14,10 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const float d = float(data_a[ibi].d);
         const uint qh = data_a[ibi].qh[ib32];
+        // Per-block scale: keep in float for d×scale precision, cast at outer fma.
         const float dl = d * float(2 * bitfieldExtract(qh, 12, 3) + 1);
-        const float delta = ((qh & 0x8000) != 0) ? -IQ1S_DELTA : IQ1S_DELTA;
+        // Inner-loop scalar reused many times: cast to FLOAT_TYPE once.
+        const FLOAT_TYPE delta = FLOAT_TYPE(((qh & 0x8000) != 0) ? -IQ1S_DELTA : IQ1S_DELTA);
 
         [[unroll]] for (uint l = 0; l < 4; ++l) {
             const uint qs = data_a[ibi].qs[4 * ib32 + l];
@@ -26,12 +28,27 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32, 
                 vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
                 vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
 
+#if defined(USE_F16ACC)
+                // RPM path: pair (b0[k], b4[k]) with their corresponding
+                // decoded grid values + delta, accumulate as f16vec2.
+                const f16vec2 delta_v = f16vec2(delta, delta);
+                f16vec2 sum_pair = f16vec2(0.0);
+                [[unroll]] for (int k = 0; k < 4; ++k) {
+                    const f16vec2 bk = f16vec2(b0[k], b4[k]);
+                    const f16vec2 gk = f16vec2(FLOAT_TYPE(bitfieldExtract(grid, 2 * k, 2)),
+                                               FLOAT_TYPE(bitfieldExtract(grid, 8 + 2 * k, 2)));
+                    sum_pair = fma(bk, gk + delta_v, sum_pair);
+                }
+                const FLOAT_TYPE sum = sum_pair.x + sum_pair.y;
+                temp[j][n] = fma(FLOAT_TYPE(dl), sum, temp[j][n]);
+#else
                 FLOAT_TYPE sum = FLOAT_TYPE(0.0);
                 [[unroll]] for (int k = 0; k < 4; ++k) {
-                    sum = fma(FLOAT_TYPE(b0[k]), bitfieldExtract(grid, 2 * k, 2) + delta,
-                          fma(FLOAT_TYPE(b4[k]), bitfieldExtract(grid, 8 + 2 * k, 2) + delta, sum));
+                    sum = fma(FLOAT_TYPE(b0[k]), FLOAT_TYPE(bitfieldExtract(grid, 2 * k, 2)) + delta,
+                          fma(FLOAT_TYPE(b4[k]), FLOAT_TYPE(bitfieldExtract(grid, 8 + 2 * k, 2)) + delta, sum));
                 }
-                temp[j][n] = fma(dl, sum, temp[j][n]);
+                temp[j][n] = fma(FLOAT_TYPE(dl), sum, temp[j][n]);
+#endif
             }
         }
         ibi += num_blocks_per_row;

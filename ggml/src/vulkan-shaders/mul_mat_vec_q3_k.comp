@@ -57,18 +57,47 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ix, co
             vec2 b96 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 48]);
             vec2 b112 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 56]);
 
+#if defined(USE_F16ACC)
+            // RPM path: pair the 8 scalar fma's inside each l iteration into
+            // 4 f16vec2 fma's that RADV lowers to v_pk_fma_f16. Pairs are
+            // (b0,b16), (b32,b48), (b64,b80), (b96,b112) with their respective
+            // sccache entries and q_u32-hmk differences.
+            const f16vec2 scA = f16vec2(sccache[csel][ix][v_im][0], sccache[csel][ix][v_im][1]);
+            const f16vec2 scB = f16vec2(sccache[csel][ix][v_im][2], sccache[csel][ix][v_im][3]);
+            const f16vec2 scC = f16vec2(sccache[csel][ix][v_im][4], sccache[csel][ix][v_im][5]);
+            const f16vec2 scD = f16vec2(sccache[csel][ix][v_im][6], sccache[csel][ix][v_im][7]);
+
+            f16vec2 sum_pair = f16vec2(0.0);
+            [[unroll]] for (int l = 0; l < 2; ++l) {
+                const f16vec2 pbA = f16vec2(b0[l],  b16[l])  * scA;
+                const f16vec2 pbB = f16vec2(b32[l], b48[l])  * scB;
+                const f16vec2 pbC = f16vec2(b64[l], b80[l])  * scC;
+                const f16vec2 pbD = f16vec2(b96[l], b112[l]) * scD;
+                const f16vec2 pqA = f16vec2(qs_u32_0[l  ] - hmk_0[l  ], qs_u32_0[l+2] - hmk_0[l+2]);
+                const f16vec2 pqB = f16vec2(qs_u32_2[l  ] - hmk_1[l  ], qs_u32_2[l+2] - hmk_1[l+2]);
+                const f16vec2 pqC = f16vec2(qs_u32_4[l  ] - hmk_2[l  ], qs_u32_4[l+2] - hmk_2[l+2]);
+                const f16vec2 pqD = f16vec2(qs_u32_6[l  ] - hmk_3[l  ], qs_u32_6[l+2] - hmk_3[l+2]);
+                sum_pair = fma(pbA, pqA, sum_pair);
+                sum_pair = fma(pbB, pqB, sum_pair);
+                sum_pair = fma(pbC, pqC, sum_pair);
+                sum_pair = fma(pbD, pqD, sum_pair);
+            }
+            const FLOAT_TYPE sum = sum_pair.x + sum_pair.y;
+            temp[j][n] = fma(d, sum, temp[j][n]);
+#else
             FLOAT_TYPE sum = FLOAT_TYPE(0.0);
             [[unroll]] for (int l = 0; l < 2; ++l) {
-                sum = fma(FLOAT_TYPE(  b0[l]) * sccache[csel][ix][v_im][0], qs_u32_0[l  ] - hmk_0[l  ],
-                      fma(FLOAT_TYPE( b16[l]) * sccache[csel][ix][v_im][1], qs_u32_0[l+2] - hmk_0[l+2],
-                      fma(FLOAT_TYPE( b32[l]) * sccache[csel][ix][v_im][2], qs_u32_2[l  ] - hmk_1[l  ],
-                      fma(FLOAT_TYPE( b48[l]) * sccache[csel][ix][v_im][3], qs_u32_2[l+2] - hmk_1[l+2],
-                      fma(FLOAT_TYPE( b64[l]) * sccache[csel][ix][v_im][4], qs_u32_4[l  ] - hmk_2[l  ],
-                      fma(FLOAT_TYPE( b80[l]) * sccache[csel][ix][v_im][5], qs_u32_4[l+2] - hmk_2[l+2],
-                      fma(FLOAT_TYPE( b96[l]) * sccache[csel][ix][v_im][6], qs_u32_6[l  ] - hmk_3[l  ],
-                      fma(FLOAT_TYPE(b112[l]) * sccache[csel][ix][v_im][7], qs_u32_6[l+2] - hmk_3[l+2], sum))))))));
+                sum = fma(FLOAT_TYPE(  b0[l]) * sccache[csel][ix][v_im][0], FLOAT_TYPE(qs_u32_0[l  ] - hmk_0[l  ]),
+                      fma(FLOAT_TYPE( b16[l]) * sccache[csel][ix][v_im][1], FLOAT_TYPE(qs_u32_0[l+2] - hmk_0[l+2]),
+                      fma(FLOAT_TYPE( b32[l]) * sccache[csel][ix][v_im][2], FLOAT_TYPE(qs_u32_2[l  ] - hmk_1[l  ]),
+                      fma(FLOAT_TYPE( b48[l]) * sccache[csel][ix][v_im][3], FLOAT_TYPE(qs_u32_2[l+2] - hmk_1[l+2]),
+                      fma(FLOAT_TYPE( b64[l]) * sccache[csel][ix][v_im][4], FLOAT_TYPE(qs_u32_4[l  ] - hmk_2[l  ]),
+                      fma(FLOAT_TYPE( b80[l]) * sccache[csel][ix][v_im][5], FLOAT_TYPE(qs_u32_4[l+2] - hmk_2[l+2]),
+                      fma(FLOAT_TYPE( b96[l]) * sccache[csel][ix][v_im][6], FLOAT_TYPE(qs_u32_6[l  ] - hmk_3[l  ]),
+                      fma(FLOAT_TYPE(b112[l]) * sccache[csel][ix][v_im][7], FLOAT_TYPE(qs_u32_6[l+2] - hmk_3[l+2]), sum))))))));
             }
             temp[j][n] = fma(d, sum, temp[j][n]);
+#endif
         }
     }
 }

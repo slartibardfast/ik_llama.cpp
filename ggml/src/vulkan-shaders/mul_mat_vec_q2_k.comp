@@ -55,17 +55,51 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             vec2 b96 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 48]);
             vec2 b112 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y_idx) / 2 + 56]);
 
+#if defined(USE_F16ACC)
+            // RPM path: pair the eight fma's per sum1 / sum2 into four f16vec2
+            // fma's each, so RADV lowers them to v_pk_fma_f16.
+            const f16vec2 sc1A = f16vec2(sccache1[csel][ix][    8*v_im], sccache1[csel][ix][1 + 8*v_im]);
+            const f16vec2 sc1B = f16vec2(sccache1[csel][ix][2 + 8*v_im], sccache1[csel][ix][3 + 8*v_im]);
+            const f16vec2 sc1C = f16vec2(sccache1[csel][ix][4 + 8*v_im], sccache1[csel][ix][5 + 8*v_im]);
+            const f16vec2 sc1D = f16vec2(sccache1[csel][ix][6 + 8*v_im], sccache1[csel][ix][7 + 8*v_im]);
+            const f16vec2 sc2A = f16vec2(sccache2[csel][ix][    8*v_im], sccache2[csel][ix][1 + 8*v_im]);
+            const f16vec2 sc2B = f16vec2(sccache2[csel][ix][2 + 8*v_im], sccache2[csel][ix][3 + 8*v_im]);
+            const f16vec2 sc2C = f16vec2(sccache2[csel][ix][4 + 8*v_im], sccache2[csel][ix][5 + 8*v_im]);
+            const f16vec2 sc2D = f16vec2(sccache2[csel][ix][6 + 8*v_im], sccache2[csel][ix][7 + 8*v_im]);
+
+            f16vec2 sum1_pair = f16vec2(0.0);
+            f16vec2 sum2_pair = f16vec2(0.0);
+            [[unroll]] for (int l = 0; l < 2; ++l) {
+                const f16vec2 bA = f16vec2(b0[l],  b16[l]);
+                const f16vec2 bB = f16vec2(b32[l], b48[l]);
+                const f16vec2 bC = f16vec2(b64[l], b80[l]);
+                const f16vec2 bD = f16vec2(b96[l], b112[l]);
+                // sum1 path: b * sc1 * q (pre-compute sc1*q, then one fma per pair)
+                sum1_pair = fma(bA * sc1A, f16vec2(qs_u32_0[l  ], qs_u32_0[l+2]), sum1_pair);
+                sum1_pair = fma(bB * sc1B, f16vec2(qs_u32_2[l  ], qs_u32_2[l+2]), sum1_pair);
+                sum1_pair = fma(bC * sc1C, f16vec2(qs_u32_4[l  ], qs_u32_4[l+2]), sum1_pair);
+                sum1_pair = fma(bD * sc1D, f16vec2(qs_u32_6[l  ], qs_u32_6[l+2]), sum1_pair);
+                // sum2 path: b * sc2
+                sum2_pair = fma(bA, sc2A, sum2_pair);
+                sum2_pair = fma(bB, sc2B, sum2_pair);
+                sum2_pair = fma(bC, sc2C, sum2_pair);
+                sum2_pair = fma(bD, sc2D, sum2_pair);
+            }
+            const FLOAT_TYPE sum1 = sum1_pair.x + sum1_pair.y;
+            const FLOAT_TYPE sum2 = sum2_pair.x + sum2_pair.y;
+            temp[j][n] = fma(dall, sum1, fma(-dmin, sum2, temp[j][n]));
+#else
             FLOAT_TYPE sum1 = FLOAT_TYPE(0.0);
             FLOAT_TYPE sum2 = FLOAT_TYPE(0.0);
             [[unroll]] for (int l = 0; l < 2; ++l) {
-                sum1 = fma(FLOAT_TYPE(b0[l]),   sccache1[csel][ix][    8*v_im] * qs_u32_0[l  ],
-                       fma(FLOAT_TYPE(b16[l]),  sccache1[csel][ix][1 + 8*v_im] * qs_u32_0[l+2],
-                       fma(FLOAT_TYPE(b32[l]),  sccache1[csel][ix][2 + 8*v_im] * qs_u32_2[l  ],
-                       fma(FLOAT_TYPE(b48[l]),  sccache1[csel][ix][3 + 8*v_im] * qs_u32_2[l+2],
-                       fma(FLOAT_TYPE(b64[l]),  sccache1[csel][ix][4 + 8*v_im] * qs_u32_4[l  ],
-                       fma(FLOAT_TYPE(b80[l]),  sccache1[csel][ix][5 + 8*v_im] * qs_u32_4[l+2],
-                       fma(FLOAT_TYPE(b96[l]),  sccache1[csel][ix][6 + 8*v_im] * qs_u32_6[l  ],
-                       fma(FLOAT_TYPE(b112[l]), sccache1[csel][ix][7 + 8*v_im] * qs_u32_6[l+2], sum1))))))));
+                sum1 = fma(FLOAT_TYPE(b0[l]),   sccache1[csel][ix][    8*v_im] * FLOAT_TYPE(qs_u32_0[l  ]),
+                       fma(FLOAT_TYPE(b16[l]),  sccache1[csel][ix][1 + 8*v_im] * FLOAT_TYPE(qs_u32_0[l+2]),
+                       fma(FLOAT_TYPE(b32[l]),  sccache1[csel][ix][2 + 8*v_im] * FLOAT_TYPE(qs_u32_2[l  ]),
+                       fma(FLOAT_TYPE(b48[l]),  sccache1[csel][ix][3 + 8*v_im] * FLOAT_TYPE(qs_u32_2[l+2]),
+                       fma(FLOAT_TYPE(b64[l]),  sccache1[csel][ix][4 + 8*v_im] * FLOAT_TYPE(qs_u32_4[l  ]),
+                       fma(FLOAT_TYPE(b80[l]),  sccache1[csel][ix][5 + 8*v_im] * FLOAT_TYPE(qs_u32_4[l+2]),
+                       fma(FLOAT_TYPE(b96[l]),  sccache1[csel][ix][6 + 8*v_im] * FLOAT_TYPE(qs_u32_6[l  ]),
+                       fma(FLOAT_TYPE(b112[l]), sccache1[csel][ix][7 + 8*v_im] * FLOAT_TYPE(qs_u32_6[l+2]), sum1))))))));
                 sum2 = fma(FLOAT_TYPE(b0[l]),   sccache2[csel][ix][    8*v_im],
                        fma(FLOAT_TYPE(b16[l]),  sccache2[csel][ix][1 + 8*v_im],
                        fma(FLOAT_TYPE(b32[l]),  sccache2[csel][ix][2 + 8*v_im],
@@ -76,6 +110,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
                        fma(FLOAT_TYPE(b112[l]), sccache2[csel][ix][7 + 8*v_im], sum2))))))));
             }
             temp[j][n] = fma(dall, sum1, fma(-dmin, sum2, temp[j][n]));
+#endif
         }
     }
 }

@@ -61,12 +61,24 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 v2 = v2 * dm.x + dm.y;
             }
 
+#if defined(USE_F16ACC)
+            // RPM-friendly form: express the 8-element dot as four independent
+            // f16vec2 fma's. Each fma() over f16vec2 lowers to one v_pk_fma_f16
+            // on Vega, doubling FP16 throughput vs the scalar fma chain that
+            // dot(vec4, vec4) lowers to.
+            f16vec2 acc = f16vec2(bv0.xy) * f16vec2(v.xy);
+            acc = fma(f16vec2(bv0.zw), f16vec2(v.zw), acc);
+            acc = fma(f16vec2(bv1.xy), f16vec2(v2.xy), acc);
+            acc = fma(f16vec2(bv1.zw), f16vec2(v2.zw), acc);
+            FLOAT_TYPE rowtmp = acc.x + acc.y;
+#else
             // matrix multiplication
-            FLOAT_TYPE rowtmp = dot(bv0, v);
-            rowtmp += dot(bv1, v2);
+            FLOAT_TYPE rowtmp = FLOAT_TYPE(dot(bv0, v));
+            rowtmp += FLOAT_TYPE(dot(bv1, v2));
+#endif
 
             if (dm.y == 0)
-                rowtmp *= dm.x;
+                rowtmp *= FLOAT_TYPE(dm.x);
 
             temp[j][n] += rowtmp;
 #else

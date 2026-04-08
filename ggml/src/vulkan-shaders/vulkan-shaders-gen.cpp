@@ -247,14 +247,23 @@ void string_to_spv_func(const std::string& _name, const std::string& in_fname, c
         command += part + " ";
     }
 
+    // RAII guard: ensures compile_count is decremented exactly once on every
+    // exit path, including the early return on stderr non-empty (compile fail)
+    // and any thrown exception. Without this, a batch of failing compiles can
+    // exhaust the parallel slot pool and deadlock the queue at line ~293.
+    struct CompileSlotGuard {
+        ~CompileSlotGuard() {
+            {
+                std::lock_guard<std::mutex> g(compile_count_mutex);
+                assert(compile_count > 0);
+                compile_count--;
+            }
+            compile_count_cond.notify_all();
+        }
+    } slot_guard;
+
     std::string stdout_str, stderr_str;
     try {
-        // std::cout << "Executing command: ";
-        // for (const auto& part : cmd) {
-        //     std::cout << part << " ";
-        // }
-        // std::cout << std::endl;
-
         execute_command(command, stdout_str, stderr_str);
         if (!stderr_str.empty()) {
             std::cerr << "cannot compile " << name << "\n\n" << command << "\n\n" << stderr_str << std::endl;
@@ -266,17 +275,14 @@ void string_to_spv_func(const std::string& _name, const std::string& in_fname, c
     } catch (const std::exception& e) {
         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
     }
-    {
-        std::lock_guard<std::mutex> guard(compile_count_mutex);
-        assert(compile_count > 0);
-        compile_count--;
-    }
-    compile_count_cond.notify_all();
 }
 
 std::map<std::string, std::string> merge_maps(const std::map<std::string, std::string>& a, const std::map<std::string, std::string>& b) {
     std::map<std::string, std::string> result = a;
-    result.insert(b.begin(), b.end());
+    // b's keys override a's keys (operator[] inserts or assigns).
+    for (const auto& kv : b) {
+        result[kv.first] = kv.second;
+    }
     return result;
 }
 
@@ -476,6 +482,21 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+        // f16 accumulator variants — for Vega (GCN5) Rapid Packed Math.
+        // FLOAT_TYPE = float16_t allows the RADV NIR compiler to emit packed
+        // v_pk_fma_f16 instructions and halves VGPR pressure for accumulators.
+        // Gated at pipeline-creation time to AMD_GCN5 in ggml-vulkan.cpp.
+        // F32/F16 input types use the existing f32-accumulator path (no f16acc).
+        if (tname != "f32" && tname != "f16" && tname != "bf16") {
+            // USE_F16ACC tells the shader to take the RPM-friendly code path
+            // (paired f16vec2 fma's that RADV's NIR vectorizer lowers to
+            // v_pk_fma_f16). FLOAT_TYPE_VEC2=f16vec2 names the vector type.
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 
         string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));

@@ -64,14 +64,56 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             vec4 by64 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 16]);
             vec4 by96 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 24]);
 
-            FLOAT_TYPE sum[4] = {0, 0, 0, 0};
+#if defined(USE_F16ACC)
+            // RPM path: four independent 4-wide dot products. Each becomes
+            // two paired f16vec2 fma's so RADV lowers them to v_pk_fma_f16.
+            const f16vec2 by0_lo  = f16vec2(by0.xy);
+            const f16vec2 by0_hi  = f16vec2(by0.zw);
+            const f16vec2 by32_lo = f16vec2(by32.xy);
+            const f16vec2 by32_hi = f16vec2(by32.zw);
+            const f16vec2 by64_lo = f16vec2(by64.xy);
+            const f16vec2 by64_hi = f16vec2(by64.zw);
+            const f16vec2 by96_lo = f16vec2(by96.xy);
+            const f16vec2 by96_hi = f16vec2(by96.zw);
+
+            const f16vec2 q0_lo = f16vec2(q0.xy);
+            const f16vec2 q0_hi = f16vec2(q0.zw);
+            const f16vec2 q1_lo = f16vec2(q1.xy);
+            const f16vec2 q1_hi = f16vec2(q1.zw);
+            const f16vec2 q2_lo = f16vec2(q2.xy);
+            const f16vec2 q2_hi = f16vec2(q2.zw);
+            const f16vec2 q3_lo = f16vec2(q3.xy);
+            const f16vec2 q3_hi = f16vec2(q3.zw);
+
+            f16vec2 s0_acc = by0_lo * q0_lo;
+            s0_acc = fma(by0_hi, q0_hi, s0_acc);
+            const FLOAT_TYPE s0 = s0_acc.x + s0_acc.y;
+
+            f16vec2 s1_acc = by32_lo * q1_lo;
+            s1_acc = fma(by32_hi, q1_hi, s1_acc);
+            const FLOAT_TYPE s1 = s1_acc.x + s1_acc.y;
+
+            f16vec2 s2_acc = by64_lo * q2_lo;
+            s2_acc = fma(by64_hi, q2_hi, s2_acc);
+            const FLOAT_TYPE s2 = s2_acc.x + s2_acc.y;
+
+            f16vec2 s3_acc = by96_lo * q3_lo;
+            s3_acc = fma(by96_hi, q3_hi, s3_acc);
+            const FLOAT_TYPE s3 = s3_acc.x + s3_acc.y;
+
+            f16vec2 d_acc = f16vec2(s0, s1) * f16vec2(sccache[csel][ix][s_offset], sccache[csel][ix][s_offset + 2]);
+            d_acc = fma(f16vec2(s2, s3), f16vec2(sccache[csel][ix][s_offset + 4], sccache[csel][ix][s_offset + 6]), d_acc);
+            temp[j][n] = fma(d_acc.x + d_acc.y, d, temp[j][n]);
+#else
+            FLOAT_TYPE sum[4] = {FLOAT_TYPE(0), FLOAT_TYPE(0), FLOAT_TYPE(0), FLOAT_TYPE(0)};
             [[unroll]] for (uint l = 0; l < 4; ++l) {
-                sum[0] = fma(FLOAT_TYPE(by0[l]), q0[l], sum[0]);
-                sum[1] = fma(FLOAT_TYPE(by32[l]), q1[l], sum[1]);
-                sum[2] = fma(FLOAT_TYPE(by64[l]), q2[l], sum[2]);
-                sum[3] = fma(FLOAT_TYPE(by96[l]), q3[l], sum[3]);
+                sum[0] = fma(FLOAT_TYPE(by0[l]),  FLOAT_TYPE(q0[l]), sum[0]);
+                sum[1] = fma(FLOAT_TYPE(by32[l]), FLOAT_TYPE(q1[l]), sum[1]);
+                sum[2] = fma(FLOAT_TYPE(by64[l]), FLOAT_TYPE(q2[l]), sum[2]);
+                sum[3] = fma(FLOAT_TYPE(by96[l]), FLOAT_TYPE(q3[l]), sum[3]);
             }
             temp[j][n] = fma(fma(sum[0], sccache[csel][ix][s_offset], fma(sum[1], sccache[csel][ix][s_offset + 2], fma(sum[2], sccache[csel][ix][s_offset + 4], sum[3] * sccache[csel][ix][s_offset + 6]))), d, temp[j][n]);
+#endif
         }
     }
 }
