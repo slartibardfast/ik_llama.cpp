@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <vector>
 
-// Phase 20f: filtered cross-device reduce helper.
+// Filtered cross-device reduce helper.
 //
 // Multi-GPU graph-split mode allocates per-device result vectors of size
 // `n_device` and conditionally fills only the entries for devices that

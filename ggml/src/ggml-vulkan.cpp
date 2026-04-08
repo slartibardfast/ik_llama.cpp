@@ -4704,7 +4704,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[a_type][num_cols-1];
     }
 
-    // Phase 20c: prefer f16acc on Vega (AMD_GCN5) — exploits Rapid Packed Math
+    // Prefer f16acc on Vega (AMD_GCN5) — exploits Rapid Packed Math
     // (v_pk_fma_f16) and halves VGPR pressure for the accumulator. Pipelines
     // only exist when the device is AMD_GCN5 with fp16; otherwise the pointer
     // is null and we fall through to the existing f32-accumulator path.
@@ -4714,8 +4714,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         const char * v = std::getenv("GGML_VK_DISABLE_F16ACC");
         return v && v[0] && v[0] != '0';
     }();
-    // Phase 20c diagnostic: count dispatches to verify the hot path. Dump on
-    // process exit when GGML_VK_F16ACC_STATS=1.
+    // Diagnostic: count dispatches to verify the hot path. Dump on process
+    // exit when GGML_VK_F16ACC_STATS=1.
     static std::atomic<uint64_t> f16acc_hits{0};
     static std::atomic<uint64_t> f32acc_hits{0};
     static const bool stats_enabled = []() {
