@@ -18,5 +18,10 @@ void main() {
         return;
     }
 
-    data_d[i] = D_TYPE(float(data_b[i])*max(float(data_a[i]), 0));
+#ifdef BCAST
+    const float xi = float(data_a[0]);
+#else
+    const float xi = float(data_a[i]);
+#endif
+    data_d[i] = D_TYPE(float(data_b[i])*max(xi, 0));
 }

@@ -18,7 +18,14 @@ void main() {
         return;
     }
 
+#ifdef BCAST
+    // Scalar-broadcast variant: src0 (the gate input) is a single scalar
+    // shared across all output positions. Used when shared_gate->ne[1] == 1
+    // in the model code.
+    const float xi = float(data_a[0]);
+#else
     const float xi = float(data_a[i]);
+#endif
     const float yi = float(data_b[i]);
     data_d[i] = D_TYPE(xi * yi / (1.0f + exp(-xi)));
 }

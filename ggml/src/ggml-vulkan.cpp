@@ -543,6 +543,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_fused_mul_gelu[2];
     vk_pipeline pipeline_fused_mul_silu[2];
     vk_pipeline pipeline_fused_mul_relu[2];
+    vk_pipeline pipeline_fused_mul_sigmoid[2];
+    // Scalar-broadcast variants for the case where src0 is a single scalar
+    // (e.g. shared expert gate in MoE single-token decode).
+    vk_pipeline pipeline_fused_mul_gelu_bcast[2];
+    vk_pipeline pipeline_fused_mul_silu_bcast[2];
+    vk_pipeline pipeline_fused_mul_relu_bcast[2];
+    vk_pipeline pipeline_fused_mul_sigmoid_bcast[2];
     vk_pipeline pipeline_multi_add_f32;
     vk_matmul_pipeline2 pipeline_fused_up_gate[GGML_TYPE_COUNT];
     // MOE_FUSED_UP_GATE — same struct, populated with MUL_MAT_ID variants.
@@ -3427,6 +3434,28 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_fused_mul_relu[0], "fused_mul_relu_f32", fused_mul_relu_f32_len, fused_mul_relu_f32_data,
             "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fused_mul_relu[1], "fused_mul_relu_f16", fused_mul_relu_f16_len, fused_mul_relu_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_sigmoid[0], "fused_mul_sigmoid_f32", fused_mul_sigmoid_f32_len, fused_mul_sigmoid_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_sigmoid[1], "fused_mul_sigmoid_f16", fused_mul_sigmoid_f16_len, fused_mul_sigmoid_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
+    // Scalar-broadcast variants — used when src0 has a single element.
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_silu_bcast[0], "fused_mul_silu_bcast_f32", fused_mul_silu_bcast_f32_len, fused_mul_silu_bcast_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_silu_bcast[1], "fused_mul_silu_bcast_f16", fused_mul_silu_bcast_f16_len, fused_mul_silu_bcast_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_gelu_bcast[0], "fused_mul_gelu_bcast_f32", fused_mul_gelu_bcast_f32_len, fused_mul_gelu_bcast_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_gelu_bcast[1], "fused_mul_gelu_bcast_f16", fused_mul_gelu_bcast_f16_len, fused_mul_gelu_bcast_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_relu_bcast[0], "fused_mul_relu_bcast_f32", fused_mul_relu_bcast_f32_len, fused_mul_relu_bcast_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_relu_bcast[1], "fused_mul_relu_bcast_f16", fused_mul_relu_bcast_f16_len, fused_mul_relu_bcast_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_sigmoid_bcast[0], "fused_mul_sigmoid_bcast_f32", fused_mul_sigmoid_bcast_f32_len, fused_mul_sigmoid_bcast_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_sigmoid_bcast[1], "fused_mul_sigmoid_bcast_f16", fused_mul_sigmoid_bcast_f16_len, fused_mul_sigmoid_bcast_f16_data,
             "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_multi_add_f32, "multi_add_f32", multi_add_f32_len, multi_add_f32_data,
@@ -7837,14 +7866,28 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             (src0->type != dst->type) || (src1->type != dst->type)) {
             return nullptr;
         } else {
+            // Pick the broadcast variant when src0 is a single scalar (the
+            // "shared expert gate × per-feature output" pattern). All other
+            // shape mismatches still fall back to CPU via supports_op.
+            const bool bcast = ggml_nelements(src0) == 1;
             ggml_unary_op unary_op = (ggml_unary_op)dst->op_params[0];
             switch (unary_op) {
                 case GGML_UNARY_OP_SILU:
-                    return ctx->device->pipeline_fused_mul_silu[dst->type == GGML_TYPE_F16];
+                    return bcast
+                        ? ctx->device->pipeline_fused_mul_silu_bcast[dst->type == GGML_TYPE_F16]
+                        : ctx->device->pipeline_fused_mul_silu      [dst->type == GGML_TYPE_F16];
                 case GGML_UNARY_OP_GELU:
-                    return ctx->device->pipeline_fused_mul_gelu[dst->type == GGML_TYPE_F16];
+                    return bcast
+                        ? ctx->device->pipeline_fused_mul_gelu_bcast[dst->type == GGML_TYPE_F16]
+                        : ctx->device->pipeline_fused_mul_gelu      [dst->type == GGML_TYPE_F16];
                 case GGML_UNARY_OP_RELU:
-                    return ctx->device->pipeline_fused_mul_relu[dst->type == GGML_TYPE_F16];
+                    return bcast
+                        ? ctx->device->pipeline_fused_mul_relu_bcast[dst->type == GGML_TYPE_F16]
+                        : ctx->device->pipeline_fused_mul_relu      [dst->type == GGML_TYPE_F16];
+                case GGML_UNARY_OP_SIGMOID:
+                    return bcast
+                        ? ctx->device->pipeline_fused_mul_sigmoid_bcast[dst->type == GGML_TYPE_F16]
+                        : ctx->device->pipeline_fused_mul_sigmoid      [dst->type == GGML_TYPE_F16];
                 default:
                     break;
             }
@@ -8866,9 +8909,16 @@ static void ggml_vk_fused_rms_norm(ggml_backend_vk_context * ctx, vk_context& su
 
 static void ggml_vk_fused_mul_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(ggml_are_same_shape(src0, src1));
-    GGML_ASSERT(ggml_are_same_shape(src0, dst));
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_FUSED_MUL_UNARY, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f }, dryrun);
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    // src0 may be a single scalar that broadcasts over src1 (the scalar
+    // bcast variant); the supports_op check accepts this case and the
+    // dispatch picks the correct shader. Here we only require dst to
+    // match src1 in shape.
+    GGML_ASSERT(ggml_are_same_shape(src1, dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, src1) || ggml_nelements(src0) == 1);
+    // KX is the loop bound — must be the OUTPUT element count, not src0's
+    // (which can be 1 in the bcast case).
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_FUSED_MUL_UNARY, { (uint32_t)ggml_nelements(dst), 0, 0.0f, 0.0f }, dryrun);
 }
 
 static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
@@ -11850,10 +11900,19 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
-                    return ggml_is_contiguous(op->src[0]) && ggml_are_same_shape(op->src[0], op->src[1]) &&
-                             (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                             (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
-                             (op->src[0]->type == op->type) && (op->src[1]->type == op->type);
+                case GGML_UNARY_OP_SIGMOID:
+                    {
+                        if (!ggml_is_contiguous(op->src[1])) return false;
+                        if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) return false;
+                        if (op->src[1]->type != GGML_TYPE_F32 && op->src[1]->type != GGML_TYPE_F16) return false;
+                        if (op->src[0]->type != op->type || op->src[1]->type != op->type) return false;
+                        // Accept either matching shapes (the original case) OR
+                        // src0 being a single scalar (the bcast variant — used
+                        // by MoE shared-expert gating in single-token decode).
+                        const bool same_shape = ggml_are_same_shape(op->src[0], op->src[1]);
+                        const bool scalar_bcast = ggml_nelements(op->src[0]) == 1;
+                        return (same_shape || scalar_bcast) && ggml_is_contiguous(op->src[0]);
+                    }
                 default:
                     return false;
             }

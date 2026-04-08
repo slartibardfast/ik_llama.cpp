@@ -1031,18 +1031,22 @@ struct test_fused_mul_unary : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     ggml_unary_op uop;
+    bool scalar_bcast;  // when true, src0 (the unary input) is a single scalar
+                        // broadcast over src1 (used by MoE shared-expert gating)
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, uop);
+        return VARS_TO_STR4(type, ne, uop, scalar_bcast);
     }
 
     test_fused_mul_unary(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {128, 10, 10, 1},
-            ggml_unary_op uop = GGML_UNARY_OP_SILU)
-        : type(type), ne(ne), uop(uop) {}
+            ggml_unary_op uop = GGML_UNARY_OP_SILU,
+            bool scalar_bcast = false)
+        : type(type), ne(ne), uop(uop), scalar_bcast(scalar_bcast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        const int64_t one[4] = {1, 1, 1, 1};
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, scalar_bcast ? one : ne.data());
         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_tensor * out = ggml_fused_mul_unary(ctx, a, b, uop);
         return out;
@@ -2897,6 +2901,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, false));
         test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, true));
     }
+    // FUSED_MUL_UNARY with scalar broadcast (Qwen3.5 shared expert
+    // single-token decode pattern: shape [1] gate × [n_ff] feature output).
+    // The CPU op only allows SILU/SIGMOID for the broadcast variant.
+    test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {2048, 1, 1, 1}, GGML_UNARY_OP_SIGMOID, true));
+    test_cases.emplace_back(new test_fused_mul_unary(GGML_TYPE_F32, {2048, 1, 1, 1}, GGML_UNARY_OP_SILU,    true));
     // FUSED_RMS_NORM: additional dimension coverage
     test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {128,  1,  1, 1}));
     test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {3072, 4,  1, 1}));

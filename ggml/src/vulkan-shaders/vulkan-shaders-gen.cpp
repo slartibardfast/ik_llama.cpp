@@ -733,6 +733,18 @@ void process_shaders() {
     string_to_spv("fused_mul_silu_f32",   "fused_mul_silu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});
     string_to_spv("fused_mul_relu_f16",   "fused_mul_relu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("fused_mul_relu_f32",   "fused_mul_relu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});
+    string_to_spv("fused_mul_sigmoid_f16","fused_mul_sigmoid.comp",{{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("fused_mul_sigmoid_f32","fused_mul_sigmoid.comp",{{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});
+    // Scalar-broadcast variants — used when the gate input is a single scalar
+    // (e.g. shared expert gate in MoE during single-token decode).
+    string_to_spv("fused_mul_gelu_bcast_f16",   "fused_mul_gelu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"BCAST", "1"}});
+    string_to_spv("fused_mul_gelu_bcast_f32",   "fused_mul_gelu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"},     {"BCAST", "1"}});
+    string_to_spv("fused_mul_silu_bcast_f16",   "fused_mul_silu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"BCAST", "1"}});
+    string_to_spv("fused_mul_silu_bcast_f32",   "fused_mul_silu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"},     {"BCAST", "1"}});
+    string_to_spv("fused_mul_relu_bcast_f16",   "fused_mul_relu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"BCAST", "1"}});
+    string_to_spv("fused_mul_relu_bcast_f32",   "fused_mul_relu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"},     {"BCAST", "1"}});
+    string_to_spv("fused_mul_sigmoid_bcast_f16","fused_mul_sigmoid.comp",{{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"BCAST", "1"}});
+    string_to_spv("fused_mul_sigmoid_bcast_f32","fused_mul_sigmoid.comp",{{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"},     {"BCAST", "1"}});
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
