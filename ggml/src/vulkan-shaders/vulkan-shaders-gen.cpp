@@ -656,6 +656,13 @@ void process_shaders() {
     string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
+    // SSM_CONV — single-sequence Vulkan port from ik PR #1251 (CUDA).
+    // Single F32 path with NC4 specialization for the d_conv=4 hot path
+    // (universal across Mamba / Mamba-2 / Qwen3.5-A3B).
+    string_to_spv("ssm_conv_x_f32",         "ssm_conv_x.comp",           {});
+    string_to_spv("ssm_conv_x_nc4_f32",     "ssm_conv_x.comp",           {{"NC4", "1"}});
+    string_to_spv("ssm_conv_final_state_f32","ssm_conv_final_state.comp",{});
+
     // MUL_MULTI_ADD: ik-specific MoE expert combine
     // (sum_j src0[k,j,t] * src1[0,j,t]). Single F32 variant.
     string_to_spv("mul_multi_add_f32", "mul_multi_add.comp", {});

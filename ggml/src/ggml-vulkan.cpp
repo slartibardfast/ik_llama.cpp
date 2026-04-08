@@ -515,6 +515,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_f32;
     vk_pipeline pipeline_grouped_topk_f32;
     vk_pipeline pipeline_mul_multi_add_f32;
+    vk_pipeline pipeline_ssm_conv_x_f32;
+    vk_pipeline pipeline_ssm_conv_x_nc4_f32;
+    vk_pipeline pipeline_ssm_conv_final_state_f32;
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
@@ -955,6 +958,23 @@ struct vk_op_mul_multi_add_push_constants {
     uint32_t nb11;     // src1 stride along ne01 (in floats)
     uint32_t nb12;     // src1 stride along ne02 (in floats)
     uint32_t dst_nb1;  // dst stride along output's row dim (in floats)
+};
+
+// Push constants for SSM_CONV (state-space model 1D conv). Layout shared
+// across all SSM_CONV shader variants — some fields are unused by some
+// kernels but a single struct simplifies wiring. Mirrors the dispatch
+// arguments used in ik PR #1251 ssm-conv.cu.
+struct vk_op_ssm_conv_push_constants {
+    uint32_t nr;
+    uint32_t n_t;
+    uint32_t nc;
+    uint32_t n_kv;
+    uint32_t src0_s0;
+    uint32_t src0_s1;
+    uint32_t src0_s2;
+    uint32_t src1_s1;
+    uint32_t src3_s1;
+    uint32_t dst_state_offset;
 };
 
 // Push constants for the GROUPED_TOPK shader. Layout matches the GLSL block
@@ -3388,6 +3408,19 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_multi_add_f32, "mul_multi_add_f32",
             mul_multi_add_f32_len, mul_multi_add_f32_data, "main", 3,
             sizeof(vk_op_mul_multi_add_push_constants), {256, 1, 1}, {}, 1);
+
+    // SSM_CONV single-seq pipelines. The NC4 variant unrolls the d_conv=4
+    // hot path; the general variant handles arbitrary nc. Both consume the
+    // same push constants struct.
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_x_f32, "ssm_conv_x_f32",
+            ssm_conv_x_f32_len, ssm_conv_x_f32_data, "main", 4,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_x_nc4_f32, "ssm_conv_x_nc4_f32",
+            ssm_conv_x_nc4_f32_len, ssm_conv_x_nc4_f32_data, "main", 4,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_final_state_f32, "ssm_conv_final_state_f32",
+            ssm_conv_final_state_f32_len, ssm_conv_final_state_f32_data, "main", 3,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
 
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -9074,6 +9107,95 @@ static void ggml_vk_mul_multi_add(ggml_backend_vk_context * ctx, vk_context& sub
     }, dryrun);
 }
 
+static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    // 4-arg ik op: ggml_ssm_conv(s, x, c, sq)
+    const ggml_tensor * src0 = dst->src[0];   // conv_state [d_conv-1, d_inner, n_kv]
+    const ggml_tensor * src1 = dst->src[1];   // x          [d_inner,   n_tokens]
+    const ggml_tensor * src2 = dst->src[2];   // conv1d.w   [d_conv,    d_inner]
+    const ggml_tensor * src3 = dst->src[3];   // state_seq  [n_kv,      n_tokens] (i32)
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(src3->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const uint32_t nc   = (uint32_t)src2->ne[0];
+    const uint32_t nr   = (uint32_t)src0->ne[1];
+    const uint32_t n_t  = (uint32_t)src1->ne[1];
+    const uint32_t n_kv = (uint32_t)src0->ne[2];
+
+    // Phase 20n.1 only handles the single-seq fast path. Multi-seq cases are
+    // rejected upstream by supports_op and stay on CPU until 20n.2 lands.
+    GGML_ASSERT(n_kv == 1 && src3->ne[0] == 1);
+
+    const vk_op_ssm_conv_push_constants pc = {
+        nr, n_t, nc, n_kv,
+        (uint32_t)(src0->nb[0] / sizeof(float)),
+        (uint32_t)(src0->nb[1] / sizeof(float)),
+        (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)(src1->nb[1] / sizeof(float)),
+        (uint32_t)(src3->nb[1] / sizeof(int32_t)),
+        nr * n_t,
+    };
+
+    vk_pipeline pipeline_x = (nc == 4)
+        ? ctx->device->pipeline_ssm_conv_x_nc4_f32
+        : ctx->device->pipeline_ssm_conv_x_f32;
+    vk_pipeline pipeline_fs = ctx->device->pipeline_ssm_conv_final_state_f32;
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_x,  1);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fs, 1);
+        return;
+    }
+
+    auto * src0_buf = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    auto * src1_buf = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    auto * src2_buf = (ggml_backend_vk_buffer_context *)src2->buffer->context;
+    auto * dst_buf  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    vk_buffer d_s0  = src0_buf->dev_buffer;
+    vk_buffer d_s1  = src1_buf->dev_buffer;
+    vk_buffer d_s2  = src2_buf->dev_buffer;
+    vk_buffer d_dst = dst_buf->dev_buffer;
+
+    const uint64_t off_s0  = vk_tensor_offset(src0) + src0->view_offs;
+    const uint64_t off_s1  = vk_tensor_offset(src1) + src1->view_offs;
+    const uint64_t off_s2  = vk_tensor_offset(src2) + src2->view_offs;
+    const uint64_t off_dst = vk_tensor_offset(dst)  + dst->view_offs;
+
+    const uint64_t sz_s0  = ggml_nbytes(src0);
+    const uint64_t sz_s1  = ggml_nbytes(src1);
+    const uint64_t sz_s2  = ggml_nbytes(src2);
+    const uint64_t sz_dst = ggml_nbytes(dst);
+
+    // Dispatch grid: (ceil(nr/256), n_t, 1) — 256 threads per workgroup
+    // along the row dim, one workgroup per token. wg_denoms is (256,1,1)
+    // so we pass nr (auto-divided), n_t, 1.
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_x,
+        {
+            vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
+            vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
+            vk_subbuffer{ d_s2,  off_s2,  sz_s2  },
+            vk_subbuffer{ d_dst, off_dst, sz_dst },
+        },
+        pc, { nr, n_t, 1 });
+
+    // Final state writeback. Disjoint region of dst (offset = nr * n_t) so
+    // technically no hazard with the conv_x dispatch, but the sync makes the
+    // ordering explicit and matches the CUDA reference's two-kernel pattern.
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fs,
+        {
+            vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
+            vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
+            vk_subbuffer{ d_dst, off_dst, sz_dst },
+        },
+        pc, { nr, 1, 1 });
+}
+
 static void ggml_vk_grouped_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     int32_t * op_params = (int32_t *)dst->op_params;
     const uint32_t n_groups     = (uint32_t)op_params[0];
@@ -10295,6 +10417,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_ARGSORT:
     case GGML_OP_GROUPED_TOPK:
     case GGML_OP_MUL_MULTI_ADD:
+    case GGML_OP_SSM_CONV:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -10636,6 +10759,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_SSM_CONV:
+        ggml_vk_ssm_conv(ctx, compute_ctx, node, dryrun);
+
+        break;
+
     //case GGML_OP_RWKV_WKV6:
     //    ggml_vk_rwkv_wkv6(ctx, compute_ctx, node, dryrun);
 
@@ -10740,6 +10868,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_ARGSORT:
     case GGML_OP_GROUPED_TOPK:
     case GGML_OP_MUL_MULTI_ADD:
+    case GGML_OP_SSM_CONV:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -12260,6 +12389,24 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                    op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[3] == 1 &&
                    op->src[1]->ne[0] == 1;
+        case GGML_OP_SSM_CONV:
+            // ik 4-arg form: (s, x, c, sq). Phase 20n.1 only handles the
+            // single-sequence fast path (n_kv == 1 && sq->ne[0] == 1) — the
+            // multi-sequence and slow paths land in 20n.2 / 20n.3.
+            if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3]) return false;
+            if (op->src[0]->type != GGML_TYPE_F32) return false;
+            if (op->src[1]->type != GGML_TYPE_F32) return false;
+            if (op->src[2]->type != GGML_TYPE_F32) return false;
+            if (op->src[3]->type != GGML_TYPE_I32) return false;
+            if (op->type != GGML_TYPE_F32) return false;
+            if (op->src[0]->nb[0] != sizeof(float)) return false;
+            if (op->src[1]->nb[0] != sizeof(float)) return false;
+            if (op->src[2]->nb[0] != sizeof(float)) return false;
+            if (op->src[3]->nb[0] != sizeof(int32_t)) return false;
+            if (op->src[0]->ne[2] != 1) return false;          // single sequence
+            if (op->src[3]->ne[0] != 1) return false;          // one slot per token
+            if (op->src[2]->ne[0] > 8) return false;           // nc cap (universal nc=4)
+            return true;
         case GGML_OP_GROUPED_TOPK:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) return false;

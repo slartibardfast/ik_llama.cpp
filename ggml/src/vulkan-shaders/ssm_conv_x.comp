@@ -1,0 +1,82 @@
+#version 450
+
+// SSM_CONV — single-sequence conv output (Path A in PR #1251 CUDA reference).
+//
+// Computes the per-token conv output, parallelized over (row, t):
+//
+//   for j in [0, nc):
+//       idx = t + j
+//       x_j = (idx < nc - 1) ? state[row, idx, 0]
+//                            : src1[row + (idx - (nc-1)) * src1_s1]
+//       sum += x_j * c[row, j]
+//   dst[row + t * nr] = sum
+//
+// Two compile variants via the NC4 define:
+//   - NC4 unrolled (Mamba/SSM hot path with d_conv=4)
+//   - General nc loop
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0 { float data_src0[]; };  // state [nc-1, nr, 1]
+layout(binding = 1) readonly buffer Src1 { float data_src1[]; };  // x [nr, n_t]
+layout(binding = 2) readonly buffer Src2 { float data_src2[]; };  // c [nc, nr]
+layout(binding = 3) writeonly buffer Dst { float data_dst[]; };   // [nr, n_t] (first region of dst)
+
+layout(push_constant) uniform PushConstants {
+    uint nr;
+    uint n_t;
+    uint nc;
+    uint n_kv;          // unused in this shader
+    uint src0_s0;       // state stride along ne[0] (in floats)
+    uint src0_s1;       // state stride along ne[1]
+    uint src0_s2;       // state stride along ne[2]
+    uint src1_s1;       // x stride along ne[1]
+    uint src3_s1;       // unused in this shader
+    uint dst_state_offset;  // unused in this shader
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    if (row >= p.nr || t >= p.n_t) return;
+
+    const uint state_base = row * p.src0_s1;
+
+#ifdef NC4
+    // Hot path for d_conv = 4 (Mamba / Mamba-2 / Qwen3.5-A3B). Unrolls the
+    // 4-tap conv into 4 explicit FMAs.
+    const uint c_base = row * 4;
+    const float c0 = data_src2[c_base + 0];
+    const float c1 = data_src2[c_base + 1];
+    const float c2 = data_src2[c_base + 2];
+    const float c3 = data_src2[c_base + 3];
+
+    const uint i0 = t;
+    const uint i1 = t + 1;
+    const uint i2 = t + 2;
+    const uint i3 = t + 3;
+    const float x0 = (i0 < 3) ? data_src0[state_base + i0 * p.src0_s0] : data_src1[row + (i0 - 3) * p.src1_s1];
+    const float x1 = (i1 < 3) ? data_src0[state_base + i1 * p.src0_s0] : data_src1[row + (i1 - 3) * p.src1_s1];
+    const float x2 = (i2 < 3) ? data_src0[state_base + i2 * p.src0_s0] : data_src1[row + (i2 - 3) * p.src1_s1];
+    const float x3 = (i3 < 3) ? data_src0[state_base + i3 * p.src0_s0] : data_src1[row + (i3 - 3) * p.src1_s1];
+
+    data_dst[row + t * p.nr] = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;
+#else
+    // General nc path.
+    const uint c_base = row * p.nc;
+    float sum = 0.0;
+    for (uint j = 0; j < p.nc; ++j) {
+        const uint idx = t + j;
+        float x;
+        if (idx < p.nc - 1) {
+            x = data_src0[state_base + idx * p.src0_s0];
+        } else {
+            x = data_src1[row + (idx - (p.nc - 1)) * p.src1_s1];
+        }
+        sum += x * data_src2[c_base + j];
+    }
+    data_dst[row + t * p.nr] = sum;
+#endif
+}

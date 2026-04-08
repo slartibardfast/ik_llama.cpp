@@ -1,0 +1,52 @@
+#version 450
+
+// SSM_CONV — single-sequence final state writeback (Path A in PR #1251 CUDA).
+//
+// After ssm_conv_x has written the per-token conv outputs to dst[0..nr*n_t-1],
+// this shader writes the new conv state to the second region of dst:
+//
+//   for j in [0, nc):
+//       idx = (n_t - 1) + j
+//       dst_state[row, j] = (idx < nc - 1) ? state[row, idx, 0]
+//                                          : src1[row + (idx - (nc-1)) * src1_s1]
+//
+// One workgroup-per-row block; nc is small (≤ 8 in practice) so the inner
+// loop is unrolled.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0 { float data_src0[]; };
+layout(binding = 1) readonly buffer Src1 { float data_src1[]; };
+layout(binding = 2) buffer Dst { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint nr;
+    uint n_t;
+    uint nc;
+    uint n_kv;
+    uint src0_s0;
+    uint src0_s1;
+    uint src0_s2;
+    uint src1_s1;
+    uint src3_s1;
+    uint dst_state_offset;  // = nr * n_t (in floats)
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (row >= p.nr) return;
+
+    const uint state_base = row * p.src0_s1;
+    const uint dst_base   = p.dst_state_offset + row * p.nc;
+
+    [[unroll]] for (uint j = 0; j < p.nc; ++j) {
+        const uint idx = (p.n_t - 1) + j;
+        if (idx < p.nc - 1) {
+            data_dst[dst_base + j] = data_src0[state_base + idx * p.src0_s0];
+        } else {
+            data_dst[dst_base + j] = data_src1[row + (idx - (p.nc - 1)) * p.src1_s1];
+        }
+    }
+}
