@@ -542,6 +542,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_fused_mul_relu[2];
     vk_pipeline pipeline_multi_add_f32;
     vk_matmul_pipeline2 pipeline_fused_up_gate[GGML_TYPE_COUNT];
+    // MOE_FUSED_UP_GATE — same struct, populated with MUL_MAT_ID variants.
+    vk_matmul_pipeline2 pipeline_moe_fused_up_gate[GGML_TYPE_COUNT];
 
     // ============================== ik_llama.cpp pipelines end ========================================
 
@@ -3406,8 +3408,54 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_FUG(GGML_TYPE_Q4_K, matmul_fused_up_gate_q4_k_f32)
     CREATE_FUG(GGML_TYPE_Q5_K, matmul_fused_up_gate_q5_k_f32)
     CREATE_FUG(GGML_TYPE_Q6_K, matmul_fused_up_gate_q6_k_f32)
-    CREATE_FUG(GGML_TYPE_IQ4_NL, matmul_fused_up_gate_iq4_nl_f32)
+    // IQ types backported from mul_mm.comp to mul_mm_fused_up_gate.comp.
+    CREATE_FUG(GGML_TYPE_IQ1_S,   matmul_fused_up_gate_iq1_s_f32)
+    CREATE_FUG(GGML_TYPE_IQ1_M,   matmul_fused_up_gate_iq1_m_f32)
+    CREATE_FUG(GGML_TYPE_IQ2_XXS, matmul_fused_up_gate_iq2_xxs_f32)
+    CREATE_FUG(GGML_TYPE_IQ2_XS,  matmul_fused_up_gate_iq2_xs_f32)
+    CREATE_FUG(GGML_TYPE_IQ2_S,   matmul_fused_up_gate_iq2_s_f32)
+    CREATE_FUG(GGML_TYPE_IQ3_XXS, matmul_fused_up_gate_iq3_xxs_f32)
+    CREATE_FUG(GGML_TYPE_IQ3_S,   matmul_fused_up_gate_iq3_s_f32)
+    CREATE_FUG(GGML_TYPE_IQ4_XS,  matmul_fused_up_gate_iq4_xs_f32)
+    CREATE_FUG(GGML_TYPE_IQ4_NL,  matmul_fused_up_gate_iq4_nl_f32)
 #undef CREATE_FUG
+
+    // MOE_FUSED_UP_GATE pipelines — same shader as the dense fused_up_gate
+    // but compiled with MUL_MAT_ID=1, 5 bindings: up, b, dst, gate, ids.
+#define CREATE_FUG_ID(TYPE, NAMELC) \
+    if (device->mul_mat_l[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->l, #NAMELC "_l", NAMELC ## _len, NAMELC ## _data, "main", 5, sizeof(vk_fused_up_gate_push_constants), l_mmq_wg_denoms, l_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 5, sizeof(vk_fused_up_gate_push_constants), l_mmq_wg_denoms, l_warptile_mmq, l_align); \
+    } \
+    if (device->mul_mat_m[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->m, #NAMELC "_m", NAMELC ## _len, NAMELC ## _data, "main", 5, sizeof(vk_fused_up_gate_push_constants), m_mmq_wg_denoms, m_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->a_m, #NAMELC "_aligned_m", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 5, sizeof(vk_fused_up_gate_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align); \
+    } \
+    if (device->mul_mat_s[TYPE]) { \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->s, #NAMELC "_s", NAMELC ## _len, NAMELC ## _data, "main", 5, sizeof(vk_fused_up_gate_push_constants), s_mmq_wg_denoms, s_warptile_mmq, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_moe_fused_up_gate[TYPE].f32acc->a_s, #NAMELC "_aligned_s", NAMELC ## _aligned_len, NAMELC ## _aligned_data, "main", 5, sizeof(vk_fused_up_gate_push_constants), s_mmq_wg_denoms, s_warptile_mmq, s_align); \
+    }
+
+    CREATE_FUG_ID(GGML_TYPE_Q4_0,    matmul_id_fused_up_gate_q4_0_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q4_1,    matmul_id_fused_up_gate_q4_1_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q5_0,    matmul_id_fused_up_gate_q5_0_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q5_1,    matmul_id_fused_up_gate_q5_1_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q8_0,    matmul_id_fused_up_gate_q8_0_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q2_K,    matmul_id_fused_up_gate_q2_k_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q3_K,    matmul_id_fused_up_gate_q3_k_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q4_K,    matmul_id_fused_up_gate_q4_k_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q5_K,    matmul_id_fused_up_gate_q5_k_f32)
+    CREATE_FUG_ID(GGML_TYPE_Q6_K,    matmul_id_fused_up_gate_q6_k_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ1_S,   matmul_id_fused_up_gate_iq1_s_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ1_M,   matmul_id_fused_up_gate_iq1_m_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ2_XXS, matmul_id_fused_up_gate_iq2_xxs_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ2_XS,  matmul_id_fused_up_gate_iq2_xs_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ2_S,   matmul_id_fused_up_gate_iq2_s_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ3_XXS, matmul_id_fused_up_gate_iq3_xxs_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ3_S,   matmul_id_fused_up_gate_iq3_s_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ4_XS,  matmul_id_fused_up_gate_iq4_xs_f32)
+    CREATE_FUG_ID(GGML_TYPE_IQ4_NL,  matmul_id_fused_up_gate_iq4_nl_f32)
+#undef CREATE_FUG_ID
     //
     // ================================ ik_llama.cpp pipelines end =========================================
 
@@ -6447,6 +6495,141 @@ static void ggml_vk_fused_up_gate(ggml_backend_vk_context * ctx, vk_context& sub
         },
         pc,
         { (uint32_t)ne01, (uint32_t)ne21, batch });
+}
+
+// MoE variant of fused_up_gate. Mirrors ggml_vk_fused_up_gate but adds
+// expert-ID handling (binding 4) and dispatches one workgroup-grid layer per
+// expert in the z dimension. Push constants reuse the dense struct layout via
+// macro aliases inside the GLSL shader.
+static void ggml_vk_moe_fused_up_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * up   = dst->src[0];  // up   experts [K, N, n_experts]
+    const ggml_tensor * gate = dst->src[1];  // gate experts [K, N, n_experts]
+    const ggml_tensor * b    = dst->src[2];  // input        [K, n_tokens, ...]
+    const ggml_tensor * ids  = dst->src[3];  // expert ids   [n_expert_used, n_tokens]
+
+    GGML_ASSERT(ggml_is_quantized(up->type));
+    GGML_ASSERT(up->type == gate->type);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    const uint64_t ne00 = up->ne[0];   // K (hidden dim)
+    const uint64_t ne01 = up->ne[1];   // N (n_ff per expert = output dim)
+    const uint64_t ne02 = up->ne[2];   // n_experts (z dispatch)
+
+    const uint64_t ne10 = b->ne[0];    // K
+    const uint64_t ne11 = b->ne[1];    // n_tokens (in input)
+
+    const uint64_t nei0 = ids->ne[0];  // n_expert_used per token
+    const uint64_t nei1 = ids->ne[1];  // n_tokens
+
+    GGML_ASSERT(nei0 * nei1 <= 4096);  // row_ids[] capacity in shader
+
+    const uint32_t nbi1 = (uint32_t)(ids->nb[1] / ggml_type_size(ids->type));
+
+    // Pick the f32-acc pipeline. f16acc-on-Vega backport is queued for later.
+    vk_matmul_pipeline mmp = ctx->device->pipeline_moe_fused_up_gate[up->type].f32acc;
+    GGML_ASSERT(mmp != nullptr);
+
+    const uint32_t kpad = ggml_vk_align_size(ne00, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, nei1, up->type, GGML_TYPE_F32));
+    // For MoE, the inner kernel iterates _ne1 (per-expert columns), not the
+    // global N. Aligned variant requires the kernel's M and N tile bounds to
+    // match exact tile boundaries — for MoE we use the unaligned form to keep
+    // the row_ids indirection simple. (Matches mul_mm_id behavior in mul_mm.comp.)
+    const bool aligned = ne00 == kpad && ne01 > 8 && nei1 > 8;
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, nei1, aligned, up->type, GGML_TYPE_F32);
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    // Get buffers
+    ggml_backend_vk_buffer_context * up_buf_ctx   = (ggml_backend_vk_buffer_context *)up->buffer->context;
+    ggml_backend_vk_buffer_context * gate_buf_ctx = (ggml_backend_vk_buffer_context *)gate->buffer->context;
+    ggml_backend_vk_buffer_context * b_buf_ctx    = (ggml_backend_vk_buffer_context *)b->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * ids_buf_ctx  = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+
+    vk_buffer d_up   = up_buf_ctx->dev_buffer;
+    vk_buffer d_gate = gate_buf_ctx->dev_buffer;
+    vk_buffer d_b    = b_buf_ctx->dev_buffer;
+    vk_buffer d_D    = dst_buf_ctx->dev_buffer;
+    vk_buffer d_ids  = ids_buf_ctx->dev_buffer;
+
+    const uint64_t up_buf_offset   = vk_tensor_offset(up)   + up->view_offs;
+    const uint64_t gate_buf_offset = vk_tensor_offset(gate) + gate->view_offs;
+    const uint64_t b_buf_offset    = vk_tensor_offset(b)    + b->view_offs;
+    const uint64_t d_buf_offset    = vk_tensor_offset(dst)  + dst->view_offs;
+    const uint64_t ids_buf_offset  = vk_tensor_offset(ids)  + ids->view_offs;
+
+    // Per-expert weight footprint, summed across n_experts.
+    const uint64_t up_sz   = ggml_type_size(up->type)   * ne00 * ne01 / ggml_blck_size(up->type);
+    const uint64_t gate_sz = ggml_type_size(gate->type) * gate->ne[0] * gate->ne[1] / ggml_blck_size(gate->type);
+    // b is shape [k, ne11, n_tokens]; the shader steps row_idx.y * batch_stride_b
+    // = row_idx.y * (ne10 * ne11) to walk between tokens, so we need the FULL
+    // tensor visible to the binding (not just a single token's worth).
+    const uint64_t b_sz    = sizeof(float) * ne10 * ne11 * b->ne[2];
+    // Output: [n_ff, n_expert_used, n_tokens]
+    const uint64_t d_sz    = sizeof(float) * dst->ne[0] * dst->ne[1] * dst->ne[2];
+    const uint64_t ids_sz  = sizeof(int32_t) * nei0 * nei1;
+
+    // Read op params: unary_op and limit (same encoding as dense FUSED_UP_GATE)
+    const int32_t unary_op_ggml = dst->op_params[0];
+    const float limit = *(const float *)(dst->op_params + 1);
+
+    uint32_t shader_unary_op;
+    switch (unary_op_ggml) {
+    case GGML_UNARY_OP_SILU: shader_unary_op = 0; break;
+    case GGML_UNARY_OP_GELU: shader_unary_op = 1; break;
+    case GGML_UNARY_OP_RELU: shader_unary_op = 2; break;
+    default:
+        GGML_ABORT("unsupported activation in moe_fused_up_gate");
+    }
+
+    // Push constants — reuse the dense struct layout. The first 5 of the
+    // "k_split/ne0X/broadcast*" slots are reinterpreted by the shader's
+    // p_nei0/nei1/nbi1/ne11/(unused) macro aliases. The dispatch grid uses
+    // gl_GlobalInvocationID.z as expert_idx, so the third grid dim = n_experts.
+    const vk_fused_up_gate_push_constants pc = {
+        (uint32_t)ne01,                             // M  = n_ff per expert
+        (uint32_t)nei1,                             // N  = n_tokens (the inner kernel uses _ne1)
+        (uint32_t)ne00,                             // K  = hidden dim
+        (uint32_t)ne00,                             // stride_a
+        (uint32_t)ne10,                             // stride_b
+        (uint32_t)dst->ne[0],                       // stride_d
+        (uint32_t)(ne00 * ne01),                    // batch_stride_a (per-expert weight stride)
+        (uint32_t)(ne10 * ne11),                    // batch_stride_b
+        (uint32_t)(dst->ne[0] * dst->ne[1]),        // batch_stride_d (per-token output stride)
+        (uint32_t)nei0,                             // <- p_nei0  (reuses k_split slot)
+        (uint32_t)nei1,                             // <- p_nei1  (reuses ne02 slot)
+        (uint32_t)nbi1,                             // <- p_nbi1  (reuses ne12 slot)
+        (uint32_t)ne11,                             // <- p_ne11  (reuses broadcast2 slot)
+        0,                                           // unused MoE pad (broadcast3 slot)
+        (uint32_t)nei1,                             // padded_N
+        shader_unary_op,
+        limit,
+        (uint32_t)(gate->ne[0] * gate->ne[1]),     // batch_stride_a_gate
+    };
+
+    // Workgroup grid: ggml_vk_dispatch_pipeline auto-divides by wg_denoms
+    // (BM, BN, 1), so we pass raw output dims here. Same convention as the
+    // existing ggml_vk_matmul_id helper.
+    //   x = M           → divided by BM → blocks_m
+    //   y = nei1        → divided by BN → blocks_n  (n_tokens; the shader
+    //                     scans ids and early-exits if a workgroup column
+    //                     has no work for its expert)
+    //   z = n_experts   → 1 workgroup-grid per expert
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            vk_subbuffer{ d_up,   up_buf_offset,   up_sz * ne02 },
+            vk_subbuffer{ d_b,    b_buf_offset,    b_sz },
+            vk_subbuffer{ d_D,    d_buf_offset,    d_sz },
+            vk_subbuffer{ d_gate, gate_buf_offset, gate_sz * ne02 },
+            vk_subbuffer{ d_ids,  ids_buf_offset,  ids_sz },
+        },
+        pc,
+        { (uint32_t)ne01, (uint32_t)nei1, (uint32_t)ne02 });
 }
 
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, bool dryrun = false) {
@@ -9946,6 +10129,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_FLASH_ATTN_EXT:
     //case GGML_OP_OPT_STEP_ADAMW:
     case GGML_OP_FUSED_UP_GATE:
+    case GGML_OP_MOE_FUSED_UP_GATE:
         break;
     case GGML_OP_REDUCE:
         // Handled in graph_compute before build_graph is called
@@ -10256,6 +10440,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_MOE_FUSED_UP_GATE:
+        ggml_vk_moe_fused_up_gate(ctx, compute_ctx, node, dryrun);
+
+        break;
+
     //case GGML_OP_RWKV_WKV6:
     //    ggml_vk_rwkv_wkv6(ctx, compute_ctx, node, dryrun);
 
@@ -10408,6 +10597,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_MUL_MAT_ID:
     case GGML_OP_FLASH_ATTN_EXT:
     case GGML_OP_FUSED_UP_GATE:
+    case GGML_OP_MOE_FUSED_UP_GATE:
         buf = tensor->buffer;
 
         break;
@@ -11794,6 +11984,28 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 if (!dev->pipeline_fused_up_gate[up->type].f32acc->s &&
                     !dev->pipeline_fused_up_gate[up->type].f32acc->m &&
                     !dev->pipeline_fused_up_gate[up->type].f32acc->l) return false;
+                return true;
+            }
+        case GGML_OP_MOE_FUSED_UP_GATE:
+            {
+                const ggml_tensor * up   = op->src[0];
+                const ggml_tensor * gate = op->src[1];
+                const ggml_tensor * b    = op->src[2];
+                const ggml_tensor * ids  = op->src[3];
+                if (!up || !gate || !b || !ids) return false;
+                if (!ggml_is_quantized(up->type)) return false;
+                if (up->type != gate->type) return false;
+                if (b->type != GGML_TYPE_F32) return false;
+                if (ids->type != GGML_TYPE_I32) return false;
+                if (!ggml_are_same_shape(up, gate)) return false;
+                // The shader caps row_ids[] at 4096 — refuse larger MoE batches
+                // (the caller should split). Matches mul_mat_id_q_f16 limit.
+                if ((uint64_t)ids->ne[0] * (uint64_t)ids->ne[1] > 4096) return false;
+                ggml_backend_vk_context * vk_ctx = (ggml_backend_vk_context *)backend->context;
+                auto & dev = vk_ctx->device;
+                if (!dev->pipeline_moe_fused_up_gate[up->type].f32acc->s &&
+                    !dev->pipeline_moe_fused_up_gate[up->type].f32acc->m &&
+                    !dev->pipeline_moe_fused_up_gate[up->type].f32acc->l) return false;
                 return true;
             }
         case GGML_OP_NORM:

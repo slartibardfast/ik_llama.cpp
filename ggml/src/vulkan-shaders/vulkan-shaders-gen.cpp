@@ -730,8 +730,10 @@ void process_shaders() {
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
-    // fused_up_gate: dual matmul + activation for GGML_OP_FUSED_UP_GATE
-    // Generate fp16 and fp32 compute variants (matching matmul_shaders pattern)
+    // fused_up_gate: dual matmul + activation for GGML_OP_FUSED_UP_GATE and
+    // GGML_OP_MOE_FUSED_UP_GATE. Generate fp16 and fp32 compute variants
+    // (matching matmul_shaders pattern), and a parallel set of MUL_MAT_ID
+    // variants (matmul_id_fused_up_gate_*) for the MoE op.
     for (const bool fug_fp16 : {false, true}) {
         std::map<std::string, std::string> fug_base_dict = {{"FLOAT_TYPE", fug_fp16 ? "float16_t" : "float"}, {"ACC_TYPE", "float"}};
         if (fug_fp16) {
@@ -742,23 +744,34 @@ void process_shaders() {
         const std::string load_vec = fug_fp16 ? "8" : "4";
         const std::string aligned_b_type = fug_fp16 ? "mat2x4" : "vec4";
 
-        // Only quant types (fused op only created for quantized weights)
+        // All quant types supported by mul_mm_fused_up_gate.comp — including
+        // the full IQ family (IQ1_S..IQ4_XS) backported from mul_mm.comp.
         const std::vector<std::string> fug_types = {
             "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
             "q2_k", "q3_k", "q4_k", "q5_k", "q6_k",
-            "iq4_nl",
+            "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s",
+            "iq3_xxs", "iq3_s", "iq4_xs", "iq4_nl",
         };
         for (const auto& tname : fug_types) {
+            // LOAD_VEC_A matches mul_mm.comp's per-quant heuristic at line ~384.
             std::string load_vec_quant = "2";
-            if ((tname == "q4_0") || (tname == "q4_1"))
+            if ((tname == "q4_0") || (tname == "q4_1") || (tname == "iq1_s") || (tname == "iq1_m") ||
+                (tname == "iq2_xxs") || (tname == "iq2_xs") || (tname == "iq2_s")) {
                 load_vec_quant = "8";
-            else if ((tname == "q5_0") || (tname == "q5_1") || (tname == "q8_0") || (tname == "iq4_nl"))
+            } else if ((tname == "q5_0") || (tname == "q5_1") || (tname == "q8_0") ||
+                       (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_nl")) {
                 load_vec_quant = "4";
+            }
 
             std::string data_a_key = "DATA_A_" + to_uppercase(tname);
 
+            // Dense FUSED_UP_GATE variants (existing).
             string_to_spv("matmul_fused_up_gate_" + tname + "_f32",         fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_quant},                          {"B_TYPE", "float"},      {"D_TYPE", "float"}}), fug_fp16);
             string_to_spv("matmul_fused_up_gate_" + tname + "_f32_aligned", fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_quant}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fug_fp16);
+
+            // MUL_MAT_ID variants for MOE_FUSED_UP_GATE (MoE expert-routed FFN).
+            string_to_spv("matmul_id_fused_up_gate_" + tname + "_f32",         fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"MUL_MAT_ID", "1"}, {"LOAD_VEC_A", load_vec_quant},                          {"B_TYPE", "float"},      {"D_TYPE", "float"}}), fug_fp16);
+            string_to_spv("matmul_id_fused_up_gate_" + tname + "_f32_aligned", fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"MUL_MAT_ID", "1"}, {"LOAD_VEC_A", load_vec_quant}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fug_fp16);
         }
     }
     //
