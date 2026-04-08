@@ -971,6 +971,38 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_L2_NORM
+struct test_l2_norm : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool v;  // when true, take a strided view of the input first (tests
+                   // the non-contiguous path used by Qwen3.5 q_fused/k_fused)
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, eps, v);
+    }
+
+    test_l2_norm(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 64, 320, 1},
+            float eps = 1e-12f,
+            bool v = false)
+        : type(type), ne(ne), eps(eps), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+        if (v) {
+            a = ggml_view_4d(ctx, a, a->ne[0]/2, a->ne[1]/2, a->ne[2]/2, a->ne[3]/2,
+                             a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view of a");
+        }
+        ggml_tensor * out = ggml_l2_norm(ctx, a, eps);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_FUSED_RMS_NORM
 struct test_fused_rms_norm : public test_case {
     const ggml_type type;
@@ -2859,6 +2891,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         test_cases.emplace_back(new test_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
         test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {64, 10, 10, 10}, eps));
+    }
+    // L2_NORM: contiguous and strided-view (q_fused/k_fused on Qwen3.5)
+    for (float eps : {1e-12f, 1e-7f, 1e-3f}) {
+        test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, false));
+        test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, true));
     }
     // FUSED_RMS_NORM: additional dimension coverage
     test_cases.emplace_back(new test_fused_rms_norm(GGML_TYPE_F32, {128,  1,  1, 1}));
