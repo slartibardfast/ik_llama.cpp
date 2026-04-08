@@ -826,6 +826,28 @@ void main() {
                     cache_b[j] = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + j) * SHMEM_STRIDE + i];
                 }
 
+#if defined(USE_F16ACC)
+                // RPM path: pair adjacent cr's into f16vec2 fma's. cache_b[cc]
+                // is broadcast to both lanes; both produce useful work. Each
+                // packed fma replaces two scalar fma's, halving instruction
+                // count for the inner outer-product. Requires TM even (all
+                // Vega warptile TMs are 2 or 4). When ACC_TYPE = float16_t and
+                // FLOAT_TYPE = float16_t, RADV emits v_pk_fma_f16 on Vega.
+                [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                    [[unroll]] for (uint cc = 0; cc < TN; cc++) {
+                        const f16vec2 b_pair = f16vec2(cache_b[cc], cache_b[cc]);
+                        [[unroll]] for (uint cr = 0; cr < TM; cr += 2) {
+                            const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
+                            const f16vec2 a_pair = f16vec2(cache_a[wsir * TM + cr],
+                                                           cache_a[wsir * TM + cr + 1]);
+                            f16vec2 s_pair = f16vec2(sums[sums_idx], sums[sums_idx + 1]);
+                            s_pair = fma(a_pair, b_pair, s_pair);
+                            sums[sums_idx]     = s_pair.x;
+                            sums[sums_idx + 1] = s_pair.y;
+                        }
+                    }
+                }
+#else
                 [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                     [[unroll]] for (uint cc = 0; cc < TN; cc++) {
                         [[unroll]] for (uint cr = 0; cr < TM; cr++) {
@@ -834,6 +856,7 @@ void main() {
                         }
                     }
                 }
+#endif
             }
         }
 #endif

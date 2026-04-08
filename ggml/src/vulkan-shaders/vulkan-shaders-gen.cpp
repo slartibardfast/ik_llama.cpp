@@ -322,6 +322,18 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
 
     base_dict["ACC_TYPE"] = f16acc ? "float16_t" : "float";
 
+    // Phase 20d: enable RPM-friendly f16vec2 packing in the scalar mul_mm
+    // inner outer-product when we're targeting f16 accumulators on the
+    // non-coopmat path. Coopmat handles its own packing via the matrix
+    // intrinsic and must NOT take the manual vec2 fma branch.
+    // Measured impact (Vega 64, llama-2-7b-Q8_0):
+    //   pp512: 449.50 -> 482.41 t/s  (+7.3%)
+    //   tg128: 32.26  -> 32.26 t/s   (unchanged - tg is dispatch-overhead bound)
+    //   RDNA2 unchanged (no regression on either pp or tg).
+    if (f16acc && !coopmat && !coopmat2) {
+        base_dict["USE_F16ACC"] = "1";
+    }
+
     if (coopmat) {
         base_dict["COOPMAT"] = "1";
     }
