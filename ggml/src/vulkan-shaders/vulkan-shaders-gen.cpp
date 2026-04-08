@@ -675,6 +675,22 @@ void process_shaders() {
     string_to_spv("ssm_conv_slow_nc4_f32",        "ssm_conv_slow.comp",        {{"NC4", "1"}});
     string_to_spv("ssm_conv_slow_ms_f32",         "ssm_conv_slow.comp",        {{"HAS_MULTI_SEQ", "1"}});
     string_to_spv("ssm_conv_slow_ms_nc4_f32",     "ssm_conv_slow.comp",        {{"NC4", "1"}, {"HAS_MULTI_SEQ", "1"}});
+    // GATED variants of the slow path read an atomic SSBO at binding 5
+    // and early-exit if fast_path_ok != 0. Used together with the
+    // validate kernel and the unique-fast kernel below to mirror the
+    // CUDA reference's "dispatch both, gate via atomic" pattern.
+    string_to_spv("ssm_conv_slow_gated_f32",        "ssm_conv_slow.comp",      {{"GATED", "1"}});
+    string_to_spv("ssm_conv_slow_gated_nc4_f32",    "ssm_conv_slow.comp",      {{"NC4", "1"}, {"GATED", "1"}});
+    string_to_spv("ssm_conv_slow_gated_ms_f32",     "ssm_conv_slow.comp",      {{"HAS_MULTI_SEQ", "1"}, {"GATED", "1"}});
+    string_to_spv("ssm_conv_slow_gated_ms_nc4_f32", "ssm_conv_slow.comp",      {{"NC4", "1"}, {"HAS_MULTI_SEQ", "1"}, {"GATED", "1"}});
+    // Validate + unique-fast kernels for the multi-sequence parallel case.
+    // The validate kernel scans src3 and atomically clears the fast_path_ok
+    // flag if the predicate fails (out-of-range seq, fanout, or recurrence).
+    // The unique kernel reads the flag and runs only when the fast path
+    // applies; the slow_gated kernel runs only when it doesn't.
+    string_to_spv("ssm_conv_validate_f32",        "ssm_conv_validate.comp",    {});
+    string_to_spv("ssm_conv_unique_f32",          "ssm_conv_unique.comp",      {});
+    string_to_spv("ssm_conv_unique_nc4_f32",      "ssm_conv_unique.comp",      {{"NC4", "1"}});
 
     // MUL_MULTI_ADD: ik-specific MoE expert combine
     // (sum_j src0[k,j,t] * src1[0,j,t]). Single F32 variant.

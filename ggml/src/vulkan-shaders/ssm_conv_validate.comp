@@ -1,0 +1,67 @@
+#version 450
+
+// SSM_CONV — multi-sequence "unique map" validation kernel.
+//
+// Decides whether the unique-fast path is applicable by scanning src3
+// (the per-token sequence assignment). The fast path is OK iff:
+//   - every token's primary seq id is in [0, n_kv)
+//   - if n_kv > 1: no token has a valid secondary seq id (no fanout)
+//   - no two tokens map to the same seq (no recurrent dependency)
+//
+// Writes per-token primary seq ids to seq_ids[t]. Atomically clears
+// fast_path_ok if any check fails. The unique-fast and slow kernels
+// both check fast_path_ok at entry and early-exit if their predicate
+// doesn't match.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src3 { int data_src3[]; };
+
+// Atomic state buffer layout (matches the host C++ allocation):
+//   atomic_buf[0]                       = fast_path_ok (init 1)
+//   atomic_buf[1 .. 1 + n_kv - 1]       = seq_seen[seq] (init 0)
+//   atomic_buf[1 + n_kv .. 1 + n_kv + n_t - 1] = seq_ids[t]
+layout(binding = 1) coherent buffer Atomic {
+    int data_atomic[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_t;
+    uint n_kv;
+    uint src3_s1;
+} p;
+
+void main() {
+    const uint t = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (t >= p.n_t) return;
+
+    const uint sq_base = t * p.src3_s1;
+    const int seq0 = data_src3[sq_base + 0];
+
+    if (seq0 < 0 || uint(seq0) >= p.n_kv) {
+        atomicExchange(data_atomic[0], 0);
+        return;
+    }
+
+    // Fast path supports one sequence per token (no copy-to-multiple-seqs
+    // routing). If sq[1] is a valid seq id, we'd need the slow path.
+    if (p.n_kv > 1) {
+        const int seq1 = data_src3[sq_base + 1];
+        if (seq1 >= 0 && uint(seq1) < p.n_kv) {
+            atomicExchange(data_atomic[0], 0);
+            return;
+        }
+    }
+
+    // Record the seq for this token, then check whether this sequence has
+    // already been claimed by an earlier token. If so, the fast path can't
+    // run because the slow path's t→t recurrence becomes load-bearing.
+    data_atomic[1 + p.n_kv + t] = seq0;
+
+    const int prev = atomicAdd(data_atomic[1 + uint(seq0)], 1);
+    if (prev != 0) {
+        atomicExchange(data_atomic[0], 0);
+    }
+}

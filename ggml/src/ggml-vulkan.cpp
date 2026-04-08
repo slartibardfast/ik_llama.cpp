@@ -524,6 +524,23 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_slow_nc4_f32;      // single-target, nc=4
     vk_pipeline pipeline_ssm_conv_slow_ms_f32;       // multi-target, general nc
     vk_pipeline pipeline_ssm_conv_slow_ms_nc4_f32;   // multi-target, nc=4
+    // GATED slow variants — read the atomic flag and early-exit when the
+    // unique-fast path applies. Used in the dispatch-both pattern.
+    vk_pipeline pipeline_ssm_conv_slow_gated_f32;
+    vk_pipeline pipeline_ssm_conv_slow_gated_nc4_f32;
+    vk_pipeline pipeline_ssm_conv_slow_gated_ms_f32;
+    vk_pipeline pipeline_ssm_conv_slow_gated_ms_nc4_f32;
+    vk_pipeline pipeline_ssm_conv_validate_f32;
+    vk_pipeline pipeline_ssm_conv_unique_f32;
+    vk_pipeline pipeline_ssm_conv_unique_nc4_f32;
+
+    // Persistent atomic state buffer for the unique-fast / slow gating
+    // (lazily allocated on first multi-seq SSM_CONV call). Layout:
+    //   data[0]                         = fast_path_ok (init 1, validate may clear to 0)
+    //   data[1 .. n_kv]                 = seq_seen[seq] (init 0)
+    //   data[1 + n_kv .. 1 + n_kv + n_t - 1] = seq_ids[t]
+    vk_buffer ssm_conv_atomic_buf = nullptr;
+    uint64_t  ssm_conv_atomic_capacity = 0;  // in int32 entries
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
@@ -631,6 +648,10 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+
+        if (ssm_conv_atomic_buf != nullptr) {
+            ggml_vk_destroy_buffer(ssm_conv_atomic_buf);
+        }
 
         compute_queue.cmd_pool.destroy(device);
         transfer_queue.cmd_pool.destroy(device);
@@ -3449,6 +3470,35 @@ static void ggml_vk_load_shaders(vk_device& device) {
             sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_ms_nc4_f32, "ssm_conv_slow_ms_nc4_f32",
             ssm_conv_slow_ms_nc4_f32_len, ssm_conv_slow_ms_nc4_f32_data, "main", 5,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+
+    // Gated slow variants (binding 5 = atomic flag SSBO).
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_gated_f32, "ssm_conv_slow_gated_f32",
+            ssm_conv_slow_gated_f32_len, ssm_conv_slow_gated_f32_data, "main", 6,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_gated_nc4_f32, "ssm_conv_slow_gated_nc4_f32",
+            ssm_conv_slow_gated_nc4_f32_len, ssm_conv_slow_gated_nc4_f32_data, "main", 6,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_gated_ms_f32, "ssm_conv_slow_gated_ms_f32",
+            ssm_conv_slow_gated_ms_f32_len, ssm_conv_slow_gated_ms_f32_data, "main", 6,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_gated_ms_nc4_f32, "ssm_conv_slow_gated_ms_nc4_f32",
+            ssm_conv_slow_gated_ms_nc4_f32_len, ssm_conv_slow_gated_ms_nc4_f32_data, "main", 6,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+
+    // Validate kernel — atomic SSBO at binding 1, src3 at binding 0.
+    // Push constants are a small subset (n_t, n_kv, src3_s1) but we reuse
+    // the SSM_CONV struct so all variants share the same layout.
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_validate_f32, "ssm_conv_validate_f32",
+            ssm_conv_validate_f32_len, ssm_conv_validate_f32_data, "main", 2,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+
+    // Unique-fast kernels — gated by binding 3 (the atomic flag SSBO).
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_unique_f32, "ssm_conv_unique_f32",
+            ssm_conv_unique_f32_len, ssm_conv_unique_f32_data, "main", 5,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_unique_nc4_f32, "ssm_conv_unique_nc4_f32",
+            ssm_conv_unique_nc4_f32_len, ssm_conv_unique_nc4_f32_data, "main", 5,
             sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
 
 
@@ -9136,6 +9186,25 @@ static void ggml_vk_mul_multi_add(ggml_backend_vk_context * ctx, vk_context& sub
     }, dryrun);
 }
 
+// Ensure the device's persistent SSM_CONV atomic state buffer is large
+// enough for the requested (n_kv, n_t). Layout is described next to the
+// `ssm_conv_atomic_buf` field. Grows on demand; the prior buffer is
+// destroyed when growing.
+static void ggml_vk_ssm_conv_ensure_atomic_buf(ggml_backend_vk_context * ctx, uint32_t n_kv, uint32_t n_t) {
+    const uint64_t needed = uint64_t(1) + uint64_t(n_kv) + uint64_t(n_t);  // int32 entries
+    auto & dev = ctx->device;
+    if (dev->ssm_conv_atomic_buf != nullptr && dev->ssm_conv_atomic_capacity >= needed) {
+        return;
+    }
+    if (dev->ssm_conv_atomic_buf != nullptr) {
+        ggml_vk_destroy_buffer(dev->ssm_conv_atomic_buf);
+    }
+    // Round up to a comfortable size to avoid frequent reallocs.
+    const uint64_t alloc_entries = std::max<uint64_t>(needed, 4096);
+    dev->ssm_conv_atomic_buf = ggml_vk_create_buffer_device(dev, alloc_entries * sizeof(int32_t));
+    dev->ssm_conv_atomic_capacity = alloc_entries;
+}
+
 static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
     // 4-arg ik op: ggml_ssm_conv(s, x, c, sq)
     const ggml_tensor * src0 = dst->src[0];   // conv_state [d_conv-1, d_inner, n_kv]
@@ -9195,8 +9264,24 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
             ggml_pipeline_request_descriptor_sets(ctx, pipeline_x,  1);
             ggml_pipeline_request_descriptor_sets(ctx, pipeline_fs, 1);
         } else {
+            // Multi-seq path runs init + validate + unique + slow_gated.
             ggml_pipeline_request_descriptor_sets(ctx, pipeline_init, 1);
-            ggml_pipeline_request_descriptor_sets(ctx, pipeline_slow, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_ssm_conv_validate_f32, 1);
+            vk_pipeline pipeline_unique = (nc == 4)
+                ? ctx->device->pipeline_ssm_conv_unique_nc4_f32
+                : ctx->device->pipeline_ssm_conv_unique_f32;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_unique, 1);
+            vk_pipeline pipeline_slow_gated;
+            if (nc == 4) {
+                pipeline_slow_gated = has_multi_seq
+                    ? ctx->device->pipeline_ssm_conv_slow_gated_ms_nc4_f32
+                    : ctx->device->pipeline_ssm_conv_slow_gated_nc4_f32;
+            } else {
+                pipeline_slow_gated = has_multi_seq
+                    ? ctx->device->pipeline_ssm_conv_slow_gated_ms_f32
+                    : ctx->device->pipeline_ssm_conv_slow_gated_f32;
+            }
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_slow_gated, 1);
         }
         return;
     }
@@ -9250,9 +9335,27 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         return;
     }
 
-    // Multi-sequence path. First init dst_state from src0 for ALL n_kv
-    // sequences (preserves untouched seqs), then run the slow kernel
-    // which serially processes tokens within each row.
+    // Multi-sequence path. Mirrors the CUDA reference's "dispatch both,
+    // gate via atomic" pattern: init dst_state for ALL seqs, then validate
+    // the seq map (sets fast_path_ok), then dispatch BOTH the unique-fast
+    // kernel (runs only when fast_path_ok != 0) and the slow kernel (runs
+    // only when fast_path_ok == 0). One of the two is a single-thread
+    // early-exit per workgroup; minimal overhead.
+    ggml_vk_ssm_conv_ensure_atomic_buf(ctx, n_kv, n_t);
+    vk_buffer d_atomic = ctx->device->ssm_conv_atomic_buf;
+    const uint64_t atomic_sz = ctx->device->ssm_conv_atomic_capacity * sizeof(int32_t);
+
+    // Clear the validate state at the start of every call:
+    //   data[0]            = 1   (fast_path_ok, default OK)
+    //   data[1 .. 1+n_kv]  = 0   (seq_seen counters)
+    //   data[1+n_kv ..]    = 0   (seq_ids slots)
+    // Zero everything first, then set data[0] = 1.
+    ggml_vk_sync_buffers(subctx);
+    subctx->s->buffer.fillBuffer(d_atomic->buffer, 0, (1 + n_kv + n_t) * sizeof(int32_t), 0);
+    const uint32_t one = 1;
+    subctx->s->buffer.updateBuffer(d_atomic->buffer, 0, sizeof(uint32_t), &one);
+
+    // 1. Init states (preserves untouched seqs).
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_init,
         {
@@ -9261,16 +9364,59 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         },
         pc, { nr, n_kv, 1 });
 
+    // 2. Validate seq map. Writes seq_ids to the atomic buffer and
+    //    atomically clears fast_path_ok if the unique-fast predicate fails.
     ggml_vk_sync_buffers(subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_slow,
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_ssm_conv_validate_f32,
         {
-            vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
-            vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
-            vk_subbuffer{ d_s2,  off_s2,  sz_s2  },
-            vk_subbuffer{ d_s3,  off_s3,  sz_s3  },
-            vk_subbuffer{ d_dst, off_dst, sz_dst },
+            vk_subbuffer{ d_s3,     off_s3, sz_s3 },
+            vk_subbuffer{ d_atomic, 0,      atomic_sz },
+        },
+        pc, { n_t, 1, 1 });
+
+    // 3. Unique-fast kernel — runs only when fast_path_ok != 0.
+    vk_pipeline pipeline_unique = (nc == 4)
+        ? ctx->device->pipeline_ssm_conv_unique_nc4_f32
+        : ctx->device->pipeline_ssm_conv_unique_f32;
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_unique,
+        {
+            vk_subbuffer{ d_s0,     off_s0,  sz_s0  },
+            vk_subbuffer{ d_s1,     off_s1,  sz_s1  },
+            vk_subbuffer{ d_s2,     off_s2,  sz_s2  },
+            vk_subbuffer{ d_atomic, 0,       atomic_sz },
+            vk_subbuffer{ d_dst,    off_dst, sz_dst },
+        },
+        pc, { nr, n_t, 1 });
+
+    // 4. Gated slow kernel — runs only when fast_path_ok == 0. Uses the
+    //    same input bindings as the un-gated slow path, plus binding 5 =
+    //    the atomic buffer.
+    vk_pipeline pipeline_slow_gated;
+    if (nc == 4) {
+        pipeline_slow_gated = has_multi_seq
+            ? ctx->device->pipeline_ssm_conv_slow_gated_ms_nc4_f32
+            : ctx->device->pipeline_ssm_conv_slow_gated_nc4_f32;
+    } else {
+        pipeline_slow_gated = has_multi_seq
+            ? ctx->device->pipeline_ssm_conv_slow_gated_ms_f32
+            : ctx->device->pipeline_ssm_conv_slow_gated_f32;
+    }
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_slow_gated,
+        {
+            vk_subbuffer{ d_s0,     off_s0,  sz_s0  },
+            vk_subbuffer{ d_s1,     off_s1,  sz_s1  },
+            vk_subbuffer{ d_s2,     off_s2,  sz_s2  },
+            vk_subbuffer{ d_s3,     off_s3,  sz_s3  },
+            vk_subbuffer{ d_dst,    off_dst, sz_dst },
+            vk_subbuffer{ d_atomic, 0,       atomic_sz },
         },
         pc, { nr, 1, 1 });
+
+    // The non-gated slow pipeline pointer is no longer used in the
+    // multi-seq path, but we silence the unused-variable warning.
+    (void)pipeline_slow;
 }
 
 static void ggml_vk_grouped_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {

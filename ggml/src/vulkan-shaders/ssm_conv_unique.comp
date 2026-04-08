@@ -1,0 +1,94 @@
+#version 450
+
+// SSM_CONV — multi-sequence unique-fast path.
+//
+// Parallelizable case where each token belongs to a UNIQUE sequence with
+// no recurrent dependency on the previous token's state. Each (row, t)
+// is independent given the initial src0 state for that token's seq.
+//
+// Gated by data_atomic[0] (fast_path_ok). The validate kernel writes 0
+// here if the predicate fails; we early-exit and let the slow kernel
+// (gated on the opposite condition) handle the work.
+//
+// Per (row, t):
+//   seq = seq_ids[t]
+//   src_state = src0[seq, row, 0..nc-2]
+//   sum = 0
+//   for i in [0, nc-1):
+//       state[seq, row, i] = src_state[i]
+//       sum += src_state[i] * c[row, i]
+//   x = src1[row + t * src1_s1]
+//   state[seq, row, nc-1] = x
+//   sum += x * c[row, nc-1]
+//   dst_x[row + t * nr] = sum
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0   { float data_src0[]; };
+layout(binding = 1) readonly buffer Src1   { float data_src1[]; };
+layout(binding = 2) readonly buffer Src2   { float data_src2[]; };
+layout(binding = 3) readonly coherent buffer Atomic { int data_atomic[]; };
+layout(binding = 4) buffer Dst             { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint nr;
+    uint n_t;
+    uint nc;
+    uint n_kv;
+    uint src0_s0;
+    uint src0_s1;
+    uint src0_s2;
+    uint src1_s1;
+    uint src3_s1;
+    uint dst_state_offset;
+} p;
+
+void main() {
+    if (data_atomic[0] == 0) return;        // fast path not applicable
+
+    const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.y;
+    if (row >= p.nr || t >= p.n_t) return;
+
+    const int seq = data_atomic[1 + p.n_kv + t];
+
+    const uint c_base         = row * p.nc;
+    const uint state_row_base = p.dst_state_offset
+                                + uint(seq) * p.nr * p.nc
+                                + row * p.nc;
+
+#ifdef NC4
+    // src0 is shape [3, nr, n_kv] for nc=4
+    const uint src_base = uint(seq) * p.nr * 3 + row * 3;
+    const float s0 = data_src0[src_base + 0];
+    const float s1 = data_src0[src_base + 1];
+    const float s2 = data_src0[src_base + 2];
+    const float x  = data_src1[row + t * p.src1_s1];
+
+    data_dst[state_row_base + 0] = s0;
+    data_dst[state_row_base + 1] = s1;
+    data_dst[state_row_base + 2] = s2;
+    data_dst[state_row_base + 3] = x;
+
+    const float c0 = data_src2[c_base + 0];
+    const float c1 = data_src2[c_base + 1];
+    const float c2 = data_src2[c_base + 2];
+    const float c3 = data_src2[c_base + 3];
+    data_dst[row + t * p.nr] = s0 * c0 + s1 * c1 + s2 * c2 + x * c3;
+#else
+    const uint src_base = uint(seq) * p.nr * (p.nc - 1) + row * (p.nc - 1);
+
+    float sum = 0.0;
+    for (uint i0 = 0; i0 < p.nc - 1; ++i0) {
+        const float v = data_src0[src_base + i0];
+        data_dst[state_row_base + i0] = v;
+        sum += v * data_src2[c_base + i0];
+    }
+    const float x = data_src1[row + t * p.src1_s1];
+    data_dst[state_row_base + p.nc - 1] = x;
+    sum += x * data_src2[c_base + p.nc - 1];
+    data_dst[row + t * p.nr] = sum;
+#endif
+}

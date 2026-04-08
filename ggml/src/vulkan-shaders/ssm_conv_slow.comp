@@ -24,6 +24,12 @@ layout(binding = 1) readonly buffer Src1 { float data_src1[]; };       // x [nr,
 layout(binding = 2) readonly buffer Src2 { float data_src2[]; };       // c [nc, nr]
 layout(binding = 3) readonly buffer Src3 { int   data_src3[]; };       // sq [n_kv, n_t] i32
 layout(binding = 4) buffer Dst { float data_dst[]; };                  // packed [conv_output | dst_state]
+#ifdef GATED
+// Atomic SSBO holding fast_path_ok at offset 0. Set to 0 by the validate
+// kernel iff the unique-fast path can't run. The slow kernel runs only
+// when fast_path_ok == 0.
+layout(binding = 5) readonly coherent buffer Atomic { int data_atomic[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint nr;
@@ -39,6 +45,13 @@ layout(push_constant) uniform PushConstants {
 } p;
 
 void main() {
+#ifdef GATED
+    // The validate kernel sets fast_path_ok = 1 (default) and clears it
+    // to 0 if the unique-fast path doesn't apply. The slow kernel only
+    // runs when the fast path was rejected.
+    if (data_atomic[0] != 0) return;
+#endif
+
     const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     if (row >= p.nr) return;
 
