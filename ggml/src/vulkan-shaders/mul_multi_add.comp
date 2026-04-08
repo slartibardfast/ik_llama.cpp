@@ -1,0 +1,47 @@
+#version 450
+
+// GGML_OP_MUL_MULTI_ADD
+//
+// Combines per-expert MoE outputs into per-token activations:
+//
+//   dst[k, t] = sum_{j=0}^{n_used-1} src0[k, j, t] * src1[0, j, t]
+//
+// where src0 is shape [n_ff, n_used, n_tokens] (the per-expert outputs) and
+// src1 is shape [1, n_used, n_tokens] (the per-expert routing weights).
+// dst is shape [n_ff, n_tokens].
+//
+// Each workgroup handles one (token, k_block) pair. Each thread inside the
+// workgroup accumulates the weighted sum for one k.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0 { float data_src0[]; };
+layout(binding = 1) readonly buffer Src1 { float data_src1[]; };
+layout(binding = 2) writeonly buffer Dst  { float data_dst[];  };
+
+layout(push_constant) uniform parameter {
+    uint ne00;     // n_ff
+    uint ne01;     // n_used (the dimension we sum over)
+    uint ne02;     // n_tokens
+    uint nb01;     // src0 stride along ne01 (in floats)
+    uint nb02;     // src0 stride along ne02 (in floats)
+    uint nb11;     // src1 stride along ne01 (in floats)
+    uint nb12;     // src1 stride along ne02 (in floats)
+    uint dst_nb1;  // dst stride along output's row dim (in floats)
+} p;
+
+void main() {
+    const uint t = gl_WorkGroupID.y;                                  // token
+    const uint k = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (t >= p.ne02 || k >= p.ne00) return;
+
+    float sum = 0.0;
+    [[unroll]] for (uint j = 0; j < p.ne01; j++) {
+        const float a = data_src0[t * p.nb02 + j * p.nb01 + k];
+        const float b = data_src1[t * p.nb12 + j * p.nb11];
+        sum += a * b;
+    }
+    data_dst[t * p.dst_nb1 + k] = sum;
+}

@@ -514,6 +514,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
     vk_pipeline pipeline_argsort_f32;
     vk_pipeline pipeline_grouped_topk_f32;
+    vk_pipeline pipeline_mul_multi_add_f32;
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
@@ -934,6 +935,19 @@ struct vk_op_argsort_push_constants {
     uint32_t ncols;
     uint32_t ncols_pad;
     int32_t order;
+};
+
+// Push constants for MUL_MULTI_ADD (ik MoE expert combine).
+// Layout matches mul_multi_add.comp.
+struct vk_op_mul_multi_add_push_constants {
+    uint32_t ne00;     // n_ff
+    uint32_t ne01;     // n_used (the dimension we sum over)
+    uint32_t ne02;     // n_tokens
+    uint32_t nb01;     // src0 stride along ne01 (in floats)
+    uint32_t nb02;     // src0 stride along ne02 (in floats)
+    uint32_t nb11;     // src1 stride along ne01 (in floats)
+    uint32_t nb12;     // src1 stride along ne02 (in floats)
+    uint32_t dst_nb1;  // dst stride along output's row dim (in floats)
 };
 
 // Push constants for the GROUPED_TOPK shader. Layout matches the GLSL block
@@ -3361,6 +3375,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 grouped_topk_f32_len, grouped_topk_f32_data, "main", 2,
                 sizeof(vk_op_grouped_topk_push_constants), {1024, 1, 1}, spec, 1);
     }
+
+    // MUL_MULTI_ADD shader. Workgroup x = 256 threads (each handles one k of
+    // n_ff per token). Dispatch grid is (n_tokens, ceil(n_ff/256), 1).
+    ggml_vk_create_pipeline(device, device->pipeline_mul_multi_add_f32, "mul_multi_add_f32",
+            mul_multi_add_f32_len, mul_multi_add_f32_data, "main", 3,
+            sizeof(vk_op_mul_multi_add_push_constants), {256, 1, 1}, {}, 1);
+
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
@@ -7731,6 +7752,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_grouped_topk_f32;
         }
         return nullptr;
+    case GGML_OP_MUL_MULTI_ADD:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_mul_multi_add_f32;
+        }
+        return nullptr;
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -8141,6 +8167,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         // constant 0 = WG_SIZE = 1024 (matches the wg_denoms passed at
         // pipeline creation time, so the dispatch grid is just nrows in x).
         elements = { 1024, (uint32_t)ggml_nrows(src0), 1 };
+        break;
+    case GGML_OP_MUL_MULTI_ADD:
+        // Grid: x = n_ff (auto-divided by wg_denoms[0]=256 → ceil(n_ff/256)),
+        // y = n_tokens. Each workgroup handles 256 k values for one token.
+        elements = { (uint32_t)src0->ne[0], (uint32_t)src0->ne[2], 1 };
         break;
     case GGML_OP_IM2COL:
         {
@@ -8973,6 +9004,23 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ncols,
         ncols_pad,
         op_params[0],
+    }, dryrun);
+}
+
+static void ggml_vk_mul_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    ggml_vk_op_f32<vk_op_mul_multi_add_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_MUL_MULTI_ADD, {
+        (uint32_t)src0->ne[0],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->ne[2],
+        (uint32_t)(src0->nb[1] / sizeof(float)),
+        (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)(src1->nb[1] / sizeof(float)),
+        (uint32_t)(src1->nb[2] / sizeof(float)),
+        (uint32_t)( dst->nb[1] / sizeof(float)),
     }, dryrun);
 }
 
@@ -10196,6 +10244,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_MUL_MAT_ID:
     case GGML_OP_ARGSORT:
     case GGML_OP_GROUPED_TOPK:
+    case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -10272,6 +10321,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_OP_ROPE_BACK:
         case GGML_OP_ARGSORT:
         case GGML_OP_GROUPED_TOPK:
+        case GGML_OP_MUL_MULTI_ADD:
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGMAX:
@@ -10468,6 +10518,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_grouped_topk(ctx, compute_ctx, src0, node, dryrun);
 
         break;
+    case GGML_OP_MUL_MULTI_ADD:
+        ggml_vk_mul_multi_add(ctx, compute_ctx, src0, src1, node, dryrun);
+
+        break;
     case GGML_OP_SUM:
         ggml_vk_sum(ctx, compute_ctx, src0, node, dryrun);
 
@@ -10635,6 +10689,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_NONE:
     case GGML_OP_ARGSORT:
     case GGML_OP_GROUPED_TOPK:
+    case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -12140,6 +12195,12 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_LEAKY_RELU:
         //case GGML_OP_OPT_STEP_ADAMW:
             return true;
+        case GGML_OP_MUL_MULTI_ADD:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[0] == 1;
         case GGML_OP_GROUPED_TOPK:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) return false;
