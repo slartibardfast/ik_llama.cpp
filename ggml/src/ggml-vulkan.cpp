@@ -518,6 +518,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_x_f32;
     vk_pipeline pipeline_ssm_conv_x_nc4_f32;
     vk_pipeline pipeline_ssm_conv_final_state_f32;
+    vk_pipeline pipeline_ssm_conv_init_states_f32;
+    vk_pipeline pipeline_ssm_conv_init_states_nc4_f32;
+    vk_pipeline pipeline_ssm_conv_slow_f32;          // single-target, general nc
+    vk_pipeline pipeline_ssm_conv_slow_nc4_f32;      // single-target, nc=4
+    vk_pipeline pipeline_ssm_conv_slow_ms_f32;       // multi-target, general nc
+    vk_pipeline pipeline_ssm_conv_slow_ms_nc4_f32;   // multi-target, nc=4
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
@@ -3420,6 +3426,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
             sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_final_state_f32, "ssm_conv_final_state_f32",
             ssm_conv_final_state_f32_len, ssm_conv_final_state_f32_data, "main", 3,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+
+    // Multi-sequence init + slow path. Init pre-fills dst_state with the
+    // previous src0 for ALL n_kv sequences (so untouched seqs survive the
+    // batch). Slow path then walks tokens serially per row, reading the
+    // sq->ne[0] sequence map and writing both conv output and new state.
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_init_states_f32, "ssm_conv_init_states_f32",
+            ssm_conv_init_states_f32_len, ssm_conv_init_states_f32_data, "main", 2,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_init_states_nc4_f32, "ssm_conv_init_states_nc4_f32",
+            ssm_conv_init_states_nc4_f32_len, ssm_conv_init_states_nc4_f32_data, "main", 2,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_f32, "ssm_conv_slow_f32",
+            ssm_conv_slow_f32_len, ssm_conv_slow_f32_data, "main", 5,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_nc4_f32, "ssm_conv_slow_nc4_f32",
+            ssm_conv_slow_nc4_f32_len, ssm_conv_slow_nc4_f32_data, "main", 5,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_ms_f32, "ssm_conv_slow_ms_f32",
+            ssm_conv_slow_ms_f32_len, ssm_conv_slow_ms_f32_data, "main", 5,
+            sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_slow_ms_nc4_f32, "ssm_conv_slow_ms_nc4_f32",
+            ssm_conv_slow_ms_nc4_f32_len, ssm_conv_slow_ms_nc4_f32_data, "main", 5,
             sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
 
 
@@ -9125,10 +9154,6 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t n_t  = (uint32_t)src1->ne[1];
     const uint32_t n_kv = (uint32_t)src0->ne[2];
 
-    // Phase 20n.1 only handles the single-seq fast path. Multi-seq cases are
-    // rejected upstream by supports_op and stay on CPU until 20n.2 lands.
-    GGML_ASSERT(n_kv == 1 && src3->ne[0] == 1);
-
     const vk_op_ssm_conv_push_constants pc = {
         nr, n_t, nc, n_kv,
         (uint32_t)(src0->nb[0] / sizeof(float)),
@@ -9139,58 +9164,110 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         nr * n_t,
     };
 
-    vk_pipeline pipeline_x = (nc == 4)
+    // Path A — single-sequence fast path. Two dispatches: per-(row, t)
+    // conv output, then a per-row final-state writeback.
+    const bool single_seq_fast = (n_kv == 1 && src3->ne[0] == 1);
+
+    vk_pipeline pipeline_x  = (nc == 4)
         ? ctx->device->pipeline_ssm_conv_x_nc4_f32
         : ctx->device->pipeline_ssm_conv_x_f32;
     vk_pipeline pipeline_fs = ctx->device->pipeline_ssm_conv_final_state_f32;
 
+    // Path C/D — multi-sequence slow path. Init kernel pre-fills dst_state
+    // for untouched seqs, then the slow kernel walks tokens serially.
+    vk_pipeline pipeline_init = (nc == 4)
+        ? ctx->device->pipeline_ssm_conv_init_states_nc4_f32
+        : ctx->device->pipeline_ssm_conv_init_states_f32;
+    const bool has_multi_seq = (n_kv > 1);
+    vk_pipeline pipeline_slow;
+    if (nc == 4) {
+        pipeline_slow = has_multi_seq
+            ? ctx->device->pipeline_ssm_conv_slow_ms_nc4_f32
+            : ctx->device->pipeline_ssm_conv_slow_nc4_f32;
+    } else {
+        pipeline_slow = has_multi_seq
+            ? ctx->device->pipeline_ssm_conv_slow_ms_f32
+            : ctx->device->pipeline_ssm_conv_slow_f32;
+    }
+
     if (dryrun) {
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline_x,  1);
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline_fs, 1);
+        if (single_seq_fast) {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_x,  1);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_fs, 1);
+        } else {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_init, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_slow, 1);
+        }
         return;
     }
 
     auto * src0_buf = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     auto * src1_buf = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     auto * src2_buf = (ggml_backend_vk_buffer_context *)src2->buffer->context;
+    auto * src3_buf = (ggml_backend_vk_buffer_context *)src3->buffer->context;
     auto * dst_buf  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
 
     vk_buffer d_s0  = src0_buf->dev_buffer;
     vk_buffer d_s1  = src1_buf->dev_buffer;
     vk_buffer d_s2  = src2_buf->dev_buffer;
+    vk_buffer d_s3  = src3_buf->dev_buffer;
     vk_buffer d_dst = dst_buf->dev_buffer;
 
     const uint64_t off_s0  = vk_tensor_offset(src0) + src0->view_offs;
     const uint64_t off_s1  = vk_tensor_offset(src1) + src1->view_offs;
     const uint64_t off_s2  = vk_tensor_offset(src2) + src2->view_offs;
+    const uint64_t off_s3  = vk_tensor_offset(src3) + src3->view_offs;
     const uint64_t off_dst = vk_tensor_offset(dst)  + dst->view_offs;
 
     const uint64_t sz_s0  = ggml_nbytes(src0);
     const uint64_t sz_s1  = ggml_nbytes(src1);
     const uint64_t sz_s2  = ggml_nbytes(src2);
+    const uint64_t sz_s3  = ggml_nbytes(src3);
     const uint64_t sz_dst = ggml_nbytes(dst);
 
-    // Dispatch grid: (ceil(nr/256), n_t, 1) — 256 threads per workgroup
-    // along the row dim, one workgroup per token. wg_denoms is (256,1,1)
-    // so we pass nr (auto-divided), n_t, 1.
+    if (single_seq_fast) {
+        // Dispatch grid: (ceil(nr/256), n_t, 1) — 256 threads per workgroup
+        // along the row dim, one workgroup per token.
+        ggml_vk_sync_buffers(subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_x,
+            {
+                vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
+                vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
+                vk_subbuffer{ d_s2,  off_s2,  sz_s2  },
+                vk_subbuffer{ d_dst, off_dst, sz_dst },
+            },
+            pc, { nr, n_t, 1 });
+
+        // Final state writeback. Disjoint region of dst (offset = nr * n_t).
+        ggml_vk_sync_buffers(subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fs,
+            {
+                vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
+                vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
+                vk_subbuffer{ d_dst, off_dst, sz_dst },
+            },
+            pc, { nr, 1, 1 });
+        return;
+    }
+
+    // Multi-sequence path. First init dst_state from src0 for ALL n_kv
+    // sequences (preserves untouched seqs), then run the slow kernel
+    // which serially processes tokens within each row.
     ggml_vk_sync_buffers(subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_x,
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_init,
+        {
+            vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
+            vk_subbuffer{ d_dst, off_dst, sz_dst },
+        },
+        pc, { nr, n_kv, 1 });
+
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_slow,
         {
             vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
             vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
             vk_subbuffer{ d_s2,  off_s2,  sz_s2  },
-            vk_subbuffer{ d_dst, off_dst, sz_dst },
-        },
-        pc, { nr, n_t, 1 });
-
-    // Final state writeback. Disjoint region of dst (offset = nr * n_t) so
-    // technically no hazard with the conv_x dispatch, but the sync makes the
-    // ordering explicit and matches the CUDA reference's two-kernel pattern.
-    ggml_vk_sync_buffers(subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fs,
-        {
-            vk_subbuffer{ d_s0,  off_s0,  sz_s0  },
-            vk_subbuffer{ d_s1,  off_s1,  sz_s1  },
+            vk_subbuffer{ d_s3,  off_s3,  sz_s3  },
             vk_subbuffer{ d_dst, off_dst, sz_dst },
         },
         pc, { nr, 1, 1 });
@@ -12390,9 +12467,11 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                    op->src[0]->ne[3] == 1 &&
                    op->src[1]->ne[0] == 1;
         case GGML_OP_SSM_CONV:
-            // ik 4-arg form: (s, x, c, sq). Phase 20n.1 only handles the
-            // single-sequence fast path (n_kv == 1 && sq->ne[0] == 1) — the
-            // multi-sequence and slow paths land in 20n.2 / 20n.3.
+            // ik 4-arg form: (s, x, c, sq). Vulkan supports both the
+            // single-sequence fast path (n_kv == 1 && sq->ne[0] == 1) and
+            // the multi-sequence slow path (any n_kv, any sq->ne[0]). The
+            // multi-sequence unique-fast optimization (parallel-over-tokens
+            // when each token maps to a distinct seq) lands later.
             if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3]) return false;
             if (op->src[0]->type != GGML_TYPE_F32) return false;
             if (op->src[1]->type != GGML_TYPE_F32) return false;
@@ -12403,8 +12482,6 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             if (op->src[1]->nb[0] != sizeof(float)) return false;
             if (op->src[2]->nb[0] != sizeof(float)) return false;
             if (op->src[3]->nb[0] != sizeof(int32_t)) return false;
-            if (op->src[0]->ne[2] != 1) return false;          // single sequence
-            if (op->src[3]->ne[0] != 1) return false;          // one slot per token
             if (op->src[2]->ne[0] > 8) return false;           // nc cap (universal nc=4)
             return true;
         case GGML_OP_GROUPED_TOPK:

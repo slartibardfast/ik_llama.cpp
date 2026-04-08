@@ -1,0 +1,56 @@
+#version 450
+
+// SSM_CONV — multi-sequence state init.
+//
+// Pre-fills the dst_state region with src0 (the previous conv_state) for
+// every sequence in the cache. The slow / unique-fast kernels then
+// overwrite only the sequences touched by tokens in the current batch;
+// untouched sequences keep this initialized snapshot so the model's
+// next-batch read sees the correct previous state.
+//
+// Per (row, seq):
+//   for i0 in [0, nc - 1):
+//       state[seq, row, 1 + i0] = src0[seq, row, i0]
+// state[seq, row, 0] is left junk — discarded next batch by the model's
+// shift-back to src0.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Src0 { float data_src0[]; };
+layout(binding = 1) buffer Dst { float data_dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint nr;
+    uint n_t;
+    uint nc;
+    uint n_kv;
+    uint src0_s0;
+    uint src0_s1;
+    uint src0_s2;
+    uint src1_s1;
+    uint src3_s1;
+    uint dst_state_offset;  // = nr * n_t (in floats)
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    const uint seq = gl_WorkGroupID.y;
+    if (row >= p.nr || seq >= p.n_kv) return;
+
+    // src0 is shape [nc-1, nr, n_kv] — per-seq base = seq * nr * (nc-1)
+    const uint src_base = seq * p.nr * (p.nc - 1) + row * (p.nc - 1);
+    // dst_state is shape [nc, nr, n_kv] starting at dst_state_offset
+    const uint dst_base = p.dst_state_offset + seq * p.nr * p.nc + row * p.nc;
+
+#ifdef NC4
+    data_dst[dst_base + 1] = data_src0[src_base + 0];
+    data_dst[dst_base + 2] = data_src0[src_base + 1];
+    data_dst[dst_base + 3] = data_src0[src_base + 2];
+#else
+    [[unroll]] for (uint i0 = 0; i0 < p.nc - 1; ++i0) {
+        data_dst[dst_base + 1 + i0] = data_src0[src_base + i0];
+    }
+#endif
+}

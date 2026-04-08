@@ -656,12 +656,25 @@ void process_shaders() {
     string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
-    // SSM_CONV — single-sequence Vulkan port from ik PR #1251 (CUDA).
-    // Single F32 path with NC4 specialization for the d_conv=4 hot path
-    // (universal across Mamba / Mamba-2 / Qwen3.5-A3B).
-    string_to_spv("ssm_conv_x_f32",         "ssm_conv_x.comp",           {});
-    string_to_spv("ssm_conv_x_nc4_f32",     "ssm_conv_x.comp",           {{"NC4", "1"}});
-    string_to_spv("ssm_conv_final_state_f32","ssm_conv_final_state.comp",{});
+    // SSM_CONV — Vulkan port. NC4 = d_conv=4 unrolled hot path (universal
+    // across Mamba / Mamba-2 / Qwen3.5-A3B).
+    //
+    // Single-sequence path (parallel-over-(row, t) conv output + per-row
+    // final-state writeback):
+    string_to_spv("ssm_conv_x_f32",            "ssm_conv_x.comp",            {});
+    string_to_spv("ssm_conv_x_nc4_f32",        "ssm_conv_x.comp",            {{"NC4", "1"}});
+    string_to_spv("ssm_conv_final_state_f32",  "ssm_conv_final_state.comp",  {});
+    //
+    // Multi-sequence init + slow path. Init pre-fills dst_state from src0
+    // for ALL n_kv sequences so untouched seqs survive the batch. The slow
+    // kernel walks tokens serially per row. The slow path has 4 variants:
+    // {NC4, general} × {single-target, multi-target fanout}.
+    string_to_spv("ssm_conv_init_states_f32",     "ssm_conv_init_states.comp", {});
+    string_to_spv("ssm_conv_init_states_nc4_f32", "ssm_conv_init_states.comp", {{"NC4", "1"}});
+    string_to_spv("ssm_conv_slow_f32",            "ssm_conv_slow.comp",        {});
+    string_to_spv("ssm_conv_slow_nc4_f32",        "ssm_conv_slow.comp",        {{"NC4", "1"}});
+    string_to_spv("ssm_conv_slow_ms_f32",         "ssm_conv_slow.comp",        {{"HAS_MULTI_SEQ", "1"}});
+    string_to_spv("ssm_conv_slow_ms_nc4_f32",     "ssm_conv_slow.comp",        {{"NC4", "1"}, {"HAS_MULTI_SEQ", "1"}});
 
     // MUL_MULTI_ADD: ik-specific MoE expert combine
     // (sum_j src0[k,j,t] * src1[0,j,t]). Single F32 variant.

@@ -973,25 +973,34 @@ struct test_rms_norm : public test_case {
 
 // GGML_OP_SSM_CONV — ik 4-arg form: ggml_ssm_conv(s, x, c, sq)
 //
-// Phase 20n.1 covers the single-sequence fast path (n_kv == 1).
-// Multi-sequence cases are added in 20n.2 / 20n.3.
+// Single-sequence and multi-sequence cases. mode controls how the seq map
+// is built:
+//   0 = unique (each token a different seq id, round-robin)
+//   1 = recurrent (all tokens to seq 0 — exercises slow-path self-read)
+//   2 = fanout (token 0 writes state to all seqs via sq[1..])
 struct test_ssm_conv : public test_case {
     const int64_t d_conv;
     const int64_t d_inner;
     const int64_t n_t;
+    const int64_t n_kv;
+    const int64_t sq_ne0;
+    const int     mode;
 
     std::string vars() override {
-        return VARS_TO_STR3(d_conv, d_inner, n_t);
+        return VARS_TO_STR6(d_conv, d_inner, n_t, n_kv, sq_ne0, mode);
     }
 
-    test_ssm_conv(int64_t d_conv = 4, int64_t d_inner = 4096, int64_t n_t = 1)
-        : d_conv(d_conv), d_inner(d_inner), n_t(n_t) {}
+    test_ssm_conv(int64_t d_conv = 4, int64_t d_inner = 4096,
+                  int64_t n_t = 1, int64_t n_kv = 1,
+                  int64_t sq_ne0 = 1, int mode = 0)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t),
+          n_kv(n_kv), sq_ne0(sq_ne0), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * s  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, 1);
+        ggml_tensor * s  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_kv);
         ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_t);
         ggml_tensor * c  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
-        ggml_tensor * sq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_t);
+        ggml_tensor * sq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, sq_ne0, n_t);
         ggml_set_name(s,  "s");
         ggml_set_name(x,  "x");
         ggml_set_name(c,  "c");
@@ -1004,8 +1013,25 @@ struct test_ssm_conv : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
-                // Single-sequence: every token routes to slot 0.
-                std::vector<int32_t> data(ggml_nelements(t), 0);
+                std::vector<int32_t> data(ggml_nelements(t), -1);  // sentinel
+                for (int64_t it = 0; it < n_t; ++it) {
+                    int32_t * row = data.data() + it * sq_ne0;
+                    if (mode == 0) {
+                        // unique: each token a different seq, round-robin
+                        row[0] = (int32_t)(it % n_kv);
+                    } else if (mode == 1) {
+                        // recurrent: all tokens write to seq 0
+                        row[0] = 0;
+                    } else if (mode == 2) {
+                        // fanout: token 0 writes state to all seqs via sq[1..]
+                        row[0] = 0;
+                        if (it == 0) {
+                            for (int64_t k = 1; k < std::min<int64_t>(n_kv, sq_ne0); ++k) {
+                                row[k] = (int32_t)k;
+                            }
+                        }
+                    }
+                }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else {
                 init_tensor_uniform(t, -1.0f, 1.0f);
@@ -2944,8 +2970,8 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, false));
         test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {64, 5, 4, 3}, eps, true));
     }
-    // SSM_CONV: single-seq fast path (Phase 20n.1). Covers Qwen3.5-A3B
-    // (d_conv=4, d_inner=4096) decode/prefill, plus smaller / general nc
+    // SSM_CONV single-sequence (Mamba/SSM hot path). Covers Qwen3.5-A3B
+    // (d_conv=4, d_inner=4096) decode/prefill plus smaller / general nc
     // shapes for fast iteration and code coverage.
     test_cases.emplace_back(new test_ssm_conv(4, 4096, 1));    // Qwen3.5 decode
     test_cases.emplace_back(new test_ssm_conv(4, 4096, 8));    // small batch
@@ -2954,6 +2980,15 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_ssm_conv(8, 64,   4));    // general nc path
     test_cases.emplace_back(new test_ssm_conv(4, 64,   1));    // degenerate
     test_cases.emplace_back(new test_ssm_conv(4, 4,    1));    // single thread
+    // SSM_CONV multi-sequence — slow path (init + serial-over-tokens
+    // per-row). Covers unique-seq, recurrent (same seq, multiple tokens),
+    // and multi-target fanout (one token writes state to multiple seqs).
+    test_cases.emplace_back(new test_ssm_conv(4, 256, 4,  4, 4, 0)); // multi-seq unique nc4
+    test_cases.emplace_back(new test_ssm_conv(4, 256, 16, 4, 4, 0)); // multi-seq unique nc4 larger batch
+    test_cases.emplace_back(new test_ssm_conv(4, 256, 8,  4, 4, 1)); // multi-seq recurrent nc4
+    test_cases.emplace_back(new test_ssm_conv(4, 256, 4,  4, 4, 2)); // multi-seq fanout nc4
+    test_cases.emplace_back(new test_ssm_conv(8, 64,  4,  4, 4, 0)); // multi-seq unique general nc
+    test_cases.emplace_back(new test_ssm_conv(8, 64,  4,  4, 4, 1)); // multi-seq recurrent general nc
     // FUSED_MUL_UNARY with scalar broadcast (Qwen3.5 shared expert
     // single-token decode pattern: shape [1] gate × [n_ff] feature output).
     // The CPU op only allows SILU/SIGMOID for the broadcast variant.
