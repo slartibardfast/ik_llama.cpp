@@ -1430,6 +1430,116 @@ struct test_moe_fused_up_gate {
     }
 };
 
+// GGML_OP_GROUPED_TOPK — uses custom eval (the CPU backend implements the
+// op directly via iqk_grouped_top_k, so we compare CPU to Vulkan).
+struct test_grouped_topk {
+    const int64_t n_experts;
+    const int64_t n_groups;
+    const int64_t n_top_groups;
+    const int64_t nk;            // top-k WITHIN each group used for scoring
+    const int64_t topk_experts;  // number of experts to select overall
+    const int64_t n_tokens;
+
+    test_grouped_topk(int64_t n_experts = 256, int64_t n_groups = 8,
+            int64_t n_top_groups = 4, int64_t nk = 2, int64_t topk_experts = 8,
+            int64_t n_tokens = 8)
+        : n_experts(n_experts), n_groups(n_groups),
+          n_top_groups(n_top_groups), nk(nk),
+          topk_experts(topk_experts), n_tokens(n_tokens) {}
+
+    bool eval(ggml_backend_t backend_vk, ggml_backend_t backend_cpu) {
+        printf("  GROUPED_TOPK(n_exp=%lld,n_grp=%lld,n_top_grp=%lld,nk=%lld,topk=%lld,n_tok=%lld): ",
+               (long long)n_experts, (long long)n_groups,
+               (long long)n_top_groups, (long long)nk,
+               (long long)topk_experts, (long long)n_tokens);
+        fflush(stdout);
+
+        // Build CPU reference graph.
+        ggml_init_params params_ref = {
+            ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true
+        };
+        ggml_context * ctx_ref = ggml_init(params_ref);
+        ggml_cgraph * gf_ref = ggml_new_graph(ctx_ref);
+        ggml_tensor * src_ref = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, n_experts, n_tokens);
+        ggml_tensor * out_ref = ggml_grouped_topk(ctx_ref, src_ref,
+                (int)n_groups, (int)n_top_groups, (int)nk, (int)topk_experts);
+        ggml_build_forward_expand(gf_ref, out_ref);
+
+        ggml_backend_buffer_t buf_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, backend_cpu);
+        if (!buf_ref) { printf("alloc fail (cpu)\n"); ggml_free(ctx_ref); return false; }
+
+        // Build Vulkan graph.
+        ggml_init_params params_vk = {
+            ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true
+        };
+        ggml_context * ctx_vk = ggml_init(params_vk);
+        ggml_cgraph * gf_vk = ggml_new_graph(ctx_vk);
+        ggml_tensor * src_vk = ggml_new_tensor_2d(ctx_vk, GGML_TYPE_F32, n_experts, n_tokens);
+        ggml_tensor * out_vk = ggml_grouped_topk(ctx_vk, src_vk,
+                (int)n_groups, (int)n_top_groups, (int)nk, (int)topk_experts);
+
+        if (!ggml_backend_supports_op(backend_vk, out_vk)) {
+            printf("not supported [%s]\n", ggml_backend_name(backend_vk));
+            ggml_free(ctx_vk); ggml_backend_buffer_free(buf_ref); ggml_free(ctx_ref);
+            return true; // skip, not fail
+        }
+
+        ggml_build_forward_expand(gf_vk, out_vk);
+        ggml_backend_buffer_t buf_vk = ggml_backend_alloc_ctx_tensors(ctx_vk, backend_vk);
+        if (!buf_vk) { printf("alloc fail (vk)\n"); ggml_free(ctx_vk); ggml_backend_buffer_free(buf_ref); ggml_free(ctx_ref); return false; }
+
+        // Initialize identical input on both backends. We use distinct random
+        // values per element to keep tie-breaking deterministic across the
+        // bitonic sort vs std::partial_sort comparison.
+        std::vector<float> src_data(n_experts * n_tokens);
+        std::default_random_engine rng(7777);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto & v : src_data) v = dist(rng);
+
+        ggml_backend_tensor_set(src_ref, src_data.data(), 0, src_data.size() * sizeof(float));
+        ggml_backend_tensor_set(src_vk,  src_data.data(), 0, src_data.size() * sizeof(float));
+
+        ggml_backend_graph_compute(backend_cpu, gf_ref);
+        ggml_backend_graph_compute(backend_vk,  gf_vk);
+        ggml_backend_synchronize(backend_vk);
+
+        // Compare outputs. Both are I32 indices. They must be set-equal per
+        // row (the order WITHIN a row may differ slightly between CPU
+        // partial_sort and bitonic sort because of f32 score equality, but
+        // the SET of selected experts must match exactly).
+        const size_t out_n = ggml_nelements(out_ref);
+        std::vector<int32_t> ref(out_n), vk(out_n);
+        ggml_backend_tensor_get(out_ref, ref.data(), 0, out_n * sizeof(int32_t));
+        ggml_backend_tensor_get(out_vk,  vk.data(),  0, out_n * sizeof(int32_t));
+
+        bool ok = true;
+        for (int t = 0; t < n_tokens && ok; t++) {
+            std::vector<int32_t> a(ref.begin() + t * topk_experts, ref.begin() + (t+1) * topk_experts);
+            std::vector<int32_t> b(vk.begin()  + t * topk_experts, vk.begin()  + (t+1) * topk_experts);
+            std::sort(a.begin(), a.end());
+            std::sort(b.begin(), b.end());
+            if (a != b) {
+                printf("\n    [debug] token %d mismatch: ref={", t);
+                for (auto x : a) printf("%d ", x);
+                printf("} vk={");
+                for (auto x : b) printf("%d ", x);
+                printf("}\n");
+                ok = false;
+            }
+        }
+
+        ggml_backend_buffer_free(buf_vk); ggml_free(ctx_vk);
+        ggml_backend_buffer_free(buf_ref); ggml_free(ctx_ref);
+
+        if (!ok) {
+            printf("\033[1;31mFAIL\033[0m\n");
+            return false;
+        }
+        printf("\033[1;32mOK\033[0m\n");
+        return true;
+    }
+};
+
 // GGML_OP_MUL_MULTI_ADD
 struct test_mul_multi_add : public test_case {
     const int64_t ne0;       // n_embd
@@ -3162,6 +3272,26 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             printf("  MOE_FUSED_UP_GATE: %zu/%zu passed\n", mfg_ok, mfg_total);
             if (mfg_ok != mfg_total) {
                 n_ok = 0; // force overall failure
+            }
+        }
+
+        // GROUPED_TOPK: per-row group-aware top-k
+        if (op_name == nullptr || std::string(op_name) == "GROUPED_TOPK") {
+            printf("\n  === GROUPED_TOPK (Vulkan vs CPU iqk_grouped_top_k) ===\n");
+            size_t gt_ok = 0, gt_total = 0;
+            // Qwen3.5-35B-A3B shape: 256 experts in 8 groups of 32, top-4 groups,
+            // top-2 within each group for scoring, top-8 experts overall.
+            for (int64_t n_tok : {1, 2, 8, 64}) {
+                gt_total++;
+                if (test_grouped_topk(256, 8, 4, 2, 8, n_tok).eval(backend, backend_cpu)) gt_ok++;
+            }
+            // Smaller / different shapes for sanity coverage.
+            gt_total++; if (test_grouped_topk(128, 8, 2, 2, 4, 4).eval(backend, backend_cpu)) gt_ok++;
+            gt_total++; if (test_grouped_topk(64,  4, 2, 2, 4, 4).eval(backend, backend_cpu)) gt_ok++;
+            gt_total++; if (test_grouped_topk(32,  4, 2, 1, 2, 1).eval(backend, backend_cpu)) gt_ok++;
+            printf("  GROUPED_TOPK: %zu/%zu passed\n", gt_ok, gt_total);
+            if (gt_ok != gt_total) {
+                n_ok = 0;
             }
         }
 

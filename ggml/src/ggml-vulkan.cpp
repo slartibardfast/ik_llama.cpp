@@ -512,6 +512,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16;
     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
     vk_pipeline pipeline_argsort_f32;
+    vk_pipeline pipeline_grouped_topk_f32;
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
@@ -932,6 +933,21 @@ struct vk_op_argsort_push_constants {
     uint32_t ncols;
     uint32_t ncols_pad;
     int32_t order;
+};
+
+// Push constants for the GROUPED_TOPK shader. Layout matches the GLSL block
+// in grouped_topk_f32.comp.
+struct vk_op_grouped_topk_push_constants {
+    uint32_t ncols;
+    uint32_t ncols_pad;
+    uint32_t ne0;
+    uint32_t n_groups;
+    uint32_t n_top_groups;
+    uint32_t n_per_group;
+    uint32_t n_per_group_pad;
+    uint32_t nk;
+    uint32_t stride_src;
+    uint32_t stride_dst;
 };
 
 struct vk_op_im2col_push_constants {
@@ -3333,6 +3349,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argsort_f32, "argsort_f32", argsort_f32_len, argsort_f32_data, "main", 2, sizeof(vk_op_argsort_push_constants), {1024, 1, 1}, {}, 1);
+
+    // GROUPED_TOPK shader. Workgroup size is set via spec constant 0 (NCOLS_PAD).
+    // We pick 1024 to cover the largest known MoE expert count (Qwen3.5 = 256,
+    // headroom for ne0 up to 1024). Spec constants 1/2 size the shared arrays.
+    {
+        const std::vector<uint32_t> spec = { 1024u, 1024u, 16u };
+        ggml_vk_create_pipeline(device, device->pipeline_grouped_topk_f32, "grouped_topk_f32",
+                grouped_topk_f32_len, grouped_topk_f32_data, "main", 2,
+                sizeof(vk_op_grouped_topk_push_constants), {1024, 1, 1}, spec, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
@@ -7696,6 +7722,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_argsort_f32;
         }
         return nullptr;
+    case GGML_OP_GROUPED_TOPK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_grouped_topk_f32;
+        }
+        return nullptr;
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -8099,6 +8130,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_ARGSORT:
         elements = { (uint32_t)ne00, (uint32_t)ggml_nrows(src0), 1 };
+        break;
+    case GGML_OP_GROUPED_TOPK:
+        // One workgroup per row; shader does its own threading via spec
+        // constant 0 = WG_SIZE = 1024 (matches the wg_denoms passed at
+        // pipeline creation time, so the dispatch grid is just nrows in x).
+        elements = { 1024, (uint32_t)ggml_nrows(src0), 1 };
         break;
     case GGML_OP_IM2COL:
         {
@@ -8931,6 +8968,44 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ncols,
         ncols_pad,
         op_params[0],
+    }, dryrun);
+}
+
+static void ggml_vk_grouped_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
+    int32_t * op_params = (int32_t *)dst->op_params;
+    const uint32_t n_groups     = (uint32_t)op_params[0];
+    const uint32_t n_top_groups = (uint32_t)op_params[1];
+    const uint32_t nk           = (uint32_t)op_params[2];
+
+    const uint32_t ncols = (uint32_t)src0->ne[0];
+    const uint32_t ne0   = (uint32_t)dst->ne[0];
+
+    GGML_ASSERT(ncols % n_groups == 0);
+    const uint32_t n_per_group = ncols / n_groups;
+
+    // Bitonic sort needs power-of-2 sizes. Restricting n_per_group to a
+    // power of 2 keeps the per-group and global sort layouts in sync (see
+    // the comment at the top of grouped_topk_f32.comp).
+    GGML_ASSERT((n_per_group & (n_per_group - 1)) == 0);
+
+    uint32_t ncols_pad = 1;
+    while (ncols_pad < ncols) ncols_pad *= 2;
+    GGML_ASSERT(ncols_pad <= 1024);
+
+    const uint32_t stride_src = (uint32_t)(src0->nb[1] / ggml_type_size(src0->type));
+    const uint32_t stride_dst = (uint32_t)(dst->nb[1]  / ggml_type_size(dst->type));
+
+    ggml_vk_op_f32<vk_op_grouped_topk_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_GROUPED_TOPK, {
+        ncols,
+        ncols_pad,
+        ne0,
+        n_groups,
+        n_top_groups,
+        n_per_group,
+        n_per_group,  // n_per_group_pad — power-of-2 enforced above, so == n_per_group
+        nk,
+        stride_src,
+        stride_dst,
     }, dryrun);
 }
 
@@ -10114,6 +10189,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_MUL_MAT:
     case GGML_OP_MUL_MAT_ID:
     case GGML_OP_ARGSORT:
+    case GGML_OP_GROUPED_TOPK:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -10189,6 +10265,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_ARGSORT:
+        case GGML_OP_GROUPED_TOPK:
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGMAX:
@@ -10381,6 +10458,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_argsort(ctx, compute_ctx, src0, node, dryrun);
 
         break;
+    case GGML_OP_GROUPED_TOPK:
+        ggml_vk_grouped_topk(ctx, compute_ctx, src0, node, dryrun);
+
+        break;
     case GGML_OP_SUM:
         ggml_vk_sum(ctx, compute_ctx, src0, node, dryrun);
 
@@ -10547,6 +10628,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_TRANSPOSE:
     case GGML_OP_NONE:
     case GGML_OP_ARGSORT:
+    case GGML_OP_GROUPED_TOPK:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -12049,6 +12131,22 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_LEAKY_RELU:
         //case GGML_OP_OPT_STEP_ADAMW:
             return true;
+        case GGML_OP_GROUPED_TOPK:
+            {
+                if (op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->type != GGML_TYPE_I32) return false;
+                const int32_t n_groups = op->op_params[0];
+                if (n_groups <= 0 || n_groups > 16) return false;
+                const int64_t ncols = op->src[0]->ne[0];
+                if (ncols <= 0 || ncols > 1024) return false;
+                if (ncols % n_groups != 0) return false;
+                const int64_t n_per_group = ncols / n_groups;
+                // Bitonic sort within a group requires power-of-2 size; the
+                // shader keeps per-group and global layouts in sync only when
+                // n_per_group is itself a power of 2.
+                if ((n_per_group & (n_per_group - 1)) != 0) return false;
+                return true;
+            }
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         default:

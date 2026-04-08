@@ -774,6 +774,11 @@ void process_shaders() {
             string_to_spv("matmul_id_fused_up_gate_" + tname + "_f32_aligned", fug_source, merge_maps(fug_base_dict, {{data_a_key, "1"}, {"MUL_MAT_ID", "1"}, {"LOAD_VEC_A", load_vec_quant}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fug_fp16);
         }
     }
+
+    // grouped_topk: per-row group-aware top-k for MoE expert routing
+    // (GGML_OP_GROUPED_TOPK). Single-shader implementation: one workgroup
+    // per row, all stages run in shared memory.
+    string_to_spv("grouped_topk_f32", "grouped_topk_f32.comp", {});
     //
     // ============================== end ik_llama.cpp
 

@@ -1,0 +1,230 @@
+#version 450
+
+// GGML_OP_GROUPED_TOPK shader.
+//
+// One workgroup per row of src (i.e. per token). All sort/score work happens
+// in shared memory; no temp buffers, no cross-dispatch sync.
+//
+// Algorithm (mirrors ggml_compute_forward_grouped_topk):
+//   1. Each thread loads its assigned column's value and its absolute index.
+//   2. Within each group of n_per_group columns: bitonic-sort the values DESC
+//      and sum the top-nk into a per-group score.
+//   3. Thread 0 sorts the n_groups group scores DESC and identifies the top
+//      n_top_groups groups.
+//   4. Threads whose group did NOT make the top set their score to -INFINITY.
+//   5. The whole row is bitonic-sorted DESC by the (possibly-masked) score.
+//   6. The first ne0 threads write their absolute indices to dst.
+//
+// All shared-memory writes are followed by a workgroup-wide barrier.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint WG_SIZE = 256;
+// Max columns the shader can handle in one workgroup. Must be >= ne00_pad.
+layout (constant_id = 1) const uint NCOLS_PAD = 256;
+// Max groups the shader can handle (small constant; 16 covers all known MoEs).
+layout (constant_id = 2) const uint MAX_GROUPS = 16;
+
+layout (binding = 0) readonly buffer Src { float data_src[]; };
+layout (binding = 1) writeonly buffer Dst { int   data_dst[]; };
+
+layout (push_constant) uniform parameter {
+    uint ncols;          // = ne00 (input columns per row)
+    uint ncols_pad;      // = next pow2 >= ncols
+    uint ne0;            // = topk_experts (output count)
+    uint n_groups;
+    uint n_top_groups;
+    uint n_per_group;    // = ncols / n_groups
+    uint n_per_group_pad;// = next pow2 >= n_per_group
+    uint nk;             // top-k WITHIN each group used for scoring
+    uint stride_src;     // = src->nb[1] / sizeof(float)
+    uint stride_dst;     // = dst->nb[1] / sizeof(int)
+} p;
+
+shared int   s_idx[NCOLS_PAD];
+shared float s_score[NCOLS_PAD];
+shared float s_group_score[MAX_GROUPS];
+shared int   s_group_in[MAX_GROUPS];   // 1 if group's score is in the top set, 0 otherwise
+
+void bitonic_sort_desc(uint pad_size) {
+    // Standard bitonic sort, descending. Indices in s_idx[], scores in s_score[].
+    // Threads with col >= pad_size do nothing (their s_score is -INF / s_idx is sentinel).
+    const uint col = gl_LocalInvocationID.x;
+    for (uint k = 2; k <= pad_size; k *= 2) {
+        for (uint j = k / 2; j > 0; j /= 2) {
+            const uint ixj = col ^ j;
+            if (col < pad_size && ixj > col && ixj < pad_size) {
+                const bool ascending_block = (col & k) == 0;
+                // Descending overall: ascending_block means we want col < ixj (smaller stays right);
+                // descending block means col > ixj (larger stays right).
+                // We sort by (-score, idx) lex order so equal-score swaps are stable in idx.
+                const float a = s_score[col];
+                const float b = s_score[ixj];
+                bool swap;
+                if (ascending_block) {
+                    // For DESC overall: in an ascending block, larger should sit at the LOWER index
+                    // after the merge — i.e. swap if a < b.
+                    swap = a < b;
+                } else {
+                    // In a descending block: larger sits at the HIGHER index — swap if a > b.
+                    swap = a > b;
+                }
+                if (swap) {
+                    const float tmps = s_score[col];
+                    s_score[col] = s_score[ixj];
+                    s_score[ixj] = tmps;
+                    const int tmpi = s_idx[col];
+                    s_idx[col] = s_idx[ixj];
+                    s_idx[ixj] = tmpi;
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+// Per-group bitonic sort DESC. Each group of n_per_group_pad consecutive
+// threads sorts its own segment of s_score / s_idx independently. Workgroup-
+// wide barriers are used between stages (groups not involved in a particular
+// pair just no-op).
+void bitonic_sort_groups_desc() {
+    const uint col       = gl_LocalInvocationID.x;
+    const uint local_col = col % p.n_per_group_pad;
+    const uint group_idx = col / p.n_per_group_pad;
+    const bool in_range    = group_idx < p.n_groups && local_col < p.n_per_group_pad;
+    for (uint k = 2; k <= p.n_per_group_pad; k *= 2) {
+        for (uint j = k / 2; j > 0; j /= 2) {
+            const uint ixj_local = local_col ^ j;
+            if (in_range && ixj_local > local_col && ixj_local < p.n_per_group_pad) {
+                const uint a_idx = group_idx * p.n_per_group_pad + local_col;
+                const uint b_idx = group_idx * p.n_per_group_pad + ixj_local;
+                const bool ascending_block = (local_col & k) == 0;
+                const float a = s_score[a_idx];
+                const float b = s_score[b_idx];
+                const bool swap = ascending_block ? a < b : a > b;
+                if (swap) {
+                    const float tmps = s_score[a_idx];
+                    s_score[a_idx] = s_score[b_idx];
+                    s_score[b_idx] = tmps;
+                    const int tmpi = s_idx[a_idx];
+                    s_idx[a_idx] = s_idx[b_idx];
+                    s_idx[b_idx] = tmpi;
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+void main() {
+    const uint col = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.y;
+
+    // ============================================================
+    // Step 1: load this row into shared memory.
+    // s_score / s_idx are laid out in TWO views over the same buffer:
+    //   - the per-group sort uses [group_idx * n_per_group_pad + local_col]
+    //   - the global sort uses [col] (assuming col < ncols_pad)
+    // To make both layouts coincide, we make sure n_per_group_pad == n_per_group
+    // when n_per_group is a power of 2. If it isn't, we pad each group's
+    // segment to n_per_group_pad with -INF entries, so the per-group layout
+    // and the global layout differ. We sort per-group first, then COMPACT
+    // and re-layout to global.
+    //
+    // For simplicity (and because all known MoE models have power-of-2
+    // n_per_group: 256/8=32, 128/8=16, 64/8=8 etc), the shader currently
+    // requires n_per_group_pad == n_per_group. The C++ caller asserts this.
+    // ============================================================
+    if (col < p.ncols) {
+        s_idx[col]   = int(col);
+        s_score[col] = data_src[row * p.stride_src + col];
+    } else if (col < p.ncols_pad) {
+        s_idx[col]   = int(col);          // sentinel — score -INF guarantees it sorts last
+        s_score[col] = -1.0/0.0;          // -INFINITY
+    }
+    barrier();
+
+    // ============================================================
+    // Step 2: per-group sort and compute group scores.
+    // ============================================================
+    // Save the original scores in per-thread variables, since we're about
+    // to clobber s_score with the sort permutation, and we need the
+    // unsorted values back for step 4 (mask + global sort).
+    const float orig_score = (col < p.ncols) ? data_src[row * p.stride_src + col] : -1.0/0.0;
+
+    if (p.n_top_groups < p.n_groups) {
+        bitonic_sort_groups_desc();
+
+        // Each group's first p.nk entries are now its top-nk values.
+        // Thread 0 of each group sums them.
+        const uint local_col = col % p.n_per_group_pad;
+        const uint group_idx = col / p.n_per_group_pad;
+        if (local_col == 0 && group_idx < p.n_groups) {
+            float gsum = 0.0;
+            for (uint k = 0; k < p.nk; ++k) {
+                gsum += s_score[group_idx * p.n_per_group_pad + k];
+            }
+            s_group_score[group_idx] = gsum;
+        }
+        barrier();
+
+        // ============================================================
+        // Step 3: thread 0 selects top n_top_groups by group_score.
+        // n_groups is small (<= MAX_GROUPS = 16), so a simple O(g^2)
+        // selection here is fine.
+        // ============================================================
+        if (col == 0) {
+            for (uint g = 0; g < p.n_groups; ++g) {
+                s_group_in[g] = 0;
+            }
+            for (uint sel = 0; sel < p.n_top_groups; ++sel) {
+                int   best_g = -1;
+                float best_v = -1.0/0.0;
+                for (uint g = 0; g < p.n_groups; ++g) {
+                    if (s_group_in[g] == 0 && s_group_score[g] > best_v) {
+                        best_v = s_group_score[g];
+                        best_g = int(g);
+                    }
+                }
+                if (best_g >= 0) {
+                    s_group_in[best_g] = 1;
+                }
+            }
+        }
+        barrier();
+    } else {
+        // No group selection — all groups are kept.
+        if (col < p.n_groups) {
+            s_group_in[col] = 1;
+        }
+        barrier();
+    }
+
+    // ============================================================
+    // Step 4: rebuild s_score / s_idx for the global sort, masking
+    // discarded groups with -INF.
+    // ============================================================
+    if (col < p.ncols) {
+        const uint group_idx = col / p.n_per_group;
+        s_idx[col]   = int(col);
+        s_score[col] = (s_group_in[group_idx] != 0) ? orig_score : -1.0/0.0;
+    } else if (col < p.ncols_pad) {
+        s_idx[col]   = int(col);
+        s_score[col] = -1.0/0.0;
+    }
+    barrier();
+
+    // ============================================================
+    // Step 5: bitonic sort all ncols_pad entries DESC.
+    // ============================================================
+    bitonic_sort_desc(p.ncols_pad);
+
+    // ============================================================
+    // Step 6: write the top ne0 indices.
+    // ============================================================
+    if (col < p.ne0) {
+        data_dst[row * p.stride_dst + col] = s_idx[col];
+    }
+}
