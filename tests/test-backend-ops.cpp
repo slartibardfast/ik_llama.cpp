@@ -1040,6 +1040,99 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_DELTA_NET — recurrent linear-attention used by Qwen3-Next /
+// Qwen3.5-A3B. Mirrors the model's tensor construction in
+// llama-delta-net.cpp::build_fused_delta_net so that the data layout
+// (in particular g and beta, which the CPU formula reads in pre-permute
+// order) matches what the production op expects.
+struct test_delta_net : public test_case {
+    const int64_t head_dim;     // S_k == S_v
+    const int64_t n_tokens;
+    const int64_t H_v;          // n_v_heads
+    const int64_t gqa_ratio;    // H_v / H_k
+    const int64_t n_seqs;
+    const int     repeat_type;  // 0 = tiled, 1 = interleaved
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_dim, n_tokens, H_v, gqa_ratio, n_seqs, repeat_type);
+    }
+
+    test_delta_net(int64_t head_dim = 128, int64_t n_tokens = 1, int64_t H_v = 32,
+                   int64_t gqa_ratio = 4, int64_t n_seqs = 1, int repeat_type = 0)
+        : head_dim(head_dim), n_tokens(n_tokens), H_v(H_v),
+          gqa_ratio(gqa_ratio), n_seqs(n_seqs), repeat_type(repeat_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H_k = H_v / gqa_ratio;
+        GGML_ASSERT(H_k * gqa_ratio == H_v);
+
+        // q, k: contiguous [head_dim, n_tokens, H_k, n_seqs]. The model
+        // produces these via permute+l2_norm; here we construct them
+        // directly since the access formula is the same for both layouts.
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, H_k, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, H_k, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+
+        // v: model permutes from [head_dim, H_v, n_tokens, n_seqs] →
+        // [head_dim, n_tokens, H_v, n_seqs]. Mirror that pattern so the
+        // strides exercise the permuted layout in the dispatch.
+        ggml_tensor * v_pre = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, H_v, n_tokens, n_seqs);
+        ggml_set_name(v_pre, "v_pre");
+        ggml_tensor * v = ggml_permute(ctx, v_pre, 0, 2, 1, 3);
+        ggml_set_name(v, "v");
+
+        // g: pre-permute shape [H_v, n_tokens, n_seqs] (contig), permute to
+        // [n_tokens, 1, H_v, n_seqs]. The CPU access formula reads the
+        // pre-permute memory order so the underlying data must live there.
+        ggml_tensor * g_pre = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_tokens, n_seqs);
+        ggml_set_name(g_pre, "g_pre");
+        ggml_tensor * g = ggml_permute(ctx, g_pre, 2, 0, 3, 1);
+        ggml_set_name(g, "g");
+
+        // beta: pre-permute shape [H_v, 1, n_tokens, n_seqs] contig,
+        // permute(2, 0, 1, 3) → [1, n_tokens, H_v, n_seqs]. Same memory
+        // layout principle as g.
+        ggml_tensor * beta_pre = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, H_v, 1, n_tokens, n_seqs);
+        ggml_set_name(beta_pre, "beta_pre");
+        ggml_tensor * beta = ggml_permute(ctx, beta_pre, 2, 0, 1, 3);
+        ggml_set_name(beta, "beta");
+
+        // state: contiguous [head_dim, head_dim*H_v, 1, n_seqs] (matches the
+        // model's reshape after the per-layer state buffer split).
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, head_dim * H_v, 1, n_seqs);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * out = ggml_delta_net(ctx, q, k, v, g, beta, state);
+        out->op_params[0] = repeat_type;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            // Use a small range for stable recurrent dynamics. The state
+            // recurrence amplifies large inputs (decay = exp(g)) — keep g
+            // strictly negative so decay stays bounded.
+            if (std::string(t->name) == "g_pre") {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else if (std::string(t->name) == "beta_pre") {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else if (std::string(t->name) == "state") {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // The recurrent state update accumulates rounding error over n_tokens
+        // iterations. Loosen the tolerance for longer sequences.
+        return n_tokens > 16 ? 1e-3 : 5e-5;
+    }
+};
+
 // GGML_OP_L2_NORM
 struct test_l2_norm : public test_case {
     const ggml_type type;
@@ -2989,6 +3082,30 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_ssm_conv(4, 256, 4,  4, 4, 2)); // multi-seq fanout nc4
     test_cases.emplace_back(new test_ssm_conv(8, 64,  4,  4, 4, 0)); // multi-seq unique general nc
     test_cases.emplace_back(new test_ssm_conv(8, 64,  4,  4, 4, 1)); // multi-seq recurrent general nc
+
+    // DELTA_NET — Qwen3-Next / Qwen3.5-A3B recurrent linear-attention.
+    // Coverage matrix: head_dim ∈ {64, 128} × n_tokens × GQA × repeat_type.
+    // The Qwen3-Next-shaped cases (head_dim=128, H_v=32, gqa=4) are the
+    // primary correctness target.
+    test_cases.emplace_back(new test_delta_net( 64,   1,  2, 1, 1, 0)); // smallest tg
+    test_cases.emplace_back(new test_delta_net( 64,   1,  8, 2, 1, 0)); // GQA tiled tg
+    test_cases.emplace_back(new test_delta_net( 64,   1,  8, 2, 1, 1)); // GQA interleaved tg
+    test_cases.emplace_back(new test_delta_net( 64,   4,  8, 1, 1, 0)); // small pp
+    test_cases.emplace_back(new test_delta_net( 64,  64,  8, 1, 1, 0)); // medium pp
+    test_cases.emplace_back(new test_delta_net( 64,  64,  8, 4, 1, 0)); // GQA stress tiled
+    test_cases.emplace_back(new test_delta_net( 64,  64,  8, 4, 1, 1)); // GQA stress interleaved
+    test_cases.emplace_back(new test_delta_net( 64,  64,  8, 1, 2, 0)); // multi-seq
+    test_cases.emplace_back(new test_delta_net(128,   1,  2, 1, 1, 0)); // h128 baseline
+    test_cases.emplace_back(new test_delta_net(128,   1, 32, 4, 1, 0)); // Qwen3-Next tg tiled
+    test_cases.emplace_back(new test_delta_net(128,   1, 32, 4, 1, 1)); // Qwen3-Next tg interleaved
+    test_cases.emplace_back(new test_delta_net(128,   8, 32, 4, 1, 0)); // small Qwen3-Next pp
+    test_cases.emplace_back(new test_delta_net(128,  64, 32, 4, 1, 0)); // medium Qwen3-Next pp
+    test_cases.emplace_back(new test_delta_net(128, 256, 32, 4, 1, 0)); // full Qwen3-Next pp tiled
+    test_cases.emplace_back(new test_delta_net(128, 256, 32, 4, 1, 1)); // full Qwen3-Next pp interleaved
+    test_cases.emplace_back(new test_delta_net(128, 256, 32, 4, 2, 0)); // multi-seq Qwen3-Next pp
+    test_cases.emplace_back(new test_delta_net(128, 256, 32, 4, 2, 1)); // multi-seq interleaved
+    test_cases.emplace_back(new test_delta_net(128,   1,  1, 1, 1, 0)); // degenerate single head
+    test_cases.emplace_back(new test_delta_net(128,   4,  4, 2, 2, 1)); // small mixed
     // FUSED_MUL_UNARY with scalar broadcast (Qwen3.5 shared expert
     // single-token decode pattern: shape [1] gate × [n_ff] feature output).
     // The CPU op only allows SILU/SIGMOID for the broadcast variant.

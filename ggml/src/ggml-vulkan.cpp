@@ -534,6 +534,16 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_unique_f32;
     vk_pipeline pipeline_ssm_conv_unique_nc4_f32;
 
+    // DELTA_NET — Qwen3-Next / Qwen3.5-A3B recurrent linear-attention core.
+    // HEAD_DIM is selected at pipeline-create via spec const 0; the same SPV
+    // is reused for both head_dims. Reduction strategy is a build-time
+    // choice. The shmem variant is universal; the subgroup variant only
+    // exists for the case where the workgroup fits in one subgroup
+    // (HEAD_DIM == subgroup_size — only Vega + h64 today).
+    vk_pipeline pipeline_delta_net_h64_shmem_f32;
+    vk_pipeline pipeline_delta_net_h64_subgroup_f32;
+    vk_pipeline pipeline_delta_net_h128_shmem_f32;
+
     // Persistent atomic state buffer for the unique-fast / slow gating
     // (lazily allocated on first multi-seq SSM_CONV call). Layout:
     //   data[0]                         = fast_path_ok (init 1, validate may clear to 0)
@@ -1001,6 +1011,22 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t src0_s2;
     uint32_t src1_s1;
     uint32_t src3_s1;
+    uint32_t dst_state_offset;
+};
+
+// Push constants for DELTA_NET (recurrent linear-attention). Mirrors the
+// glsl block in delta_net.comp. v_nb1/v_nb2/v_nb3 are passed because the
+// model permutes v before calling the op.
+struct vk_op_delta_net_push_constants {
+    uint32_t n_tokens;
+    uint32_t n_heads;       // = H_v
+    uint32_t n_seqs;
+    uint32_t n_heads_kq;    // = H_v / gqa_ratio
+    uint32_t gqa_ratio;
+    uint32_t repeat_type;   // 0 = tiled, non-zero = interleaved
+    uint32_t v_nb1;         // v stride for token (in floats)
+    uint32_t v_nb2;         // v stride for head  (in floats)
+    uint32_t v_nb3;         // v stride for batch (in floats)
     uint32_t dst_state_offset;
 };
 
@@ -3500,6 +3526,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_unique_nc4_f32, "ssm_conv_unique_nc4_f32",
             ssm_conv_unique_nc4_f32_len, ssm_conv_unique_nc4_f32_data, "main", 5,
             sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {}, 1);
+
+    // DELTA_NET — Vulkan port. HEAD_DIM is baked into each SPV via #define
+    // (one SPV per head_dim). The shmem variant is universal. The subgroup
+    // variant requires the entire workgroup to fit in one subgroup so a
+    // single subgroupAdd suffices — only created when HEAD_DIM ==
+    // subgroup_size (Vega: 64). Today nothing exposes a 128-wide subgroup,
+    // so h128 always uses shmem.
+    ggml_vk_create_pipeline(device, device->pipeline_delta_net_h64_shmem_f32, "delta_net_h64_shmem_f32",
+            delta_net_h64_shmem_f32_len, delta_net_h64_shmem_f32_data, "main", 7,
+            sizeof(vk_op_delta_net_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_delta_net_h128_shmem_f32, "delta_net_h128_shmem_f32",
+            delta_net_h128_shmem_f32_len, delta_net_h128_shmem_f32_data, "main", 7,
+            sizeof(vk_op_delta_net_push_constants), {128, 1, 1}, {}, 1);
+    if (device->subgroup_size == 64) {
+        ggml_vk_create_pipeline(device, device->pipeline_delta_net_h64_subgroup_f32, "delta_net_h64_subgroup_f32",
+                delta_net_h64_subgroup_f32_len, delta_net_h64_subgroup_f32_data, "main", 7,
+                sizeof(vk_op_delta_net_push_constants), {64, 1, 1}, {}, 1, false, true, 64);
+    }
 
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -9419,6 +9463,120 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     (void)pipeline_slow;
 }
 
+// DELTA_NET — recurrent linear-attention used by Qwen3-Next / Qwen3.5-A3B.
+// 6-arg ik form: ggml_delta_net(q, k, v, g, beta, state). Output is a 1D
+// tensor of (output_size + state_size) floats packed together.
+static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * src0 = dst->src[0];   // q     [S_k, n_tokens, H_k, n_seqs]
+    const ggml_tensor * src1 = dst->src[1];   // k     [S_k, n_tokens, H_k, n_seqs]
+    const ggml_tensor * src2 = dst->src[2];   // v     [S_v, n_tokens, H_v, n_seqs] (may be permuted)
+    const ggml_tensor * src3 = dst->src[3];   // g     [n_tokens, 1, H_v, n_seqs]
+    const ggml_tensor * src4 = dst->src[4];   // beta  [1, n_tokens, H_v, n_seqs]
+    const ggml_tensor * src5 = dst->src[5];   // state [S_v, S_v*H_v, 1, n_seqs]
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_ASSERT(src3->type == GGML_TYPE_F32);
+    GGML_ASSERT(src4->type == GGML_TYPE_F32);
+    GGML_ASSERT(src5->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int64_t S_k      = src0->ne[0];
+    const int64_t n_tokens = src0->ne[1];
+    const int64_t H_k      = src0->ne[2];
+    const int64_t n_seqs   = src0->ne[3];
+    const int64_t S_v      = src2->ne[0];
+    const int64_t H_v      = src2->ne[2];
+
+    GGML_ASSERT(S_k == S_v);                  // ik model invariant (head_dim square)
+    GGML_ASSERT(S_k == 64 || S_k == 128);     // matches iqk fast path coverage
+    GGML_ASSERT(H_v % H_k == 0);
+
+    const int gqa_ratio   = (int)(H_v / H_k);
+    const int repeat_type = dst->op_params[0];
+
+    // Pipeline selection: prefer the subgroup-add reduction when the
+    // workgroup fits in one subgroup (currently only Vega + h64).
+    vk_pipeline pipeline = nullptr;
+    if (S_k == 64) {
+        pipeline = ctx->device->pipeline_delta_net_h64_subgroup_f32
+                       ? ctx->device->pipeline_delta_net_h64_subgroup_f32
+                       : ctx->device->pipeline_delta_net_h64_shmem_f32;
+    } else {
+        pipeline = ctx->device->pipeline_delta_net_h128_shmem_f32;
+    }
+    GGML_ASSERT(pipeline);
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const uint32_t output_size = (uint32_t)(S_v * H_v * n_tokens * n_seqs);
+
+    vk_op_delta_net_push_constants pc{};
+    pc.n_tokens         = (uint32_t)n_tokens;
+    pc.n_heads          = (uint32_t)H_v;
+    pc.n_seqs           = (uint32_t)n_seqs;
+    pc.n_heads_kq       = (uint32_t)H_k;
+    pc.gqa_ratio        = (uint32_t)gqa_ratio;
+    pc.repeat_type      = (uint32_t)repeat_type;
+    pc.v_nb1            = (uint32_t)(src2->nb[1] / sizeof(float));
+    pc.v_nb2            = (uint32_t)(src2->nb[2] / sizeof(float));
+    pc.v_nb3            = (uint32_t)(src2->nb[3] / sizeof(float));
+    pc.dst_state_offset = output_size;
+
+    auto * src0_buf = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    auto * src1_buf = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    auto * src2_buf = (ggml_backend_vk_buffer_context *)src2->buffer->context;
+    auto * src3_buf = (ggml_backend_vk_buffer_context *)src3->buffer->context;
+    auto * src4_buf = (ggml_backend_vk_buffer_context *)src4->buffer->context;
+    auto * src5_buf = (ggml_backend_vk_buffer_context *)src5->buffer->context;
+    auto * dst_buf  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    vk_buffer d_q   = src0_buf->dev_buffer;
+    vk_buffer d_k   = src1_buf->dev_buffer;
+    vk_buffer d_v   = src2_buf->dev_buffer;
+    vk_buffer d_g   = src3_buf->dev_buffer;
+    vk_buffer d_b   = src4_buf->dev_buffer;
+    vk_buffer d_s   = src5_buf->dev_buffer;
+    vk_buffer d_dst = dst_buf->dev_buffer;
+
+    const uint64_t off_q   = vk_tensor_offset(src0) + src0->view_offs;
+    const uint64_t off_k   = vk_tensor_offset(src1) + src1->view_offs;
+    const uint64_t off_v   = vk_tensor_offset(src2) + src2->view_offs;
+    const uint64_t off_g   = vk_tensor_offset(src3) + src3->view_offs;
+    const uint64_t off_b   = vk_tensor_offset(src4) + src4->view_offs;
+    const uint64_t off_s   = vk_tensor_offset(src5) + src5->view_offs;
+    const uint64_t off_dst = vk_tensor_offset(dst)  + dst->view_offs;
+
+    const uint64_t sz_q   = ggml_nbytes(src0);
+    const uint64_t sz_k   = ggml_nbytes(src1);
+    const uint64_t sz_v   = ggml_nbytes(src2);
+    const uint64_t sz_g   = ggml_nbytes(src3);
+    const uint64_t sz_b   = ggml_nbytes(src4);
+    const uint64_t sz_s   = ggml_nbytes(src5);
+    const uint64_t sz_dst = ggml_nbytes(dst);
+
+    // ggml_vk_dispatch_pipeline divides `elements` by `wg_denoms` to get the
+    // workgroup count, so we have to multiply our desired (H_v, n_seqs, 1)
+    // workgroup grid by the wg_denoms ({HEAD_DIM, 1, 1}).
+    const uint32_t head_dim_u = (uint32_t)S_k;
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {
+            vk_subbuffer{ d_q,   off_q,   sz_q   },
+            vk_subbuffer{ d_k,   off_k,   sz_k   },
+            vk_subbuffer{ d_v,   off_v,   sz_v   },
+            vk_subbuffer{ d_g,   off_g,   sz_g   },
+            vk_subbuffer{ d_b,   off_b,   sz_b   },
+            vk_subbuffer{ d_s,   off_s,   sz_s   },
+            vk_subbuffer{ d_dst, off_dst, sz_dst },
+        },
+        pc, { (uint32_t)H_v * head_dim_u, (uint32_t)n_seqs, 1 });
+}
+
 static void ggml_vk_grouped_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     int32_t * op_params = (int32_t *)dst->op_params;
     const uint32_t n_groups     = (uint32_t)op_params[0];
@@ -10641,6 +10799,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_GROUPED_TOPK:
     case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SSM_CONV:
+    case GGML_OP_DELTA_NET:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -10987,6 +11146,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_DELTA_NET:
+        ggml_vk_delta_net(ctx, compute_ctx, node, dryrun);
+
+        break;
+
     //case GGML_OP_RWKV_WKV6:
     //    ggml_vk_rwkv_wkv6(ctx, compute_ctx, node, dryrun);
 
@@ -11092,6 +11256,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_GROUPED_TOPK:
     case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SSM_CONV:
+    case GGML_OP_DELTA_NET:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -12630,6 +12795,33 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             if (op->src[3]->nb[0] != sizeof(int32_t)) return false;
             if (op->src[2]->ne[0] > 8) return false;           // nc cap (universal nc=4)
             return true;
+        case GGML_OP_DELTA_NET: {
+            // ik 6-arg form: ggml_delta_net(q, k, v, g, beta, state). Vulkan
+            // matches the iqk fast path's coverage: head_dim ∈ {64, 128},
+            // S_k == S_v (square head), GQA via H_v % H_k == 0, contiguous
+            // q/k/state. v may be permuted (its strides are passed through).
+            if (!op->src[0] || !op->src[1] || !op->src[2] ||
+                !op->src[3] || !op->src[4] || !op->src[5]) return false;
+            for (int i = 0; i < 6; ++i) {
+                if (op->src[i]->type != GGML_TYPE_F32) return false;
+            }
+            if (op->type != GGML_TYPE_F32) return false;
+            const int64_t S_k = op->src[0]->ne[0];
+            const int64_t S_v = op->src[2]->ne[0];
+            if (S_k != S_v) return false;
+            if (S_k != 64 && S_k != 128) return false;
+            const int64_t H_k = op->src[0]->ne[2];
+            const int64_t H_v = op->src[2]->ne[2];
+            if (H_v == 0 || H_k == 0 || H_v % H_k != 0) return false;
+            // q, k, state must be contiguous; v may be permuted (we pass
+            // its byte strides through), but its innermost dim must be
+            // packed (nb[0] == sizeof(float)).
+            if (!ggml_is_contiguous(op->src[0])) return false;
+            if (!ggml_is_contiguous(op->src[1])) return false;
+            if (op->src[2]->nb[0] != sizeof(float)) return false;
+            if (!ggml_is_contiguous(op->src[5])) return false;
+            return true;
+        }
         case GGML_OP_GROUPED_TOPK:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) return false;

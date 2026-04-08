@@ -1,0 +1,176 @@
+#version 450
+
+// DELTA_NET — Vulkan port of ik fork's `ggml_delta_net` op.
+//
+// The op is the recurrent linear-attention core used by Qwen3-Next /
+// Qwen3.5-A3B hybrid Mamba-Transformer models. Per (head, seq) we maintain
+// a head_dim × head_dim state matrix; for each token in the batch we
+// update it via an outer-product step and emit one head_dim-sized output
+// vector. The recurrence is serial within a (head, seq); heads and
+// sequences are independent.
+//
+// Storage convention (DIFFERENT from upstream's ggml_gated_delta_net):
+//   state[col * head_dim + row]   ← col slow (k_idx), row fast (v_idx)
+// This is the TRANSPOSE of the canonical [d_v, d_k] state used by
+// upstream's gated_delta_net.comp.
+//
+// Parallelization:
+//   gl_WorkGroupID.x = head_idx ∈ [0, n_heads)        (= H_v)
+//   gl_WorkGroupID.y = batch_idx ∈ [0, n_seqs)
+//   local_size_x     = HEAD_DIM                        (one thread per state row)
+//
+// Each thread holds ONE row of state in registers (HEAD_DIM floats). The
+// state load/store happens once per dispatch — amortized across n_tokens.
+//
+// Compile-time variants:
+//   HEAD_DIM ∈ {64, 128}     spec constant 0
+//   USE_SUBGROUP_ADD         define — if set, use subgroupAdd for the
+//                            attn_score reduction (single-subgroup case)
+
+#extension GL_EXT_control_flow_attributes : require
+#ifdef USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#endif
+
+// HEAD_DIM is set at SPV-gen time via -DHEAD_DIM=64 or -DHEAD_DIM=128. The
+// shader is compiled twice — once per head_dim — because using spec
+// constants for array sizes turns out to be unreliable on some Vulkan
+// implementations (the workgroup dispatches ran with a single thread,
+// likely from a workgroup-size spec-constant aliasing bug).
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+layout(local_size_x = HEAD_DIM, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q     { float data_q[];     };
+layout(binding = 1) readonly buffer K     { float data_k[];     };
+layout(binding = 2) readonly buffer V     { float data_v[];     };
+layout(binding = 3) readonly buffer G     { float data_g[];     };
+layout(binding = 4) readonly buffer Beta  { float data_beta[];  };
+layout(binding = 5) readonly buffer State { float data_state[]; };
+layout(binding = 6)          buffer Dst   { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint n_tokens;
+    uint n_heads;          // H_v
+    uint n_seqs;
+    uint n_heads_kq;       // H_v / gqa_ratio
+    uint gqa_ratio;
+    uint repeat_type;      // 0 = tiled, non-zero = interleaved
+    uint v_nb1;            // v stride for token (in floats)
+    uint v_nb2;            // v stride for head  (in floats)
+    uint v_nb3;            // v stride for batch (in floats)
+    uint dst_state_offset; // = head_dim * H_v * n_tokens * n_seqs (output_size)
+} p;
+
+// Per-token cooperative loads of q and k.
+shared float k_shared[HEAD_DIM];
+shared float q_shared[HEAD_DIM];
+#ifndef USE_SUBGROUP_ADD
+shared float reduce_partial[HEAD_DIM];
+#endif
+
+float workgroup_reduce_add(float v) {
+#ifdef USE_SUBGROUP_ADD
+    return subgroupAdd(v);
+#else
+    const uint tid = gl_LocalInvocationID.x;
+    reduce_partial[tid] = v;
+    barrier();
+    [[unroll]] for (uint s = HEAD_DIM / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            reduce_partial[tid] += reduce_partial[tid + s];
+        }
+        barrier();
+    }
+    return reduce_partial[0];
+#endif
+}
+
+void main() {
+    const uint head_idx  = gl_WorkGroupID.x;
+    const uint batch_idx = gl_WorkGroupID.y;
+    const uint my_row    = gl_LocalInvocationID.x;
+
+    if (my_row >= HEAD_DIM) return;
+
+    // GQA: head_idx_kq picks which q/k head this v-head reads from.
+    const uint head_idx_kq = (p.repeat_type == 0u)
+        ? (head_idx / p.gqa_ratio)
+        : (head_idx % p.n_heads_kq);
+
+    // Address bases (in float units)
+    const uint head_dim_sq        = HEAD_DIM * HEAD_DIM;
+    const uint state_off          = batch_idx * (head_dim_sq * p.n_heads)
+                                  + head_idx  * head_dim_sq;
+    const uint qkv_kq_off         = batch_idx * (HEAD_DIM * p.n_tokens * p.n_heads_kq)
+                                  + head_idx_kq * (HEAD_DIM * p.n_tokens);
+    const uint gb_off             = batch_idx * (p.n_tokens * p.n_heads) + head_idx;
+    const uint out_head_off       = batch_idx * (HEAD_DIM * p.n_heads * p.n_tokens)
+                                  + head_idx * HEAD_DIM;
+    const uint out_token_stride   = HEAD_DIM * p.n_heads;
+
+    const float scale = inversesqrt(float(HEAD_DIM));
+
+    // Load initial state — my row across all columns. Strided global reads,
+    // but only ONCE per dispatch (amortized across n_tokens).
+    float my_state[HEAD_DIM];
+    [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+        my_state[c] = data_state[state_off + c * HEAD_DIM + my_row];
+    }
+
+    for (uint t = 0u; t < p.n_tokens; ++t) {
+        const uint q_off = qkv_kq_off + t * HEAD_DIM;
+        const uint k_off = q_off;
+        const uint v_off = batch_idx * p.v_nb3 + head_idx * p.v_nb2 + t * p.v_nb1;
+
+        // Cooperative q, k load — coalesced across the workgroup.
+        k_shared[my_row] = data_k[k_off + my_row];
+        q_shared[my_row] = data_q[q_off + my_row];
+        barrier();
+
+        // attn_score = (q . k) * scale
+        const float attn_partial = q_shared[my_row] * k_shared[my_row];
+        const float attn_score   = workgroup_reduce_add(attn_partial) * scale;
+
+        // Per-token scalars (broadcast — same value for all threads)
+        const float beta_raw = data_beta[gb_off + t * p.n_heads];
+        const float g_val    = data_g[gb_off + t * p.n_heads];
+        const float beta_val = 1.0f / (1.0f + exp(-beta_raw));
+        const float decay    = exp(min(g_val, 50.0f));
+
+        // Per-row dot products against my row of state.
+        // v_prime[row] = sum_col(state[col, row] * k[col])
+        // out_val[row] = sum_col(state[col, row] * q[col])
+        float v_prime = 0.0f;
+        float out_val = 0.0f;
+        [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+            const float s = my_state[c];
+            v_prime += s * k_shared[c];
+            out_val += s * q_shared[c];
+        }
+
+        // v_new for this row (thread-local — only used by this thread).
+        const float v_t_my = data_v[v_off + my_row];
+        const float v_new  = v_t_my * beta_val - v_prime * beta_val * decay;
+
+        // Output for this row at this token. Coalesced write across rows.
+        data_dst[out_head_off + t * out_token_stride + my_row]
+            = out_val * decay * scale + v_new * attn_score;
+
+        // State update — purely in this thread's registers.
+        // state[col, row] = clamp(decay * state[col, row] + v_new[row] * k[col], -1e6, 1e6)
+        [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+            const float s = decay * my_state[c] + v_new * k_shared[c];
+            my_state[c] = clamp(s, -1.0e6f, 1.0e6f);
+        }
+
+        barrier(); // ensure k_shared/q_shared can be overwritten next iter
+    }
+
+    // Write final state back. Same strided pattern as the load.
+    [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+        data_dst[p.dst_state_offset + state_off + c * HEAD_DIM + my_row] = my_state[c];
+    }
+}

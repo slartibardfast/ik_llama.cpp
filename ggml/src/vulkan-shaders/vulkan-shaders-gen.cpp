@@ -692,6 +692,17 @@ void process_shaders() {
     string_to_spv("ssm_conv_unique_f32",          "ssm_conv_unique.comp",      {});
     string_to_spv("ssm_conv_unique_nc4_f32",      "ssm_conv_unique.comp",      {{"NC4", "1"}});
 
+    // DELTA_NET — Vulkan port. The op is Qwen3-Next / Qwen3.5-A3B's recurrent
+    // linear-attention core. One workgroup per (head, seq); each thread holds
+    // one row of state in registers. HEAD_DIM is a #define (matches iqk fast
+    // path: 64 and 128). Reduction strategy is a build-time choice: shmem is
+    // universal, subgroup-add is selected at pipeline-create when the entire
+    // workgroup fits in one subgroup.
+    string_to_spv("delta_net_h64_shmem_f32",     "delta_net.comp", {{"HEAD_DIM", "64"}});
+    string_to_spv("delta_net_h64_subgroup_f32",  "delta_net.comp", {{"HEAD_DIM", "64"},  {"USE_SUBGROUP_ADD", "1"}});
+    string_to_spv("delta_net_h128_shmem_f32",    "delta_net.comp", {{"HEAD_DIM", "128"}});
+    string_to_spv("delta_net_h128_subgroup_f32", "delta_net.comp", {{"HEAD_DIM", "128"}, {"USE_SUBGROUP_ADD", "1"}});
+
     // MUL_MULTI_ADD: ik-specific MoE expert combine
     // (sum_j src0[k,j,t] * src1[0,j,t]). Single F32 variant.
     string_to_spv("mul_multi_add_f32", "mul_multi_add.comp", {});
