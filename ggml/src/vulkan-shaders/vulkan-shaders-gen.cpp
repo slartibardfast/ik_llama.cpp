@@ -504,10 +504,15 @@ void process_shaders() {
             // USE_F16ACC tells the shader to take the RPM-friendly code path
             // (paired f16vec2 fma's that RADV's NIR vectorizer lowers to
             // v_pk_fma_f16). FLOAT_TYPE_VEC2=f16vec2 names the vector type.
-            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}}));
-            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
-            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
-            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPE_VEC2", "f16vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            // FLOAT_TYPE = float for safe accumulation; the USE_F16ACC flag
+            // gates explicit f16vec2 RPM products in the inner loop. The
+            // temp[] accumulator, sccache, reduce_result, and subgroupAdd
+            // all operate in f32 to prevent overflow at realistic activation
+            // magnitudes (~50× larger than test uniform [-1,1]).
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32",          shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f32_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float"},     {"B_TYPE_VEC2", "vec2"},    {"B_TYPE_VEC4", "vec4"},    {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16acc_f16_f32_subgroup", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {"USE_F16ACC", "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
 
         string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));

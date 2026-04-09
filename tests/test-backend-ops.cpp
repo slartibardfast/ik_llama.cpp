@@ -1257,6 +1257,37 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Stress variant of test_mul_mat: uses a wider B-vector (activation) range
+// to catch f16 accumulator overflow on Vega's f16acc mul_mat_vec path.
+// Real model activations after ~40 residual layers are 10-50× larger than
+// the default [-1, 1] test data. Phase 20c's f16acc (FLOAT_TYPE=float16_t)
+// overflows at these magnitudes; the f32 path does not.
+struct test_mul_mat_stress : public test_mul_mat {
+    float b_range;
+
+    test_mul_mat_stress(ggml_type type_a, ggml_type type_b,
+                        int64_t m, int64_t n, int64_t k, float b_range)
+        : test_mul_mat(type_a, type_b, m, n, k, {1, 1}, {1, 1}),
+          b_range(b_range) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_b, m, n, k, bs, nr) +
+               ",b_range=" + std::to_string((int)b_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) {
+                // B tensor (activations) — use wide range
+                init_tensor_uniform(t, -b_range, b_range);
+            } else {
+                // A tensor (quantized weights) — standard range
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -3173,7 +3204,20 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         }
     }
 
-    // Large-M tests (output/lm_head matmul dimensions)
+    // MUL_MAT stress: realistic activation magnitudes for f16acc overflow
+    // detection. B∈[-10,10] and B∈[-50,50] capture what deep residual models
+    // produce. n=1 tests mul_mat_vec (tg path); n=8 tests mul_mm (pp path).
+    // Both use f16acc on Vega (FLOAT_TYPE/ACC_TYPE = float16_t).
+    for (float br : {10.0f, 50.0f}) {
+        for (ggml_type ta : {GGML_TYPE_Q8_0,
+                             GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                             GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                             GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S}) {
+            test_cases.emplace_back(new test_mul_mat_stress(ta, GGML_TYPE_F32, 2048, 1, 2048, br));
+            test_cases.emplace_back(new test_mul_mat_stress(ta, GGML_TYPE_F32, 2048, 8, 2048, br));
+        }
+    }
+
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K}) {
         // m=vocab_size, n=1 (token gen), k=hidden_dim
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 32000, 1, 256, {1, 1}, {1, 1}));

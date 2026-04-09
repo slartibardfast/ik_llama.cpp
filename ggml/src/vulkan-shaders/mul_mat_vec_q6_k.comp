@@ -101,9 +101,15 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             s3_acc = fma(by96_hi, q3_hi, s3_acc);
             const FLOAT_TYPE s3 = s3_acc.x + s3_acc.y;
 
-            f16vec2 d_acc = f16vec2(s0, s1) * f16vec2(sccache[csel][ix][s_offset], sccache[csel][ix][s_offset + 2]);
-            d_acc = fma(f16vec2(s2, s3), f16vec2(sccache[csel][ix][s_offset + 4], sccache[csel][ix][s_offset + 6]), d_acc);
-            temp[j][n] = fma(d_acc.x + d_acc.y, d, temp[j][n]);
+            // Scale multiply in f32 — the f16vec2 dot products above (s0..s3)
+            // can reach O(1000+) with large activations, and scales are ±128;
+            // the product exceeds f16 max (65504). Promote to float here; the
+            // 8 inner f16vec2 fma's above still emit v_pk_fma_f16.
+            const float d_sum = float(s0) * float(sccache[csel][ix][s_offset])
+                              + float(s1) * float(sccache[csel][ix][s_offset + 2])
+                              + float(s2) * float(sccache[csel][ix][s_offset + 4])
+                              + float(s3) * float(sccache[csel][ix][s_offset + 6]);
+            temp[j][n] = fma(FLOAT_TYPE(d_sum), d, temp[j][n]);
 #else
             FLOAT_TYPE sum[4] = {FLOAT_TYPE(0), FLOAT_TYPE(0), FLOAT_TYPE(0), FLOAT_TYPE(0)};
             [[unroll]] for (uint l = 0; l < 4; ++l) {

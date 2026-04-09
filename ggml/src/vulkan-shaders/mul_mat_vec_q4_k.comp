@@ -112,11 +112,12 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
             smin_acc = fma(sum20_232, f16vec2(sc6, sc7), smin_acc);
             const FLOAT_TYPE smin = smin_acc.x + smin_acc.y;
 
-            // dall * (sx*sc0 + sy*sc1 + sz*sc4 + sw*sc5) - dmin*smin + temp
-            f16vec2 d_acc = f16vec2(sx, sy) * f16vec2(sc0, sc1);
-            d_acc = fma(f16vec2(sz, sw), f16vec2(sc4, sc5), d_acc);
-            const FLOAT_TYPE d_sum = d_acc.x + d_acc.y;
-            temp[j][n] = fma(dall, d_sum, fma(-dmin, smin, temp[j][n]));
+            // Scale multiply in f32 — dot products (sx..sw) can reach O(1000+)
+            // with large activations; scales are 6-bit (0..63). The product
+            // overflows f16 max (65504). Inner f16vec2 fma's still emit RPM.
+            const float d_sum = float(sx) * float(sc0) + float(sy) * float(sc1)
+                              + float(sz) * float(sc4) + float(sw) * float(sc5);
+            temp[j][n] = fma(dall, FLOAT_TYPE(d_sum), fma(-dmin, smin, temp[j][n]));
 #else
             const FLOAT_TYPE sx = fma(FLOAT_TYPE(by10.x),      q4_0,  fma(FLOAT_TYPE(by10.y),  q4_1,  fma(FLOAT_TYPE(by10.z),  q4_2,  FLOAT_TYPE(by10.w) *  q4_3)));
             const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x),     q4_4,  fma(FLOAT_TYPE(by132.y), q4_5,  fma(FLOAT_TYPE(by132.z), q4_6,  FLOAT_TYPE(by132.w) * q4_7)));

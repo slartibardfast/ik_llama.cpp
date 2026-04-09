@@ -4990,14 +4990,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     // (v_pk_fma_f16) and halves VGPR pressure for the accumulator. Pipelines
     // only exist when the device is AMD_GCN5 with fp16; otherwise the pointer
     // is null and we fall through to the existing f32-accumulator path.
-    // f16acc mul_mat_vec on Vega (AMD_GCN5) is DISABLED by default. Phase 20c
-    // measured 0% tg gain, and the f16 accumulation produces NaN on
-    // multi-quant models (Qwen3.5-35B-A3B-UD-IQ3_XXS confirmed — likely an
-    // f16 overflow in the per-thread accumulation or a RADV compiler issue).
-    // Set GGML_VK_ENABLE_F16ACC=1 to force it on for benchmarking.
+    // GGML_VK_DISABLE_F16ACC=1 forces the f32-accumulator path for A/B
+    // benchmarking on the same binary.
     static const bool disable_f16acc = []() {
-        const char * v = std::getenv("GGML_VK_ENABLE_F16ACC");
-        return !(v && v[0] && v[0] != '0');
+        const char * v = std::getenv("GGML_VK_DISABLE_F16ACC");
+        return v && v[0] && v[0] != '0';
     }();
     // Diagnostic: count dispatches to verify the hot path. Dump on process
     // exit when GGML_VK_F16ACC_STATS=1.
