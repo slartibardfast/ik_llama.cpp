@@ -1,0 +1,32 @@
+#version 450
+
+// FUSED_GATE_PREP: softplus(alpha[i] + dt_bias[h]) * ssm_a[h]
+// where h = i % num_v_heads.
+//
+// Fuses add + softplus + mul into a single dispatch. The per-head bias
+// and scale are broadcast across the token dimension.
+//
+// Push constants: KX = total elements, KY = num_v_heads.
+
+#include "generic_head.comp"
+#include "types.comp"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Alpha  { float data_alpha[]; };
+layout (binding = 1) readonly  buffer Bias   { float data_bias[];  };
+layout (binding = 2) readonly  buffer Scale  { float data_scale[]; };
+layout (binding = 3) writeonly buffer D      { float data_d[];     };
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144u
+                 + gl_GlobalInvocationID.y * 512u
+                 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) return;
+
+    const uint h = i % p.KY;  // KY = num_v_heads
+    const float x = data_alpha[i] + data_bias[h];
+    const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+    data_d[i] = sp * data_scale[h];
+}

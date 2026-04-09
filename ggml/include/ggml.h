@@ -699,6 +699,7 @@ extern "C" {
         GGML_OP_REDUCE,
         GGML_OP_FAKE_CPY,
         GGML_OP_FUSED_NORM,
+        GGML_OP_FUSED,
 
         GGML_OP_COUNT,
     };

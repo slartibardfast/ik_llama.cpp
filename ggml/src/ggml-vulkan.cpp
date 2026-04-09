@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-fusion.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -515,6 +516,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_f32;
     vk_pipeline pipeline_grouped_topk_f32;
     vk_pipeline pipeline_mul_multi_add_f32;
+    vk_pipeline pipeline_fused_gate_prep_f32;
     vk_pipeline pipeline_ssm_conv_x_f32;
     vk_pipeline pipeline_ssm_conv_x_nc4_f32;
     vk_pipeline pipeline_ssm_conv_final_state_f32;
@@ -3465,6 +3467,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_multi_add_f32, "mul_multi_add_f32",
             mul_multi_add_f32_len, mul_multi_add_f32_data, "main", 3,
             sizeof(vk_op_mul_multi_add_push_constants), {256, 1, 1}, {}, 1);
+
+    // FUSED_GATE_PREP: softplus(alpha + dt_bias) * ssm_a. 4 bindings
+    // (alpha, bias, scale, dst). Uses standard push constants (KX = nelements,
+    // KY = num_v_heads).
+    ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32, "fused_gate_prep_f32",
+            fused_gate_prep_f32_len, fused_gate_prep_f32_data, "main", 4,
+            sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     // SSM_CONV single-seq pipelines. The NC4 variant unrolls the d_conv=4
     // hot path; the general variant handles arbitrary nc. Both consume the
@@ -8031,6 +8040,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_fused_rms_norm_f32;
         }
         return nullptr;
+    case GGML_OP_FUSED:
+    {
+        const int32_t fid = ((const int32_t *)dst->op_params)[0];
+        if (fid == GGML_FUSION_SILU_MUL) {
+            return ctx->device->pipeline_fused_mul_silu[dst->type == GGML_TYPE_F16];
+        }
+        return nullptr; // GATE_PREP uses custom dispatch, not op_get_pipeline
+    }
     case GGML_OP_FUSED_MUL_UNARY:
         if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
             (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
@@ -9479,6 +9496,51 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     (void)pipeline_slow;
 }
 
+// GGML_OP_FUSED — dispatch by fusion_id.
+static void ggml_vk_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const int32_t fusion_id = ((const int32_t *)dst->op_params)[0];
+
+    if (fusion_id == GGML_FUSION_GATE_PREP) {
+        // softplus(alpha + dt_bias) * ssm_a
+        const ggml_tensor * alpha  = dst->src[0];
+        const ggml_tensor * dt_bias = dst->src[1];
+        const ggml_tensor * ssm_a   = dst->src[2];
+        const int32_t num_v_heads = ((const int32_t *)dst->op_params)[1];
+
+        vk_pipeline pipeline = ctx->device->pipeline_fused_gate_prep_f32;
+        GGML_ASSERT(pipeline);
+
+        if (dryrun) { ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1); return; }
+
+        const uint32_t ne = (uint32_t)ggml_nelements(alpha);
+        const vk_op_push_constants pc = { ne, (uint32_t)num_v_heads, 0.0f, 0.0f };
+
+        ggml_vk_sync_buffers(subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {
+                vk_subbuffer{((ggml_backend_vk_buffer_context *)alpha->buffer->context)->dev_buffer,
+                             vk_tensor_offset(alpha) + alpha->view_offs, ggml_nbytes(alpha)},
+                vk_subbuffer{((ggml_backend_vk_buffer_context *)dt_bias->buffer->context)->dev_buffer,
+                             vk_tensor_offset(dt_bias) + dt_bias->view_offs, ggml_nbytes(dt_bias)},
+                vk_subbuffer{((ggml_backend_vk_buffer_context *)ssm_a->buffer->context)->dev_buffer,
+                             vk_tensor_offset(ssm_a) + ssm_a->view_offs, ggml_nbytes(ssm_a)},
+                vk_subbuffer{((ggml_backend_vk_buffer_context *)dst->buffer->context)->dev_buffer,
+                             vk_tensor_offset(dst) + dst->view_offs, ggml_nbytes(dst)},
+            },
+            pc, { ne, 1, 1 });
+    } else if (fusion_id == GGML_FUSION_SILU_MUL) {
+        // silu(x) * y — reuse the existing fused_mul_silu pipeline via
+        // ggml_vk_op_f32. Pipeline selected by op_get_pipeline (GGML_OP_FUSED
+        // case checks fusion_id and returns pipeline_fused_mul_silu).
+        ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, dst->src[0], dst->src[1], nullptr, dst, GGML_OP_FUSED, {
+            (uint32_t)ggml_nelements(dst->src[0]),
+            0, 0.0f, 0.0f,
+        }, dryrun);
+    } else {
+        GGML_ABORT("unsupported fusion_id %d", fusion_id);
+    }
+}
+
 // DELTA_NET — recurrent linear-attention used by Qwen3-Next / Qwen3.5-A3B.
 // 6-arg ik form: ggml_delta_net(q, k, v, g, beta, state). Output is a 1D
 // tensor of (output_size + state_size) floats packed together.
@@ -10828,6 +10890,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SSM_CONV:
     case GGML_OP_DELTA_NET:
+    case GGML_OP_FUSED:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -11179,6 +11242,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FUSED:
+        ggml_vk_fused(ctx, compute_ctx, node, dryrun);
+
+        break;
+
     //case GGML_OP_RWKV_WKV6:
     //    ggml_vk_rwkv_wkv6(ctx, compute_ctx, node, dryrun);
 
@@ -11285,6 +11353,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_MUL_MULTI_ADD:
     case GGML_OP_SSM_CONV:
     case GGML_OP_DELTA_NET:
+    case GGML_OP_FUSED:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
     case GGML_OP_ARGMAX:
@@ -12849,6 +12918,21 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             if (op->src[2]->nb[0] != sizeof(float)) return false;
             if (!ggml_is_contiguous(op->src[5])) return false;
             return true;
+        }
+        case GGML_OP_FUSED: {
+            const int32_t fid = op->op_params[0];
+            if (fid == GGML_FUSION_GATE_PREP) {
+                return op->src[0] && op->src[1] && op->src[2] &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_F32 &&
+                       op->src[2]->type == GGML_TYPE_F32;
+            }
+            if (fid == GGML_FUSION_SILU_MUL) {
+                return op->src[0] && op->src[1] &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_F32;
+            }
+            return false;
         }
         case GGML_OP_GROUPED_TOPK:
             {

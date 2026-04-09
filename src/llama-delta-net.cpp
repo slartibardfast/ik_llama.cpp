@@ -1,4 +1,5 @@
 #include "llama-delta-net.h"
+#include "ggml-fusion.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
@@ -267,11 +268,8 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
     ggml_build_forward_expand(gf, beta);
     ggml_build_forward_expand(gf, alpha);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, ssm_dt);
-    cb(alpha_biased, "alpha_biased", il);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, ssm_a);
+    // Fused: softplus(alpha + ssm_dt) * ssm_a → one dispatch instead of 3.
+    ggml_tensor * gate = ggml_fused_gate_prep(ctx0, alpha, ssm_dt, ssm_a);
     cb(gate, "gate", il);
 
     return {beta, gate};

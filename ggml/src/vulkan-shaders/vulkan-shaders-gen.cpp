@@ -697,6 +697,9 @@ void process_shaders() {
     string_to_spv("ssm_conv_unique_f32",          "ssm_conv_unique.comp",      {});
     string_to_spv("ssm_conv_unique_nc4_f32",      "ssm_conv_unique.comp",      {{"NC4", "1"}});
 
+    // FUSED_GATE_PREP: softplus(alpha + dt_bias) * ssm_a. Custom push constants.
+    string_to_spv("fused_gate_prep_f32", "fused_gate_prep.comp", {});
+
     // DELTA_NET — Vulkan port. The op is Qwen3-Next / Qwen3.5-A3B's recurrent
     // linear-attention core. One workgroup per (head, seq); each thread holds
     // one row of state in registers. HEAD_DIM is a #define (matches iqk fast

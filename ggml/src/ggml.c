@@ -8,6 +8,7 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "ggml-impl.h"
+#include "ggml-fusion.h"
 #include "ggml-quants.h"
 #include "ggml.h"
 #include "ggml-aarch64.h"
@@ -4319,9 +4320,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "REDUCE",
     "FAKE_CPY",
     "FUSED_NORM",
+    "FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4438,9 +4440,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "reduce(x1,x2,...)",
     "fake_cpy(x,y)",
     "norm(x,y)",
+    "fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -9947,6 +9950,57 @@ struct ggml_tensor * ggml_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_fused_gate_prep
+
+struct ggml_tensor * ggml_fused_gate_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * ssm_a) {
+    GGML_ASSERT(alpha->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ssm_a->type  == GGML_TYPE_F32);
+
+    const int64_t num_v_heads = dt_bias->ne[0];
+    GGML_ASSERT(ssm_a->ne[0] == num_v_heads);
+    GGML_ASSERT(alpha->ne[0] == num_v_heads);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
+
+    int32_t params[2];
+    params[0] = GGML_FUSION_GATE_PREP;
+    params[1] = (int32_t)num_v_heads;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = alpha;
+    result->src[1] = dt_bias;
+    result->src[2] = ssm_a;
+
+    return result;
+}
+
+// ggml_fused_silu_mul
+
+struct ggml_tensor * ggml_fused_silu_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y) {
+    GGML_ASSERT(ggml_are_same_shape(x, y));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    int32_t params[1];
+    params[0] = GGML_FUSION_SILU_MUL;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = x;
+    result->src[1] = y;
 
     return result;
 }
@@ -22586,6 +22640,76 @@ static void ggml_compute_forward_solve_tri(const struct ggml_compute_params * pa
     }
 }
 
+// ggml_compute_forward_fused
+
+static void ggml_compute_forward_fused_gate_prep(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * alpha  = dst->src[0];
+    const struct ggml_tensor * dt_bias = dst->src[1];
+    const struct ggml_tensor * ssm_a   = dst->src[2];
+
+    const int64_t ne = ggml_nelements(alpha);
+    const int32_t num_v_heads = ((const int32_t *)dst->op_params)[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = ir0 + dr < ne ? ir0 + dr : ne;
+
+    const float * src_alpha = (const float *) alpha->data;
+    const float * src_bias  = (const float *) dt_bias->data;
+    const float * src_a     = (const float *) ssm_a->data;
+    float       * dst_data  = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const int h = (int)(i % num_v_heads);
+        const float x = src_alpha[i] + src_bias[h];
+        const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        dst_data[i] = sp * src_a[h];
+    }
+}
+
+static void ggml_compute_forward_fused_silu_mul(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * x = dst->src[0];
+    const struct ggml_tensor * y = dst->src[1];
+
+    const int64_t ne = ggml_nelements(x);
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = ir0 + dr < ne ? ir0 + dr : ne;
+
+    const float * src_x = (const float *) x->data;
+    const float * src_y = (const float *) y->data;
+    float       * dst_d = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const float xi = src_x[i];
+        dst_d[i] = (xi / (1.0f + expf(-xi))) * src_y[i];
+    }
+}
+
+static void ggml_compute_forward_fused(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const int32_t fusion_id = ((const int32_t *)dst->op_params)[0];
+    switch (fusion_id) {
+        case GGML_FUSION_GATE_PREP:
+            ggml_compute_forward_fused_gate_prep(params, dst);
+            break;
+        case GGML_FUSION_SILU_MUL:
+            ggml_compute_forward_fused_silu_mul(params, dst);
+            break;
+        default:
+            GGML_ABORT("unsupported fusion_id %d", fusion_id);
+    }
+}
+
 // ggml_compute_forward_delta_net
 
 static void ggml_compute_forward_delta_net_f32(
@@ -24460,6 +24584,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_solve_tri(params, tensor);
             } break;
+        case GGML_OP_FUSED:
+            {
+                ggml_compute_forward_fused(params, tensor);
+            } break;
         case GGML_OP_DELTA_NET:
             {
                 ggml_compute_forward_delta_net(params, tensor);
@@ -25523,6 +25651,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_FILL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
+        case GGML_OP_FUSED:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -26256,6 +26385,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OUT_PROD:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_DELTA_NET:
+        case GGML_OP_FUSED:
             {
                 n_tasks = n_threads;
             } break;
