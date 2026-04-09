@@ -543,6 +543,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_delta_net_h64_shmem_f32;
     vk_pipeline pipeline_delta_net_h64_subgroup_f32;
     vk_pipeline pipeline_delta_net_h128_shmem_f32;
+    // STATE_INPLACE variants: write state back to src[5] (KV cache) directly.
+    vk_pipeline pipeline_delta_net_h64_shmem_inplace_f32;
+    vk_pipeline pipeline_delta_net_h64_subgroup_inplace_f32;
+    vk_pipeline pipeline_delta_net_h128_shmem_inplace_f32;
 
     // Persistent atomic state buffer for the unique-fast / slow gating
     // (lazily allocated on first multi-seq SSM_CONV call). Layout:
@@ -3542,6 +3546,18 @@ static void ggml_vk_load_shaders(vk_device& device) {
     if (device->subgroup_size == 64) {
         ggml_vk_create_pipeline(device, device->pipeline_delta_net_h64_subgroup_f32, "delta_net_h64_subgroup_f32",
                 delta_net_h64_subgroup_f32_len, delta_net_h64_subgroup_f32_data, "main", 7,
+                sizeof(vk_op_delta_net_push_constants), {64, 1, 1}, {}, 1, false, true, 64);
+    }
+    // STATE_INPLACE variants: write state to src[5] (KV cache) directly.
+    ggml_vk_create_pipeline(device, device->pipeline_delta_net_h64_shmem_inplace_f32, "delta_net_h64_shmem_inplace_f32",
+            delta_net_h64_shmem_inplace_f32_len, delta_net_h64_shmem_inplace_f32_data, "main", 7,
+            sizeof(vk_op_delta_net_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_delta_net_h128_shmem_inplace_f32, "delta_net_h128_shmem_inplace_f32",
+            delta_net_h128_shmem_inplace_f32_len, delta_net_h128_shmem_inplace_f32_data, "main", 7,
+            sizeof(vk_op_delta_net_push_constants), {128, 1, 1}, {}, 1);
+    if (device->subgroup_size == 64) {
+        ggml_vk_create_pipeline(device, device->pipeline_delta_net_h64_subgroup_inplace_f32, "delta_net_h64_subgroup_inplace_f32",
+                delta_net_h64_subgroup_inplace_f32_len, delta_net_h64_subgroup_inplace_f32_data, "main", 7,
                 sizeof(vk_op_delta_net_push_constants), {64, 1, 1}, {}, 1, false, true, 64);
     }
 
@@ -9495,16 +9511,28 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
 
     const int gqa_ratio   = (int)(H_v / H_k);
     const int repeat_type = dst->op_params[0];
+    const bool state_inplace = dst->op_params[1] != 0;
 
     // Pipeline selection: prefer the subgroup-add reduction when the
     // workgroup fits in one subgroup (currently only Vega + h64).
+    // STATE_INPLACE variants write state to src[5] (KV cache) directly.
     vk_pipeline pipeline = nullptr;
-    if (S_k == 64) {
-        pipeline = ctx->device->pipeline_delta_net_h64_subgroup_f32
-                       ? ctx->device->pipeline_delta_net_h64_subgroup_f32
-                       : ctx->device->pipeline_delta_net_h64_shmem_f32;
+    if (state_inplace) {
+        if (S_k == 64) {
+            pipeline = ctx->device->pipeline_delta_net_h64_subgroup_inplace_f32
+                           ? ctx->device->pipeline_delta_net_h64_subgroup_inplace_f32
+                           : ctx->device->pipeline_delta_net_h64_shmem_inplace_f32;
+        } else {
+            pipeline = ctx->device->pipeline_delta_net_h128_shmem_inplace_f32;
+        }
     } else {
-        pipeline = ctx->device->pipeline_delta_net_h128_shmem_f32;
+        if (S_k == 64) {
+            pipeline = ctx->device->pipeline_delta_net_h64_subgroup_f32
+                           ? ctx->device->pipeline_delta_net_h64_subgroup_f32
+                           : ctx->device->pipeline_delta_net_h64_shmem_f32;
+        } else {
+            pipeline = ctx->device->pipeline_delta_net_h128_shmem_f32;
+        }
     }
     GGML_ASSERT(pipeline);
 

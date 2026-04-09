@@ -707,6 +707,12 @@ void process_shaders() {
     string_to_spv("delta_net_h64_subgroup_f32",  "delta_net.comp", {{"HEAD_DIM", "64"},  {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("delta_net_h128_shmem_f32",    "delta_net.comp", {{"HEAD_DIM", "128"}});
     string_to_spv("delta_net_h128_subgroup_f32", "delta_net.comp", {{"HEAD_DIM", "128"}, {"USE_SUBGROUP_ADD", "1"}});
+    // STATE_INPLACE variants: write state back to src[5] (KV cache) directly
+    // instead of to dst. Eliminates downstream CONT+CONCAT+CPY chain.
+    string_to_spv("delta_net_h64_shmem_inplace_f32",     "delta_net.comp", {{"HEAD_DIM", "64"},  {"STATE_INPLACE", "1"}});
+    string_to_spv("delta_net_h64_subgroup_inplace_f32",  "delta_net.comp", {{"HEAD_DIM", "64"},  {"USE_SUBGROUP_ADD", "1"}, {"STATE_INPLACE", "1"}});
+    string_to_spv("delta_net_h128_shmem_inplace_f32",    "delta_net.comp", {{"HEAD_DIM", "128"}, {"STATE_INPLACE", "1"}});
+    string_to_spv("delta_net_h128_subgroup_inplace_f32", "delta_net.comp", {{"HEAD_DIM", "128"}, {"USE_SUBGROUP_ADD", "1"}, {"STATE_INPLACE", "1"}});
 
     // MUL_MULTI_ADD: ik-specific MoE expert combine
     // (sum_j src0[k,j,t] * src1[0,j,t]). Single F32 variant.

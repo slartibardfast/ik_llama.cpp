@@ -48,7 +48,11 @@ layout(binding = 1) readonly buffer K     { float data_k[];     };
 layout(binding = 2) readonly buffer V     { float data_v[];     };
 layout(binding = 3) readonly buffer G     { float data_g[];     };
 layout(binding = 4) readonly buffer Beta  { float data_beta[];  };
+#ifdef STATE_INPLACE
+layout(binding = 5)          buffer State { float data_state[]; };
+#else
 layout(binding = 5) readonly buffer State { float data_state[]; };
+#endif
 layout(binding = 6)          buffer Dst   { float data_dst[];   };
 
 layout(push_constant) uniform PushConstants {
@@ -170,7 +174,14 @@ void main() {
     }
 
     // Write final state back. Same strided pattern as the load.
+    // STATE_INPLACE: write directly to the input state buffer (= KV cache)
+    // instead of the dst tensor's state region. Eliminates the downstream
+    // CONT+CONCAT+CPY chain that copies state from dst to KV cache.
     [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+#ifdef STATE_INPLACE
+        data_state[state_off + c * HEAD_DIM + my_row] = my_state[c];
+#else
         data_dst[p.dst_state_offset + state_off + c * HEAD_DIM + my_row] = my_state[c];
+#endif
     }
 }

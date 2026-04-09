@@ -371,19 +371,36 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
+    // State writeback to KV cache. The conv state always needs an explicit
+    // CONT+CPY (it's a non-contiguous view of SSM_CONV output). The SSM
+    // state writeback depends on op_params[1]:
+    //   op_params[1] == 1: Vulkan wrote state inplace to src[5] (= KV cache
+    //       ssm portion). Skip the ssm concat+cpy — just copy conv state
+    //       directly to the conv portion of the KV cache.
+    //   op_params[1] == 0: standard path (concat conv+ssm, copy to KV cache).
     ggml_tensor * new_conv_states = ggml_view_2d(ctx0, conv_output_raw, ssm_d_conv - 1, conv_dim,
             ssm_d_conv * ggml_element_size(conv_output_raw),
             (1 + conv_dim * n_tok) * ggml_element_size(conv_output_raw));
     auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
     cb(new_conv_states_cont, "new_conv_states_cont", il);
-    ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
-    ggml_tensor * new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, 1);
-    ggml_tensor * new_state_flat = ggml_concat(ctx0, new_conv_flat, new_ssm_flat, 0);
-    cb(new_state_flat, "new_state_flat", il);
 
-    auto state_cpy = ggml_cpy(ctx0, new_state_flat, state_dst);
-    cb(state_cpy, "state_cpy", il);
-    ggml_build_forward_expand(gf, state_cpy);
+    // Always set inplace flag — the Vulkan backend uses it; CPU ignores the
+    // state portion of dst and the writeback chain handles it below.
+    // TODO: also make the CPU/iqk path write state inplace, then we can
+    // unconditionally skip the ssm concat+cpy on all backends.
+    ggml_tensor * fused_result = output->view_src ? output->view_src : output;
+    fused_result->op_params[1] = 1;
+
+    // Conv state: copy to the conv portion of the KV cache (first conv_state_dim floats).
+    ggml_tensor * conv_dst = ggml_view_2d(ctx0, state_dst, conv_state_dim, 1, state_dst->nb[1], 0);
+    ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
+    auto conv_cpy = ggml_cpy(ctx0, new_conv_flat, conv_dst);
+    cb(conv_cpy, "conv_state_cpy", il);
+    ggml_build_forward_expand(gf, conv_cpy);
+
+    // SSM state: already written inplace by the Vulkan DELTA_NET shader.
+    // The KV cache's ssm portion (at offset conv_state_dim) is up-to-date.
+    // No CONCAT or CPY needed for the ssm state.
 
     return output;
 }

@@ -22614,7 +22614,11 @@ static void ggml_compute_forward_delta_net_f32(
     const float * beta_data = (const float *) src4->data;
     const float * state_in  = (const float *) src5->data;
     float * out_data  = (float *) dst->data;
-    float * state_out = out_data + output_size;
+    // op_params[1] != 0: write state back to src[5] (KV cache) in-place
+    // instead of to dst[output_size..]. Allows the graph builder to skip
+    // the CONT+CONCAT+CPY state writeback chain.
+    const bool state_inplace = dst->op_params[1] != 0;
+    float * state_out = state_inplace ? (float *) src5->data : out_data + output_size;
 
     const int ith = params->ith;
     const int nth = params->nth;
