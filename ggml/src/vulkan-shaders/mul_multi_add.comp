@@ -1,0 +1,52 @@
+#version 450
+
+// MUL_MULTI_ADD: weighted sum across expert dimension
+// dst[token][elem] = sum_j( src0[elem, j, token] * src1[0, j, token] )
+//
+// src0: F32 [ne0=n_embd, ne1=n_expert_used, ne2=n_tokens]
+// src1: F32 [ne0=1,      ne1=n_expert_used, ne2=n_tokens]
+// dst:  F32 [ne0=n_embd, ne1=n_tokens]
+
+#include "types.comp"
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter
+{
+    uint ne;      // total output elements (ne0 * ne1 of dst)
+    uint ne0;     // n_embd (output row width)
+    uint ne1;     // n_tokens (output rows = dst->ne[1])
+    uint nused;   // n_expert_used (src0->ne[1])
+    uint nb1;     // dst stride in elements (dst->nb[1] / sizeof(float))
+    uint nb01;    // src0 expert stride in elements (src0->nb[1] / sizeof(float))
+    uint nb02;    // src0 token stride in elements (src0->nb[2] / sizeof(float))
+    uint nb11;    // src1 expert stride in elements (src1->nb[1] / sizeof(float))
+    uint nb12;    // src1 token stride in elements (src1->nb[2] / sizeof(float))
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 256 + gl_GlobalInvocationID.x;
+
+    if (i >= p.ne) {
+        return;
+    }
+
+    uint i1 = i / p.ne0;  // token index
+    uint i0 = i % p.ne0;  // element index within row
+
+    float sum = 0.0;
+    for (uint j = 0; j < p.nused; ++j) {
+        float a_val = data_a[i1 * p.nb02 + j * p.nb01 + i0];
+        float b_val = data_b[i1 * p.nb12 + j * p.nb11];
+        sum += a_val * b_val;
+    }
+
+    data_d[i1 * p.nb1 + i0] = sum;
+}
