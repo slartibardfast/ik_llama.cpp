@@ -2837,24 +2837,33 @@ void server_context::add_sampled_tokens() {
 
             auto & params_spec = slot.params.speculative;
 
-            if (slot.has_mtp) {
-                if (!slot.mtp_hidden_state.empty()) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
-                    llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
-                } else {
-                    LOG_ERROR("MTP hidden state is empty during speculation", {});
-                    const float* emb_neg1 = llama_get_embeddings_ith(ctx, -1);
-                    if (emb_neg1) {
+            // Single-pass MTP: read draft token from inline MTP logits (computed in main graph)
+            // This avoids the two-pass warmup/draft_gen cycle entirely.
+            llama_token mtp_inline_draft = llama_get_mtp_draft_token(ctx);
+
+            llama_tokens draft;
+            if (slot.has_mtp && mtp_inline_draft != LLAMA_TOKEN_NULL) {
+                // Use inline MTP draft (no separate decode needed)
+                draft.push_back(mtp_inline_draft);
+            } else {
+                // Fallback: two-pass MTP or external draft model
+                if (slot.has_mtp) {
+                    if (!slot.mtp_hidden_state.empty()) {
                         const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                        slot.mtp_hidden_state.resize(n_embd);
-                        memcpy(slot.mtp_hidden_state.data(), emb_neg1, n_embd * sizeof(float));
-                        llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data());
+                        const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
+                        llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
+                    } else {
+                        const float* emb_neg1 = llama_get_embeddings_ith(ctx, -1);
+                        if (emb_neg1) {
+                            const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+                            slot.mtp_hidden_state.resize(n_embd);
+                            memcpy(slot.mtp_hidden_state.data(), emb_neg1, n_embd * sizeof(float));
+                            llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data());
+                        }
                     }
                 }
+                draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
             }
-
-            llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
 
             const int n_draft_max = slot.get_n_draft_max();
 
@@ -3414,7 +3423,10 @@ void server_context::speculative_decoding_accept() {
         // the accepted tokens from the speculation
         const auto ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
         
-        if (slot.has_mtp) {
+        // Single-pass MTP: skip two-pass KV update (inline head manages its own KV)
+        bool inline_mtp = slot.has_mtp && llama_get_mtp_logits(ctx) != nullptr;
+        if (slot.has_mtp && !inline_mtp) {
+            // Two-pass fallback
             const int n_embd = llama_model_n_embd(llama_get_model(ctx));
             if (!ids.empty()) {
                 const float* emb = llama_get_embeddings(ctx);
@@ -3429,7 +3441,7 @@ void server_context::speculative_decoding_accept() {
                     memcpy(slot.mtp_hidden_state.data(), emb0, n_embd * sizeof(float));
                 }
             }
-            
+
             llama_set_draft_input_hidden_state(ctx, slot.mtp_hidden_state.data());
 
             int32_t n_past_base = slot.n_past - (slot.drafted.size() + 1);
@@ -3448,7 +3460,9 @@ void server_context::speculative_decoding_accept() {
         slot.n_draft_accepted += ids.size() - 1;
 
         // inform the speculative decoding about the number of accepted tokens
-        common_speculative_accept(slot.spec, ids.size() - 1);
+        if (!inline_mtp) {
+            common_speculative_accept(slot.spec, ids.size() - 1);
+        }
 
         // rollback to the state before sampling the draft tokens
         slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_draft);
@@ -3932,7 +3946,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             slot.i_batch = -1;
         }
-        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty()) {
+        // Single-pass MTP: skip warmup when inline MTP logits are available
+        // (the MTP KV cache is already populated by the in-graph MTP head)
+        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty() && !llama_get_mtp_logits(ctx)) {
             llama_set_draft_input_hidden_state(ctx, batch_mtp_hidden_state.data());
             mtp_update_kv_cache(ctx, batch_view, true);
         }
