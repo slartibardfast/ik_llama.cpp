@@ -307,7 +307,10 @@ struct llama_hparams {
     }
 
     bool is_recurrent(uint32_t il) const {
-        return il < n_layer ? recurrent_layer_arr[il] : false;
+        if (il >= n_layer) return false;
+        // MTP nextn layers are never recurrent (they use standard attention)
+        if (nextn_predict_layers > 0 && il >= n_layer - nextn_predict_layers) return false;
+        return recurrent_layer_arr[il];
     }
 
     static bool is_float_close(float a, float b, float abs_tol) {
