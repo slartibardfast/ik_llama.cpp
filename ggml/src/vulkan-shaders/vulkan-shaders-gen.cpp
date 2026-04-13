@@ -587,6 +587,18 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
 
+    // TURBO_KV_4B: subgroup-cooperative FWHT shaders (wave32 + wave64)
+    // Compiled with SUBGROUP_SIZE define; actual workgroup size set via specialization constant.
+    for (int ss : {32, 64}) {
+        auto suf = "_w" + std::to_string(ss);
+        auto ssd = std::pair<std::string, std::string>{"SUBGROUP_SIZE", std::to_string(ss)};
+        string_to_spv("dequant_turbo_kv_4b" + suf, "dequant_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float16_t"}});
+        string_to_spv("dequant_turbo_kv_4b_f32" + suf, "dequant_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float"}});
+        string_to_spv("get_rows_turbo_kv_4b" + suf, "get_rows_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float16_t"}});
+        string_to_spv("get_rows_turbo_kv_4b_f32" + suf, "get_rows_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float"}});
+        string_to_spv("cpy_f32_turbo_kv_4b" + suf, "cpy_f32_turbo_kv_4b.comp", {ssd});
+    }
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

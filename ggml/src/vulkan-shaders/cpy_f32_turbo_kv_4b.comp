@@ -1,0 +1,124 @@
+#version 450
+
+// Quantize F32 -> TURBO_KV_4B: normalize -> forward RHT -> codebook nearest -> pack.
+// One workgroup (= one subgroup) per 128-element block.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.comp"
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 64
+#endif
+
+#include "turbo_kv_4b_rht.comp"
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03;
+    uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13;
+    uint nb10; uint nb11; uint nb12; uint nb13;
+    uint misalign_offsets;
+    float param1; float param2;
+    uint ne0_012mp; uint ne0_012L;
+    uint ne0_01mp;  uint ne0_01L;
+    uint ne0_0mp;   uint ne0_0L;
+    uint ne1_012mp; uint ne1_012L;
+    uint ne1_01mp;  uint ne1_01L;
+    uint ne1_0mp;   uint ne1_0L;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {block_turbo_kv_4b data_b[];};
+
+void main() {
+    const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
+    if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
+
+    const uint tid = gl_SubgroupInvocationID;
+    const uint base = block_id * QUANT_K_TURBO_KV_4B;
+
+#if SUBGROUP_SIZE >= 64
+    float val0 = data_a[base + tid];
+    float val1 = data_a[base + tid + 64];
+
+    float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
+    float norm = sqrt(sum_sq);
+    float rcp_norm = 1.0 / max(norm, 1e-10);
+    val0 *= rcp_norm;
+    val1 *= rcp_norm;
+
+    turbo_kv_forward_rht(val0, val1, tid);
+
+    float max_abs = subgroupMax(max(abs(val0), abs(val1)));
+    float inv_std = 2.7326 / max(max_abs, 1e-10);
+
+    uint idx0 = turbo_kv_nearest(val0 * inv_std);
+    uint idx1 = turbo_kv_nearest(val1 * inv_std);
+
+    uint partner0 = subgroupShuffleXor(idx0, 1);
+    uint partner1 = subgroupShuffleXor(idx1, 1);
+    if ((tid & 1u) == 0) {
+        data_b[block_id].mse_indices[tid / 2]        = uint8_t(idx0 | (partner0 << 4));
+        data_b[block_id].mse_indices[(tid + 64) / 2]  = uint8_t(idx1 | (partner1 << 4));
+    }
+    if (tid == 0) {
+        data_b[block_id].norm = turbo_kv_f32_to_fp16_bits(norm);
+        data_b[block_id].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_b[block_id].residual_norm = uint16_t(0);
+        data_b[block_id]._pad = uint16_t(0);
+    }
+#else
+    float v0 = data_a[base + tid];
+    float v1 = data_a[base + tid + 32];
+    float v2 = data_a[base + tid + 64];
+    float v3 = data_a[base + tid + 96];
+
+    float sum_sq = subgroupAdd(v0*v0 + v1*v1 + v2*v2 + v3*v3);
+    float norm = sqrt(sum_sq);
+    float rcp_norm = 1.0 / max(norm, 1e-10);
+    v0 *= rcp_norm; v1 *= rcp_norm; v2 *= rcp_norm; v3 *= rcp_norm;
+
+    turbo_kv_forward_rht(v0, v1, v2, v3, tid);
+
+    float max_abs = subgroupMax(max(max(abs(v0), abs(v1)), max(abs(v2), abs(v3))));
+    float inv_std = 2.7326 / max(max_abs, 1e-10);
+
+    uint i0 = turbo_kv_nearest(v0 * inv_std);
+    uint i1 = turbo_kv_nearest(v1 * inv_std);
+    uint i2 = turbo_kv_nearest(v2 * inv_std);
+    uint i3 = turbo_kv_nearest(v3 * inv_std);
+
+    // Pack pairs: elements [2k, 2k+1] into one byte
+    // For wave32, tid maps to elements [tid, tid+32, tid+64, tid+96]
+    // Byte tid/2 holds elements [2*(tid/2), 2*(tid/2)+1]
+    // We need to pair consecutive elements, so use shuffleXor(1) for stride-1 pairs
+    uint p0 = subgroupShuffleXor(i0, 1);
+    uint p1 = subgroupShuffleXor(i1, 1);
+    uint p2 = subgroupShuffleXor(i2, 1);
+    uint p3 = subgroupShuffleXor(i3, 1);
+    if ((tid & 1u) == 0) {
+        data_b[block_id].mse_indices[tid / 2]        = uint8_t(i0 | (p0 << 4));
+        data_b[block_id].mse_indices[(tid + 32) / 2]  = uint8_t(i1 | (p1 << 4));
+        data_b[block_id].mse_indices[(tid + 64) / 2]  = uint8_t(i2 | (p2 << 4));
+        data_b[block_id].mse_indices[(tid + 96) / 2]  = uint8_t(i3 | (p3 << 4));
+    }
+    if (tid == 0) {
+        data_b[block_id].norm = turbo_kv_f32_to_fp16_bits(norm);
+        data_b[block_id].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_b[block_id].residual_norm = uint16_t(0);
+        data_b[block_id]._pad = uint16_t(0);
+    }
+#endif
+}

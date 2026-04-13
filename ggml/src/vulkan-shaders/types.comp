@@ -1441,4 +1441,34 @@ float bf16_to_fp32(uint32_t u)
     return uintBitsToFloat(u << 16);
 }
 
+// TURBO_KV_4B: RHT + Lloyd-Max 4-bit KV cache compression
+// 72 bytes per 128 elements (4.5 bpe)
+#define QUANT_K_TURBO_KV_4B 128
+#define QUANT_R_TURBO_KV_4B 2
+
+struct block_turbo_kv_4b
+{
+    uint16_t norm;            // fp16, ||x||_2
+    uint16_t residual_norm;   // reserved
+    uint16_t inv_std_fp16;    // fp16, = 2.7326 / max(|rotated|)
+    uint16_t _pad;
+    uint8_t mse_indices[64];  // 128 x 4-bit packed (2 per byte)
+};
+
+struct block_turbo_kv_4b_packed16
+{
+    uint16_t norm;
+    uint16_t residual_norm;
+    uint16_t inv_std_fp16;
+    uint16_t _pad;
+    uint16_t mse_indices[32];
+};
+
+#if defined(DATA_A_TURBO_KV_4B)
+#define QUANT_K QUANT_K_TURBO_KV_4B
+#define QUANT_R QUANT_R_TURBO_KV_4B
+#define A_TYPE block_turbo_kv_4b
+#define A_TYPE_PACKED16 block_turbo_kv_4b_packed16
+#endif
+
 #endif // !defined(GGML_TYPES_COMP)

@@ -10,6 +10,7 @@
 #include "ggml-impl.h"
 #include "ggml-fusion.h"
 #include "ggml-quants.h"
+#include "ggml-turbo-kv.h"
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "iqk/iqk_quantize.h"
@@ -1692,6 +1693,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
 #else
         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
 #endif
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        .type_name                = "turbo_kv_4b",
+        .blck_size                = 128,
+        .type_size                = 72,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_kv_4b,
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+        .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
         .row_meta_size            = 0,
     },

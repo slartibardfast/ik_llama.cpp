@@ -1,0 +1,64 @@
+#version 450
+
+// Dequantize TURBO_KV_4B -> F16/F32 via inverse RHT.
+// One workgroup (= one subgroup) per 128-element block.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "types.comp"
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 64
+#endif
+
+#include "turbo_kv_4b_rht.comp"
+
+layout (push_constant) uniform parameter {
+    uint M; uint K; uint stride_a; uint stride_b; uint nel;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_turbo_kv_4b data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
+    if (block_id >= p.nel / QUANT_K_TURBO_KV_4B) return;
+
+    const uint tid = gl_SubgroupInvocationID;
+    const float norm = unpackHalf2x16(uint(data_a[block_id].norm)).x;
+    const float inv_std = unpackHalf2x16(uint(data_a[block_id].inv_std_fp16)).x;
+    const float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
+
+#if SUBGROUP_SIZE >= 64
+    float val0 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[tid / 2]),      tid,      rcp_inv_std);
+    float val1 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[(tid + 64) / 2]), tid + 64, rcp_inv_std);
+
+    turbo_kv_inverse_rht(val0, val1, tid, norm);
+
+    const uint base = block_id * QUANT_K_TURBO_KV_4B;
+    data_b[base + tid]      = D_TYPE(val0);
+    data_b[base + tid + 64] = D_TYPE(val1);
+#else
+    float v0 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[tid / 2]),        tid,      rcp_inv_std);
+    float v1 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[(tid + 32) / 2]), tid + 32, rcp_inv_std);
+    float v2 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[(tid + 64) / 2]), tid + 64, rcp_inv_std);
+    float v3 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[(tid + 96) / 2]), tid + 96, rcp_inv_std);
+
+    turbo_kv_inverse_rht(v0, v1, v2, v3, tid, norm);
+
+    const uint base = block_id * QUANT_K_TURBO_KV_4B;
+    data_b[base + tid]      = D_TYPE(v0);
+    data_b[base + tid + 32] = D_TYPE(v1);
+    data_b[base + tid + 64] = D_TYPE(v2);
+    data_b[base + tid + 96] = D_TYPE(v3);
+#endif
+}

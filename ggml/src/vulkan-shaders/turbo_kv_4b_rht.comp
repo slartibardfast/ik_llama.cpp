@@ -1,0 +1,148 @@
+// turbo_kv_4b_rht.comp — Subgroup-cooperative Fast Walsh-Hadamard Transform
+//
+// Supports both wave64 (GCN/CDNA) and wave32 (RDNA) via compile-time branching.
+//
+// wave64: 64 threads x 2 values = 128 elements per block
+//   stages 0-5: subgroupShuffleXor(val, stride) for stride = 1..32
+//   stage 6: thread-local swap (stride 64)
+//
+// wave32: 32 threads x 4 values = 128 elements per block
+//   stages 0-4: subgroupShuffleXor(val, stride) for stride = 1..16
+//   stages 5-6: thread-local swaps (stride 32, 64)
+
+#ifndef TURBO_KV_4B_RHT_COMP
+#define TURBO_KV_4B_RHT_COMP
+
+// SUBGROUP_SIZE must be set via specialization constant or compile define
+// before including this file.
+
+const float TURBO_KV_CODEBOOK[16] = float[16](
+    -2.7326,  -1.8627,  -1.3382,  -0.9265,
+    -0.5712,  -0.2478,   0.0548,   0.3446,
+     0.6325,   0.9265,   1.2365,   1.5795,
+     1.9795,   2.4943,   3.2655,   4.7475
+);
+
+const float TURBO_KV_RSQRT128 = 0.08838834764831845; // 1/sqrt(128)
+
+// Deterministic sign from RHT seed (popcnt parity)
+float turbo_kv_sign(uint idx) {
+    uint seed = 0x12345678u;
+    uint bits = idx & seed;
+    bits = bits ^ (bits >> 16);
+    bits = bits ^ (bits >> 8);
+    bits = bits ^ (bits >> 4);
+    bits = bits ^ (bits >> 2);
+    bits = bits ^ (bits >> 1);
+    return ((bits & 1u) == 0u) ? 1.0 : -1.0;
+}
+
+// --- Wave64 FWHT (2 values per thread, 64 threads) ---
+
+#if SUBGROUP_SIZE >= 64
+
+void turbo_kv_fwht(inout float val0, inout float val1, uint tid) {
+    [[unroll]] for (uint s = 1; s <= 32; s <<= 1) {
+        float other0 = subgroupShuffleXor(val0, s);
+        float other1 = subgroupShuffleXor(val1, s);
+        float t0 = val0; val0 = t0 + other0; float u0 = t0 - other0;
+        float t1 = val1; val1 = t1 + other1; float u1 = t1 - other1;
+        if ((tid & s) != 0u) { val0 = u0; val1 = u1; }
+    }
+    // Stage 6: stride 64, thread-local swap between val0 and val1
+    float t0 = val0; float t1 = val1;
+    val0 = t0 + t1; val1 = t0 - t1;
+}
+
+void turbo_kv_forward_rht(inout float val0, inout float val1, uint tid) {
+    val0 *= turbo_kv_sign(tid);
+    val1 *= turbo_kv_sign(tid + 64);
+    turbo_kv_fwht(val0, val1, tid);
+    val0 *= TURBO_KV_RSQRT128;
+    val1 *= TURBO_KV_RSQRT128;
+}
+
+void turbo_kv_inverse_rht(inout float val0, inout float val1, uint tid, float norm) {
+    turbo_kv_fwht(val0, val1, tid);
+    float scale = norm * TURBO_KV_RSQRT128;
+    val0 *= turbo_kv_sign(tid)      * scale;
+    val1 *= turbo_kv_sign(tid + 64) * scale;
+}
+
+float turbo_kv_unpack_byte(uint byte_val, uint elem, float rcp_inv_std) {
+    uint nibble = ((elem & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
+    return TURBO_KV_CODEBOOK[nibble] * rcp_inv_std;
+}
+
+#else // SUBGROUP_SIZE < 64 (wave32 — RDNA)
+
+// Wave32: 32 threads x 4 values = 128 elements per block
+// Element mapping: thread tid owns elements [tid, tid+32, tid+64, tid+96]
+
+void turbo_kv_fwht_w32(inout float v0, inout float v1, inout float v2, inout float v3, uint tid) {
+    // Stages 0-4: subgroup shuffles (stride 1..16)
+    [[unroll]] for (uint s = 1; s <= 16; s <<= 1) {
+        float o0 = subgroupShuffleXor(v0, s);
+        float o1 = subgroupShuffleXor(v1, s);
+        float o2 = subgroupShuffleXor(v2, s);
+        float o3 = subgroupShuffleXor(v3, s);
+        float t;
+        t = v0; v0 = t + o0; if ((tid & s) != 0u) v0 = t - o0;
+        t = v1; v1 = t + o1; if ((tid & s) != 0u) v1 = t - o1;
+        t = v2; v2 = t + o2; if ((tid & s) != 0u) v2 = t - o2;
+        t = v3; v3 = t + o3; if ((tid & s) != 0u) v3 = t - o3;
+    }
+    // Stage 5: stride 32, thread-local (v0↔v1, v2↔v3)
+    float t0, t1;
+    t0 = v0; t1 = v1; v0 = t0 + t1; v1 = t0 - t1;
+    t0 = v2; t1 = v3; v2 = t0 + t1; v3 = t0 - t1;
+    // Stage 6: stride 64, thread-local (v0↔v2, v1↔v3)
+    t0 = v0; t1 = v2; v0 = t0 + t1; v2 = t0 - t1;
+    t0 = v1; t1 = v3; v1 = t0 + t1; v3 = t0 - t1;
+}
+
+void turbo_kv_forward_rht(inout float v0, inout float v1, inout float v2, inout float v3, uint tid) {
+    v0 *= turbo_kv_sign(tid);
+    v1 *= turbo_kv_sign(tid + 32);
+    v2 *= turbo_kv_sign(tid + 64);
+    v3 *= turbo_kv_sign(tid + 96);
+    turbo_kv_fwht_w32(v0, v1, v2, v3, tid);
+    v0 *= TURBO_KV_RSQRT128;
+    v1 *= TURBO_KV_RSQRT128;
+    v2 *= TURBO_KV_RSQRT128;
+    v3 *= TURBO_KV_RSQRT128;
+}
+
+void turbo_kv_inverse_rht(inout float v0, inout float v1, inout float v2, inout float v3, uint tid, float norm) {
+    turbo_kv_fwht_w32(v0, v1, v2, v3, tid);
+    float scale = norm * TURBO_KV_RSQRT128;
+    v0 *= turbo_kv_sign(tid)      * scale;
+    v1 *= turbo_kv_sign(tid + 32) * scale;
+    v2 *= turbo_kv_sign(tid + 64) * scale;
+    v3 *= turbo_kv_sign(tid + 96) * scale;
+}
+
+float turbo_kv_unpack_byte(uint byte_val, uint elem, float rcp_inv_std) {
+    uint nibble = ((elem & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
+    return TURBO_KV_CODEBOOK[nibble] * rcp_inv_std;
+}
+
+#endif // SUBGROUP_SIZE
+
+// Shared helpers (wave-size independent)
+
+uint turbo_kv_nearest(float x) {
+    uint best = 0;
+    float best_dist = abs(x - TURBO_KV_CODEBOOK[0]);
+    [[unroll]] for (uint i = 1; i < 16; i++) {
+        float d = abs(x - TURBO_KV_CODEBOOK[i]);
+        if (d < best_dist) { best_dist = d; best = i; }
+    }
+    return best;
+}
+
+uint turbo_kv_f32_to_fp16_bits(float x) {
+    return packHalf2x16(vec2(x, 0.0));
+}
+
+#endif // TURBO_KV_4B_RHT_COMP

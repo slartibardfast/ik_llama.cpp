@@ -423,7 +423,7 @@ extern "C" {
         GGML_TYPE_I2_S      = 36,  // So we are able to consume MS BitNet I2_S quants
         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
-        //
+        GGML_TYPE_TURBO_KV_4B = 44, // RHT + Lloyd-Max 4-bit KV cache compression (128 elem/block, 72 bytes)
         //
         GGML_TYPE_Q8_0_X4 = 97,
         GGML_TYPE_Q8_1_X4 = 98,

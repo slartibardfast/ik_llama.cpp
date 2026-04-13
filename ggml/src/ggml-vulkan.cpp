@@ -3232,6 +3232,21 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
 
+    // TURBO_KV_4B: subgroup-cooperative FWHT (one workgroup per 128-element block)
+    if (device->subgroup_shuffle) {
+        const uint32_t ss = device->subgroup_size;
+        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],
+            "dequant_turbo_kv_4b" + wsuf, 0, nullptr, "main", 2, 5 * sizeof(uint32_t),
+            {1, 1, 1}, {ss}, 1, true, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],
+            "get_rows_turbo_kv_4b" + wsuf, 0, nullptr, "main", 3, sizeof(vk_op_binary_push_constants),
+            {1, 1, 1}, {ss}, 1, true, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],
+            "get_rows_turbo_kv_4b_f32" + wsuf, 0, nullptr, "main", 3, sizeof(vk_op_binary_push_constants),
+            {1, 1, 1}, {ss}, 1, true, true, ss);
+    }
+
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F16 ], "get_rows_f16",  get_rows_f16_len,  get_rows_f16_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -3320,7 +3335,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q5_0], "cpy_f32_q5_0", cpy_f32_q5_0_len, cpy_f32_q5_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q5_1], "cpy_f32_q5_1", cpy_f32_q5_1_len, cpy_f32_q5_1_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q8_0], "cpy_f32_q8_0", cpy_f32_q8_0_len, cpy_f32_q8_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_IQ4_NL], "cpy_f32_iq4_nl", cpy_f32_iq4_nl_len, cpy_f32_iq4_nl_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_IQ4_NL], "cpy_f32_iq4_nl", cpy_f32_iq4_nl_rte_len, cpy_f32_iq4_nl_rte_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
+    }
+
+    // TURBO_KV_4B CPY (F32 -> TURBO_KV_4B quantize, subgroup-cooperative)
+    if (device->subgroup_shuffle) {
+        const uint32_t ss = device->subgroup_size;
+        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B],
+            "cpy_f32_turbo_kv_4b" + wsuf, 0, nullptr, "main", 2, sizeof(vk_op_unary_push_constants),
+            {1, 1, 1}, {ss}, 1, true, true, ss);
     }
 
     if (device->float_controls_rte_fp16) {
@@ -3351,6 +3375,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q5_1], "cpy_q5_1_f32", cpy_q5_1_f32_len, cpy_q5_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_1), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0], "cpy_q8_0_f32", cpy_q8_0_f32_len, cpy_q8_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f32", cpy_iq4_nl_f32_len, cpy_iq4_nl_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
+
+    // TURBO_KV_4B CPY (quant -> F32, reuses dequant shader with D_TYPE=float)
+    if (device->subgroup_shuffle) {
+        const uint32_t ss = device->subgroup_size;
+        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
+            "dequant_turbo_kv_4b_f32" + wsuf, 0, nullptr, "main", 2, 5 * sizeof(uint32_t),
+            {1, 1, 1}, {ss}, 1, true, true, ss);
+    }
 
     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
         std::string s;
@@ -5933,6 +5966,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TURBO_KV_4B:
             return ctx->device->pipeline_cpy_f32_quant[to];
         default:
             break;
@@ -5947,6 +5981,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TURBO_KV_4B:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
