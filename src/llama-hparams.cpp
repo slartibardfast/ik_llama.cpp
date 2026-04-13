@@ -504,11 +504,9 @@ void llm_load_hparams(
 
                 // NextN/MTP parameters
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
-                if (model.mtp) {
-                    hparams.n_layer_kv_from_start = hparams.n_layer;
-                } else {
-                    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
-                }
+                // Note: n_layer_kv_from_start left at default (-1) so all layers
+                // are eligible for KV cache. is_recurrent() handles layer classification.
+                // model.mtp is not yet set at hparams load time.
 
                 // Mark recurrent layers (linear attention layers)
                 // MTP layers use standard attention, not recurrent
@@ -545,11 +543,9 @@ void llm_load_hparams(
 
                 // NextN/MTP parameters
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
-                if (model.mtp) {
-                    hparams.n_layer_kv_from_start = hparams.n_layer;
-                } else {
-                    hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
-                }
+                // Note: n_layer_kv_from_start left at default (-1) so all layers
+                // are eligible for KV cache. is_recurrent() handles layer classification.
+                // model.mtp is not yet set at hparams load time.
 
                 // Mark recurrent layers (linear attention layers)
                 // MTP layers use standard attention, not recurrent

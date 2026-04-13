@@ -8342,10 +8342,16 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
             Qcur = Q; Kcur = K; Vcur = V;
         }
 
-        // RoPE
+        // RoPE (architecture-aware: multi-rope with sections for Qwen3.5, standard for GLM-4)
         if (rope_cache) {
             Qcur = ggml_rope_fast(ctx0, Qcur, rope_cache);
             Kcur = ggml_rope_fast(ctx0, Kcur, rope_cache);
+        } else if (hparams.rope_sections[0] > 0) {
+            // Multi-rope with dimension sections (Qwen3.5)
+            int sections[4];
+            std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
+            Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
         } else {
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
             Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
