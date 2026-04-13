@@ -4691,6 +4691,12 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         inpL = cur;
     }
 
+    // Save raw hidden state for MTP before output norm is applied.
+    if (hparams.nextn_predict_layers > 0) {
+        cb(inpL, "result_embd_pooled", -1);
+        ggml_set_output(inpL);
+    }
+
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
     cb(cur, "result_output", -1);
 
@@ -4772,6 +4778,14 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         cb(cur, "l_out", il);
 
         inpL = cur;
+    }
+
+    // Save raw hidden state for MTP before output norm is applied.
+    // MTP's hnorm expects the pre-norm state; using result_norm would
+    // double-normalize and corrupt draft predictions.
+    if (hparams.nextn_predict_layers > 0) {
+        cb(inpL, "result_embd_pooled", -1);
+        ggml_set_output(inpL);
     }
 
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
@@ -8314,24 +8328,50 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
     cb(combined, "mtp_concat", il);
     ggml_tensor* cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
 
-    struct ggml_tensor * inpSA = cur;
+    // Use the standard attention + FFN path (same as main model layers).
+    // This ensures numerical equivalence with the main forward pass for
+    // gated-Q attention, multi-rope sections, flash attention, etc.
+    if (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+        float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = llm_build_norm(ctx0, cur, hparams, mtp_layer.attn_norm, NULL, LLM_NORM_RMS, cb, il);
-    cb(cur, "attn_norm", il);
+        // Attention: build_std_attention handles attn_norm, gated-Q, multi-rope, KV cache, residual
+        cur = build_std_attention(gf, mtp_layer.attn_norm, cur, inp_pos, nullptr, nullptr,
+                KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
 
-    // Self-Attention (architecture-aware: gated-Q for Qwen3.5, standard for GLM-4)
-    {
-        ggml_tensor *Qcur, *Kcur, *Vcur, *gate = nullptr;
-
-        if (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-            // Qwen3.5 gated-Q attention: wq encodes Q + output gate concatenated
-            auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur,
-                    mtp_layer.wq, mtp_layer.wk, mtp_layer.wv,
-                    mtp_layer.attn_q_norm, mtp_layer.attn_k_norm, il);
-            Qcur = Q; Kcur = K; Vcur = V; gate = G;
+        // FFN: llm_build_ffn handles ffn_norm, FFN computation, residual
+        if (mtp_layer.ffn_gate_inp != nullptr) {
+            // MOE FFN path (Qwen3.5-MOE)
+            cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
+                            mtp_layer.ffn_gate_inp,  NULL,
+                            mtp_layer.ffn_up_exps,   NULL,
+                            mtp_layer.ffn_gate_exps, NULL,
+                            mtp_layer.ffn_down_exps, NULL,
+                            mtp_layer.ffn_exp_probs_b,
+                            mtp_layer.ffn_up_shexp,    nullptr,
+                            mtp_layer.ffn_gate_shexp,  nullptr,
+                            mtp_layer.ffn_down_shexp,  nullptr,
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, true, false, 0.0f,
+                            LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                            LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
         } else {
-            // GLM-4 standard QKV
-            auto [Q, K, V] = llm_build_mul_mat_qkv(gf, cur,
+            // Dense FFN path (Qwen3.5)
+            cur = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
+                            mtp_layer.ffn_up,   NULL, NULL,
+                            mtp_layer.ffn_gate, NULL, NULL,
+                            mtp_layer.ffn_down, NULL, NULL,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+        }
+    } else {
+        // GLM-4 path: original hand-written attention + MOE FFN
+        struct ggml_tensor * inpSA = cur;
+
+        cur = llm_build_norm(ctx0, cur, hparams, mtp_layer.attn_norm, NULL, LLM_NORM_RMS, cb, il);
+        cb(cur, "attn_norm", il);
+
+        {
+            auto [Qcur, Kcur, Vcur] = llm_build_mul_mat_qkv(gf, cur,
                     nullptr, nullptr,
                     nullptr, nullptr,
                     mtp_layer.wq, mtp_layer.bq,
@@ -8339,57 +8379,29 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
                     mtp_layer.wv, mtp_layer.bv,
                     mtp_layer.attn_q_norm, mtp_layer.attn_k_norm,
                     0.f, il);
-            Qcur = Q; Kcur = K; Vcur = V;
-        }
 
-        // RoPE (architecture-aware: multi-rope with sections for Qwen3.5, standard for GLM-4)
-        if (rope_cache) {
-            Qcur = ggml_rope_fast(ctx0, Qcur, rope_cache);
-            Kcur = ggml_rope_fast(ctx0, Kcur, rope_cache);
-        } else if (hparams.rope_sections[0] > 0) {
-            // Multi-rope with dimension sections (Qwen3.5)
-            int sections[4];
-            std::copy(hparams.rope_sections.begin(), hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
-            Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-            Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        } else {
-            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
-        }
+            if (rope_cache) {
+                Qcur = ggml_rope_fast(ctx0, Qcur, rope_cache);
+                Kcur = ggml_rope_fast(ctx0, Kcur, rope_cache);
+            } else {
+                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            }
 
-        cb(Qcur, "Qcur", il);
-        cb(Kcur, "Kcur", il);
-        cb(Vcur, "Vcur", il);
+            cb(Qcur, "Qcur", il);
+            cb(Kcur, "Kcur", il);
+            cb(Vcur, "Vcur", il);
 
-        // KV Cache & Attention
-        if (gate) {
-            // Gated attention: wo applied AFTER sigmoid gate
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                            nullptr, nullptr,
-                            Kcur, Vcur, Qcur, KQ_mask,
-                            n_tokens, kv_head, n_kv,
-                            1.0f/sqrtf(float(n_embd_head)), cb, il);
-            gate = ggml_sigmoid(ctx0, gate);
-            cb(gate, "gate", il);
-            cur = ggml_mul(ctx0, cur, gate);
-            cb(cur, "qkv_gated", il);
-            cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.wo, cur);
-            cb(cur, "attn_out", il);
-        } else {
             cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                             mtp_layer.wo, NULL,
                             Kcur, Vcur, Qcur, KQ_mask,
                             n_tokens, kv_head, n_kv,
                             1.0f/sqrtf(float(n_embd_head)), cb, il);
         }
-    }
 
-    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-    cb(ffn_inp, "mtp_ffn_inp", il);
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        cb(ffn_inp, "mtp_ffn_inp", il);
 
-    // FFN (architecture-aware: MOE for GLM-4/Qwen3.5-MOE, dense for Qwen3.5)
-    if (mtp_layer.ffn_gate_inp != nullptr) {
-        // MOE FFN path
         cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, ffn_inp,
                         mtp_layer.ffn_gate_inp,  NULL,
                         mtp_layer.ffn_up_exps,   NULL,
@@ -8403,14 +8415,6 @@ struct ggml_tensor * llm_build_context::build_mtp_tail(
                         LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
                         (llm_expert_gating_func_type) hparams.expert_gating_func,
                         LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps);
-    } else {
-        // Dense FFN path
-        cur = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, ffn_inp,
-                        mtp_layer.ffn_up,   NULL, NULL,
-                        mtp_layer.ffn_gate, NULL, NULL,
-                        mtp_layer.ffn_down, NULL, NULL,
-                        NULL,
-                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
     }
     cb(cur, "ffn_out", il);
 
