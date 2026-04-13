@@ -4612,14 +4612,43 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
 
-    delta_net delta(lctx, batch);
-
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
 
-    ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
+
+    auto rope_cache = model.split_mode != LLAMA_SPLIT_MODE_GRAPH && cparams.rope_cache && (rope_type == LLAMA_ROPE_TYPE_NEOX || rope_type == LLAMA_ROPE_TYPE_NORM) ?
+        ggml_rope_cache(ctx0, inp_pos, nullptr, n_embd_head, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow) : nullptr;
+
+    // MTP dual-path: when mtp_op_type != NONE, run only the MTP tail
+    if (cparams.mtp_op_type != MTP_OP_NONE) {
+        ggml_tensor * hidden_states_from_main_model;
+
+        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
+            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        } else {
+            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
+        }
+        ggml_set_name(hidden_states_from_main_model, "result_embd_pooled");
+        ggml_set_input(hidden_states_from_main_model);
+
+        lctx.inp_mtp_states = hidden_states_from_main_model;
+
+        const int il_mtp = hparams.n_layer - 1;
+        const auto & mtp_layer = model.layers[il_mtp];
+
+        ggml_tensor * cur = build_mtp_tail(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos, rope_cache);
+
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
+    // Normal forward path
+    delta_net delta(lctx, batch);
+
+    ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+    ggml_tensor * inp_out_ids = (n_tokens > 1 && !cparams.mtp) ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
@@ -4628,14 +4657,17 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    // Only process main transformer layers (skip MTP nextn layers)
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
+
     ggml_tensor * cur = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_transformer_layers; ++il) {
 
         if (hparams.is_recurrent(il)) {
-            cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_layer - 1 ? inp_out_ids : nullptr, il, cb);
+            cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb);
         } else {
-            cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
+            cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
                     KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
         }
 
@@ -4645,7 +4677,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
                 model.layers[il].ffn_gate_exps, nullptr,
                 model.layers[il].ffn_down_exps, nullptr,
                 nullptr,
-                model.layers[il].ffn_up_shexp,    nullptr, // we don't have shared expert biases?
+                model.layers[il].ffn_up_shexp,    nullptr,
                 model.layers[il].ffn_gate_shexp,  nullptr,
                 model.layers[il].ffn_down_shexp,  nullptr,
                 n_expert, n_expert_used,
@@ -4671,14 +4703,43 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
 
-    delta_net delta(lctx, batch);
-
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
 
-    ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
+
+    auto rope_cache = model.split_mode != LLAMA_SPLIT_MODE_GRAPH && cparams.rope_cache && (rope_type == LLAMA_ROPE_TYPE_NEOX || rope_type == LLAMA_ROPE_TYPE_NORM) ?
+        ggml_rope_cache(ctx0, inp_pos, nullptr, n_embd_head, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow) : nullptr;
+
+    // MTP dual-path
+    if (cparams.mtp_op_type != MTP_OP_NONE) {
+        ggml_tensor * hidden_states_from_main_model;
+
+        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
+            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        } else {
+            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
+        }
+        ggml_set_name(hidden_states_from_main_model, "result_embd_pooled");
+        ggml_set_input(hidden_states_from_main_model);
+
+        lctx.inp_mtp_states = hidden_states_from_main_model;
+
+        const int il_mtp = hparams.n_layer - 1;
+        const auto & mtp_layer = model.layers[il_mtp];
+
+        ggml_tensor * cur = build_mtp_tail(mtp_layer, hidden_states_from_main_model, n_embd_head, gf, inp_pos, rope_cache);
+
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
+    // Normal forward path
+    delta_net delta(lctx, batch);
+
+    ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+    ggml_tensor * inp_out_ids = (n_tokens > 1 && !cparams.mtp) ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
@@ -4687,14 +4748,16 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
     float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
+
     ggml_tensor * cur = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_transformer_layers; ++il) {
 
         if (hparams.is_recurrent(il)) {
-            cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_layer - 1 ? inp_out_ids : nullptr, il, cb);
+            cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb);
         } else {
-            cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, nullptr,
+            cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
                     KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
         }
 
