@@ -216,6 +216,9 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
+    struct ggml_tensor * mtp_logits_tensor = nullptr; // single-pass MTP: in-graph logits
+    std::vector<float>  mtp_logits_extracted;          // host buffer for extracted MTP logits
+    int64_t             mtp_n_vocab = 0;               // vocab size of MTP logits
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 

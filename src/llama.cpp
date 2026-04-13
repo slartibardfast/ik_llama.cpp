@@ -4029,6 +4029,16 @@ static int llama_decode_internal(
                     }
                 }
             }
+            // Find in-graph MTP logits tensor (single-pass MTP)
+            if (has_mtp && cparams.mtp_op_type == MTP_OP_NONE) {
+                lctx.mtp_logits_tensor = nullptr;
+                for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                    if (strcmp(gf->nodes[i]->name, "mtp_logits") == 0) {
+                        lctx.mtp_logits_tensor = gf->nodes[i];
+                        break;
+                    }
+                }
+            }
             if (cparams.embeddings && lctx.model.hparams.nextn_predict_layers == 0) {
                 res = nullptr; // do not extract logits for embedding case
             } else {
@@ -4167,6 +4177,20 @@ static int llama_decode_internal(
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
         }
+        // Extract single-pass MTP logits (if available)
+        if (lctx.mtp_logits_tensor && cparams.mtp_op_type == MTP_OP_NONE) {
+            ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.mtp_logits_tensor);
+            if (backend_mtp) {
+                const int64_t mtp_n_vocab = lctx.mtp_logits_tensor->ne[0];
+                const int64_t mtp_n_tokens = lctx.mtp_logits_tensor->ne[1];
+                lctx.mtp_logits_extracted.resize(mtp_n_vocab * mtp_n_tokens);
+                ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
+                        lctx.mtp_logits_extracted.data(), 0,
+                        mtp_n_vocab * mtp_n_tokens * sizeof(float));
+                lctx.mtp_n_vocab = mtp_n_vocab;
+            }
+        }
+
         n_outputs_prev += lctx.n_outputs;
         n_outputs_prev_embd += has_mtp ? n_tokens : lctx.n_outputs;
         cur_token += n_tokens;
@@ -9170,5 +9194,37 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
     ctx->draft_input_hidden_state = hidden_state;
+}
+
+// Single-pass MTP: get the inline MTP logits from the last decode
+const float * llama_get_mtp_logits(struct llama_context * ctx) {
+    if (ctx->mtp_logits_extracted.empty()) return nullptr;
+    return ctx->mtp_logits_extracted.data();
+}
+
+int64_t llama_get_mtp_n_vocab(struct llama_context * ctx) {
+    return ctx->mtp_n_vocab;
+}
+
+// Single-pass MTP: pick the best draft token from inline MTP logits (last position)
+llama_token llama_get_mtp_draft_token(struct llama_context * ctx) {
+    const float * logits = llama_get_mtp_logits(ctx);
+    if (!logits || ctx->mtp_n_vocab == 0) return LLAMA_TOKEN_NULL;
+
+    // Get logits for the last position
+    const int64_t n_vocab = ctx->mtp_n_vocab;
+    const int64_t n_tokens = (int64_t)ctx->mtp_logits_extracted.size() / n_vocab;
+    const float * last_logits = logits + (n_tokens - 1) * n_vocab;
+
+    // Argmax
+    llama_token best = 0;
+    float best_logit = last_logits[0];
+    for (int64_t i = 1; i < n_vocab; i++) {
+        if (last_logits[i] > best_logit) {
+            best_logit = last_logits[i];
+            best = (llama_token)i;
+        }
+    }
+    return best;
 }
 

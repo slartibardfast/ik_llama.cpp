@@ -1535,6 +1535,11 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
+    // Single-pass MTP: get inline MTP logits/draft from last decode
+    LLAMA_API const float * llama_get_mtp_logits(struct llama_context * ctx);
+    LLAMA_API int64_t       llama_get_mtp_n_vocab(struct llama_context * ctx);
+    LLAMA_API llama_token   llama_get_mtp_draft_token(struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

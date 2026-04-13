@@ -4780,18 +4780,75 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         inpL = cur;
     }
 
-    // Save raw hidden state for MTP before output norm is applied.
-    // MTP's hnorm expects the pre-norm state; using result_norm would
-    // double-normalize and corrupt draft predictions.
-    if (hparams.nextn_predict_layers > 0) {
-        cb(inpL, "result_embd_pooled", -1);
-        ggml_set_output(inpL);
-    }
+    // Save raw hidden state for MTP (pre-output-norm, all batch positions)
+    ggml_tensor * mtp_hidden_state = inpL;
 
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
+
+    // Single-pass MTP: build MTP head inline in the same graph.
+    // This eliminates the two-pass warmup/draft_gen cycle, graph reallocation
+    // storm, and host-device hidden state copies.
+    if (hparams.nextn_predict_layers > 0 && cparams.mtp) {
+        const int il_mtp = hparams.n_layer - 1;
+        const auto & mtp_layer = model.layers[il_mtp];
+
+        if (mtp_layer.nextn.eh_proj != nullptr) {
+            // Step 1: Argmax of main logits → greedy token IDs (in-graph)
+            ggml_tensor * greedy_tokens = ggml_argmax(ctx0, cur);
+            cb(greedy_tokens, "mtp_greedy_tokens", -1);
+            ggml_set_output(greedy_tokens);
+
+            // Step 2: Embed greedy tokens
+            ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
+            if (tok_embd == nullptr) tok_embd = model.tok_embd;
+            ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, greedy_tokens);
+            cb(emb, "mtp_token_embd", il_mtp);
+
+            // Step 3: Normalize embedding and hidden state, project
+            ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            ggml_tensor * h_norm = llm_build_norm(ctx0, mtp_hidden_state, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
+            cb(combined, "mtp_concat", il_mtp);
+            ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+
+            // Step 4: Standard attention + FFN (same code path as main layers)
+            cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                    KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+            cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
+                    mtp_layer.ffn_up,   NULL, NULL,
+                    mtp_layer.ffn_gate, NULL, NULL,
+                    mtp_layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+
+            // Step 5: Output norm + LM head → MTP logits
+            if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            } else {
+                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            }
+
+            ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+            if (mtp_head == nullptr) mtp_head = model.output;
+
+            cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+            cb(cur_mtp, "mtp_logits", -1);
+            ggml_set_output(cur_mtp);
+
+            // Save hidden state for embedding extraction (chained draft gen)
+            ggml_set_name(mtp_hidden_state, "result_embd_pooled");
+            ggml_set_output(mtp_hidden_state);
+
+            ggml_build_forward_expand(gf, cur_mtp);
+
+            // Store MTP logits pointer for extraction
+            lctx.mtp_logits_tensor = cur_mtp;
+        }
+    }
 
     return gf;
 }
