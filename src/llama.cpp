@@ -3979,13 +3979,14 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
-        // Clear inline MTP state — will be repopulated if inline head runs
-        lctx.mtp_logits_tensor = nullptr;
+        // Clear inline MTP extracted logits (repopulated after compute)
         lctx.mtp_logits_extracted.clear();
         lctx.mtp_n_vocab = 0;
 
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
+            // Clear MTP tensor pointer (will be re-found during graph build)
+            lctx.mtp_logits_tensor = nullptr;
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
@@ -4206,9 +4207,6 @@ static int llama_decode_internal(
 #endif
         }
         // Extract single-pass MTP logits (if available)
-        // Extract inline MTP logits — only the LAST position's row.
-        // The MTP logits tensor has shape [mtp_n_vocab, n_tokens] where n_tokens
-        // is the full batch. We only need the last position for draft production.
         if (lctx.mtp_logits_tensor && cparams.mtp_op_type == MTP_OP_NONE) {
             ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.mtp_logits_tensor);
             if (backend_mtp) {

@@ -4845,8 +4845,29 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             cb(combined, "mtp_concat", il_mtp);
             ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
 
-            // DEBUG: skip attention/FFN/output — just test if embed+concat+proj corrupts main model
-            cb(cur_mtp, "mtp_projected", il_mtp);
+            // Standard attention + FFN (same code path as main layers)
+            cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                    KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+            cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
+                    mtp_layer.ffn_up,   NULL, NULL,
+                    mtp_layer.ffn_gate, NULL, NULL,
+                    mtp_layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+
+            // Output norm + LM head → MTP logits
+            if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            } else {
+                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+            }
+
+            ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+            if (mtp_head == nullptr) mtp_head = model.output;
+
+            cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+            cb(cur_mtp, "mtp_logits", -1);
             ggml_set_output(cur_mtp);
             ggml_build_forward_expand(gf, cur_mtp);
 

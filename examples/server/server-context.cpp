@@ -3949,8 +3949,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             slot.i_batch = -1;
         }
-        // Two-pass MTP warmup: only for models WITHOUT inline MTP support
-        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty()) {
+        // Two-pass MTP warmup: skip when inline MTP is active (KV cache populated by in-graph head)
+        const bool model_has_inline_mtp_warmup = llama_model_n_nextn_layer(llama_get_model(ctx)) > 0 && params_base.has_mtp;
+        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty() && !model_has_inline_mtp_warmup) {
             llama_set_draft_input_hidden_state(ctx, batch_mtp_hidden_state.data());
             mtp_update_kv_cache(ctx, batch_view, true);
         }
