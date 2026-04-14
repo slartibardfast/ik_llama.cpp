@@ -4812,25 +4812,25 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         if (mtp_layer.nextn.eh_proj != nullptr) {
             // Greedy token selection for MTP embedding input.
-            ggml_tensor * greedy_tokens;
-            if (inp_out_ids != nullptr && batch.token) {
-                // Prompt eval: use shifted input tokens (ground truth next tokens)
-                // to avoid the expensive full-position lm_head matmul that corrupts
-                // the main model output via graph scheduler interference.
-                greedy_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-                ggml_set_name(greedy_tokens, "mtp_greedy_tokens");
-                ggml_set_input(greedy_tokens);
-                ggml_set_output(greedy_tokens);
-                lctx.mtp_greedy_tokens = greedy_tokens;
+            // Compute full-position logits from unfiltered hidden state so argmax
+            // produces n_tokens entries matching the MTP hidden state dimensions.
+            // This matches the fork's approach (qwen35.cpp:441-442).
+            ggml_tensor * greedy_logits;
+            if (inp_out_ids != nullptr) {
+                // Prompt eval: main logits are filtered — recompute from unfiltered state
+                ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams,
+                        model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
+                greedy_logits = llm_build_lora_mm(lctx, ctx0, model.output, full_normed);
             } else {
-                // Token gen: argmax of main logits
-                ggml_tensor * greedy_logits = ggml_clamp(ctx0, cur, -1e4f, 1e4f);
-                greedy_tokens = ggml_argmax(ctx0, greedy_logits);
-                ggml_set_input(greedy_tokens);
-                ggml_set_output(greedy_tokens);
-                cb(greedy_tokens, "mtp_greedy_tokens", -1);
-                lctx.mtp_greedy_tokens = nullptr;
+                // Token gen: main logits cover all positions
+                greedy_logits = cur;
             }
+            greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
+            ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
+            ggml_set_input(greedy_tokens);
+            ggml_set_output(greedy_tokens);
+            cb(greedy_tokens, "mtp_greedy_tokens", -1);
+            lctx.mtp_greedy_tokens = nullptr;
 
             // Embed greedy tokens — shape [n_embd, n_tokens] matching hidden_state
             ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
