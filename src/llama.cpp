@@ -2320,10 +2320,14 @@ static bool llm_load_tensors(
 
     // Offload input embedding to GPU when all layers are offloaded.
     // Eliminates a CPU→GPU graph split on the embedding lookup.
-    // With MTP this is critical (embedding used every token by MTP head).
-    // Without MTP the benefit is smaller but still saves one sync fence.
+    // For MTP models, co-locate with the MTP layer device specifically
+    // (which may differ from main_gpu in cross-device setups).
     if (n_gpu_layers >= n_layer) {
-        model.buft_input = llama_default_buffer_type_offload(model, model.devices[main_gpu]);
+        int embd_device = main_gpu;
+        if (hparams.nextn_predict_layers > 0 && model.default_layer_device.size() > (size_t)(n_layer - 1)) {
+            embd_device = model.default_layer_device[n_layer - 1];
+        }
+        model.buft_input = llama_default_buffer_type_offload(model, model.devices[embd_device]);
     } else {
         model.buft_input = llama_default_buffer_type_cpu(true);
     }
@@ -2451,6 +2455,21 @@ static bool llm_load_tensors(
                     }
                 }
                 last = il;
+            }
+            // Co-locate MTP layers + output head with the last main transformer layer.
+            // The MTP head runs every token and accesses model.output, tok_embd, and
+            // MTP layer weights. Spreading these across GPUs causes per-token PCIe
+            // transfers that reduce MTP speed from ~18 t/s to 0.16 t/s.
+            if (hparams.nextn_predict_layers > 0) {
+                const int n_main = n_layer - hparams.nextn_predict_layers;
+                if (n_main > 0) {
+                    const int last_main_device = model.default_layer_device[n_main - 1];
+                    for (int il = n_main; il < n_layer; ++il) {
+                        model.default_layer_device[il] = last_main_device;
+                    }
+                    // Output head follows MTP layer
+                    model.default_layer_device[n_layer] = last_main_device;
+                }
             }
         }
         if (fit && required_mem > available_mem) {
@@ -2620,9 +2639,14 @@ static bool llm_load_tensors(
             split_buft = llama_default_buffer_type_offload(model, model.devices[main_gpu]);
         }
         // assign the repeating layers
+        const int n_main_layers = n_layer - hparams.nextn_predict_layers;
         for (int i = i_gpu_start; i < n_layer; ++i) {
             auto buft_layer = llama_default_buffer_type_offload(model, model.default_layer_device[i]);
-            if (split_mode == LLAMA_SPLIT_MODE_ATTN) {
+            // MTP layers: single-device (not split) to avoid cross-GPU REDUCE overhead.
+            // The MTP layer is only 1 transformer layer — splitting gains nothing.
+            if (hparams.nextn_predict_layers > 0 && i >= n_main_layers) {
+                model.buft_layer[i] = { buft_layer, buft_layer };
+            } else if (split_mode == LLAMA_SPLIT_MODE_ATTN) {
                 int layer_gpu = std::upper_bound(model.splits.begin(), model.splits.begin() + device_count,
                         float(i - i_gpu_start)/act_gpu_layers) - model.splits.begin();
                 model.buft_layer[i] = { split_buft, llama_default_buffer_type_offload(model, model.devices[layer_gpu]) };
