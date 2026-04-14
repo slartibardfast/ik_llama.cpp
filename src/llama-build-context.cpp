@@ -4836,10 +4836,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             }
             greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
             ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
-            ggml_set_input(greedy_tokens);
-            ggml_set_output(greedy_tokens);
+            // Don't mark as input/output — let the allocator keep it on GPU
+            // to avoid Vulkan_Host placement and extra graph splits.
             cb(greedy_tokens, "mtp_greedy_tokens", -1);
-            lctx.mtp_greedy_tokens = nullptr;
 
             // Embed greedy tokens — shape [n_embd, n_tokens] matching hidden_state
             ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
