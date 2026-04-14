@@ -12814,6 +12814,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
+                    case GGML_TYPE_TURBO_KV_4B:
                         return true;
                     default:
                         break;
@@ -12831,6 +12832,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
+                    case GGML_TYPE_TURBO_KV_4B:
                         return true;
                     default:
                         break;
