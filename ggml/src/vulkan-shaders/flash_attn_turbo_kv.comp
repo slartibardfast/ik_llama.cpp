@@ -22,8 +22,10 @@ const uint32_t cols_per_iter = WorkGroupSize / D_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 
 // Standard FA binding layout: Q at 0, kv_packed[2] at 1, M at 3, O at 4
+// Also alias kv_packed as non-packed struct for direct byte access in RHT dequant
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+layout (binding = 1) readonly buffer KV_NONPACKED {block_turbo_kv_4b data_kv_np[];} kv_np[2];
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 D_TYPE perElemOpGqaStore(const in uint32_t r, const in uint32_t c, const in D_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
@@ -60,12 +62,9 @@ void dequant_turbo_block_to_shared(
     uint p16_idx0 = byte_idx0 / 2;          // packed16 index
     uint p16_idx1 = byte_idx1 / 2;
 
-    uint bind = is_k ? BINDING_IDX_K : BINDING_IDX_V;
-    uint word0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[p16_idx0]);
-    uint word1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[p16_idx1]);
-    // Extract the correct byte from the uint16_t word
-    uint byte0 = (byte_idx0 & 1) == 0 ? (word0 & 0xFF) : ((word0 >> 8) & 0xFF);
-    uint byte1 = (byte_idx1 & 1) == 0 ? (word1 & 0xFF) : ((word1 >> 8) & 0xFF);
+    uint bind = is_k ? 0 : 1;
+    uint byte0 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[byte_idx0]);
+    uint byte1 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[byte_idx1]);
 
     float val0 = turbo_kv_unpack_byte(byte0, sub_tid,      rcp_inv_std);
     float val1 = turbo_kv_unpack_byte(byte1, sub_tid + 64,  rcp_inv_std);
@@ -81,16 +80,11 @@ void dequant_turbo_block_to_shared(
     uint bi2 = (sub_tid + 64) / 2;    // byte 32..47
     uint bi3 = (sub_tid + 96) / 2;    // byte 48..63
 
-    uint bind = is_k ? BINDING_IDX_K : BINDING_IDX_V;
-    uint w0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi0 / 2]);
-    uint w1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi1 / 2]);
-    uint w2 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi2 / 2]);
-    uint w3 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi3 / 2]);
-    // Extract correct byte from each uint16_t word
-    uint b0 = (bi0 & 1) == 0 ? (w0 & 0xFF) : ((w0 >> 8) & 0xFF);
-    uint b1 = (bi1 & 1) == 0 ? (w1 & 0xFF) : ((w1 >> 8) & 0xFF);
-    uint b2 = (bi2 & 1) == 0 ? (w2 & 0xFF) : ((w2 >> 8) & 0xFF);
-    uint b3 = (bi3 & 1) == 0 ? (w3 & 0xFF) : ((w3 >> 8) & 0xFF);
+    uint bind = is_k ? 0 : 1;
+    uint b0 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[bi0]);
+    uint b1 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[bi1]);
+    uint b2 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[bi2]);
+    uint b3 = uint(kv_np[bind].data_kv_np[block_idx].mse_indices[bi3]);
 
     float v0 = turbo_kv_unpack_byte(b0, sub_tid,      rcp_inv_std);
     float v1 = turbo_kv_unpack_byte(b1, sub_tid + 32,  rcp_inv_std);
@@ -180,8 +174,8 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
-                    float norm = unpackHalf2x16(uint(kv_packed[BINDING_IDX_K].data_packed16[block_idx].norm)).x;
-                    float inv_std = unpackHalf2x16(uint(kv_packed[BINDING_IDX_K].data_packed16[block_idx].inv_std_fp16)).x;
+                    float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
+                    float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
                     dequant_turbo_block_to_shared(
@@ -293,8 +287,8 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
-                    float norm = unpackHalf2x16(uint(kv_packed[BINDING_IDX_V].data_packed16[block_idx].norm)).x;
-                    float inv_std = unpackHalf2x16(uint(kv_packed[BINDING_IDX_V].data_packed16[block_idx].inv_std_fp16)).x;
+                    float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
+                    float inv_std = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
                     dequant_turbo_block_to_shared(
