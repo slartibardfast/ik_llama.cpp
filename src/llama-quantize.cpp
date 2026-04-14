@@ -336,6 +336,19 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
     //    return GGML_TYPE_IQ3_K;
     //}
 
+    // Keep MTP transformer layer weights at F16 for draft quality
+    // MTP layers are the final nextn_predict_layers blocks
+    const uint32_t nextn_layers = qs.model.hparams.nextn_predict_layers;
+    if (nextn_layers > 0) {
+        int il = -1;
+        if (sscanf(tensor->name, "blk.%d.", &il) == 1) {
+            const int n_layer = (int)qs.model.hparams.n_layer;
+            if (il >= n_layer - (int)nextn_layers) {
+                return GGML_TYPE_F16;
+            }
+        }
+    }
+
     const int n_expert = std::max(1, (int)qs.model.hparams.n_expert);
     auto layer_info = [n_expert] (int i_layer, int n_layer, const char * name) {
         if (n_expert > 1) {
@@ -1337,6 +1350,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // do not quantize relative position bias (T5)
         quantize &= name.find("attn_rel_b.weight") == std::string::npos;
+
+        // do not quantize NextN/MTP-specific tensors (eh_proj, enorm, hnorm, etc.)
+        // these must stay at F16 for acceptable MTP draft quality
+        quantize &= name.find(".nextn.") == std::string::npos;
 
         enum ggml_type new_type;
         void * new_data = nullptr;

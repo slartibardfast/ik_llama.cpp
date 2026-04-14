@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.comp"
+#include "generic_binary_head.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint block_off = gl_WorkGroupID.x;
+    const uint pos = gl_LocalInvocationID.x;
+    const uint i10 = gl_GlobalInvocationID.y;
+    const uint i11 = gl_GlobalInvocationID.z / p.ne12;
+    const uint i12 = gl_GlobalInvocationID.z % p.ne12;
+
+    if (block_off * QUANT_K_Q5_K + pos >= p.ne00) return;
+
+    const uint i01 = data_b[i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+    const uint a_offset = i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint d_offset = i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+    const uint ib = a_offset + block_off;
+    const uint out_idx = d_offset + block_off * QUANT_K_Q5_K + pos;
+
+    const FLOAT_TYPE dall = FLOAT_TYPE(data_a[ib].d.x);
+    const FLOAT_TYPE dmin = FLOAT_TYPE(data_a[ib].d.y);
+
+    // Map position to qs byte, nibble, and high bit
+    const uint g = pos / 64;
+    const uint h = (pos / 32) & 1;
+    const uint idx = pos % 32;
+    const uint qs_byte = 32*g + idx;
+
+    uint raw = (h == 0) ? (uint(data_a[ib].qs[qs_byte]) & 0xF)
+                         : (uint(data_a[ib].qs[qs_byte]) >> 4);
+    // Q5_K high bit from qh array
+    const uint8_t hm = uint8_t(1 << (2*g + h));
+    raw += ((data_a[ib].qh[idx] & hm) != uint8_t(0)) ? 16 : 0;
+
+    // Sub-block scale extraction (same packing as Q4_K)
+    const uint sb = pos / 32;
+    const uint is = sb & 0xFE;
+
+    uint scidx0, scidx1;
+    uint mbidx0, mbidx1;
+
+    if ((sb & 1) == 0) {
+        scidx0 = (is < 4) ? is : (is + 4);
+        scidx1 = (is < 4) ? is : (is - 4);
+        mbidx0 = is + 4;
+        mbidx1 = (is < 4) ? is + 4 : is;
+    } else {
+        uint is1 = is + 1;
+        scidx0 = (is < 4) ? is1 : (is1 + 4);
+        scidx1 = (is < 4) ? is1 : (is1 - 4);
+        mbidx0 = is + 5;
+        mbidx1 = (is < 4) ? is + 5 : is + 1;
+    }
+
+    const uint scidxmask1 = (is < 4) ? 0x30 : 0xC0;
+    const uint scidxshift1 = (is < 4) ? 0 : 2;
+    const uint mbidxmask0 = (is < 4) ? 0xF : 0xF0;
+    const uint mbidxshift0 = (is < 4) ? 0 : 4;
+    const uint mbidxmask1 = (is < 4) ? 0x30 : 0xC0;
+    const uint mbidxshift1 = (is < 4) ? 0 : 2;
+
+    const uint sc = (uint(data_a[ib].scales[scidx0]) & 0xF) |
+                    ((uint(data_a[ib].scales[scidx1]) & scidxmask1) >> scidxshift1);
+    const uint mb = ((uint(data_a[ib].scales[mbidx0]) & mbidxmask0) >> mbidxshift0) |
+                    ((uint(data_a[ib].scales[mbidx1]) & mbidxmask1) >> mbidxshift1);
+
+    data_d[out_idx] = D_TYPE(dall * FLOAT_TYPE(sc) * FLOAT_TYPE(raw) - dmin * FLOAT_TYPE(mb));
+}

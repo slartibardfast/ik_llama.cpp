@@ -542,7 +542,12 @@ void process_shaders() {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
 
-        if (!string_ends_with(tname, "_k")) {
+        if (tname == "q4_k" || tname == "q5_k" || tname == "q6_k") {
+            // K-quant types use standalone get_rows shaders (complex sub-block scales)
+            shader = "get_rows_" + tname + ".comp";
+            string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+            string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+        } else if (!string_ends_with(tname, "_k")) {
             shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
 
             if (tname == "f16") {

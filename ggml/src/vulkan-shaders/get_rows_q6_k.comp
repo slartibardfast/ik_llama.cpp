@@ -1,0 +1,57 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.comp"
+#include "generic_binary_head.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint block_off = gl_WorkGroupID.x;
+    const uint pos = gl_LocalInvocationID.x;
+    const uint i10 = gl_GlobalInvocationID.y;
+    const uint i11 = gl_GlobalInvocationID.z / p.ne12;
+    const uint i12 = gl_GlobalInvocationID.z % p.ne12;
+
+    if (block_off * QUANT_K_Q6_K + pos >= p.ne00) return;
+
+    const uint i01 = data_b[i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+    const uint a_offset = i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint d_offset = i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+    const uint ib = a_offset + block_off;
+    const uint out_idx = d_offset + block_off * QUANT_K_Q6_K + pos;
+
+    const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
+
+    // Q6_K layout: 4 quarters of 64 elements each
+    // ql[128]: low 4 bits, qh[64]: high 2 bits, scales[16]: int8 per 16 elements
+    const uint ip = pos / 128;         // 0 or 1 (upper/lower half)
+    const uint il = pos % 128;         // 0..127 within half
+    const uint is = 8*ip + il/16;      // scale index (0..15)
+
+    const uint ql_idx = 64*ip + (il % 64);
+    const uint qh_idx = 32*ip + (il % 32);
+
+    // Extract 4 low bits from ql
+    uint ql_raw;
+    if (il < 64) {
+        ql_raw = uint(data_a[ib].ql[ql_idx]) & 0xF;
+    } else {
+        ql_raw = uint(data_a[ib].ql[ql_idx - 64]) >> 4;
+    }
+
+    // Extract 2 high bits from qh
+    const uint qh_val = uint(data_a[ib].qh[qh_idx]);
+    const uint qh_shift = 2 * ((il / 32) % 2) + 4 * ip;
+    const uint qh_bits = (qh_val >> qh_shift) & 3;
+
+    // Combine to 6-bit value and apply scale
+    const uint q6 = ql_raw | (qh_bits << 4);
+    const FLOAT_TYPE sc = FLOAT_TYPE(data_a[ib].scales[is]);
+
+    data_d[out_idx] = D_TYPE(d * sc * (FLOAT_TYPE(q6) - 32.0));
+}
