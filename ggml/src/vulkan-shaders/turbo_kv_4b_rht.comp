@@ -16,25 +16,23 @@
 // SUBGROUP_SIZE must be set via specialization constant or compile define
 // before including this file.
 
+// Symmetric Lloyd-Max-Gaussian codebook for N(0,1).
+// Must match turbo_kv_4b_codebook[16] in ggml-turbo-kv.c exactly.
 const float TURBO_KV_CODEBOOK[16] = float[16](
-    -2.7326,  -1.8627,  -1.3382,  -0.9265,
-    -0.5712,  -0.2478,   0.0548,   0.3446,
-     0.6325,   0.9265,   1.2365,   1.5795,
-     1.9795,   2.4943,   3.2655,   4.7475
+    -2.7326,  -2.0690,  -1.6180,  -1.2562,
+    -0.9423,  -0.6568,  -0.3881,  -0.1284,
+     0.1284,   0.3881,   0.6568,   0.9423,
+     1.2562,   1.6180,   2.0690,   2.7326
 );
 
 const float TURBO_KV_RSQRT128 = 0.08838834764831845; // 1/sqrt(128)
 
-// Deterministic sign from RHT seed (popcnt parity)
+// Deterministic sign from Knuth multiplicative hash.
+// Must match turbo_kv_random_sign() in ggml-turbo-kv.c exactly.
 float turbo_kv_sign(uint idx) {
-    uint seed = 0x12345678u;
-    uint bits = idx & seed;
-    bits = bits ^ (bits >> 16);
-    bits = bits ^ (bits >> 8);
-    bits = bits ^ (bits >> 4);
-    bits = bits ^ (bits >> 2);
-    bits = bits ^ (bits >> 1);
-    return ((bits & 1u) == 0u) ? 1.0 : -1.0;
+    uint h = 0x12345678u ^ idx;        // TURBO_KV_DEFAULT_SEED ^ idx
+    h = h * 2654435761u;               // Knuth golden-ratio hash
+    return ((h & 1u) != 0u) ? 1.0 : -1.0;
 }
 
 // --- Wave64 FWHT (2 values per thread, 64 threads) ---
