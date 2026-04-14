@@ -92,11 +92,17 @@ void dequant_turbo_block_to_shared(
     uint b2 = (bi2 & 1) == 0 ? (w2 & 0xFF) : ((w2 >> 8) & 0xFF);
     uint b3 = (bi3 & 1) == 0 ? (w3 & 0xFF) : ((w3 >> 8) & 0xFF);
 
-    // DEBUG: use constant 0.01 to test attention computation alone
-    kv_sh[sh_base + sub_tid]      = 0.01;
-    kv_sh[sh_base + sub_tid + 32] = 0.01;
-    kv_sh[sh_base + sub_tid + 64] = 0.01;
-    kv_sh[sh_base + sub_tid + 96] = 0.01;
+    float v0 = turbo_kv_unpack_byte(b0, sub_tid,      rcp_inv_std);
+    float v1 = turbo_kv_unpack_byte(b1, sub_tid + 32,  rcp_inv_std);
+    float v2 = turbo_kv_unpack_byte(b2, sub_tid + 64,  rcp_inv_std);
+    float v3 = turbo_kv_unpack_byte(b3, sub_tid + 96,  rcp_inv_std);
+
+    turbo_kv_inverse_rht(v0, v1, v2, v3, sub_tid, norm);
+
+    kv_sh[sh_base + sub_tid]      = v0;
+    kv_sh[sh_base + sub_tid + 32] = v1;
+    kv_sh[sh_base + sub_tid + 64] = v2;
+    kv_sh[sh_base + sub_tid + 96] = v3;
 #endif
 }
 
@@ -160,7 +166,13 @@ void main() {
     for (uint32_t j = start_j; j < end_j; ++j) {
 
         // ===================== Phase 1: Dequant K into shared memory =====================
-        // Dequant Bc KV tokens × blocks_per_row blocks each
+        // Zero kv_sh first — positions beyond KV won't be dequanted but the
+        // attention mask might not fully prevent 0*NaN = NaN in P·V accumulation.
+        for (uint32_t idx = tid; idx < Bc * HSK; idx += WorkGroupSize) {
+            kv_sh[idx] = 0.0;
+        }
+        barrier();
+
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
@@ -190,10 +202,28 @@ void main() {
             }
         }
 
-        // DEBUG: skip Q·K and D_split reduction — use constant S scores
-        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-                Sf[r][c] = 0.0;
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            uint32_t kv_col = c * cols_per_iter + col_tid;
+            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+                uint32_t elem_base = 4 * (d * D_split + d_tid);
+                vec4 K_Tf = vec4(
+                    kv_sh[kv_col * HSK + elem_base + 0],
+                    kv_sh[kv_col * HSK + elem_base + 1],
+                    kv_sh[kv_col * HSK + elem_base + 2],
+                    kv_sh[kv_col * HSK + elem_base + 3]
+                );
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    Sf[r][c] += dot(Qf[r][d * D_split + d_tid], K_Tf);
+                }
+            }
+        }
+
+        // D_split reduction
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    Sf[r][c] += subgroupShuffleXor(Sf[r][c], s);
+                }
             }
         }
 
@@ -251,6 +281,11 @@ void main() {
 
         // ===================== Phase 3: Dequant V into shared memory =====================
         barrier();
+        for (uint32_t idx = tid; idx < Bc * HSV; idx += WorkGroupSize) {
+            kv_sh[idx] = 0.0;
+        }
+        barrier();
+
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
