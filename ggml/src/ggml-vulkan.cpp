@@ -3442,11 +3442,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t ss = device->subgroup_size;
         if (ss >= 64) {
             ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
-                "dequant_turbo_kv_4b_f32_w64", dequant_turbo_kv_4b_f32_w64_len, dequant_turbo_kv_4b_f32_w64_data, "main", 2, 5 * sizeof(uint32_t),
+                "cpy_turbo_kv_4b_f32_w64", cpy_turbo_kv_4b_f32_w64_len, cpy_turbo_kv_4b_f32_w64_data, "main", 2, sizeof(vk_op_unary_push_constants),
                 {1, 1, 1}, {ss}, 1, true, true, ss);
         } else {
             ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
-                "dequant_turbo_kv_4b_f32_w32", dequant_turbo_kv_4b_f32_w32_len, dequant_turbo_kv_4b_f32_w32_data, "main", 2, 5 * sizeof(uint32_t),
+                "cpy_turbo_kv_4b_f32_w32", cpy_turbo_kv_4b_f32_w32_len, cpy_turbo_kv_4b_f32_w32_data, "main", 2, sizeof(vk_op_unary_push_constants),
                 {1, 1, 1}, {ss}, 1, true, true, ss);
         }
     }

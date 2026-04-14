@@ -1,0 +1,57 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "types.comp"
+#include "generic_unary_head.comp"
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 64
+#endif
+
+#include "turbo_kv_4b_rht.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
+    if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
+
+    const uint tid = gl_SubgroupInvocationID;
+
+    uint src_idx = src0_idx_quant(block_id * QUANT_K_TURBO_KV_4B, QUANT_K_TURBO_KV_4B);
+    uint dst_idx = get_doffset() + dst_idx(block_id * QUANT_K_TURBO_KV_4B);
+
+    const float norm = unpackHalf2x16(uint(data_a[src_idx].norm)).x;
+    const float inv_std = unpackHalf2x16(uint(data_a[src_idx].inv_std_fp16)).x;
+    const float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
+
+#if SUBGROUP_SIZE >= 64
+    float val0 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[tid / 2]),      tid,      rcp_inv_std);
+    float val1 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[(tid + 64) / 2]), tid + 64, rcp_inv_std);
+
+    turbo_kv_inverse_rht(val0, val1, tid, norm);
+
+    data_d[dst_idx + tid]      = val0;
+    data_d[dst_idx + tid + 64] = val1;
+#else
+    float v0 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[tid / 2]),        tid,      rcp_inv_std);
+    float v1 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[(tid + 32) / 2]), tid + 32, rcp_inv_std);
+    float v2 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[(tid + 64) / 2]), tid + 64, rcp_inv_std);
+    float v3 = turbo_kv_unpack_byte(uint(data_a[src_idx].mse_indices[(tid + 96) / 2]), tid + 96, rcp_inv_std);
+
+    turbo_kv_inverse_rht(v0, v1, v2, v3, tid, norm);
+
+    data_d[dst_idx + tid]      = v0;
+    data_d[dst_idx + tid + 32] = v1;
+    data_d[dst_idx + tid + 64] = v2;
+    data_d[dst_idx + tid + 96] = v3;
+#endif
+}
