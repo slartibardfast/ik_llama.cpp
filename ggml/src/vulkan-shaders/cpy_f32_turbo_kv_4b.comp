@@ -55,6 +55,8 @@ void main() {
 
     float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
     float norm = sqrt(sum_sq);
+    // Round norm to fp16 before use — dequant will read the fp16 value
+    norm = unpackHalf2x16(packHalf2x16(vec2(norm, 0.0))).x;
     float rcp_norm = 1.0 / max(norm, 1e-10);
     val0 *= rcp_norm;
     val1 *= rcp_norm;
@@ -63,6 +65,9 @@ void main() {
 
     float max_abs = subgroupMax(max(abs(val0), abs(val1)));
     float inv_std = 2.7326 / max(max_abs, 1e-10);
+    // Round inv_std to fp16 BEFORE quantization so the codebook search
+    // uses the same precision as the dequant path (which reads fp16)
+    inv_std = unpackHalf2x16(packHalf2x16(vec2(inv_std, 0.0))).x;
 
     uint idx0 = turbo_kv_nearest(val0 * inv_std);
     uint idx1 = turbo_kv_nearest(val1 * inv_std);
@@ -87,6 +92,7 @@ void main() {
 
     float sum_sq = subgroupAdd(v0*v0 + v1*v1 + v2*v2 + v3*v3);
     float norm = sqrt(sum_sq);
+    norm = unpackHalf2x16(packHalf2x16(vec2(norm, 0.0))).x;
     float rcp_norm = 1.0 / max(norm, 1e-10);
     v0 *= rcp_norm; v1 *= rcp_norm; v2 *= rcp_norm; v3 *= rcp_norm;
 
@@ -94,6 +100,7 @@ void main() {
 
     float max_abs = subgroupMax(max(max(abs(v0), abs(v1)), max(abs(v2), abs(v3))));
     float inv_std = 2.7326 / max(max_abs, 1e-10);
+    inv_std = unpackHalf2x16(packHalf2x16(vec2(inv_std, 0.0))).x;
 
     uint i0 = turbo_kv_nearest(v0 * inv_std);
     uint i1 = turbo_kv_nearest(v1 * inv_std);
