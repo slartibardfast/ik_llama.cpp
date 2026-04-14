@@ -3966,6 +3966,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
+        // Clear inline MTP state — will be repopulated if inline head runs
+        lctx.mtp_logits_tensor = nullptr;
+        lctx.mtp_logits_extracted.clear();
+        lctx.mtp_n_vocab = 0;
+
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
             lctx.reset_scheduler();
