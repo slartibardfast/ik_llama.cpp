@@ -54,12 +54,18 @@ void dequant_turbo_block_to_shared(
     bool is_k           // true for K buffer, false for V buffer
 ) {
 #if SUBGROUP_SIZE >= 64
-    uint byte0_idx = sub_tid / 2;
-    uint byte1_idx = (sub_tid + 64) / 2;
+    // Byte indices in the uint8_t[64] layout, then convert to packed16[32] indices
+    uint byte_idx0 = sub_tid / 2;           // byte 0..31
+    uint byte_idx1 = (sub_tid + 64) / 2;    // byte 32..63
+    uint p16_idx0 = byte_idx0 / 2;          // packed16 index
+    uint p16_idx1 = byte_idx1 / 2;
 
     uint bind = is_k ? BINDING_IDX_K : BINDING_IDX_V;
-    uint byte0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte0_idx]);
-    uint byte1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte1_idx]);
+    uint word0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[p16_idx0]);
+    uint word1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[p16_idx1]);
+    // Extract the correct byte from the uint16_t word
+    uint byte0 = (byte_idx0 & 1) == 0 ? (word0 & 0xFF) : ((word0 >> 8) & 0xFF);
+    uint byte1 = (byte_idx1 & 1) == 0 ? (word1 & 0xFF) : ((word1 >> 8) & 0xFF);
 
     float val0 = turbo_kv_unpack_byte(byte0, sub_tid,      rcp_inv_std);
     float val1 = turbo_kv_unpack_byte(byte1, sub_tid + 64,  rcp_inv_std);
@@ -69,28 +75,28 @@ void dequant_turbo_block_to_shared(
     kv_sh[sh_base + sub_tid]      = val0;
     kv_sh[sh_base + sub_tid + 64] = val1;
 #else
-    uint byte0_idx = sub_tid / 2;
-    uint byte1_idx = (sub_tid + 32) / 2;
-    uint byte2_idx = (sub_tid + 64) / 2;
-    uint byte3_idx = (sub_tid + 96) / 2;
+    // Byte indices in the uint8_t[64] layout, then convert to packed16[32] indices
+    uint bi0 = sub_tid / 2;           // byte 0..15
+    uint bi1 = (sub_tid + 32) / 2;    // byte 16..31
+    uint bi2 = (sub_tid + 64) / 2;    // byte 32..47
+    uint bi3 = (sub_tid + 96) / 2;    // byte 48..63
 
     uint bind = is_k ? BINDING_IDX_K : BINDING_IDX_V;
-    uint b0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte0_idx]);
-    uint b1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte1_idx]);
-    uint b2 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte2_idx]);
-    uint b3 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[byte3_idx]);
+    uint w0 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi0 / 2]);
+    uint w1 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi1 / 2]);
+    uint w2 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi2 / 2]);
+    uint w3 = uint(kv_packed[bind].data_packed16[block_idx].mse_indices[bi3 / 2]);
+    // Extract correct byte from each uint16_t word
+    uint b0 = (bi0 & 1) == 0 ? (w0 & 0xFF) : ((w0 >> 8) & 0xFF);
+    uint b1 = (bi1 & 1) == 0 ? (w1 & 0xFF) : ((w1 >> 8) & 0xFF);
+    uint b2 = (bi2 & 1) == 0 ? (w2 & 0xFF) : ((w2 >> 8) & 0xFF);
+    uint b3 = (bi3 & 1) == 0 ? (w3 & 0xFF) : ((w3 >> 8) & 0xFF);
 
-    float v0 = turbo_kv_unpack_byte(b0, sub_tid,      rcp_inv_std);
-    float v1 = turbo_kv_unpack_byte(b1, sub_tid + 32,  rcp_inv_std);
-    float v2 = turbo_kv_unpack_byte(b2, sub_tid + 64,  rcp_inv_std);
-    float v3 = turbo_kv_unpack_byte(b3, sub_tid + 96,  rcp_inv_std);
-
-    turbo_kv_inverse_rht(v0, v1, v2, v3, sub_tid, norm);
-
-    kv_sh[sh_base + sub_tid]      = v0;
-    kv_sh[sh_base + sub_tid + 32] = v1;
-    kv_sh[sh_base + sub_tid + 64] = v2;
-    kv_sh[sh_base + sub_tid + 96] = v3;
+    // DEBUG: use constant 0.01 to test attention computation alone
+    kv_sh[sh_base + sub_tid]      = 0.01;
+    kv_sh[sh_base + sub_tid + 32] = 0.01;
+    kv_sh[sh_base + sub_tid + 64] = 0.01;
+    kv_sh[sh_base + sub_tid + 96] = 0.01;
 #endif
 }
 
@@ -99,6 +105,7 @@ void main() {
 
     const uint32_t tid = gl_LocalInvocationIndex;
     const uint32_t d_tid = tid % D_split;
+
     const uint32_t col_tid = tid / D_split;
     const uint32_t sub_id = gl_SubgroupID;
     const uint32_t sub_tid = gl_SubgroupInvocationID;
@@ -138,11 +145,11 @@ void main() {
         }
     }
 
-    // KV offsets: in TURBO_KV_4B block units
-    // Each block = 128 elements. For a KV row of D elements, there are D/128 blocks per row.
+    // KV offsets: in TURBO_KV_4B block units (72 bytes per block)
     const uint32_t blocks_per_row = HSK / QUANT_K_TURBO_KV_4B;
-    uint32_t k_row_offset = ik2 * (p.nb12 / 72) + ik3 * (p.nb13 / 72);  // 72 bytes per block
-    uint32_t v_row_offset = iv2 * (p.nb22 / 72) + iv3 * (p.nb23 / 72);
+    // nb12/nb13 are byte strides for dims 2/3. Divide by block byte size (72) to get block offsets.
+    uint32_t k_row_offset = (ik2*p.nb12 + ik3*p.nb13) / 72;
+    uint32_t v_row_offset = (iv2*p.nb22 + iv3*p.nb23) / 72;
 
     uint32_t m_offset = 0;
     if (p.nem2 != 1 || p.nem3 != 1) {
@@ -183,28 +190,10 @@ void main() {
             }
         }
 
-        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            uint32_t kv_col = c * cols_per_iter + col_tid;
-            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
-                uint32_t elem_base = 4 * (d * D_split + d_tid);
-                vec4 K_Tf = vec4(
-                    kv_sh[kv_col * HSK + elem_base + 0],
-                    kv_sh[kv_col * HSK + elem_base + 1],
-                    kv_sh[kv_col * HSK + elem_base + 2],
-                    kv_sh[kv_col * HSK + elem_base + 3]
-                );
-                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-                    Sf[r][c] += dot(Qf[r][d * D_split + d_tid], K_Tf);
-                }
-            }
-        }
-
-        // D_split reduction
-        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
-                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-                    Sf[r][c] += subgroupShuffleXor(Sf[r][c], s);
-                }
+        // DEBUG: skip Q·K and D_split reduction — use constant S scores
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                Sf[r][c] = 0.0;
             }
         }
 
