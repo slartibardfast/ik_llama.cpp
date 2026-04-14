@@ -74,8 +74,8 @@ void main() {
         data_b[block_id].mse_indices[(tid + 64) / 2]  = uint8_t(idx1 | (partner1 << 4));
     }
     if (tid == 0) {
-        data_b[block_id].norm = turbo_kv_f32_to_fp16_bits(norm);
-        data_b[block_id].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_b[block_id].norm = uint16_t(turbo_kv_f32_to_fp16_bits(norm));
+        data_b[block_id].inv_std_fp16 = uint16_t(turbo_kv_f32_to_fp16_bits(inv_std));
         data_b[block_id].residual_norm = uint16_t(0);
         data_b[block_id]._pad = uint16_t(0);
     }
@@ -115,8 +115,8 @@ void main() {
         data_b[block_id].mse_indices[(tid + 96) / 2]  = uint8_t(i3 | (p3 << 4));
     }
     if (tid == 0) {
-        data_b[block_id].norm = turbo_kv_f32_to_fp16_bits(norm);
-        data_b[block_id].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_b[block_id].norm = uint16_t(turbo_kv_f32_to_fp16_bits(norm));
+        data_b[block_id].inv_std_fp16 = uint16_t(turbo_kv_f32_to_fp16_bits(inv_std));
         data_b[block_id].residual_norm = uint16_t(0);
         data_b[block_id]._pad = uint16_t(0);
     }

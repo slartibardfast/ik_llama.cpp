@@ -2617,6 +2617,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_FA(GGML_TYPE_Q4_K,  q4_k,   FA_SCALAR, )
     CREATE_FA(GGML_TYPE_Q5_K,  q5_k,   FA_SCALAR, )
     CREATE_FA(GGML_TYPE_Q6_K,  q6_k,   FA_SCALAR, )
+    // TURBO_KV_4B FA requires subgroup shuffles for the inverse RHT.
+    // Compiled with wave32 and wave64 variants; select based on device.
+    if (device->subgroup_shuffle) {
+        if (device->subgroup_size >= 64) {
+            CREATE_FA(GGML_TYPE_TURBO_KV_4B, turbo_kv_4b_w64, FA_SCALAR, )
+        } else {
+            CREATE_FA(GGML_TYPE_TURBO_KV_4B, turbo_kv_4b_w32, FA_SCALAR, )
+        }
+    }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
@@ -12717,6 +12726,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
+                case GGML_TYPE_TURBO_KV_4B:
                     // supported in scalar and coopmat2 paths
                     break;
                 //case GGML_TYPE_Q2_K:

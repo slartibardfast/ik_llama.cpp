@@ -602,6 +602,13 @@ void process_shaders() {
         string_to_spv("get_rows_turbo_kv_4b" + suf, "get_rows_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float16_t"}});
         string_to_spv("get_rows_turbo_kv_4b_f32" + suf, "get_rows_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float"}});
         string_to_spv("cpy_f32_turbo_kv_4b" + suf, "cpy_f32_turbo_kv_4b.comp", {ssd});
+
+        // Flash attention with TURBO_KV_4B (uses shared memory pre-dequant via RHT)
+        for (const auto& f16acc : {false, true}) {
+            std::string acctype = f16acc ? "float16_t" : "float";
+            string_to_spv("flash_attn_f32_f16_turbo_kv_4b" + suf, "flash_attn_turbo_kv.comp",
+                merge_maps(base_dict, {ssd, {"DATA_A_TURBO_KV_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"ACC_TYPE", acctype}}), true, false, false, f16acc);
+        }
     }
 
     auto get_type_str = [](bool f16) {
