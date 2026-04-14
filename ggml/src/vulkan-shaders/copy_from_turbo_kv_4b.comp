@@ -26,8 +26,9 @@ void main() {
 
     const uint tid = gl_SubgroupInvocationID;
 
-    uint src_idx = src0_idx_quant(block_id * QUANT_K_TURBO_KV_4B, QUANT_K_TURBO_KV_4B);
-    uint dst_idx = get_doffset() + dst_idx(block_id * QUANT_K_TURBO_KV_4B);
+    // For contiguous tensors, src block = block_id, dst base = block_id * 128
+    uint src_idx = block_id;
+    uint dst_idx = block_id * QUANT_K_TURBO_KV_4B;
 
     const float norm = unpackHalf2x16(uint(data_a[src_idx].norm)).x;
     const float inv_std = unpackHalf2x16(uint(data_a[src_idx].inv_std_fp16)).x;

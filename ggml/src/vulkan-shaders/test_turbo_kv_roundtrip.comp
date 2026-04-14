@@ -1,0 +1,103 @@
+#version 450
+
+// Test shader: forward_rht → quantize → dequant → inverse_rht in one shader.
+// Input: F32 data. Output: F32 round-trip result. Single workgroup per 128 elements.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 32
+#endif
+
+#include "turbo_kv_4b_rht.comp"
+
+layout (push_constant) uniform parameter {
+    uint nel;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint block_id = gl_WorkGroupID.x;
+    if (block_id >= p.nel / 128) return;
+
+    const uint tid = gl_SubgroupInvocationID;
+    const uint base = block_id * 128;
+
+#if SUBGROUP_SIZE >= 64
+    float v0 = data_a[base + tid];
+    float v1 = data_a[base + tid + 64];
+
+    // Normalize
+    float sum_sq = subgroupAdd(v0*v0 + v1*v1);
+    float norm = sqrt(sum_sq);
+    float rn = 1.0 / max(norm, 1e-10);
+    v0 *= rn; v1 *= rn;
+
+    // Forward RHT
+    turbo_kv_forward_rht(v0, v1, tid);
+
+    // Quantize
+    float max_abs = subgroupMax(max(abs(v0), abs(v1)));
+    float inv_std = 2.7326 / max(max_abs, 1e-10);
+    uint idx0 = turbo_kv_nearest(v0 * inv_std);
+    uint idx1 = turbo_kv_nearest(v1 * inv_std);
+
+    // Dequantize
+    float rcp = 1.0 / max(inv_std, 1e-10);
+    v0 = TURBO_KV_CODEBOOK[idx0] * rcp;
+    v1 = TURBO_KV_CODEBOOK[idx1] * rcp;
+
+    // Inverse RHT
+    turbo_kv_inverse_rht(v0, v1, tid, norm);
+
+    data_d[base + tid]      = v0;
+    data_d[base + tid + 64] = v1;
+#else
+    float v0 = data_a[base + tid];
+    float v1 = data_a[base + tid + 32];
+    float v2 = data_a[base + tid + 64];
+    float v3 = data_a[base + tid + 96];
+
+    // Normalize
+    float sum_sq = subgroupAdd(v0*v0 + v1*v1 + v2*v2 + v3*v3);
+    float norm = sqrt(sum_sq);
+    float rn = 1.0 / max(norm, 1e-10);
+    v0 *= rn; v1 *= rn; v2 *= rn; v3 *= rn;
+
+    // Forward RHT
+    turbo_kv_forward_rht(v0, v1, v2, v3, tid);
+
+    // Quantize
+    float max_abs = subgroupMax(max(max(abs(v0), abs(v1)), max(abs(v2), abs(v3))));
+    float inv_std = 2.7326 / max(max_abs, 1e-10);
+    uint i0 = turbo_kv_nearest(v0 * inv_std);
+    uint i1 = turbo_kv_nearest(v1 * inv_std);
+    uint i2 = turbo_kv_nearest(v2 * inv_std);
+    uint i3 = turbo_kv_nearest(v3 * inv_std);
+
+    // Dequantize
+    float rcp = 1.0 / max(inv_std, 1e-10);
+    v0 = TURBO_KV_CODEBOOK[i0] * rcp;
+    v1 = TURBO_KV_CODEBOOK[i1] * rcp;
+    v2 = TURBO_KV_CODEBOOK[i2] * rcp;
+    v3 = TURBO_KV_CODEBOOK[i3] * rcp;
+
+    // Inverse RHT
+    turbo_kv_inverse_rht(v0, v1, v2, v3, tid, norm);
+
+    data_d[base + tid]      = v0;
+    data_d[base + tid + 32] = v1;
+    data_d[base + tid + 64] = v2;
+    data_d[base + tid + 96] = v3;
+#endif
+}
