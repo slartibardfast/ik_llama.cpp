@@ -2318,12 +2318,13 @@ static bool llm_load_tensors(
     int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     bool use_mmap_buffer = true;
 
-    // For models with MTP, the input embedding is used by the MTP head's embedding
-    // lookup every token. Keeping it on CPU causes GPU→CPU→GPU round trips per token.
-    if (mtp && hparams.nextn_predict_layers > 0 && n_gpu_layers > 0) {
+    // Offload input embedding to GPU when all layers are offloaded.
+    // Eliminates a CPU→GPU graph split on the embedding lookup.
+    // With MTP this is critical (embedding used every token by MTP head).
+    // Without MTP the benefit is smaller but still saves one sync fence.
+    if (n_gpu_layers >= n_layer) {
         model.buft_input = llama_default_buffer_type_offload(model, model.devices[main_gpu]);
     } else {
-        // there is very little benefit to offloading the input layer, so always keep it on the CPU
         model.buft_input = llama_default_buffer_type_cpu(true);
     }
 
