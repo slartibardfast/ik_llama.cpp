@@ -460,3 +460,117 @@ vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), float(data_a[a_offset + ib].m));
 }
 #endif
+
+// K-quant types: fully dequantize in dequantize4, get_dm returns (1, 0)
+#if defined(DATA_A_Q4_K)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) { return vec2(0); }  // unused, vec4 path only
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    float dall = float(data_a[a_offset + ib].d.x);
+    float dmin = float(data_a[a_offset + ib].d.y);
+
+    uint sb = iqs / 32;
+    uint is = sb & 0xFE;
+
+    uint scidx0, scidx1, mbidx0, mbidx1;
+    if ((sb & 1) == 0) {
+        scidx0 = (is < 4) ? is : (is + 4);  scidx1 = (is < 4) ? is : (is - 4);
+        mbidx0 = is + 4;  mbidx1 = (is < 4) ? is + 4 : is;
+    } else {
+        uint is1 = is + 1;
+        scidx0 = (is < 4) ? is1 : (is1 + 4);  scidx1 = (is < 4) ? is1 : (is1 - 4);
+        mbidx0 = is + 5;  mbidx1 = (is < 4) ? is + 5 : is + 1;
+    }
+    uint scm1 = (is < 4) ? 0x30 : 0xC0, scs1 = (is < 4) ? 0 : 2;
+    uint mbm0 = (is < 4) ? 0x0F : 0xF0, mbs0 = (is < 4) ? 0 : 4;
+    uint mbm1 = (is < 4) ? 0x30 : 0xC0, mbs1 = (is < 4) ? 0 : 2;
+
+    float sc = float((uint(data_a[a_offset + ib].scales[scidx0]) & 0xF) | ((uint(data_a[a_offset + ib].scales[scidx1]) & scm1) >> scs1));
+    float mb = float(((uint(data_a[a_offset + ib].scales[mbidx0]) & mbm0) >> mbs0) | ((uint(data_a[a_offset + ib].scales[mbidx1]) & mbm1) >> mbs1));
+
+    float d = dall * sc, m = dmin * mb;
+
+    uint g = iqs / 64, h = (iqs / 32) & 1, idx = iqs % 32;
+    uint qs0 = uint(data_a[a_offset + ib].qs[32*g + idx]);
+    uint qs1 = uint(data_a[a_offset + ib].qs[32*g + idx + 1]);
+    uint qs2 = uint(data_a[a_offset + ib].qs[32*g + idx + 2]);
+    uint qs3 = uint(data_a[a_offset + ib].qs[32*g + idx + 3]);
+    uint shift = h * 4;
+    return d * vec4((qs0 >> shift) & 0xF, (qs1 >> shift) & 0xF, (qs2 >> shift) & 0xF, (qs3 >> shift) & 0xF) - vec4(m);
+}
+vec2 get_dm(uint ib, uint a_offset) { return vec2(1, 0); }
+#endif
+
+#if defined(DATA_A_Q5_K)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) { return vec2(0); }
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    float dall = float(data_a[a_offset + ib].d.x);
+    float dmin = float(data_a[a_offset + ib].d.y);
+
+    uint sb = iqs / 32, is = sb & 0xFE;
+    uint scidx0, scidx1, mbidx0, mbidx1;
+    if ((sb & 1) == 0) {
+        scidx0 = (is < 4) ? is : (is + 4);  scidx1 = (is < 4) ? is : (is - 4);
+        mbidx0 = is + 4;  mbidx1 = (is < 4) ? is + 4 : is;
+    } else {
+        uint is1 = is + 1;
+        scidx0 = (is < 4) ? is1 : (is1 + 4);  scidx1 = (is < 4) ? is1 : (is1 - 4);
+        mbidx0 = is + 5;  mbidx1 = (is < 4) ? is + 5 : is + 1;
+    }
+    uint scm1 = (is < 4) ? 0x30 : 0xC0, scs1 = (is < 4) ? 0 : 2;
+    uint mbm0 = (is < 4) ? 0x0F : 0xF0, mbs0 = (is < 4) ? 0 : 4;
+    uint mbm1 = (is < 4) ? 0x30 : 0xC0, mbs1 = (is < 4) ? 0 : 2;
+
+    float sc = float((uint(data_a[a_offset + ib].scales[scidx0]) & 0xF) | ((uint(data_a[a_offset + ib].scales[scidx1]) & scm1) >> scs1));
+    float mb = float(((uint(data_a[a_offset + ib].scales[mbidx0]) & mbm0) >> mbs0) | ((uint(data_a[a_offset + ib].scales[mbidx1]) & mbm1) >> mbs1));
+
+    float d = dall * sc, m = dmin * mb;
+
+    uint g = iqs / 64, h = (iqs / 32) & 1, idx = iqs % 32;
+    uint shift = h * 4;
+    vec4 qv = vec4(
+        (uint(data_a[a_offset + ib].qs[32*g + idx])     >> shift) & 0xF,
+        (uint(data_a[a_offset + ib].qs[32*g + idx + 1]) >> shift) & 0xF,
+        (uint(data_a[a_offset + ib].qs[32*g + idx + 2]) >> shift) & 0xF,
+        (uint(data_a[a_offset + ib].qs[32*g + idx + 3]) >> shift) & 0xF
+    );
+    uint bit = 2*g + h;
+    vec4 hv = vec4(
+        float((uint(data_a[a_offset + ib].qh[idx])     >> bit) & 1),
+        float((uint(data_a[a_offset + ib].qh[idx + 1]) >> bit) & 1),
+        float((uint(data_a[a_offset + ib].qh[idx + 2]) >> bit) & 1),
+        float((uint(data_a[a_offset + ib].qh[idx + 3]) >> bit) & 1)
+    );
+    return d * (qv + 16.0 * hv) - vec4(m);
+}
+vec2 get_dm(uint ib, uint a_offset) { return vec2(1, 0); }
+#endif
+
+#if defined(DATA_A_Q6_K)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) { return vec2(0); }
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    float d_val = float(data_a[a_offset + ib].d);
+
+    uint ip = iqs / 128, local_pos = iqs - 128*ip;
+    uint layer = local_pos / 32, within = local_pos % 32;
+    uint scale_idx = iqs / 16;
+    float sc = float(data_a[a_offset + ib].scales[scale_idx]);
+
+    uint ql_base = 64*ip + 32*(layer & 1) + within;
+    uint ql_shift = (layer >= 2) ? 4 : 0;
+    vec4 ql_vals = vec4(
+        (uint(data_a[a_offset + ib].ql[ql_base])     >> ql_shift) & 0xF,
+        (uint(data_a[a_offset + ib].ql[ql_base + 1]) >> ql_shift) & 0xF,
+        (uint(data_a[a_offset + ib].ql[ql_base + 2]) >> ql_shift) & 0xF,
+        (uint(data_a[a_offset + ib].ql[ql_base + 3]) >> ql_shift) & 0xF
+    );
+    uint qh_base = 32*ip + within, qh_shift = 2*layer;
+    vec4 qh_vals = vec4(
+        float((uint(data_a[a_offset + ib].qh[qh_base])     >> qh_shift) & 3),
+        float((uint(data_a[a_offset + ib].qh[qh_base + 1]) >> qh_shift) & 3),
+        float((uint(data_a[a_offset + ib].qh[qh_base + 2]) >> qh_shift) & 3),
+        float((uint(data_a[a_offset + ib].qh[qh_base + 3]) >> qh_shift) & 3)
+    );
+    return d_val * sc * (ql_vals + 16.0 * qh_vals - vec4(32.0));
+}
+vec2 get_dm(uint ib, uint a_offset) { return vec2(1, 0); }
+#endif

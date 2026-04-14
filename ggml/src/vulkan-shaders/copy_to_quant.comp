@@ -229,6 +229,186 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_Q4_K)
+void quantize(uint dst_idx, uint src_idx)
+{
+    float mins[8], scales[8];
+    float max_scale = 0.0, max_min = 0.0;
+
+    // Pass 1: find per-sub-block scale and min
+    for (int j = 0; j < 8; ++j) {
+        float vmin = data_s[src_idx + 32*j];
+        float vmax = vmin;
+        [[unroll]] for (int l = 1; l < 32; ++l) {
+            float v = data_s[src_idx + 32*j + l];
+            vmin = min(vmin, v);
+            vmax = max(vmax, v);
+        }
+        scales[j] = (vmax - vmin) / 15.0;
+        mins[j] = -vmin;
+        max_scale = max(max_scale, scales[j]);
+        max_min = max(max_min, mins[j]);
+    }
+
+    float inv_scale = max_scale > 0 ? 63.0 / max_scale : 0.0;
+    float inv_min   = max_min   > 0 ? 63.0 / max_min   : 0.0;
+
+    float dall = max_scale / 63.0;
+    float dmin_val = max_min / 63.0;
+    data_q[dst_idx].d.x = float16_t(dall);
+    data_q[dst_idx].d.y = float16_t(dmin_val);
+
+    // Pack 6-bit scales (ls) and mins (lm) into 12-byte scales array
+    uint ls[8], lm[8];
+    for (int j = 0; j < 8; ++j) {
+        ls[j] = min(63, uint(scales[j] * inv_scale + 0.5));
+        lm[j] = min(63, uint(mins[j]   * inv_min   + 0.5));
+    }
+
+    for (int j = 0; j < 4; ++j) {
+        data_q[dst_idx].scales[j]   = uint8_t(ls[j] | ((ls[j+4] >> 4) << 6));
+        data_q[dst_idx].scales[j+4] = uint8_t(lm[j] | ((lm[j+4] >> 4) << 6));
+        data_q[dst_idx].scales[j+8] = uint8_t((ls[j+4] & 0xF) | ((lm[j+4] & 0xF) << 4));
+    }
+
+    // Re-read dall/dmin from the quantized f16 values for consistency
+    dall = float(float16_t(dall));
+    dmin_val = float(float16_t(dmin_val));
+
+    for (int j = 0; j < 4; ++j) {
+        // Two sub-blocks share the same qs bytes: low nibble = sub-block 2j, high nibble = sub-block 2j+1
+        float d0 = dall * float(ls[2*j]);
+        float m0 = dmin_val * float(lm[2*j]);
+        float d1 = dall * float(ls[2*j+1]);
+        float m1 = dmin_val * float(lm[2*j+1]);
+        float id0 = (d0 != 0.0) ? 1.0/d0 : 0.0;
+        float id1 = (d1 != 0.0) ? 1.0/d1 : 0.0;
+
+        [[unroll]] for (int l = 0; l < 32; ++l) {
+            uint q0 = uint(clamp((data_s[src_idx + 64*j + l]      + m0) * id0 + 0.5, 0.0, 15.0));
+            uint q1 = uint(clamp((data_s[src_idx + 64*j + l + 32] + m1) * id1 + 0.5, 0.0, 15.0));
+            data_q[dst_idx].qs[32*j + l] = uint8_t(q0 | (q1 << 4));
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_Q5_K)
+void quantize(uint dst_idx, uint src_idx)
+{
+    float mins[8], scales[8];
+    float max_scale = 0.0, max_min = 0.0;
+
+    for (int j = 0; j < 8; ++j) {
+        float vmin = data_s[src_idx + 32*j];
+        float vmax = vmin;
+        [[unroll]] for (int l = 1; l < 32; ++l) {
+            float v = data_s[src_idx + 32*j + l];
+            vmin = min(vmin, v);
+            vmax = max(vmax, v);
+        }
+        scales[j] = (vmax - vmin) / 31.0;
+        mins[j] = -vmin;
+        max_scale = max(max_scale, scales[j]);
+        max_min = max(max_min, mins[j]);
+    }
+
+    float inv_scale = max_scale > 0 ? 63.0 / max_scale : 0.0;
+    float inv_min   = max_min   > 0 ? 63.0 / max_min   : 0.0;
+
+    float dall = max_scale / 63.0;
+    float dmin_val = max_min / 63.0;
+    data_q[dst_idx].d.x = float16_t(dall);
+    data_q[dst_idx].d.y = float16_t(dmin_val);
+
+    uint ls[8], lm[8];
+    for (int j = 0; j < 8; ++j) {
+        ls[j] = min(63, uint(scales[j] * inv_scale + 0.5));
+        lm[j] = min(63, uint(mins[j]   * inv_min   + 0.5));
+    }
+
+    for (int j = 0; j < 4; ++j) {
+        data_q[dst_idx].scales[j]   = uint8_t(ls[j] | ((ls[j+4] >> 4) << 6));
+        data_q[dst_idx].scales[j+4] = uint8_t(lm[j] | ((lm[j+4] >> 4) << 6));
+        data_q[dst_idx].scales[j+8] = uint8_t((ls[j+4] & 0xF) | ((lm[j+4] & 0xF) << 4));
+    }
+
+    dall = float(float16_t(dall));
+    dmin_val = float(float16_t(dmin_val));
+
+    for (int j = 0; j < 4; ++j) {
+        float d0 = dall * float(ls[2*j]);
+        float m0 = dmin_val * float(lm[2*j]);
+        float d1 = dall * float(ls[2*j+1]);
+        float m1 = dmin_val * float(lm[2*j+1]);
+        float id0 = (d0 != 0.0) ? 1.0/d0 : 0.0;
+        float id1 = (d1 != 0.0) ? 1.0/d1 : 0.0;
+
+        [[unroll]] for (int l = 0; l < 32; ++l) {
+            uint q0 = uint(clamp((data_s[src_idx + 64*j + l]      + m0) * id0 + 0.5, 0.0, 31.0));
+            uint q1 = uint(clamp((data_s[src_idx + 64*j + l + 32] + m1) * id1 + 0.5, 0.0, 31.0));
+            data_q[dst_idx].qs[32*j + l] = uint8_t((q0 & 0xF) | ((q1 & 0xF) << 4));
+            // High bits: bit for element 64*j+l is bit (2*j) of qh[l],
+            //            bit for element 64*j+l+32 is bit (2*j+1) of qh[l]
+            if (j == 0) data_q[dst_idx].qh[l] = uint8_t(0);
+            data_q[dst_idx].qh[l] |= uint8_t(((q0 >> 4) << (2*j)) | ((q1 >> 4) << (2*j + 1)));
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_Q6_K)
+void quantize(uint dst_idx, uint src_idx)
+{
+    // Q6_K: 16 sub-blocks of 16 elements, each with an int8 scale
+    float max_abs_scale = 0.0;
+
+    float sb_scales[16];
+    for (int j = 0; j < 16; ++j) {
+        float amax = 0.0;
+        [[unroll]] for (int l = 0; l < 16; ++l) {
+            amax = max(amax, abs(data_s[src_idx + 16*j + l]));
+        }
+        sb_scales[j] = amax / 32.0;
+        max_abs_scale = max(max_abs_scale, sb_scales[j]);
+    }
+
+    float d = max_abs_scale / 127.0;
+    float id = (d != 0.0) ? 1.0/d : 0.0;
+
+    data_q[dst_idx].d = float16_t(d);
+
+    int q_scales[16];
+    for (int j = 0; j < 16; ++j) {
+        q_scales[j] = int(clamp(sb_scales[j] * id + 0.5, 0.0, 127.0));
+        data_q[dst_idx].scales[j] = int8_t(q_scales[j]);
+    }
+
+    for (int ip = 0; ip < 2; ++ip) {
+        for (int il = 0; il < 32; ++il) {
+            uint si0 = (8*ip + il/16);
+            uint si1 = (8*ip + il/16 + 2);
+            uint si2 = (8*ip + il/16 + 4);
+            uint si3 = (8*ip + il/16 + 6);
+
+            float isc0 = (q_scales[si0] != 0) ? 1.0 / (d * float(q_scales[si0])) : 0.0;
+            float isc1 = (q_scales[si1] != 0) ? 1.0 / (d * float(q_scales[si1])) : 0.0;
+            float isc2 = (q_scales[si2] != 0) ? 1.0 / (d * float(q_scales[si2])) : 0.0;
+            float isc3 = (q_scales[si3] != 0) ? 1.0 / (d * float(q_scales[si3])) : 0.0;
+
+            uint q0 = uint(clamp(data_s[src_idx + 128*ip + il]      * isc0 + 32.5, 0.0, 63.0));
+            uint q1 = uint(clamp(data_s[src_idx + 128*ip + il + 32] * isc1 + 32.5, 0.0, 63.0));
+            uint q2 = uint(clamp(data_s[src_idx + 128*ip + il + 64] * isc2 + 32.5, 0.0, 63.0));
+            uint q3 = uint(clamp(data_s[src_idx + 128*ip + il + 96] * isc3 + 32.5, 0.0, 63.0));
+
+            data_q[dst_idx].ql[64*ip + il]      = uint8_t((q0 & 0xF) | ((q2 & 0xF) << 4));
+            data_q[dst_idx].ql[64*ip + il + 32]  = uint8_t((q1 & 0xF) | ((q3 & 0xF) << 4));
+            data_q[dst_idx].qh[32*ip + il]       = uint8_t(((q0 >> 4) & 3) | (((q1 >> 4) & 3) << 2) | (((q2 >> 4) & 3) << 4) | (((q3 >> 4) & 3) << 6));
+        }
+    }
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 void quantize(uint dst_idx, uint src_idx)
 {
