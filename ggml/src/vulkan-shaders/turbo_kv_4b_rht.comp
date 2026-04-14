@@ -45,9 +45,10 @@ void turbo_kv_fwht(inout float val0, inout float val1, uint tid) {
     [[unroll]] for (uint s = 1; s <= 32; s <<= 1) {
         float other0 = subgroupShuffleXor(val0, s);
         float other1 = subgroupShuffleXor(val1, s);
-        float t0 = val0; val0 = t0 + other0; float u0 = t0 - other0;
-        float t1 = val1; val1 = t1 + other1; float u1 = t1 - other1;
-        if ((tid & s) != 0u) { val0 = u0; val1 = u1; }
+        float sum0 = val0 + other0, sum1 = val1 + other1;
+        float dif0 = other0 - val0, dif1 = other1 - val1;
+        val0 = ((tid & s) != 0u) ? dif0 : sum0;
+        val1 = ((tid & s) != 0u) ? dif1 : sum1;
     }
     // Stage 6: stride 64, thread-local swap between val0 and val1
     float t0 = val0; float t1 = val1;
@@ -86,11 +87,11 @@ void turbo_kv_fwht_w32(inout float v0, inout float v1, inout float v2, inout flo
         float o1 = subgroupShuffleXor(v1, s);
         float o2 = subgroupShuffleXor(v2, s);
         float o3 = subgroupShuffleXor(v3, s);
-        float t;
-        t = v0; v0 = t + o0; if ((tid & s) != 0u) v0 = t - o0;
-        t = v1; v1 = t + o1; if ((tid & s) != 0u) v1 = t - o1;
-        t = v2; v2 = t + o2; if ((tid & s) != 0u) v2 = t - o2;
-        t = v3; v3 = t + o3; if ((tid & s) != 0u) v3 = t - o3;
+        bool hi = (tid & s) != 0u;
+        v0 = hi ? (o0 - v0) : (v0 + o0);
+        v1 = hi ? (o1 - v1) : (v1 + o1);
+        v2 = hi ? (o2 - v2) : (v2 + o2);
+        v3 = hi ? (o3 - v3) : (v3 + o3);
     }
     // Stage 5: stride 32, thread-local (v0↔v1, v2↔v3)
     float t0, t1;
