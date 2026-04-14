@@ -603,6 +603,7 @@ void process_shaders() {
         string_to_spv("get_rows_turbo_kv_4b_f32" + suf, "get_rows_turbo_kv_4b.comp", {ssd, {"D_TYPE", "float"}});
         string_to_spv("cpy_f32_turbo_kv_4b" + suf, "cpy_f32_turbo_kv_4b.comp", {ssd});
         string_to_spv("cpy_turbo_kv_4b_f32" + suf, "copy_from_turbo_kv_4b.comp", {ssd, {"DATA_A_TURBO_KV_4B", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("test_turbo_kv_roundtrip" + suf, "test_turbo_kv_roundtrip.comp", {ssd});
 
         // Flash attention with TURBO_KV_4B (uses shared memory pre-dequant via RHT)
         for (const auto& f16acc : {false, true}) {
