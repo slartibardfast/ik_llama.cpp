@@ -4785,16 +4785,12 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         inpL = cur;
     }
 
-    // Save raw hidden state for MTP (pre-output-norm, all batch positions)
-    // Always emit result_embd_pooled when MTP is active so the warmup path
-    // (prompt eval) and the inline path (token gen) both get pre-norm states.
+    // Save unfiltered hidden state for MTP (pre-output-norm, all batch positions).
+    // The MTP head needs ALL positions to populate its KV cache correctly.
     ggml_tensor * mtp_hidden_state = inpL;
-    if (has_mtp_inline) {
-        cb(mtp_hidden_state, "result_embd_pooled", -1);
-        ggml_set_output(mtp_hidden_state);
-    }
 
-    // Apply inp_out_ids filtering for the main output head (deferred from last layer when MTP active)
+    // Apply inp_out_ids filtering for the main output head only.
+    // When MTP is active, filtering was deferred from the last main layer.
     if (has_mtp_inline && inp_out_ids) {
         inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
     }
@@ -4805,50 +4801,54 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     ggml_build_forward_expand(gf, cur);
 
     // Single-pass MTP: build MTP head inline in the same graph.
-    // Only during token generation (n_tokens == 1 or small batch).
-    // During prompt eval, the MTP KV cache needs populating via the two-pass path.
-    if (hparams.nextn_predict_layers > 0 && cparams.mtp && n_tokens <= 2) {
+    // Runs ALWAYS (both prompt eval and token gen) — no n_tokens guard.
+    // The MTP KV cache is populated transparently via standard attention infrastructure.
+    if (has_mtp_inline) {
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
 
         if (mtp_layer.nextn.eh_proj != nullptr) {
-            // Step 1: Compute full-position logits for greedy token selection.
-            // The main output head (cur) may be filtered to output positions only.
-            // MTP needs argmax for ALL positions to match hidden_state dimensions.
-            ggml_tensor * greedy_logits;
-            if (n_tokens > 1) {
-                // Prompt eval: compute full-position logits from unfiltered hidden state
-                ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
-                greedy_logits = llm_build_lora_mm(lctx, ctx0, model.output, full_normed);
+            // Greedy token selection for MTP embedding input.
+            // During token gen: argmax of main logits (1 token).
+            // During prompt eval: use input tokens shifted by 1 position — the actual
+            // next tokens from the prompt. This is the ground truth for the MTP head's
+            // training signal and avoids the expensive full-position lm_head matmul.
+            ggml_tensor * greedy_tokens;
+            if (inp_out_ids != nullptr && batch.token) {
+                // Prompt eval: use shifted input tokens as MTP input
+                // Position i's "greedy next token" is the actual token at position i+1.
+                // Last position uses argmax of main logits.
+                greedy_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+                ggml_set_name(greedy_tokens, "mtp_greedy_tokens");
+                ggml_set_input(greedy_tokens);
+                ggml_set_output(greedy_tokens);
+                // Will be filled by set_inputs with shifted tokens
+                lctx.mtp_greedy_tokens = greedy_tokens;
             } else {
-                // Token gen: main logits already have all positions (1 token)
-                greedy_logits = cur;
+                // Token gen: argmax of main logits
+                ggml_tensor * greedy_logits = ggml_clamp(ctx0, cur, -1e4f, 1e4f);
+                greedy_tokens = ggml_argmax(ctx0, greedy_logits);
+                ggml_set_input(greedy_tokens);
+                ggml_set_output(greedy_tokens);
+                cb(greedy_tokens, "mtp_greedy_tokens", -1);
+                lctx.mtp_greedy_tokens = nullptr;
             }
 
-            // Clamp to prevent OOB token IDs from stale graph allocations
-            greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
-            ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
-            // Force dedicated allocation: prevent buffer aliasing bug that corrupts
-            // I32 argmax result with float bit patterns from downstream ops
-            ggml_set_input(greedy_tokens);
-            ggml_set_output(greedy_tokens);
-            cb(greedy_tokens, "mtp_greedy_tokens", -1);
-
-            // Step 2: Embed greedy tokens (n_tokens entries)
+            // Embed greedy tokens — shape [n_embd, n_tokens] matching hidden_state
             ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
             if (tok_embd == nullptr) tok_embd = model.tok_embd;
             ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, greedy_tokens);
             cb(emb, "mtp_token_embd", il_mtp);
 
-            // Step 3: Normalize embedding and hidden state, project
-            // Both e_norm and h_norm have shape [n_embd, n_tokens]
+            // Normalize and project: concat(enorm(emb), hnorm(hidden)) → eh_proj
             ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
             ggml_tensor * h_norm = llm_build_norm(ctx0, mtp_hidden_state, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
             ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
             cb(combined, "mtp_concat", il_mtp);
             ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
 
-            // Step 4: Standard attention + FFN (same code path as main layers)
+            // Standard attention + FFN (same code path as main layers)
+            // This populates the MTP layer's KV cache for all batch positions.
             cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
                     KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
 
@@ -4859,7 +4859,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
 
-            // Step 5: Output norm + LM head → MTP logits
+            // Output norm + LM head → MTP logits
             if (mtp_layer.nextn.shared_head_norm != nullptr) {
                 cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
             } else {
@@ -4875,9 +4875,14 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
             ggml_build_forward_expand(gf, cur_mtp);
 
-            // Store MTP logits pointer for extraction
             lctx.mtp_logits_tensor = cur_mtp;
         }
+    }
+
+    // Emit result_embd_pooled for embedding extraction (used by server for hidden state)
+    if (has_mtp_inline) {
+        cb(mtp_hidden_state, "result_embd_pooled", -1);
+        ggml_set_output(mtp_hidden_state);
     }
 
     return gf;

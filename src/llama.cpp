@@ -3597,6 +3597,19 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
         }
     }
+
+    // Fill MTP greedy tokens for prompt eval: use input tokens shifted by 1.
+    // Position i's "next token" is the actual token at position i+1.
+    // Last position gets token 0 (will be overwritten by argmax during token gen).
+    if (lctx.mtp_greedy_tokens && batch.token && batch.n_tokens > 1) {
+        std::vector<int32_t> shifted(batch.n_tokens);
+        for (int i = 0; i < batch.n_tokens - 1; i++) {
+            shifted[i] = batch.token[i + 1];
+        }
+        shifted[batch.n_tokens - 1] = batch.token[batch.n_tokens - 1]; // repeat last
+        ggml_backend_tensor_set(lctx.mtp_greedy_tokens, shifted.data(), 0,
+                batch.n_tokens * sizeof(int32_t));
+    }
 }
 
 // Make sure enough space is available for outputs.
@@ -4183,15 +4196,22 @@ static int llama_decode_internal(
 #endif
         }
         // Extract single-pass MTP logits (if available)
+        // Extract inline MTP logits — only the LAST position's row.
+        // The MTP logits tensor has shape [mtp_n_vocab, n_tokens] where n_tokens
+        // is the full batch. We only need the last position for draft production.
         if (lctx.mtp_logits_tensor && cparams.mtp_op_type == MTP_OP_NONE) {
             ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.mtp_logits_tensor);
             if (backend_mtp) {
                 const int64_t mtp_n_vocab = lctx.mtp_logits_tensor->ne[0];
                 const int64_t mtp_n_tokens = lctx.mtp_logits_tensor->ne[1];
-                lctx.mtp_logits_extracted.resize(mtp_n_vocab * mtp_n_tokens);
+                const int64_t last_pos = mtp_n_tokens - 1;
+
+                // Extract only the last position's logits
+                lctx.mtp_logits_extracted.resize(mtp_n_vocab);
                 ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
-                        lctx.mtp_logits_extracted.data(), 0,
-                        mtp_n_vocab * mtp_n_tokens * sizeof(float));
+                        lctx.mtp_logits_extracted.data(),
+                        last_pos * mtp_n_vocab * sizeof(float),
+                        mtp_n_vocab * sizeof(float));
                 lctx.mtp_n_vocab = mtp_n_vocab;
             }
         }
@@ -9216,19 +9236,21 @@ llama_token llama_get_mtp_draft_token(struct llama_context * ctx) {
     const float * logits = llama_get_mtp_logits(ctx);
     if (!logits || ctx->mtp_n_vocab == 0) return LLAMA_TOKEN_NULL;
 
-    // Get logits for the last position
     const int64_t n_vocab = ctx->mtp_n_vocab;
-    const int64_t n_tokens = (int64_t)ctx->mtp_logits_extracted.size() / n_vocab;
-    const float * last_logits = logits + (n_tokens - 1) * n_vocab;
 
-    // Argmax
+    // Argmax over extracted last-position logits
     llama_token best = 0;
-    float best_logit = last_logits[0];
+    float best_logit = logits[0];
     for (int64_t i = 1; i < n_vocab; i++) {
-        if (last_logits[i] > best_logit) {
-            best_logit = last_logits[i];
+        if (logits[i] > best_logit) {
+            best_logit = logits[i];
             best = (llama_token)i;
         }
+    }
+
+    // Don't propose EOG tokens as drafts
+    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), best)) {
+        return LLAMA_TOKEN_NULL;
     }
     return best;
 }
