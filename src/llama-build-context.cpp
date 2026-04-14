@@ -4798,6 +4798,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
     cb(cur, "result_output", -1);
 
+    // Mark main logits as output to prevent the graph allocator from reusing
+    // its buffer for MTP operations (which would corrupt the main logits).
+    ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
 
     // Single-pass MTP: build MTP head inline in the same graph.
@@ -4809,20 +4812,15 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         if (mtp_layer.nextn.eh_proj != nullptr) {
             // Greedy token selection for MTP embedding input.
-            // During token gen: argmax of main logits (1 token).
-            // During prompt eval: use input tokens shifted by 1 position — the actual
-            // next tokens from the prompt. This is the ground truth for the MTP head's
-            // training signal and avoids the expensive full-position lm_head matmul.
             ggml_tensor * greedy_tokens;
             if (inp_out_ids != nullptr && batch.token) {
-                // Prompt eval: use shifted input tokens as MTP input
-                // Position i's "greedy next token" is the actual token at position i+1.
-                // Last position uses argmax of main logits.
+                // Prompt eval: use shifted input tokens (ground truth next tokens)
+                // to avoid the expensive full-position lm_head matmul that corrupts
+                // the main model output via graph scheduler interference.
                 greedy_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
                 ggml_set_name(greedy_tokens, "mtp_greedy_tokens");
                 ggml_set_input(greedy_tokens);
                 ggml_set_output(greedy_tokens);
-                // Will be filled by set_inputs with shifted tokens
                 lctx.mtp_greedy_tokens = greedy_tokens;
             } else {
                 // Token gen: argmax of main logits
@@ -4847,32 +4845,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             cb(combined, "mtp_concat", il_mtp);
             ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
 
-            // Standard attention + FFN (same code path as main layers)
-            // This populates the MTP layer's KV cache for all batch positions.
-            cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
-                    KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
-
-            cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
-                    mtp_layer.ffn_up,   NULL, NULL,
-                    mtp_layer.ffn_gate, NULL, NULL,
-                    mtp_layer.ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
-
-            // Output norm + LM head → MTP logits
-            if (mtp_layer.nextn.shared_head_norm != nullptr) {
-                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            } else {
-                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            }
-
-            ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
-            if (mtp_head == nullptr) mtp_head = model.output;
-
-            cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
-            cb(cur_mtp, "mtp_logits", -1);
+            // DEBUG: skip attention/FFN/output — just test if embed+concat+proj corrupts main model
+            cb(cur_mtp, "mtp_projected", il_mtp);
             ggml_set_output(cur_mtp);
-
             ggml_build_forward_expand(gf, cur_mtp);
 
             lctx.mtp_logits_tensor = cur_mtp;

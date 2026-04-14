@@ -4026,8 +4026,18 @@ static int llama_decode_internal(
             }
         }
 
-        // the output is always the last tensor in the graph
-        struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
+        // Find the main logits tensor (result_output) in the graph.
+        // With single-pass MTP, additional nodes are appended after result_output.
+        struct ggml_tensor * res = nullptr;
+        for (int i = gf->n_nodes - 1; i >= 0; --i) {
+            if (strcmp(gf->nodes[i]->name, "result_output") == 0) {
+                res = gf->nodes[i];
+                break;
+            }
+        }
+        if (!res) {
+            res = gf->nodes[gf->n_nodes - 1]; // fallback: last node
+        }
         struct ggml_tensor * embd = nullptr;
 
         if (lctx.n_outputs == 0) {
