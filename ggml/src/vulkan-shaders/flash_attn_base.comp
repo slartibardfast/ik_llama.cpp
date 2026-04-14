@@ -85,6 +85,292 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_Q4_1)
+#define BLOCK_BYTE_SIZE 20
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float d = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d);
+    float m = float(kv_packed[binding_idx].data_packed16[a_offset + ib].m);
+
+    uint vui_lo = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+
+    return d * vec4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF) + vec4(m);
+}
+#endif
+
+#if defined(DATA_A_Q5_0)
+#define BLOCK_BYTE_SIZE 22
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float d = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d);
+
+    uint uint_qh = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[1]) << 16
+                 | uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[0]);
+
+    uint vui_lo = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+
+    // qh bit i = 5th bit of value at position i (0..31)
+    vec4 hi = vec4(
+        float(int((uint_qh >> (iqs + 0)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 1)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 2)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 3)) & 1) << 4)
+    );
+
+    return d * (vec4((vui_lo & 0xF), ((vui_lo >> 8) & 0xF), (vui_hi & 0xF), ((vui_hi >> 8) & 0xF)) + hi - 16.0);
+}
+#endif
+
+#if defined(DATA_A_Q5_1)
+#define BLOCK_BYTE_SIZE 24
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float d = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d);
+    float m = float(kv_packed[binding_idx].data_packed16[a_offset + ib].m);
+
+    uint uint_qh = kv_packed[binding_idx].data_packed16[a_offset + ib].qh;
+
+    uint vui_lo = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+
+    vec4 hi = vec4(
+        float(int((uint_qh >> (iqs + 0)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 1)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 2)) & 1) << 4),
+        float(int((uint_qh >> (iqs + 3)) & 1) << 4)
+    );
+
+    return d * (vec4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF) + hi) + vec4(m);
+}
+#endif
+
+#if defined(DATA_A_IQ4_NL)
+#define BLOCK_BYTE_SIZE 18
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float d = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d);
+
+    uint vui_lo = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+
+    return d * vec4(
+        kvalues_iq4nl[(vui_lo     ) & 0xF],
+        kvalues_iq4nl[(vui_lo >> 8) & 0xF],
+        kvalues_iq4nl[(vui_hi     ) & 0xF],
+        kvalues_iq4nl[(vui_hi >> 8) & 0xF]
+    );
+}
+#endif
+
+#if defined(DATA_A_Q4_K)
+#define BLOCK_BYTE_SIZE 144
+
+// Helper: extract uint8 from packed uint16 scales array
+uint q4k_scale_byte(uint ib, uint idx, uint a_offset, uint binding_idx) {
+    uint word = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].scales[idx >> 1]);
+    return (word >> (8 * (idx & 1))) & 0xFF;
+}
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float dall = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d.x);
+    float dmin = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d.y);
+
+    // Sub-block index (0..7) — each vec4 stays within one 32-element sub-block
+    uint sb = iqs / 32;
+    uint is = sb & 0xFE;
+
+    // Extract 6-bit scale and min using the Q4_K packing scheme
+    uint scidx0, scidx1, mbidx0, mbidx1;
+    if ((sb & 1) == 0) {
+        scidx0 = (is < 4) ? is     : (is + 4);
+        scidx1 = (is < 4) ? is     : (is - 4);
+        mbidx0 = is + 4;
+        mbidx1 = (is < 4) ? is + 4 : is;
+    } else {
+        uint is1 = is + 1;
+        scidx0 = (is < 4) ? is1     : (is1 + 4);
+        scidx1 = (is < 4) ? is1     : (is1 - 4);
+        mbidx0 = is + 5;
+        mbidx1 = (is < 4) ? is + 5  : is + 1;
+    }
+    uint scmask1  = (is < 4) ? 0x30 : 0xC0;
+    uint scshift1 = (is < 4) ? 0    : 2;
+    uint mbmask0  = (is < 4) ? 0x0F : 0xF0;
+    uint mbshift0 = (is < 4) ? 0    : 4;
+    uint mbmask1  = (is < 4) ? 0x30 : 0xC0;
+    uint mbshift1 = (is < 4) ? 0    : 2;
+
+    float sc = float((q4k_scale_byte(ib, scidx0, a_offset, binding_idx) & 0xF) |
+                     ((q4k_scale_byte(ib, scidx1, a_offset, binding_idx) & scmask1) >> scshift1));
+    float mb = float(((q4k_scale_byte(ib, mbidx0, a_offset, binding_idx) & mbmask0) >> mbshift0) |
+                     ((q4k_scale_byte(ib, mbidx1, a_offset, binding_idx) & mbmask1) >> mbshift1));
+
+    float d = dall * sc;
+    float m = dmin * mb;
+
+    // Extract 4 quantized nibbles from qs[64] (packed uint16_t)
+    uint g = iqs / 64;
+    uint h = (iqs / 32) & 1;
+    uint idx = iqs % 32;
+    uint qs_base = 32 * g + idx;  // always even (iqs is 4-aligned)
+
+    uint q16_0 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[qs_base / 2]);
+    uint q16_1 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[qs_base / 2 + 1]);
+
+    vec4 qv;
+    if (h == 0) {
+        qv = vec4(q16_0 & 0xF, (q16_0 >> 8) & 0xF, q16_1 & 0xF, (q16_1 >> 8) & 0xF);
+    } else {
+        qv = vec4((q16_0 >> 4) & 0xF, (q16_0 >> 12) & 0xF, (q16_1 >> 4) & 0xF, (q16_1 >> 12) & 0xF);
+    }
+
+    return d * qv - vec4(m);
+}
+#endif
+
+#if defined(DATA_A_Q5_K)
+#define BLOCK_BYTE_SIZE 176
+
+// Reuse scale byte helper (same packed scale layout as Q4_K)
+uint q5k_scale_byte(uint ib, uint idx, uint a_offset, uint binding_idx) {
+    uint word = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].scales[idx >> 1]);
+    return (word >> (8 * (idx & 1))) & 0xFF;
+}
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float dall = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d.x);
+    float dmin = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d.y);
+
+    // Sub-block scale extraction (identical to Q4_K)
+    uint sb = iqs / 32;
+    uint is = sb & 0xFE;
+
+    uint scidx0, scidx1, mbidx0, mbidx1;
+    if ((sb & 1) == 0) {
+        scidx0 = (is < 4) ? is     : (is + 4);
+        scidx1 = (is < 4) ? is     : (is - 4);
+        mbidx0 = is + 4;
+        mbidx1 = (is < 4) ? is + 4 : is;
+    } else {
+        uint is1 = is + 1;
+        scidx0 = (is < 4) ? is1     : (is1 + 4);
+        scidx1 = (is < 4) ? is1     : (is1 - 4);
+        mbidx0 = is + 5;
+        mbidx1 = (is < 4) ? is + 5  : is + 1;
+    }
+    uint scmask1  = (is < 4) ? 0x30 : 0xC0;
+    uint scshift1 = (is < 4) ? 0    : 2;
+    uint mbmask0  = (is < 4) ? 0x0F : 0xF0;
+    uint mbshift0 = (is < 4) ? 0    : 4;
+    uint mbmask1  = (is < 4) ? 0x30 : 0xC0;
+    uint mbshift1 = (is < 4) ? 0    : 2;
+
+    float sc = float((q5k_scale_byte(ib, scidx0, a_offset, binding_idx) & 0xF) |
+                     ((q5k_scale_byte(ib, scidx1, a_offset, binding_idx) & scmask1) >> scshift1));
+    float mb = float(((q5k_scale_byte(ib, mbidx0, a_offset, binding_idx) & mbmask0) >> mbshift0) |
+                     ((q5k_scale_byte(ib, mbidx1, a_offset, binding_idx) & mbmask1) >> mbshift1));
+
+    float d = dall * sc;
+    float m = dmin * mb;
+
+    // Extract 4 base nibbles from qs (same layout as Q4_K)
+    uint g = iqs / 64;
+    uint h = (iqs / 32) & 1;
+    uint idx = iqs % 32;
+    uint qs_base = 32 * g + idx;
+
+    uint q16_0 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[qs_base / 2]);
+    uint q16_1 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[qs_base / 2 + 1]);
+
+    vec4 qv;
+    if (h == 0) {
+        qv = vec4(q16_0 & 0xF, (q16_0 >> 8) & 0xF, q16_1 & 0xF, (q16_1 >> 8) & 0xF);
+    } else {
+        qv = vec4((q16_0 >> 4) & 0xF, (q16_0 >> 12) & 0xF, (q16_1 >> 4) & 0xF, (q16_1 >> 12) & 0xF);
+    }
+
+    // Q5_K 5th bit: qh[32] bytes packed as qh[16] uint16_t
+    // Bit position = 2*group + half, byte index = pos_in_subblock
+    uint bit = 2 * g + h;
+    uint qh_base = idx;  // 0..31, always even (4-aligned iqs)
+
+    uint qh16_0 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[qh_base / 2]);
+    uint qh16_1 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[qh_base / 2 + 1]);
+
+    vec4 hv = vec4(
+        float((qh16_0 >> bit) & 1),
+        float(((qh16_0 >> 8) >> bit) & 1),
+        float((qh16_1 >> bit) & 1),
+        float(((qh16_1 >> 8) >> bit) & 1)
+    );
+
+    return d * (qv + 16.0 * hv) - vec4(m);
+}
+#endif
+
+#if defined(DATA_A_Q6_K)
+#define BLOCK_BYTE_SIZE 210
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float d = float(kv_packed[binding_idx].data_packed16[a_offset + ib].d);
+
+    // Q6_K: 4 quarters of 64, each quarter has layers at offsets 0, 32, 64, 96
+    uint ip = iqs / 128;            // 0 or 1
+    uint local_pos = iqs - 128*ip;  // 0..127
+    uint layer = local_pos / 32;    // 0..3
+    uint within = local_pos % 32;   // 0..31 (4-aligned)
+
+    // Scale: 16 int8 scales, one per 16 elements
+    uint scale_idx = iqs / 16;
+    float sc = float(kv_packed[binding_idx].data_packed16[a_offset + ib].scales[scale_idx]);
+
+    // ql: low 4 bits from ql[64] uint16_t (128 bytes)
+    // layers 0,1 use low nibble; layers 2,3 use high nibble (of same bytes)
+    uint ql_byte_base = 64*ip + 32*(layer & 1) + within;
+    uint ql_shift = (layer >= 2) ? 4 : 0;
+
+    uint ql16_0 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].ql[ql_byte_base / 2]);
+    uint ql16_1 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].ql[ql_byte_base / 2 + 1]);
+
+    vec4 ql_vals = vec4(
+        (ql16_0 >> ql_shift) & 0xF,
+        ((ql16_0 >> 8) >> ql_shift) & 0xF,
+        (ql16_1 >> ql_shift) & 0xF,
+        ((ql16_1 >> 8) >> ql_shift) & 0xF
+    );
+
+    // qh: high 2 bits from qh[32] uint16_t (64 bytes)
+    uint qh_byte_base = 32*ip + within;
+    uint qh_shift = 2*layer;
+
+    uint qh16_0 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[qh_byte_base / 2]);
+    uint qh16_1 = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[qh_byte_base / 2 + 1]);
+
+    vec4 qh_vals = vec4(
+        float((qh16_0 >> qh_shift) & 3),
+        float(((qh16_0 >> 8) >> qh_shift) & 3),
+        float((qh16_1 >> qh_shift) & 3),
+        float(((qh16_1 >> 8) >> qh_shift) & 3)
+    );
+
+    return d * sc * (ql_vals + 16.0 * qh_vals - vec4(32.0));
+}
+#endif
+
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 

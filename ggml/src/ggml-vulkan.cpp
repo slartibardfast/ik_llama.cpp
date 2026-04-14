@@ -2607,9 +2607,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 256, 256, 256) \
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 576, 512, 576_512)
 
-    CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
-    CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
-    CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_F16,    f16,    FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q4_0,  q4_0,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q4_1,  q4_1,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q5_0,  q5_0,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q5_1,  q5_1,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q8_0,  q8_0,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_IQ4_NL,iq4_nl, FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q4_K,  q4_k,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q5_K,  q5_k,   FA_SCALAR, )
+    CREATE_FA(GGML_TYPE_Q6_K,  q6_k,   FA_SCALAR, )
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
@@ -12684,18 +12691,18 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 switch (op->src[1]->type) {
                 case GGML_TYPE_F16:
                 case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q8_0:
-                    // supported in scalar and coopmat2 paths
-                    break;
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
-                // K dequants currently disabled because D dimension is rounded up to 256 and runs inefficiently
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    // supported in scalar and coopmat2 paths
+                    break;
                 //case GGML_TYPE_Q2_K:
                 //case GGML_TYPE_Q3_K:
-                //case GGML_TYPE_Q4_K:
-                //case GGML_TYPE_Q5_K:
-                //case GGML_TYPE_Q6_K:
                 //case GGML_TYPE_IQ1_S:
                 //case GGML_TYPE_IQ1_M:
                 //case GGML_TYPE_IQ2_XXS:
@@ -12704,12 +12711,6 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 //case GGML_TYPE_IQ3_XXS:
                 //case GGML_TYPE_IQ3_S:
                 //case GGML_TYPE_IQ4_XS:
-                case GGML_TYPE_IQ4_NL:
-                    // currently supported only in coopmat2 path
-                    if (!coopmat2) {
-                        return false;
-                    }
-                    break;
                 default:
                     return false;
                 }
