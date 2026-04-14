@@ -4815,14 +4815,23 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             // Compute full-position logits from unfiltered hidden state so argmax
             // produces n_tokens entries matching the MTP hidden state dimensions.
             // This matches the fork's approach (qwen35.cpp:441-442).
+            // FastMTP: trim lm_head to top-32K tokens (frequency-ordered).
+            // Reduces the two 248K matmuls to 32K — ~7.8x faster each.
+            const int64_t mtp_vocab_size = 32768;
+
             ggml_tensor * greedy_logits;
             if (inp_out_ids != nullptr) {
                 // Prompt eval: main logits are filtered — recompute from unfiltered state
                 ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams,
                         model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
-                greedy_logits = llm_build_lora_mm(lctx, ctx0, model.output, full_normed);
+                ggml_tensor * greedy_head = model.output;
+                if (greedy_head->ne[1] > mtp_vocab_size) {
+                    greedy_head = ggml_view_2d(ctx0, greedy_head,
+                            greedy_head->ne[0], mtp_vocab_size, greedy_head->nb[1], 0);
+                }
+                greedy_logits = llm_build_lora_mm(lctx, ctx0, greedy_head, full_normed);
             } else {
-                // Token gen: main logits cover all positions
+                // Token gen: main logits cover all positions (full vocab for main sampling)
                 greedy_logits = cur;
             }
             greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
@@ -4865,6 +4874,12 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
             ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
             if (mtp_head == nullptr) mtp_head = model.output;
+
+            // FastMTP: trim output head to top-32K tokens
+            if (mtp_head->ne[1] > mtp_vocab_size) {
+                mtp_head = ggml_view_2d(ctx0, mtp_head,
+                        mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
+            }
 
             cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
             cb(cur_mtp, "mtp_logits", -1);
