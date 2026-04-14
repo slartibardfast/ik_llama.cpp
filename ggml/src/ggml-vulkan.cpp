@@ -2618,13 +2618,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_FA(GGML_TYPE_Q5_K,  q5_k,   FA_SCALAR, )
     CREATE_FA(GGML_TYPE_Q6_K,  q6_k,   FA_SCALAR, )
     // TURBO_KV_4B FA requires subgroup shuffles for the inverse RHT.
-    // Compiled with wave32 and wave64 variants; select based on device.
+    // Only create large_rows variants (Bc=32) — small_rows (Bc=64) exceeds
+    // shared memory budget due to the kv_sh[Bc*D] pre-dequant buffer.
     if (device->subgroup_shuffle) {
+#define CREATE_FA_TURBO(NAMELC) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 64, 64, 64) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 80, 80, 80) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 96, 96, 96) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 112, 112, 112) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 128, 128, 128) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 192, 192) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 128, 192_128) \
+        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 256, 256, 256)
         if (device->subgroup_size >= 64) {
-            CREATE_FA(GGML_TYPE_TURBO_KV_4B, turbo_kv_4b_w64, FA_SCALAR, )
+            CREATE_FA_TURBO(turbo_kv_4b_w64)
         } else {
-            CREATE_FA(GGML_TYPE_TURBO_KV_4B, turbo_kv_4b_w32, FA_SCALAR, )
+            CREATE_FA_TURBO(turbo_kv_4b_w32)
         }
+#undef CREATE_FA_TURBO
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -7584,6 +7595,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     switch (path) {
     case FA_SCALAR:
         pipelines = &ctx->device->pipeline_flash_attn_f32_f16[k->type][head_sizes][f32acc][small_rows][0];
+        // Fallback: if small_rows pipeline doesn't exist (e.g. TURBO_KV_4B shared
+        // memory constraints), use large_rows instead
+        if (small_rows && !pipelines[0] && !pipelines[1]) {
+            pipelines = &ctx->device->pipeline_flash_attn_f32_f16[k->type][head_sizes][f32acc][0][0];
+            small_rows = false;
+        }
         break;
     case FA_COOPMAT1:
         pipelines = &ctx->device->pipeline_flash_attn_f32_f16_cm1[k->type][head_sizes][f32acc][small_rows][0];
@@ -7595,6 +7612,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         GGML_ASSERT(0);
     }
     assert(pipelines);
+
+    // DEBUG: print pipeline state for TURBO_KV_4B
+    if (k->type == GGML_TYPE_TURBO_KV_4B) {
+        fprintf(stderr, "FA TURBO_KV_4B: head_sizes=%d f32acc=%d small_rows=%d aligned_pipe=%p unaligned_pipe=%p\n",
+                head_sizes, f32acc, small_rows,
+                (void*)(pipelines[1] ? pipelines[1].get() : nullptr),
+                (void*)(pipelines[0] ? pipelines[0].get() : nullptr));
+    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     const uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));

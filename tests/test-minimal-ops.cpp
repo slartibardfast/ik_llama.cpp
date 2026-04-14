@@ -456,7 +456,9 @@ int main(int argc, char ** argv) {
             auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, 1, nh, 1);
             auto * k = ggml_new_tensor_4d(ctx, kv_type, hs, kv, nh, 1);
             auto * v = ggml_new_tensor_4d(ctx, kv_type, hs, kv, nh, 1);
-            auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, 1);
+            // Mask dim1 must be padded to GGML_KQ_MASK_PAD (64)
+            int64_t mask_rows = ((1 + 63) / 64) * 64;  // pad to 64
+            auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, mask_rows);
             auto * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / sqrtf((float)hs), 0.0f, 0.0f);
 
             struct ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -485,8 +487,9 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(v, kv_quant.data(), 0, quant_size);
 
             // Mask: all zeros (no masking)
-            std::vector<uint16_t> mask_data(kv, 0);  // f16 zeros
-            ggml_backend_tensor_set(mask, mask_data.data(), 0, kv * sizeof(uint16_t));
+            size_t mask_bytes = kv * mask_rows * sizeof(uint16_t);
+            std::vector<uint16_t> mask_data(kv * mask_rows, 0);  // f16 zeros
+            ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_bytes);
 
             ggml_backend_graph_compute(backend, gf);
 
@@ -514,6 +517,7 @@ int main(int argc, char ** argv) {
     run("fa_q6_k_256",  [&]{ return test_fa_kquant(gpu, cpu, GGML_TYPE_Q6_K, 256, 4, 64); });
     run("fa_q4_k_128",  [&]{ return test_fa_kquant(gpu, cpu, GGML_TYPE_Q4_K, 128, 4, 64); });
     run("fa_q4_0_ref",  [&]{ return test_fa_kquant(gpu, cpu, GGML_TYPE_Q4_0, 128, 4, 64); });
+    run("fa_tkv_256",   [&]{ return test_fa_kquant(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 4, 64); });
 
     fprintf(stderr, "\n=== Summary: %d passed, %d failed ===\n", pass, fail);
 
