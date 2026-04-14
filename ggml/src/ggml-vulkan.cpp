@@ -3262,16 +3262,27 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TURBO_KV_4B: subgroup-cooperative FWHT (one workgroup per 128-element block)
     if (device->subgroup_shuffle) {
         const uint32_t ss = device->subgroup_size;
-        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
-        ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],
-            "dequant_turbo_kv_4b" + wsuf, 0, nullptr, "main", 2, 5 * sizeof(uint32_t),
-            {1, 1, 1}, {ss}, 1, true, true, ss);
-        ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],
-            "get_rows_turbo_kv_4b" + wsuf, 0, nullptr, "main", 3, sizeof(vk_op_binary_push_constants),
-            {1, 1, 1}, {ss}, 1, true, true, ss);
-        ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],
-            "get_rows_turbo_kv_4b_f32" + wsuf, 0, nullptr, "main", 3, sizeof(vk_op_binary_push_constants),
-            {1, 1, 1}, {ss}, 1, true, true, ss);
+        if (ss >= 64) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],
+                "dequant_turbo_kv_4b_w64", dequant_turbo_kv_4b_w64_len, dequant_turbo_kv_4b_w64_data, "main", 2, 5 * sizeof(uint32_t),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],
+                "get_rows_turbo_kv_4b_w64", get_rows_turbo_kv_4b_w64_len, get_rows_turbo_kv_4b_w64_data, "main", 3, sizeof(vk_op_binary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],
+                "get_rows_turbo_kv_4b_f32_w64", get_rows_turbo_kv_4b_f32_w64_len, get_rows_turbo_kv_4b_f32_w64_data, "main", 3, sizeof(vk_op_binary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],
+                "dequant_turbo_kv_4b_w32", dequant_turbo_kv_4b_w32_len, dequant_turbo_kv_4b_w32_data, "main", 2, 5 * sizeof(uint32_t),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],
+                "get_rows_turbo_kv_4b_w32", get_rows_turbo_kv_4b_w32_len, get_rows_turbo_kv_4b_w32_data, "main", 3, sizeof(vk_op_binary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],
+                "get_rows_turbo_kv_4b_f32_w32", get_rows_turbo_kv_4b_f32_w32_len, get_rows_turbo_kv_4b_f32_w32_data, "main", 3, sizeof(vk_op_binary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        }
     }
 
     // get_rows
@@ -3380,10 +3391,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TURBO_KV_4B CPY (F32 -> TURBO_KV_4B quantize, subgroup-cooperative)
     if (device->subgroup_shuffle) {
         const uint32_t ss = device->subgroup_size;
-        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
-        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B],
-            "cpy_f32_turbo_kv_4b" + wsuf, 0, nullptr, "main", 2, sizeof(vk_op_unary_push_constants),
-            {1, 1, 1}, {ss}, 1, true, true, ss);
+        if (ss >= 64) {
+            ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B],
+                "cpy_f32_turbo_kv_4b_w64", cpy_f32_turbo_kv_4b_w64_len, cpy_f32_turbo_kv_4b_w64_data, "main", 2, sizeof(vk_op_unary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B],
+                "cpy_f32_turbo_kv_4b_w32", cpy_f32_turbo_kv_4b_w32_len, cpy_f32_turbo_kv_4b_w32_data, "main", 2, sizeof(vk_op_unary_push_constants),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        }
     }
 
     if (device->float_controls_rte_fp16) {
@@ -3424,10 +3440,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TURBO_KV_4B CPY (quant -> F32, reuses dequant shader with D_TYPE=float)
     if (device->subgroup_shuffle) {
         const uint32_t ss = device->subgroup_size;
-        const std::string wsuf = ss >= 64 ? "_w64" : "_w32";
-        ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
-            "dequant_turbo_kv_4b_f32" + wsuf, 0, nullptr, "main", 2, 5 * sizeof(uint32_t),
-            {1, 1, 1}, {ss}, 1, true, true, ss);
+        if (ss >= 64) {
+            ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
+                "dequant_turbo_kv_4b_f32_w64", dequant_turbo_kv_4b_f32_w64_len, dequant_turbo_kv_4b_f32_w64_data, "main", 2, 5 * sizeof(uint32_t),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B],
+                "dequant_turbo_kv_4b_f32_w32", dequant_turbo_kv_4b_f32_w32_len, dequant_turbo_kv_4b_f32_w32_data, "main", 2, 5 * sizeof(uint32_t),
+                {1, 1, 1}, {ss}, 1, true, true, ss);
+        }
     }
 
     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
@@ -7612,14 +7633,6 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         GGML_ASSERT(0);
     }
     assert(pipelines);
-
-    // DEBUG: print pipeline state for TURBO_KV_4B
-    if (k->type == GGML_TYPE_TURBO_KV_4B) {
-        fprintf(stderr, "FA TURBO_KV_4B: head_sizes=%d f32acc=%d small_rows=%d aligned_pipe=%p unaligned_pipe=%p\n",
-                head_sizes, f32acc, small_rows,
-                (void*)(pipelines[1] ? pipelines[1].get() : nullptr),
-                (void*)(pipelines[0] ? pipelines[0].get() : nullptr));
-    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     const uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
