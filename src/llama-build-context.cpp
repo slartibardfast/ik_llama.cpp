@@ -4786,7 +4786,13 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     }
 
     // Save raw hidden state for MTP (pre-output-norm, all batch positions)
+    // Always emit result_embd_pooled when MTP is active so the warmup path
+    // (prompt eval) and the inline path (token gen) both get pre-norm states.
     ggml_tensor * mtp_hidden_state = inpL;
+    if (has_mtp_inline) {
+        cb(mtp_hidden_state, "result_embd_pooled", -1);
+        ggml_set_output(mtp_hidden_state);
+    }
 
     // Apply inp_out_ids filtering for the main output head (deferred from last layer when MTP active)
     if (has_mtp_inline && inp_out_ids) {
@@ -4866,10 +4872,6 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
             cb(cur_mtp, "mtp_logits", -1);
             ggml_set_output(cur_mtp);
-
-            // Save hidden state for embedding extraction (chained draft gen)
-            ggml_set_name(mtp_hidden_state, "result_embd_pooled");
-            ggml_set_output(mtp_hidden_state);
 
             ggml_build_forward_expand(gf, cur_mtp);
 

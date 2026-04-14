@@ -2839,13 +2839,16 @@ void server_context::add_sampled_tokens() {
 
             // Single-pass MTP: read draft token from inline MTP logits (computed in main graph)
             // This avoids the two-pass warmup/draft_gen cycle entirely.
-            llama_token mtp_inline_draft = llama_get_mtp_draft_token(ctx);
+            // Use model capability check (not per-decode logit check) to avoid fallback cascade.
+            const bool model_has_inline_mtp = slot.has_mtp &&
+                llama_model_n_nextn_layer(llama_get_model(ctx)) > 0;
+            llama_token mtp_inline_draft = model_has_inline_mtp ? llama_get_mtp_draft_token(ctx) : LLAMA_TOKEN_NULL;
 
             llama_tokens draft;
-            if (slot.has_mtp && mtp_inline_draft != LLAMA_TOKEN_NULL) {
+            if (mtp_inline_draft != LLAMA_TOKEN_NULL) {
                 // Use inline MTP draft (no separate decode needed)
                 draft.push_back(mtp_inline_draft);
-            } else {
+            } else if (!model_has_inline_mtp) {
                 // Fallback: two-pass MTP or external draft model
                 if (slot.has_mtp) {
                     if (!slot.mtp_hidden_state.empty()) {
@@ -3424,7 +3427,7 @@ void server_context::speculative_decoding_accept() {
         const auto ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
         
         // Single-pass MTP: skip two-pass KV update (inline head manages its own KV)
-        bool inline_mtp = slot.has_mtp && llama_get_mtp_logits(ctx) != nullptr;
+        bool inline_mtp = slot.has_mtp && llama_model_n_nextn_layer(llama_get_model(ctx)) > 0;
         if (slot.has_mtp && !inline_mtp) {
             // Two-pass fallback
             const int n_embd = llama_model_n_embd(llama_get_model(ctx));
@@ -3946,9 +3949,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             slot.i_batch = -1;
         }
-        // Single-pass MTP: skip warmup when inline MTP logits are available
-        // (the MTP KV cache is already populated by the in-graph MTP head)
-        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty() && !llama_get_mtp_logits(ctx)) {
+        // Two-pass MTP warmup: only for models WITHOUT inline MTP support
+        if (mtp_warmup_needed && !batch_mtp_hidden_state.empty()) {
             llama_set_draft_input_hidden_state(ctx, batch_mtp_hidden_state.data());
             mtp_update_kv_cache(ctx, batch_view, true);
         }
