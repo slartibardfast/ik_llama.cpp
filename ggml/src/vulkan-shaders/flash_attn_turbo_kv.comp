@@ -46,8 +46,10 @@ shared vec4 Qf[Br][HSK / 4];
 // With HSK=HSV=256 and Bc=32: 32*256*4 = 32 KB
 shared float kv_sh[Bc * HSK];
 
-// FWHT scratch for out-of-place butterfly (avoids shmem read-after-write)
+// FWHT scratch for out-of-place butterfly
 shared float fwht_tmp[QUANT_K_TURBO_KV_4B];
+
+// No separate function — NIR inlines and optimizes through it anyway.
 
 // Dequant one 128-element block: codebook lookup with per-block scaling.
 // For K: includes norm factor so Q_rot · K_stored = Q · K (not Q · K/norm).
@@ -364,15 +366,16 @@ void main() {
                     barrier();
                     for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                         uint32_t partner = idx ^ s;
-                        float a = fwht_tmp[idx];
-                        float b = fwht_tmp[partner];
-                        float result;
+                        // Use volatile reads to prevent NIR from optimizing
+                        // the subtraction into addition (Mesa bug: NIR eliminates
+                        // fsub in FWHT butterfly inside hot loops)
+                        volatile float a = fwht_tmp[idx];
+                        volatile float b = fwht_tmp[partner];
                         if ((idx & s) == 0u) {
-                            result = a + b;
+                            kv_sh[base + idx] = a + b;
                         } else {
-                            result = b - a;
+                            kv_sh[base + idx] = b - a;
                         }
-                        kv_sh[base + idx] = result;
                     }
                     barrier();
                 }
