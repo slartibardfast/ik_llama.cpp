@@ -124,11 +124,8 @@ void main() {
     }
     barrier();
 
-    // Step 2: Forward-RHT Q — DISABLED for testing norm-only K fix.
-    // Without Q rotation, score = Q · (codebook * norm / inv_std) which is
-    // NOT mathematically correct (Q is in original domain, K is in RHT domain).
-    // But with norm included, the per-block scaling may be sufficient.
-    if (false)
+    // Step 2: Forward-RHT each 128-element block of Q via kv_sh scratch.
+    // TurboQuant: score = Q_rot · K_stored where Q_rot = (1/√128) · FWHT(D · Q).
     for (uint32_t r = 0; r < Br; r++) {
         if (i * Br + r >= N) continue;
 
