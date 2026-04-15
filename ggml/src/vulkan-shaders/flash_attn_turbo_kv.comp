@@ -124,8 +124,9 @@ void main() {
     }
     barrier();
 
-    // Step 2: Forward-RHT each 128-element block of Q via kv_sh scratch.
-    // TurboQuant: score = Q_rot · K_stored where Q_rot = (1/√128) · FWHT(D · Q).
+    // Step 2: Q rotation DISABLED — using full inverse RHT on K instead.
+    // Standard attention: Q · K_approx where K_approx = inverse_RHT(codebook/inv_std) * norm.
+    if (false)
     for (uint32_t r = 0; r < Br; r++) {
         if (i * Br + r >= N) continue;
 
@@ -156,6 +157,7 @@ void main() {
                         kv_sh[base + partner] = a - b;
                     }
                 }
+                memoryBarrierShared();
                 barrier();
             }
 
@@ -224,20 +226,52 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
-                    float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
-                    // K scale includes norm: Q_rot · (codebook/inv_std * norm) = Q · K
+                    // Write codebook/inv_std (pre-inverse-RHT)
                     dequant_block_codebook_to_shared(
                         block_idx,
                         token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp * norm, 0
+                        sub_tid, rcp, 0
                     );
                 }
             }
         }
         barrier();
+
+        // In-place inverse RHT on K blocks (same approach as V)
+        for (uint32_t token_base = 0; token_base < Bc; token_base++) {
+            uint32_t kv_token = j * Bc + token_base;
+            if (kv_token >= KV) continue;
+
+            for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
+                uint32_t base = token_base * HSK + blk * QUANT_K_TURBO_KV_4B;
+
+                for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
+                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                        uint32_t partner = idx ^ s;
+                        if (idx < partner) {
+                            float a = kv_sh[base + idx];
+                            float b = kv_sh[base + partner];
+                            kv_sh[base + idx]     = a + b;
+                            kv_sh[base + partner] = a - b;
+                        }
+                    }
+                    memoryBarrierShared();
+                    barrier();
+                }
+
+                uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
+                float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
+                float scale = norm * TURBO_KV_RSQRT128;
+                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                    kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
+                }
+                memoryBarrierShared();
+                barrier();
+            }
+        }
 
         // ===================== Phase 2: Q·K dot product from shared memory =====================
         float Sf[Br][cols_per_thread];
