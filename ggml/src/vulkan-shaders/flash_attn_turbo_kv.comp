@@ -282,18 +282,14 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
+                    float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
                     float inv_std = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
-                    // V also uses codebook-only dequant (no inverse RHT).
-                    // Since Q·K is computed in the rotated domain and K/V share the same
-                    // RHT rotation, the P·V product is also in the rotated domain.
-                    // The output is approximately correct because attention is a weighted
-                    // average and the RHT coefficients correlate with the original values.
-                    dequant_k_block_to_shared(
+                    dequant_v_block_to_shared(
                         block_idx,
                         token_idx * HSV + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp
+                        sub_tid, norm, rcp
                     );
                 }
             }

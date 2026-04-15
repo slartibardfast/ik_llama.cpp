@@ -596,8 +596,92 @@ int main(int argc, char ** argv) {
     };
 
     run("fa_q4_0_gpu",  [&]{ return test_fa_gpu_only(gpu, GGML_TYPE_Q4_0, 128, 4, 64); });
-    // FA TURBO_KV_4B crashes (VK_ERROR_DEVICE_LOST) — debug separately
-    // run("fa_tkv_gpu",   [&]{ return test_fa_gpu_only(gpu, GGML_TYPE_TURBO_KV_4B, 256, 2, 16); });
+
+    // TURBO_KV_4B FA via scheduler (matches model dispatch path)
+    auto test_fa_sched = [](ggml_backend_t gpu, ggml_backend_t cpu, ggml_type kv_type, int hs, int nh, int kv) -> bool {
+        fprintf(stderr, "\n=== FA sched (F16 vs %s, hs=%d, nh=%d, kv=%d) ===\n",
+                ggml_type_name(kv_type), hs, nh, kv);
+
+        int q_total = hs * nh;
+        int kv_total = hs * kv * nh;
+        std::vector<float> q_data(q_total), k_data(kv_total), v_data(kv_total);
+        srand(42);
+        for (int i = 0; i < q_total; i++) q_data[i] = ((float)(rand() / (double)RAND_MAX) - 0.5f) * 0.1f;
+        for (int i = 0; i < kv_total; i++) k_data[i] = ((float)(rand() / (double)RAND_MAX) - 0.5f) * 2.0f;
+        for (int i = 0; i < kv_total; i++) v_data[i] = ((float)(rand() / (double)RAND_MAX) - 0.5f) * 2.0f;
+
+        auto run_with_sched = [&](ggml_type cache_type) -> std::vector<float> {
+            struct ggml_init_params params = { 256*1024*1024, nullptr, true };
+            struct ggml_context * ctx = ggml_init(params);
+
+            auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, 1, nh, 1);
+            auto * k_f32 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, kv, nh, 1);
+            auto * v_f32 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, kv, nh, 1);
+            auto * k_q = ggml_new_tensor_4d(ctx, cache_type, hs, kv, nh, 1);
+            auto * v_q = ggml_new_tensor_4d(ctx, cache_type, hs, kv, nh, 1);
+            auto * k_cpy = ggml_cpy(ctx, k_f32, k_q);
+            auto * v_cpy = ggml_cpy(ctx, v_f32, v_q);
+            int64_t mask_rows = ((1 + 63) / 64) * 64;
+            auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, mask_rows);
+            auto * out = ggml_flash_attn_ext(ctx, q, k_cpy, v_cpy, mask, 1.0f / sqrtf((float)hs), 0.0f, 0.0f);
+
+            struct ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, out);
+
+            // Use scheduler — this is how the model dispatches
+            ggml_backend_t backends[2] = {gpu, cpu};
+            ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 256, false);
+            if (!ggml_backend_sched_reserve(sched, gf)) {
+                fprintf(stderr, "    Failed to reserve graph\n");
+                ggml_backend_sched_free(sched);
+                ggml_free(ctx);
+                return {};
+            }
+            ggml_backend_sched_alloc_graph(sched, gf);
+
+            ggml_backend_tensor_set(q, q_data.data(), 0, q_total * sizeof(float));
+            ggml_backend_tensor_set(k_f32, k_data.data(), 0, kv_total * sizeof(float));
+            ggml_backend_tensor_set(v_f32, v_data.data(), 0, kv_total * sizeof(float));
+            size_t mask_bytes = kv * mask_rows * sizeof(uint16_t);
+            std::vector<uint16_t> mask_data(kv * mask_rows, 0);
+            ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_bytes);
+
+            fprintf(stderr, "  Running %s ...\n", ggml_type_name(cache_type));
+            ggml_backend_sched_graph_compute(sched, gf);
+
+            int out_total = hs * nh;
+            std::vector<float> result(out_total);
+            ggml_backend_tensor_get(out, result.data(), 0, out_total * sizeof(float));
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx);
+            return result;
+        };
+
+        auto f16_result = run_with_sched(GGML_TYPE_F16);
+        auto quant_result = run_with_sched(kv_type);
+
+        fprintf(stderr, "  f16_size=%d quant_size=%d\n", (int)f16_result.size(), (int)quant_result.size());
+        if (!f16_result.empty() && !quant_result.empty()) {
+            fprintf(stderr, "  f16[0..3] = %.6f %.6f %.6f %.6f\n", f16_result[0], f16_result[1], f16_result[2], f16_result[3]);
+            fprintf(stderr, "  qnt[0..3] = %.6f %.6f %.6f %.6f\n", quant_result[0], quant_result[1], quant_result[2], quant_result[3]);
+            double sd = 0, sr = 0;
+            for (int i = 0; i < (int)f16_result.size(); i++) {
+                double d = quant_result[i] - f16_result[i];
+                sd += d*d;
+                sr += (double)f16_result[i]*f16_result[i];
+            }
+            fprintf(stderr, "  manual: sum_diff2=%.10e sum_ref2=%.10e ratio=%.10f\n", sd, sr, sr > 0 ? sd/sr : 0.0);
+        }
+
+        double nmse = compute_nmse(quant_result.data(), f16_result.data(), (int)f16_result.size());
+        print_values("F16  ", f16_result.data(), (int)f16_result.size());
+        print_values("Quant", quant_result.data(), (int)quant_result.size());
+        fprintf(stderr, "  NMSE vs F16 = %.10f %s\n", nmse, nmse < 0.05 ? "PASS" : "FAIL");
+        return nmse < 0.05;
+    };
+
+    run("fa_tkv_sched",   [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 2, 32); });
+    run("fa_tkv_sched_l", [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 2, 128); });
 
     // TURBO_KV_4B round-trip: F32 → quantize(GPU) → dequant(GPU) → F32
     // Self-contained RHT round-trip: forward→quant→dequant→inverse, no byte packing

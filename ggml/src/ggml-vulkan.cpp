@@ -2620,22 +2620,34 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TURBO_KV_4B FA requires subgroup shuffles for the inverse RHT.
     // Only create large_rows variants (Bc=32) — small_rows (Bc=64) exceeds
     // shared memory budget due to the kv_sh[Bc*D] pre-dequant buffer.
+    // CREATE_FA2_LARGE creates only the 4 large_rows pipelines (indices [*][0][*]),
+    // leaving small_rows ([*][1][*]) null so the dispatch fallback selects large_rows.
     if (device->subgroup_shuffle) {
+#define CREATE_FA2_LARGE(TYPE, NAMELC, FAPATH, SUFFIX, HSK, HSV, HEAD_SIZES) \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_f32_f16 ## SUFFIX[TYPE][FA_HEAD_SIZE_##HEAD_SIZES][0][0][0], "flash_attn_f32_f16_" #HEAD_SIZES "_f16acc"         #NAMELC #SUFFIX,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data, "main", 5, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,false), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,false), 1,                                            true, false, 0); \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_f32_f16 ## SUFFIX[TYPE][FA_HEAD_SIZE_##HEAD_SIZES][0][0][1], "flash_attn_f32_f16_" #HEAD_SIZES "_aligned_f16acc" #NAMELC #SUFFIX,  flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _len, flash_attn_f32_f16_ ## NAMELC ## _f16acc ## SUFFIX ## _data, "main", 5, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,false), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,false), fa_rows_cols(FAPATH,HSK,HSV,0,TYPE,false)[1], true, false, 0); \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_f32_f16 ## SUFFIX[TYPE][FA_HEAD_SIZE_##HEAD_SIZES][1][0][0], "flash_attn_f32_f16_" #HEAD_SIZES "_f32acc"         #NAMELC #SUFFIX,  flash_attn_f32_f16_ ## NAMELC ##     SUFFIX ## _len,        flash_attn_f32_f16_ ## NAMELC ##     SUFFIX ## _data,        "main", 5, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,1,TYPE,false), fa_spec_constants(FAPATH, HSK,HSV,1,TYPE,false), 1,                                            true, false, 0); \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_f32_f16 ## SUFFIX[TYPE][FA_HEAD_SIZE_##HEAD_SIZES][1][0][1], "flash_attn_f32_f16_" #HEAD_SIZES "_aligned_f32acc" #NAMELC #SUFFIX,  flash_attn_f32_f16_ ## NAMELC ##     SUFFIX ## _len,        flash_attn_f32_f16_ ## NAMELC ##     SUFFIX ## _data,        "main", 5, sizeof(vk_flash_attn_push_constants), fa_wg_denoms(FAPATH, HSK,HSV,0,TYPE,false), fa_spec_constants(FAPATH, HSK,HSV,0,TYPE,false), fa_rows_cols(FAPATH,HSK,HSV,0,TYPE,false)[1], true, false, 0);
+
 #define CREATE_FA_TURBO(NAMELC) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 64, 64, 64) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 80, 80, 80) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 96, 96, 96) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 112, 112, 112) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 128, 128, 128) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 192, 192) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 128, 192_128) \
-        CREATE_FA2(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 256, 256, 256)
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 64, 64, 64) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 80, 80, 80) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 96, 96, 96) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 112, 112, 112) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 128, 128, 128) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 192, 192) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 128, 192_128) \
+        CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 256, 256, 256)
+        fprintf(stderr, "TURBO_KV_4B FA: device=%s subgroup_size=%d, selecting %s\n",
+                device->name.c_str(), device->subgroup_size,
+                device->subgroup_size >= 64 ? "w64" : "w32");
         if (device->subgroup_size >= 64) {
             CREATE_FA_TURBO(turbo_kv_4b_w64)
         } else {
             CREATE_FA_TURBO(turbo_kv_4b_w32)
         }
 #undef CREATE_FA_TURBO
+#undef CREATE_FA2_LARGE
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -7638,7 +7650,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     const uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
 
-    bool aligned = (KV % pipelines[1]->align) == 0 &&
+    if (!pipelines[0] && !pipelines[1]) {
+        fprintf(stderr, "TURBO_KV_4B FA: no pipeline for type=%d head_sizes=%d f32acc=%d small_rows=%d\n",
+                k->type, (int)head_sizes, f32acc, small_rows);
+        GGML_ASSERT(false && "no FA pipeline");
+    }
+
+    bool aligned = pipelines[1] && (KV % pipelines[1]->align) == 0 &&
                    // the "aligned" shader variant will forcibly align strides, for performance
                    (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
 
@@ -7646,7 +7664,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT((nem1 % GGML_KQ_MASK_PAD) == 0);
 
     vk_pipeline pipeline = pipelines[aligned];
-    assert(pipeline);
+    if (!pipeline) {
+        pipeline = pipelines[0] ? pipelines[0] : pipelines[1];
+    }
+    GGML_ASSERT(pipeline);
 
     uint32_t split_kv = KV;
     uint32_t split_k = 1;
@@ -7770,6 +7791,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
+
+    fprintf(stderr, "[FA] type=%s N=%d KV=%d HSK=%d HSV=%d gqa=%d split_k=%d pipeline=%s small=%d aligned=%d\n",
+            ggml_type_name(k->type), N, KV, HSK, HSV, gqa_ratio, split_k,
+            pipeline->name.c_str(), small_rows, aligned);
 
     ggml_vk_sync_buffers(subctx);
 
