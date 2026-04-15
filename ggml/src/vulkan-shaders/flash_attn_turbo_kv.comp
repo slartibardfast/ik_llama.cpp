@@ -60,16 +60,16 @@ void dequant_block_codebook_to_shared(
     }
 }
 
-// Dequant V: full inverse RHT to original domain via subgroup-cooperative FWHT.
-// V values must be in the original domain for P·V accumulation.
-void dequant_v_block_to_shared(
-    uint block_idx, uint sh_base, uint sub_tid, float norm, float rcp_inv_std
+// Dequant KV block: full inverse RHT to original domain via subgroup-cooperative FWHT.
+// bind_idx: 0 for K, 1 for V.
+void dequant_block_rht_to_shared(
+    uint block_idx, uint sh_base, uint sub_tid, float norm, float rcp_inv_std, uint bind_idx
 ) {
 #if SUBGROUP_SIZE >= 64
     uint byte_idx0 = sub_tid / 2;
     uint byte_idx1 = (sub_tid + 64) / 2;
-    uint byte0 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[byte_idx0]);
-    uint byte1 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[byte_idx1]);
+    uint byte0 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[byte_idx0]);
+    uint byte1 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[byte_idx1]);
     float val0 = turbo_kv_unpack_byte(byte0, sub_tid,      rcp_inv_std);
     float val1 = turbo_kv_unpack_byte(byte1, sub_tid + 64,  rcp_inv_std);
     turbo_kv_inverse_rht(val0, val1, sub_tid, norm);
@@ -80,10 +80,10 @@ void dequant_v_block_to_shared(
     uint bi1 = (sub_tid + 32) / 2;
     uint bi2 = (sub_tid + 64) / 2;
     uint bi3 = (sub_tid + 96) / 2;
-    uint b0 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[bi0]);
-    uint b1 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[bi1]);
-    uint b2 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[bi2]);
-    uint b3 = uint(kv_np[1].data_kv_np[block_idx].mse_indices[bi3]);
+    uint b0 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[bi0]);
+    uint b1 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[bi1]);
+    uint b2 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[bi2]);
+    uint b3 = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[bi3]);
     float v0 = turbo_kv_unpack_byte(b0, sub_tid,      rcp_inv_std);
     float v1 = turbo_kv_unpack_byte(b1, sub_tid + 32,  rcp_inv_std);
     float v2 = turbo_kv_unpack_byte(b2, sub_tid + 64,  rcp_inv_std);
@@ -219,6 +219,7 @@ void main() {
         }
         barrier();
 
+        // Dequant K: codebook then shmem inverse RHT (strongest barriers)
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
@@ -228,26 +229,20 @@ void main() {
                     uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
-
-                    // Write codebook/inv_std (pre-inverse-RHT)
                     dequant_block_codebook_to_shared(
-                        block_idx,
-                        token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp, 0
-                    );
+                        block_idx, token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
+                        sub_tid, rcp, 0);
                 }
             }
         }
-        barrier();
+        memoryBarrierShared(); barrier();
 
-        // In-place inverse RHT on K blocks (same approach as V)
+        // Shmem inverse RHT on K — one token+block at a time, full barriers
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
             if (kv_token >= KV) continue;
-
             for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                 uint32_t base = token_base * HSK + blk * QUANT_K_TURBO_KV_4B;
-
                 for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
                     for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                         uint32_t partner = idx ^ s;
@@ -258,18 +253,15 @@ void main() {
                             kv_sh[base + partner] = a - b;
                         }
                     }
-                    memoryBarrierShared();
-                    barrier();
+                    memoryBarrierShared(); barrier();
                 }
-
                 uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
                 float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
                 float scale = norm * TURBO_KV_RSQRT128;
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                     kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
                 }
-                memoryBarrierShared();
-                barrier();
+                memoryBarrierShared(); barrier();
             }
         }
 
@@ -358,13 +350,12 @@ void main() {
             }
         }
 
-        // ===================== Phase 3: Dequant V into shared memory via shmem FWHT =====================
-        // Step 3a: Write raw codebook values to kv_sh (same as K dequant, no RHT yet)
+        // ===================== Phase 3: Dequant V via shmem FWHT =====================
         barrier();
         for (uint32_t idx = tid; idx < Bc * HSV; idx += WorkGroupSize) {
             kv_sh[idx] = 0.0;
         }
-        barrier();
+        memoryBarrierShared(); barrier();
 
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
@@ -375,28 +366,19 @@ void main() {
                     uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
                     float inv_std = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
-
-                    // Write codebook values (pre-inverse-RHT)
                     dequant_block_codebook_to_shared(
-                        block_idx,
-                        token_idx * HSV + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp, 1  // V buffer
-                    );
+                        block_idx, token_idx * HSV + blk * QUANT_K_TURBO_KV_4B,
+                        sub_tid, rcp, 1);
                 }
             }
         }
-        barrier();
+        memoryBarrierShared(); barrier();
 
-        // In-place inverse RHT on V blocks via shared-memory FWHT.
-        // Same approach as Q rotation — avoids subgroupShuffleXor precision issues.
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
-            if (token_base >= Bc || kv_token >= KV) continue;
-
+            if (kv_token >= KV) continue;
             for (uint32_t blk = 0; blk < HSV / QUANT_K_TURBO_KV_4B; blk++) {
                 uint32_t base = token_base * HSV + blk * QUANT_K_TURBO_KV_4B;
-
-                // FWHT butterfly via shared memory
                 for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
                     for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                         uint32_t partner = idx ^ s;
@@ -407,17 +389,15 @@ void main() {
                             kv_sh[base + partner] = a - b;
                         }
                     }
-                    barrier();
+                    memoryBarrierShared(); barrier();
                 }
-
-                // Sign multiply + norm scaling
                 uint32_t block_idx = v_row_offset + kv_token * (HSV / QUANT_K_TURBO_KV_4B) + blk;
                 float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
                 float scale = norm * TURBO_KV_RSQRT128;
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                     kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
                 }
-                barrier();
+                memoryBarrierShared(); barrier();
             }
         }
 
