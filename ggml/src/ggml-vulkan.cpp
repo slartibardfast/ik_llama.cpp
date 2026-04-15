@@ -2574,6 +2574,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         uint32_t wg_size = (path == FA_SCALAR || path == FA_COOPMAT1)
                             ? scalar_flash_attention_workgroup_size
                             : ((small_rows && (D % 32) == 0) ? 256 : 128);
+
+        // NOTE: TURBO_KV_4B uses shared-memory FWHT (not subgroupShuffleXor)
+        // to avoid a RADV multi-subgroup shuffle bug. Keeping wg_size=128.
         auto rows_cols = fa_rows_cols(path, hsk, hsv, clamp, type, small_rows);
 
         // D_split can't be larger than a subgroup because we use subgroupShuffle to reduce it.

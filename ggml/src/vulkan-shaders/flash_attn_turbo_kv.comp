@@ -128,23 +128,17 @@ void main() {
     for (uint32_t r = 0; r < Br; r++) {
         if (i * Br + r >= N) continue;
 
-        // Copy Q row to kv_sh as flat floats (reuse token 0's slot)
         for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
             kv_sh[idx] = Qf[r][idx / 4][idx % 4];
         }
         barrier();
 
-        // Apply sign per block, then FWHT per block, then scale
         for (uint32_t blk = 0; blk < HSK / QUANT_K_TURBO_KV_4B; blk++) {
             uint32_t base = blk * QUANT_K_TURBO_KV_4B;
-
-            // Sign multiply
             for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                 kv_sh[base + idx] *= turbo_kv_sign(idx);
             }
             barrier();
-
-            // FWHT butterfly via shared memory
             for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                     uint32_t partner = idx ^ s;
@@ -155,18 +149,14 @@ void main() {
                         kv_sh[base + partner] = a - b;
                     }
                 }
-                memoryBarrierShared();
                 barrier();
             }
-
-            // Scale by 1/√128
             for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                 kv_sh[base + idx] *= TURBO_KV_RSQRT128;
             }
             barrier();
         }
 
-        // Copy rotated Q back to Qf[]
         for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
             Qf[r][idx / 4][idx % 4] = kv_sh[idx];
         }
@@ -330,7 +320,7 @@ void main() {
         }
         barrier();
 
-        // Write V codebook values
+        // V codebook write
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
@@ -347,7 +337,7 @@ void main() {
         }
         barrier();
 
-        // Shmem inverse RHT on each V block
+        // V shmem inverse RHT
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
             if (kv_token >= KV) continue;
