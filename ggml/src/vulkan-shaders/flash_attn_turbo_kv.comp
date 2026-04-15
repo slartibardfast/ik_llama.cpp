@@ -359,13 +359,20 @@ void main() {
                 uint32_t base = token_base * HSV + blk * QUANT_K_TURBO_KV_4B;
                 for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
                     for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                        fwht_tmp[idx] = kv_sh[base + idx];
+                    }
+                    barrier();
+                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                         uint32_t partner = idx ^ s;
-                        if (idx < partner) {
-                            float a = kv_sh[base + idx];
-                            float b = kv_sh[base + partner];
-                            kv_sh[base + idx]     = a + b;
-                            kv_sh[base + partner] = a - b;
+                        float a = fwht_tmp[idx];
+                        float b = fwht_tmp[partner];
+                        float result;
+                        if ((idx & s) == 0u) {
+                            result = a + b;
+                        } else {
+                            result = b - a;
                         }
+                        kv_sh[base + idx] = result;
                     }
                     barrier();
                 }
