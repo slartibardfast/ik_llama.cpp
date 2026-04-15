@@ -124,9 +124,7 @@ void main() {
     }
     barrier();
 
-    // Step 2: Q rotation DISABLED — using full inverse RHT on K instead.
-    // Standard attention: Q · K_approx where K_approx = inverse_RHT(codebook/inv_std) * norm.
-    if (false)
+    // Step 2: Forward-RHT each 128-element block of Q via kv_sh scratch.
     for (uint32_t r = 0; r < Br; r++) {
         if (i * Br + r >= N) continue;
 
@@ -219,7 +217,7 @@ void main() {
         }
         barrier();
 
-        // Dequant K: codebook then shmem inverse RHT (strongest barriers)
+        // Dequant K: codebook × norm/inv_std (no inverse RHT — Q is rotated)
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
@@ -227,41 +225,16 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
+                    float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
-                    dequant_block_codebook_to_shared(
-                        block_idx, token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp, 0);
-                }
-            }
-        }
-        memoryBarrierShared(); barrier();
 
-        // Shmem inverse RHT on K — one token+block at a time, full barriers
-        for (uint32_t token_base = 0; token_base < Bc; token_base++) {
-            uint32_t kv_token = j * Bc + token_base;
-            if (kv_token >= KV) continue;
-            for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
-                uint32_t base = token_base * HSK + blk * QUANT_K_TURBO_KV_4B;
-                for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
-                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                        uint32_t partner = idx ^ s;
-                        if (idx < partner) {
-                            float a = kv_sh[base + idx];
-                            float b = kv_sh[base + partner];
-                            kv_sh[base + idx]     = a + b;
-                            kv_sh[base + partner] = a - b;
-                        }
-                    }
-                    memoryBarrierShared(); barrier();
+                    dequant_block_codebook_to_shared(
+                        block_idx,
+                        token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
+                        sub_tid, rcp * norm, 0
+                    );
                 }
-                uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
-                float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
-                float scale = norm * TURBO_KV_RSQRT128;
-                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                    kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
-                }
-                memoryBarrierShared(); barrier();
             }
         }
 
@@ -350,17 +323,17 @@ void main() {
             }
         }
 
-        // ===================== Phase 3: Dequant V via shmem FWHT =====================
+        // ===================== Phase 3: Dequant V — codebook then shmem FWHT =====================
         barrier();
         for (uint32_t idx = tid; idx < Bc * HSV; idx += WorkGroupSize) {
             kv_sh[idx] = 0.0;
         }
-        memoryBarrierShared(); barrier();
+        barrier();
 
+        // Write V codebook values
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
-
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
@@ -372,8 +345,9 @@ void main() {
                 }
             }
         }
-        memoryBarrierShared(); barrier();
+        barrier();
 
+        // Shmem inverse RHT on each V block
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
             if (kv_token >= KV) continue;
@@ -389,15 +363,15 @@ void main() {
                             kv_sh[base + partner] = a - b;
                         }
                     }
-                    memoryBarrierShared(); barrier();
+                    barrier();
                 }
                 uint32_t block_idx = v_row_offset + kv_token * (HSV / QUANT_K_TURBO_KV_4B) + blk;
                 float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
-                float scale = norm * TURBO_KV_RSQRT128;
+                float vscale = norm * TURBO_KV_RSQRT128;
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                    kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
+                    kv_sh[base + idx] *= turbo_kv_sign(idx) * vscale;
                 }
-                memoryBarrierShared(); barrier();
+                barrier();
             }
         }
 
