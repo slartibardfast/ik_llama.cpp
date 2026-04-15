@@ -153,14 +153,15 @@ void main() {
                     fwht_tmp[idx] = kv_sh[base + idx];
                 }
                 barrier();
-                // Butterfly: read from scratch, write to kv_sh
+                // Butterfly: read from scratch, write to kv_sh.
+                // Use branchless form to prevent ACO from merging the add/sub branches.
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                     uint32_t partner = idx ^ s;
-                    if ((idx & s) == 0u) {
-                        kv_sh[base + idx]     = fwht_tmp[idx] + fwht_tmp[partner];
-                    } else {
-                        kv_sh[base + idx]     = fwht_tmp[partner] - fwht_tmp[idx];
-                    }
+                    float a = fwht_tmp[idx];
+                    float b = fwht_tmp[partner];
+                    // sign = +1 for low half (idx & s == 0), -1 for high half
+                    float sign = ((idx & s) == 0u) ? 1.0 : -1.0;
+                    kv_sh[base + idx] = b + sign * a;
                 }
                 barrier();
             }
