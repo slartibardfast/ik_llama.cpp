@@ -216,8 +216,8 @@ void main() {
     for (uint32_t j = start_j; j < end_j; ++j) {
 
         // ===================== Phase 1: Dequant K into shared memory =====================
-        // Zero kv_sh first — positions beyond KV won't be dequanted but the
-        // attention mask might not fully prevent 0*NaN = NaN in P·V accumulation.
+        // Zero-fill kv_sh for K. Positions beyond KV will have score=0 after Q·K,
+        // which is corrected to -inf in the score clamping step below.
         for (uint32_t idx = tid; idx < Bc * HSK; idx += WorkGroupSize) {
             kv_sh[idx] = 0.0;
         }
@@ -274,6 +274,18 @@ void main() {
             [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
                 [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
                     Sf[r][c] += subgroupShuffleXor(Sf[r][c], s);
+                }
+            }
+        }
+
+        // Clamp scores for positions beyond KV to -inf.
+        // TURBO_KV_4B zero-fills kv_sh for unfilled positions, giving score=0.
+        // Without clamping, exp(0) ≈ 1 dilutes the softmax denominator.
+        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+            uint32_t kv_col = c * cols_per_iter + col_tid;
+            if (j * Bc + kv_col >= KV) {
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    Sf[r][c] = uintBitsToFloat(0xFF800000u); // -inf
                 }
             }
         }
