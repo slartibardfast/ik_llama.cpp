@@ -336,7 +336,6 @@ void main() {
             }
         }
         barrier();
-
         // V shmem inverse RHT
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
