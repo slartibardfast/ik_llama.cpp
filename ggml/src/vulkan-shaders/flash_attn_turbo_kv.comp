@@ -46,21 +46,20 @@ shared vec4 Qf[Br][HSK / 4];
 // With HSK=HSV=256 and Bc=32: 32*256*4 = 32 KB
 shared float kv_sh[Bc * HSK];
 
-// Dequant K: codebook lookup only (no inverse RHT).
-// The Q·K dot product is computed in the RHT domain, which preserves dot products.
-// This matches the CPU path where Q is pre-rotated via turbo_kv_rotate_query().
-void dequant_k_block_to_shared(
-    uint block_idx, uint sh_base, uint sub_tid, float rcp_inv_std
+// Dequant one 128-element block: codebook lookup only (no inverse RHT).
+// bind_idx: 0 for K buffer, 1 for V buffer.
+void dequant_block_codebook_to_shared(
+    uint block_idx, uint sh_base, uint sub_tid, float rcp_inv_std, uint bind_idx
 ) {
     for (uint elem = sub_tid; elem < QUANT_K_TURBO_KV_4B; elem += gl_SubgroupSize) {
         uint byte_idx = elem / 2;
-        uint byte_val = uint(kv_np[0].data_kv_np[block_idx].mse_indices[byte_idx]);
+        uint byte_val = uint(kv_np[bind_idx].data_kv_np[block_idx].mse_indices[byte_idx]);
         uint nibble = ((elem & 1u) == 0u) ? (byte_val & 0xFu) : ((byte_val >> 4) & 0xFu);
         kv_sh[sh_base + elem] = TURBO_KV_CODEBOOK[nibble] * rcp_inv_std;
     }
 }
 
-// Dequant V: full inverse RHT to original domain.
+// Dequant V: full inverse RHT to original domain via subgroup-cooperative FWHT.
 // V values must be in the original domain for P·V accumulation.
 void dequant_v_block_to_shared(
     uint block_idx, uint sh_base, uint sub_tid, float norm, float rcp_inv_std
@@ -173,10 +172,10 @@ void main() {
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
-                    dequant_k_block_to_shared(
+                    dequant_block_codebook_to_shared(
                         block_idx,
                         token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, rcp
+                        sub_tid, rcp, 0  // K=0, V=1
                     );
                 }
             }
@@ -268,7 +267,8 @@ void main() {
             }
         }
 
-        // ===================== Phase 3: Dequant V into shared memory =====================
+        // ===================== Phase 3: Dequant V into shared memory via shmem FWHT =====================
+        // Step 3a: Write raw codebook values to kv_sh (same as K dequant, no RHT yet)
         barrier();
         for (uint32_t idx = tid; idx < Bc * HSV; idx += WorkGroupSize) {
             kv_sh[idx] = 0.0;

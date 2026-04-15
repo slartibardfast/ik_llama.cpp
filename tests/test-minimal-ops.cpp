@@ -660,17 +660,14 @@ int main(int argc, char ** argv) {
         auto f16_result = run_with_sched(GGML_TYPE_F16);
         auto quant_result = run_with_sched(kv_type);
 
-        fprintf(stderr, "  f16_size=%d quant_size=%d\n", (int)f16_result.size(), (int)quant_result.size());
+        // Check for NaN in each result
+        int f16_nan = 0, q_nan = 0;
+        for (int i = 0; i < (int)f16_result.size(); i++) if (std::isnan(f16_result[i])) f16_nan++;
+        for (int i = 0; i < (int)quant_result.size(); i++) if (std::isnan(quant_result[i])) q_nan++;
+        fprintf(stderr, "  NaN: f16=%d/%d quant=%d/%d\n", f16_nan, (int)f16_result.size(), q_nan, (int)quant_result.size());
         if (!f16_result.empty() && !quant_result.empty()) {
             fprintf(stderr, "  f16[0..3] = %.6f %.6f %.6f %.6f\n", f16_result[0], f16_result[1], f16_result[2], f16_result[3]);
             fprintf(stderr, "  qnt[0..3] = %.6f %.6f %.6f %.6f\n", quant_result[0], quant_result[1], quant_result[2], quant_result[3]);
-            double sd = 0, sr = 0;
-            for (int i = 0; i < (int)f16_result.size(); i++) {
-                double d = quant_result[i] - f16_result[i];
-                sd += d*d;
-                sr += (double)f16_result[i]*f16_result[i];
-            }
-            fprintf(stderr, "  manual: sum_diff2=%.10e sum_ref2=%.10e ratio=%.10f\n", sd, sr, sr > 0 ? sd/sr : 0.0);
         }
 
         double nmse = compute_nmse(quant_result.data(), f16_result.data(), (int)f16_result.size());
@@ -680,8 +677,9 @@ int main(int argc, char ** argv) {
         return nmse < 0.05;
     };
 
-    run("fa_tkv_sched",   [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 2, 32); });
-    run("fa_tkv_sched_l", [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 2, 128); });
+    run("fa_f16_sched",   [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_F16,          256, 1, 32); });
+    run("fa_tkv_sched",   [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 1, 32); });
+    run("fa_tkv_sched_l", [&]{ return test_fa_sched(gpu, cpu, GGML_TYPE_TURBO_KV_4B, 256, 1, 128); });
 
     // TURBO_KV_4B round-trip: F32 → quantize(GPU) → dequant(GPU) → F32
     // Self-contained RHT round-trip: forward→quant→dequant→inverse, no byte packing

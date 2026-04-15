@@ -2638,9 +2638,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 192, 192) \
         CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 192, 128, 192_128) \
         CREATE_FA2_LARGE(GGML_TYPE_TURBO_KV_4B, NAMELC, FA_SCALAR, , 256, 256, 256)
-        fprintf(stderr, "TURBO_KV_4B FA: device=%s subgroup_size=%d, selecting %s\n",
-                device->name.c_str(), device->subgroup_size,
-                device->subgroup_size >= 64 ? "w64" : "w32");
         if (device->subgroup_size >= 64) {
             CREATE_FA_TURBO(turbo_kv_4b_w64)
         } else {
@@ -7791,10 +7788,6 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                               scale, max_bias, logit_softcap,
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
-
-    fprintf(stderr, "[FA] type=%s N=%d KV=%d HSK=%d HSV=%d gqa=%d split_k=%d pipeline=%s small=%d aligned=%d\n",
-            ggml_type_name(k->type), N, KV, HSK, HSV, gqa_ratio, split_k,
-            pipeline->name.c_str(), small_rows, aligned);
 
     ggml_vk_sync_buffers(subctx);
 
