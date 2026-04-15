@@ -204,6 +204,10 @@ void main() {
 
     // KV offsets: in TURBO_KV_4B block units (72 bytes per block)
     const uint32_t blocks_per_row = HSK / QUANT_K_TURBO_KV_4B;
+    // k_stride/v_stride are in block units (nb1/type_size). For multi-head KV,
+    // this accounts for ALL heads interleaved in the cache, not just one head's blocks.
+    const uint32_t k_blk_stride = k_stride;  // blocks between same-head K tokens
+    const uint32_t v_blk_stride = v_stride;  // blocks between same-head V tokens
     // nb12/nb13 are byte strides for dims 2/3. Divide by block byte size (72) to get block offsets.
     uint32_t k_row_offset = (ik2*p.nb12 + ik3*p.nb13) / 72;
     uint32_t v_row_offset = (iv2*p.nb22 + iv3*p.nb23) / 72;
@@ -230,7 +234,7 @@ void main() {
 
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
-                    uint32_t block_idx = k_row_offset + kv_token * blocks_per_row + blk;
+                    uint32_t block_idx = k_row_offset + kv_token * k_blk_stride + blk;
                     float norm = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].norm)).x;
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
@@ -355,7 +359,7 @@ void main() {
             uint32_t kv_token = j * Bc + token_idx;
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
-                    uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
+                    uint32_t block_idx = v_row_offset + kv_token * v_blk_stride + blk;
                     float inv_std = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
                     dequant_block_codebook_to_shared(
@@ -388,7 +392,7 @@ void main() {
                     }
                     barrier();
                 }
-                uint32_t block_idx = v_row_offset + kv_token * (HSV / QUANT_K_TURBO_KV_4B) + blk;
+                uint32_t block_idx = v_row_offset + kv_token * v_blk_stride + blk;
                 float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
                 float vscale = norm * TURBO_KV_RSQRT128;
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
