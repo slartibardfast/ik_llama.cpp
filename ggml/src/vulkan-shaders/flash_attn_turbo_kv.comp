@@ -320,7 +320,7 @@ void main() {
         }
         barrier();
 
-        // V codebook write
+        // V codebook write then shmem inverse RHT
         for (uint32_t token_base = 0; token_base < Bc; token_base += n_subgroups) {
             uint32_t token_idx = token_base + sub_id;
             uint32_t kv_token = j * Bc + token_idx;
@@ -336,7 +336,6 @@ void main() {
             }
         }
         barrier();
-        // V shmem inverse RHT
         for (uint32_t token_base = 0; token_base < Bc; token_base++) {
             uint32_t kv_token = j * Bc + token_base;
             if (kv_token >= KV) continue;

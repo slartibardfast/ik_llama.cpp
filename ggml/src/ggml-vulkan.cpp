@@ -2575,8 +2575,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
                             ? scalar_flash_attention_workgroup_size
                             : ((small_rows && (D % 32) == 0) ? 256 : 128);
 
-        // NOTE: TURBO_KV_4B uses shared-memory FWHT (not subgroupShuffleXor)
-        // to avoid a RADV multi-subgroup shuffle bug. Keeping wg_size=128.
+        // TURBO_KV_4B uses shmem FWHT — WG=128 required (WG=64 breaks FA structure)
         auto rows_cols = fa_rows_cols(path, hsk, hsv, clamp, type, small_rows);
 
         // D_split can't be larger than a subgroup because we use subgroupShuffle to reduce it.
@@ -7776,6 +7775,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
             m_buf_offset = vk_tensor_offset(mask) + mask->view_offs;
         }
     }
+
+    // debug removed
 
     uint32_t mask_n_head_log2 = ((mask != nullptr) << 16) | n_head_log2;
 
