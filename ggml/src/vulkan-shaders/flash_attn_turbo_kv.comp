@@ -46,6 +46,9 @@ shared vec4 Qf[Br][HSK / 4];
 // With HSK=HSV=256 and Bc=32: 32*256*4 = 32 KB
 shared float kv_sh[Bc * HSK];
 
+// FWHT scratch for out-of-place butterfly (avoids shmem read-after-write)
+shared float fwht_tmp[QUANT_K_TURBO_KV_4B];
+
 // Dequant one 128-element block: codebook lookup with per-block scaling.
 // For K: includes norm factor so Q_rot · K_stored = Q · K (not Q · K/norm).
 // bind_idx: 0 for K buffer, 1 for V buffer.
@@ -128,8 +131,13 @@ void main() {
     for (uint32_t r = 0; r < Br; r++) {
         if (i * Br + r >= N) continue;
 
-        for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
-            kv_sh[idx] = Qf[r][idx / 4][idx % 4];
+        // Read Q as full vec4s (avoid component access overhead)
+        for (uint32_t d = tid; d < HSK / 4; d += WorkGroupSize) {
+            vec4 q = Qf[r][d];
+            kv_sh[d*4+0] = q.x;
+            kv_sh[d*4+1] = q.y;
+            kv_sh[d*4+2] = q.z;
+            kv_sh[d*4+3] = q.w;
         }
         barrier();
 
@@ -140,13 +148,18 @@ void main() {
             }
             barrier();
             for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
+                // Copy to scratch for out-of-place read
+                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                    fwht_tmp[idx] = kv_sh[base + idx];
+                }
+                barrier();
+                // Butterfly: read from scratch, write to kv_sh
                 for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
                     uint32_t partner = idx ^ s;
-                    if (idx < partner) {
-                        float a = kv_sh[base + idx];
-                        float b = kv_sh[base + partner];
-                        kv_sh[base + idx]     = a + b;
-                        kv_sh[base + partner] = a - b;
+                    if ((idx & s) == 0u) {
+                        kv_sh[base + idx]     = fwht_tmp[idx] + fwht_tmp[partner];
+                    } else {
+                        kv_sh[base + idx]     = fwht_tmp[partner] - fwht_tmp[idx];
                     }
                 }
                 barrier();
@@ -157,8 +170,9 @@ void main() {
             barrier();
         }
 
-        for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
-            Qf[r][idx / 4][idx % 4] = kv_sh[idx];
+        // Write rotated Q back as full vec4s (avoid component write race)
+        for (uint32_t d = tid; d < HSK / 4; d += WorkGroupSize) {
+            Qf[r][d] = vec4(kv_sh[d*4], kv_sh[d*4+1], kv_sh[d*4+2], kv_sh[d*4+3]);
         }
         barrier();
     }
@@ -219,6 +233,7 @@ void main() {
                     float inv_std = unpackHalf2x16(uint(kv_np[0].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
+                    // K scale includes norm: Q_rot · (codebook/inv_std * norm) = Q · K
                     dequant_block_codebook_to_shared(
                         block_idx,
                         token_idx * HSK + blk * QUANT_K_TURBO_KV_4B,
