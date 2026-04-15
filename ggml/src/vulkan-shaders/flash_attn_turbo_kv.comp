@@ -108,7 +108,12 @@ void main() {
 
     uint32_t q_offset = (iq2*p.nb02+iq3*p.nb03) / 4;
 
-    // Load Q into shared memory
+    // Load Q into shared memory and apply per-block forward RHT.
+    // TurboQuant computes scores as RHT(Q) · K_stored, exploiting dot-product preservation.
+    // The rotation is: per element, sign(elem) * x, then FWHT, then scale 1/√128.
+    // We use kv_sh[] as scratch for the per-element FWHT butterfly.
+
+    // Step 1: Load Q into Qf[] (unrotated)
     [[unroll]] for (uint32_t idx = 0; idx < Br * HSK / 4; idx += gl_WorkGroupSize.x) {
         uint32_t d = (idx + tid) % (HSK / 4);
         uint32_t r = (idx + tid) / (HSK / 4);
@@ -117,6 +122,55 @@ void main() {
         }
     }
     barrier();
+
+    // Step 2: Forward-RHT each 128-element block of Q via kv_sh scratch.
+    // For each row r in Br, rotate blocks independently.
+    for (uint32_t r = 0; r < Br; r++) {
+        if (i * Br + r >= N) continue;
+
+        // Copy Q row to kv_sh as flat floats (reuse token 0's slot)
+        for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
+            kv_sh[idx] = Qf[r][idx / 4][idx % 4];
+        }
+        barrier();
+
+        // Apply sign per block, then FWHT per block, then scale
+        for (uint32_t blk = 0; blk < HSK / QUANT_K_TURBO_KV_4B; blk++) {
+            uint32_t base = blk * QUANT_K_TURBO_KV_4B;
+
+            // Sign multiply
+            for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                kv_sh[base + idx] *= turbo_kv_sign(idx);
+            }
+            barrier();
+
+            // FWHT butterfly via shared memory
+            for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
+                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                    uint32_t partner = idx ^ s;
+                    if (idx < partner) {
+                        float a = kv_sh[base + idx];
+                        float b = kv_sh[base + partner];
+                        kv_sh[base + idx]     = a + b;
+                        kv_sh[base + partner] = a - b;
+                    }
+                }
+                barrier();
+            }
+
+            // Scale by 1/√128
+            for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                kv_sh[base + idx] *= TURBO_KV_RSQRT128;
+            }
+            barrier();
+        }
+
+        // Copy rotated Q back to Qf[]
+        for (uint32_t idx = tid; idx < HSK; idx += WorkGroupSize) {
+            Qf[r][idx / 4][idx % 4] = kv_sh[idx];
+        }
+        barrier();
+    }
 
     vec4 Of[Br][HSV_per_thread / 4];
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
@@ -282,19 +336,53 @@ void main() {
             if (token_idx < Bc && kv_token < KV) {
                 for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
                     uint32_t block_idx = v_row_offset + kv_token * blocks_per_row + blk;
-                    float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
                     float inv_std = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].inv_std_fp16)).x;
                     float rcp = 1.0 / max(inv_std, 1e-10);
 
-                    dequant_v_block_to_shared(
+                    // Write codebook values (pre-inverse-RHT)
+                    dequant_block_codebook_to_shared(
                         block_idx,
                         token_idx * HSV + blk * QUANT_K_TURBO_KV_4B,
-                        sub_tid, norm, rcp
+                        sub_tid, rcp, 1  // V buffer
                     );
                 }
             }
         }
         barrier();
+
+        // In-place inverse RHT on V blocks via shared-memory FWHT.
+        // Same approach as Q rotation — avoids subgroupShuffleXor precision issues.
+        for (uint32_t token_base = 0; token_base < Bc; token_base++) {
+            uint32_t kv_token = j * Bc + token_base;
+            if (token_base >= Bc || kv_token >= KV) continue;
+
+            for (uint32_t blk = 0; blk < HSV / QUANT_K_TURBO_KV_4B; blk++) {
+                uint32_t base = token_base * HSV + blk * QUANT_K_TURBO_KV_4B;
+
+                // FWHT butterfly via shared memory
+                for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
+                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                        uint32_t partner = idx ^ s;
+                        if (idx < partner) {
+                            float a = kv_sh[base + idx];
+                            float b = kv_sh[base + partner];
+                            kv_sh[base + idx]     = a + b;
+                            kv_sh[base + partner] = a - b;
+                        }
+                    }
+                    barrier();
+                }
+
+                // Sign multiply + norm scaling
+                uint32_t block_idx = v_row_offset + kv_token * (HSV / QUANT_K_TURBO_KV_4B) + blk;
+                float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
+                float scale = norm * TURBO_KV_RSQRT128;
+                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
+                    kv_sh[base + idx] *= turbo_kv_sign(idx) * scale;
+                }
+                barrier();
+            }
+        }
 
         // ===================== Phase 4: P·V accumulation from shared memory =====================
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
