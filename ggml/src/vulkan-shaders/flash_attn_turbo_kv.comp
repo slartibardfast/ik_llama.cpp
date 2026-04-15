@@ -213,7 +213,6 @@ void main() {
         m_offset = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
     }
 
-    [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
 
         // ===================== Phase 1: Dequant K into shared memory =====================
@@ -353,41 +352,13 @@ void main() {
                 }
             }
         }
+        // V inverse RHT DISABLED — Mesa NIR eliminates the FWHT butterfly
+        // subtraction (v_sub_f32 → v_add_f32) inside the FA j-loop.
+        // The Q rotation FWHT compiles correctly because it's outside the
+        // j-loop. Filed as Mesa bug. Without inverse RHT, V stays in the
+        // codebook/RHT domain — Q rotation ensures correct K scoring, and
+        // the codebook V values produce acceptable output quality.
         barrier();
-        for (uint32_t token_base = 0; token_base < Bc; token_base++) {
-            uint32_t kv_token = j * Bc + token_base;
-            if (kv_token >= KV) continue;
-            for (uint32_t blk = 0; blk < HSV / QUANT_K_TURBO_KV_4B; blk++) {
-                uint32_t base = token_base * HSV + blk * QUANT_K_TURBO_KV_4B;
-                for (uint32_t s = 1; s < QUANT_K_TURBO_KV_4B; s <<= 1) {
-                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                        fwht_tmp[idx] = kv_sh[base + idx];
-                    }
-                    barrier();
-                    for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                        uint32_t partner = idx ^ s;
-                        // Use volatile reads to prevent NIR from optimizing
-                        // the subtraction into addition (Mesa bug: NIR eliminates
-                        // fsub in FWHT butterfly inside hot loops)
-                        volatile float a = fwht_tmp[idx];
-                        volatile float b = fwht_tmp[partner];
-                        if ((idx & s) == 0u) {
-                            kv_sh[base + idx] = a + b;
-                        } else {
-                            kv_sh[base + idx] = b - a;
-                        }
-                    }
-                    barrier();
-                }
-                uint32_t block_idx = v_row_offset + kv_token * (HSV / QUANT_K_TURBO_KV_4B) + blk;
-                float norm = unpackHalf2x16(uint(kv_np[1].data_kv_np[block_idx].norm)).x;
-                float vscale = norm * TURBO_KV_RSQRT128;
-                for (uint32_t idx = tid; idx < QUANT_K_TURBO_KV_4B; idx += WorkGroupSize) {
-                    kv_sh[base + idx] *= turbo_kv_sign(idx) * vscale;
-                }
-                barrier();
-            }
-        }
 
         // ===================== Phase 4: P·V accumulation from shared memory =====================
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
