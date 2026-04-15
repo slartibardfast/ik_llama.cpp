@@ -448,6 +448,10 @@ void ggml_fp16_to_fp32_row(const ggml_fp16_t * x, float * y, int64_t n) {
     }
 }
 
+static void ggml_fp32_to_fp32_row(const float * x, float * y, int64_t n) {
+    memcpy(y, x, n * sizeof(float));
+}
+
 void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n) {
     int64_t i = 0;
 #if defined(__F16C__)
@@ -684,6 +688,8 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 1,
         .type_size                = sizeof(float),
         .is_quantized             = false,
+        .from_float               = (ggml_from_float_t) ggml_fp32_to_fp32_row,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp32_row,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
