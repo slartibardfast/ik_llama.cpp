@@ -290,3 +290,36 @@ Nothing to fix.
 
 CPU and Vulkan now agree within Q8_0 quantization tolerance on the
 4-prompt battery. Stage 3 closed.
+
+## Stage F result — MTP-IR rollback keep-copy fixed
+
+`tests/test-intermediate-rollback.cpp` had been failing at
+`ROLLBACK_IDX=0` with max_diff=19.27 since the port — the invariant
+"roll back to post-T state = fresh 1-token decode of T" didn't hold.
+Prior sessions ruled out seq_rm, kernel fast-vs-slow paths,
+graph_reuse, multithreading, and buffer-reclamation via
+`ggml_set_output`. This session localized the bug:
+`ggml_cpy(fused_result, ggml_new_tensor_1d(total_elems))` at
+`src/llama-delta-net.cpp:438` (the `dn_result_keep` scaffolding)
+did not reliably copy its source in ik_llama's scheduler.
+Diagnostic `LLAMA_RB_DIAG=1` showed the delta-net kernel wrote
+the correct tiny state values to `fused_result` slot 0, but
+`dn_result_keep` — supposedly a cpy of it — read back large
+unrelated values at the same byte offset. Separate buffer
+addresses (so not naïve aliasing) — the cpy was either elided
+or wrote wrong data.
+
+Fix: replace `ggml_cpy` with `ggml_scale(fused_result, 1.0f)` +
+`ggml_set_output`. Scale produces a new tensor with an op-backed
+lineage the scheduler can't elide; `set_output` pins the buffer.
+
+Result: A vs B at IDX=0 max_diff 19.27 → 4.77e-07 (float32 noise).
+PASS. No regression in coherence / golden snapshots (the ssm_cpy
+reading slot-n_tok-1 happened to work pre-fix; only the slot-0
+rollback path was broken).
+
+Production impact: zero callers today (`llama_rollback_delta_net_state`
+isn't wired into the server; chained rollout uses stacked-logit
+readback). The fix unblocks future in-place-rollback use cases for
+speculative decoding on 35B-A3B, where the extra batch size could
+make it a real throughput win.

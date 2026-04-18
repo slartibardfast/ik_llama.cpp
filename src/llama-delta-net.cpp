@@ -391,9 +391,6 @@ ggml_tensor * delta_net::build_qkv(llama_context & lctx, ggml_context * ctx0,
 
     // MTP-IR: emit per-token intermediate states when batching drafts (n_tok > 1).
     // Required for llama_rollback_delta_net_state on partial reject.
-    // DIAG: env override for testing — set LLAMA_MTP_FORCE_EMIT=1 to force on
-    // even for single-token batches, isolating kernel-path differences
-    // (IQK fast path vs slow path) that cause rollback test mismatches.
     const bool emit_intermediates = (n_tok > 1);
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type, emit_intermediates);
 
@@ -431,15 +428,11 @@ ggml_tensor * delta_net::build_qkv(llama_context & lctx, ggml_context * ctx0,
     //   - emit_intermediates=1: explicit CPY of new_state (= last intermediate)
     //     into the ssm portion of the cache cell at offset conv_state_dim.
     if (emit_intermediates) {
-        // Persistent copy of the delta-net result FIRST — before any consumer
-        // that could let the scheduler reclaim fused_result's buffer.
-        // Without the keep-copy, rollback reads garbage.
-        // Using ggml_scale(x, 1.0f) instead of ggml_cpy — ggml_cpy into a
-        // new_tensor_1d did not reliably copy the state region of fused_result
-        // in ik_llama's scheduler (kernel writes tiny values to fused_result
-        // slot 0, but dn_result_keep reads large unrelated values at same
-        // offset). ggml_scale is an op-backed lineage that the scheduler
-        // can't elide / buffer-alias the same way.
+        // Persistent copy of the delta-net result for rollback reads. Must be
+        // ggml_scale(x, 1.0f) rather than ggml_cpy-into-new-tensor: the cpy
+        // variant is unreliably elided/aliased by the scheduler for this 1D
+        // whole-tensor copy pattern, producing wrong bytes at the slot-0
+        // offset rollback needs. Scale's op-backed lineage survives.
         ggml_tensor * dn_result_keep = ggml_scale(ctx0, fused_result, 1.0f);
         ggml_set_name(dn_result_keep, "dn_result_keep");
         ggml_set_output(dn_result_keep);
