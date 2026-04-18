@@ -78,7 +78,8 @@ delta_net::~delta_net() = default;
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_context * ctx0,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
-        int il, const llm_build_cb & cb, int repeat_type) {
+        int il, const llm_build_cb & cb, int repeat_type,
+        bool emit_intermediates) {
 
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[2];
@@ -120,9 +121,10 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(beta,      "beta_fused", il);
     cb(state_flat,"state_fused", il);
 
-    ggml_tensor * fused_result = ggml_delta_net(ctx0, q, k, v, g, beta, state_flat);
+    ggml_tensor * fused_result = ggml_delta_net_ext(ctx0, q, k, v, g, beta, state_flat, emit_intermediates);
     cb(fused_result, "delta_net_fused_raw", il);
     fused_result->op_params[0] = repeat_type;
+    // op_params[2] is already set to emit_intermediates by ggml_delta_net_ext
 
     const int64_t output_size = S_v * H_v * n_tokens * n_seqs;
     const int64_t state_size  = S_v * S_v * H_v * n_seqs;
@@ -134,8 +136,12 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
             ggml_row_size(fused_result->type, S_v * H_v * n_tokens), 0);
     //output_tokens = ggml_cont_4d(ctx0, output_tokens, S_v, H_v, n_tokens, n_seqs);
 
+    // With emit_intermediates, the kernel writes n_tokens state copies. The
+    // FINAL state lives in the LAST slot; new_state_flat must point there.
+    const int64_t final_state_offset = output_size +
+        (emit_intermediates ? (n_tokens - 1) * state_size : 0);
     ggml_tensor * new_state_flat = ggml_view_1d(ctx0, fused_result, state_size,
-            output_size * ggml_element_size(fused_result));
+            final_state_offset * ggml_element_size(fused_result));
     ggml_tensor * new_state = ggml_reshape_4d(ctx0, new_state_flat, S_v, S_v, H_v, n_seqs);
 
     cb(output_tokens, "output_tokens", il);
@@ -275,7 +281,8 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
     return {beta, gate};
 }
 
-ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_storage, ggml_tensor * ssm_conv1d,
+ggml_tensor * delta_net::build_qkv(llama_context & lctx, ggml_context * ctx0,
+        ggml_tensor * state_storage, ggml_tensor * ssm_conv1d,
         ggml_tensor * qkv_mixed, ggml_tensor * inp_s_seq_qnext, ggml_tensor * beta, ggml_tensor * gate,
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
@@ -322,7 +329,25 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(state, "state_predelta", il);
     ggml_build_forward_expand(gf, state);
 
-    ggml_tensor * conv_output_raw = ggml_ssm_conv(ctx0, conv_states, qkv_mixed, ssm_conv1d, inp_s_seq_qnext);
+    // MTP-IR: materialize conv_states into a FRESH tensor that becomes the
+    // input to both ssm_conv AND the rollback snapshot. This decouples the
+    // rollback capture from the cache's post-batch state: once
+    // conv_states_stable is computed, its buffer is frozen and subsequent
+    // conv_cpy writes to the cache don't affect it.
+    ggml_tensor * conv_states_for_ssm = conv_states;
+    ggml_tensor * conv_states_keep_early = nullptr;
+    if (n_seq_tokens > 1) {
+        ggml_tensor * conv_states_stable = ggml_scale(ctx0, conv_states, 1.0f);
+        ggml_set_name(conv_states_stable, "conv_states_stable");
+        conv_states_for_ssm = conv_states_stable;
+        conv_states_keep_early = ggml_cpy(ctx0, conv_states_stable,
+            ggml_new_tensor_3d(ctx0, conv_states_stable->type,
+                conv_states_stable->ne[0], conv_states_stable->ne[1], conv_states_stable->ne[2]));
+        ggml_set_name(conv_states_keep_early, "conv_states_keep_early");
+        ggml_build_forward_expand(gf, conv_states_keep_early);
+    }
+
+    ggml_tensor * conv_output_raw = ggml_ssm_conv(ctx0, conv_states_for_ssm, qkv_mixed, ssm_conv1d, inp_s_seq_qnext);
     cb(conv_output_raw, "conv_output_raw", il);
 
     ggml_tensor * conv_output = ggml_view_2d(ctx0, conv_output_raw, conv_dim, n_tok, conv_dim * ggml_element_size(conv_output_raw), 0);
@@ -364,7 +389,13 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(q_conv, "q_conv_normed", il);
     cb(k_conv, "k_conv_normed", il);
 
-    auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type);
+    // MTP-IR: emit per-token intermediate states when batching drafts (n_tok > 1).
+    // Required for llama_rollback_delta_net_state on partial reject.
+    // DIAG: env override for testing — set LLAMA_MTP_FORCE_EMIT=1 to force on
+    // even for single-token batches, isolating kernel-path differences
+    // (IQK fast path vs slow path) that cause rollback test mismatches.
+    const bool emit_intermediates = (n_tok > 1);
+    auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type, emit_intermediates);
 
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
@@ -382,12 +413,11 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
     cb(new_conv_states_cont, "new_conv_states_cont", il);
 
-    // Always set inplace flag — the Vulkan backend uses it; CPU ignores the
-    // state portion of dst and the writeback chain handles it below.
-    // TODO: also make the CPU/iqk path write state inplace, then we can
-    // unconditionally skip the ssm concat+cpy on all backends.
+    // Set inplace flag ONLY when emit_intermediates=0 (they're mutually
+    // exclusive — see ggml.c:22817 assert). With intermediates, the Vulkan
+    // shader skips the inplace SSM write; we add an explicit CPY below.
     ggml_tensor * fused_result = output->view_src ? output->view_src : output;
-    fused_result->op_params[1] = 1;
+    fused_result->op_params[1] = emit_intermediates ? 0 : 1;
 
     // Conv state: copy to the conv portion of the KV cache (first conv_state_dim floats).
     ggml_tensor * conv_dst = ggml_view_2d(ctx0, state_dst, conv_state_dim, 1, state_dst->nb[1], 0);
@@ -396,9 +426,65 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(conv_cpy, "conv_state_cpy", il);
     ggml_build_forward_expand(gf, conv_cpy);
 
-    // SSM state: already written inplace by the Vulkan DELTA_NET shader.
-    // The KV cache's ssm portion (at offset conv_state_dim) is up-to-date.
-    // No CONCAT or CPY needed for the ssm state.
+    // SSM state writeback:
+    //   - emit_intermediates=0: shader wrote inplace via op_params[1]=1; skip.
+    //   - emit_intermediates=1: explicit CPY of new_state (= last intermediate)
+    //     into the ssm portion of the cache cell at offset conv_state_dim.
+    if (emit_intermediates) {
+        // Persistent copy of the delta-net result FIRST — before any consumer
+        // that could let the scheduler reclaim fused_result's buffer.
+        // Without the keep-copy, rollback reads garbage (Step 8 fix in polaris).
+        const int64_t total_elems = fused_result->ne[0];
+        ggml_tensor * dn_result_keep = ggml_cpy(ctx0, fused_result,
+                ggml_new_tensor_1d(ctx0, fused_result->type, total_elems));
+        ggml_set_name(dn_result_keep, "dn_result_keep");
+        ggml_build_forward_expand(gf, dn_result_keep);
+
+        // SSM state writeback: copy the final state (= last intermediate slot
+        // of dn_result_keep) into the ssm portion of the cache cell. Source
+        // from dn_result_keep (persistent) so scheduler can't reclaim mid-run.
+        const int64_t output_size = head_v_dim * num_v_heads * n_tok * n_seqs;
+        const int64_t state_size  = head_v_dim * head_v_dim * num_v_heads * n_seqs;
+        const int64_t final_offset_elems = output_size + (n_tok - 1) * state_size;
+        ggml_tensor * final_state_view = ggml_view_1d(ctx0, dn_result_keep,
+                state_size, final_offset_elems * ggml_element_size(dn_result_keep));
+        ggml_tensor * final_state_2d = ggml_reshape_2d(ctx0, final_state_view, ssm_state_dim, 1);
+
+        ggml_tensor * ssm_dst = ggml_view_2d(ctx0, state_dst, ssm_state_dim, 1,
+                state_dst->nb[1], conv_state_dim * ggml_element_size(state_dst));
+        auto ssm_cpy = ggml_cpy(ctx0, final_state_2d, ssm_dst);
+        cb(ssm_cpy, "ssm_state_cpy", il);
+        ggml_build_forward_expand(gf, ssm_cpy);
+
+        // Capture qkv_mixed (new inputs) here; conv_states_keep was captured
+        // EARLIER in the graph (before conv_cpy overwrites the cache) — see
+        // conv_states_keep_early above. Rollback reconstructs the sliding
+        // window from these two.
+        ggml_tensor * qkv_mixed_keep = ggml_cpy(ctx0, qkv_mixed,
+                ggml_new_tensor_3d(ctx0, qkv_mixed->type,
+                    qkv_mixed->ne[0], qkv_mixed->ne[1], qkv_mixed->ne[2]));
+        ggml_set_name(qkv_mixed_keep, "qkv_mixed_keep");
+        ggml_build_forward_expand(gf, qkv_mixed_keep);
+
+        // Push metadata for rollback. `kv_head` = state_seq_id_local (the
+        // cache cell index used by state_dst above).
+        llama_context::delta_net_state_info info;
+        info.result          = dn_result_keep;
+        info.cache_s_l       = state_storage;
+        info.S_v             = head_v_dim;
+        info.H_v             = num_v_heads;
+        // Kernel intermediate layout is per-seq-token, not per-flattened-token
+        // (rollback uses info.n_tokens × info.n_seqs to recover output_size).
+        info.n_tokens        = n_seq_tokens;
+        info.n_seqs          = n_seqs;
+        info.kv_head         = state_seq_id_local;
+        info.conv_states_keep = conv_states_keep_early;
+        info.qkv_mixed_keep   = qkv_mixed_keep;
+        info.conv_states_all  = state_storage;
+        info.d_conv           = ssm_d_conv;
+        info.conv_channels    = (key_dim * 2 + value_dim);
+        lctx.delta_net_intermediates.push_back(info);
+    }
 
     return output;
 }
@@ -528,7 +614,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             }
             auto split_ssm_conv1d = (ggml_split_tensor_t *)l.ssm_conv1d->extra;
             GGML_ASSERT(split_ssm_conv1d && split_ssm_conv1d->splits[id]);
-            auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
+            auto output = build_qkv(lctx, ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
                                state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
                                l.ssm_beta_alpha ? 0 : 1, il, cb, gf);
@@ -581,7 +667,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     auto [beta, gate] = build_beta_gate(lctx, ctx0, model.layers[il].ssm_beta_alpha, model.layers[il].ssm_beta, model.layers[il].ssm_alpha,
             model.layers[il].ssm_dt, model.layers[il].ssm_a, num_k_heads, num_v_heads, n_seqs, cur, il, cb, gf);
 
-    auto output = build_qkv(ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
+    auto output = build_qkv(lctx, ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
         qkv_mixed, inp_s_seq_qnext, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,

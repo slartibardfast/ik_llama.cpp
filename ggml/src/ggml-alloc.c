@@ -363,11 +363,13 @@ struct ggml_gallocr {
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
-    struct node_alloc * node_allocs; // [n_nodes]
-    int n_nodes;
+    struct node_alloc * node_allocs; // allocated capacity: n_nodes_cap
+    int n_nodes;      // usage from current graph (used by needs_realloc)
+    int n_nodes_cap;  // allocated capacity — grow-only, prevents free+calloc churn
 
-    struct leaf_alloc * leaf_allocs; // [n_leafs]
-    int n_leafs;
+    struct leaf_alloc * leaf_allocs; // allocated capacity: n_leafs_cap
+    int n_leafs;      // usage from current graph
+    int n_leafs_cap;  // allocated capacity — grow-only
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -675,6 +677,7 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
 
+
     // initialize hash table
     if (galloc->hash_set.size < min_hash_size) {
         ggml_hash_set_free(&galloc->hash_set);
@@ -694,11 +697,19 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
-    // set the node_allocs from the hash table
-    if (galloc->n_nodes < graph->n_nodes) {
+    // set the node_allocs from the hash table.
+    // Grow-only capacity with 2x headroom + 4096 floor. Avoids repeated
+    // free+calloc across decodes on Vulkan/RADV where interleaved large
+    // malloc (mmap path) and vkFreeMemory (also mmap-based) can corrupt
+    // glibc's mmap chunk tracking and crash with "corrupted double-linked
+    // list" on a later reserve_n.
+    if (galloc->n_nodes_cap < graph->n_nodes) {
+        int new_cap = graph->n_nodes * 2;
+        if (new_cap < 4096) new_cap = 4096;
         free(galloc->node_allocs);
-        galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+        galloc->node_allocs = calloc(new_cap, sizeof(struct node_alloc));
         GGML_ASSERT(galloc->node_allocs != NULL);
+        galloc->n_nodes_cap = new_cap;
     }
     galloc->n_nodes = graph->n_nodes;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -728,10 +739,14 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
             }
         }
     }
-    if (galloc->n_leafs < graph->n_leafs) {
+    // Grow-only capacity (see n_nodes note above).
+    if (galloc->n_leafs_cap < graph->n_leafs) {
+        int new_cap = graph->n_leafs * 2;
+        if (new_cap < 4096) new_cap = 4096;
         free(galloc->leaf_allocs);
-        galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
+        galloc->leaf_allocs = calloc(new_cap, sizeof(galloc->leaf_allocs[0]));
         GGML_ASSERT(galloc->leaf_allocs != NULL);
+        galloc->n_leafs_cap = new_cap;
     }
     galloc->n_leafs = graph->n_leafs;
     for (int i = 0; i < graph->n_leafs; i++) {

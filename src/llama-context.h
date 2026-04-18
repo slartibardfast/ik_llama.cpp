@@ -221,6 +221,37 @@ struct llama_context {
     std::vector<float>  mtp_logits_extracted;          // host buffer for extracted MTP logits
     int64_t             mtp_n_vocab = 0;               // vocab size of MTP logits
 
+    // MTP-IR (intermediate rollback). Position-major layout:
+    //   [mtp_n_pos][mtp_n_drafts][mtp_n_vocab]
+    // `mtp_logits_buf` retains ALL batch positions (not just the last). Read
+    // back via llama_get_mtp_logits_ith(ctx, i). `mtp_logits_extracted` above
+    // remains the single-position buffer used by llama_get_mtp_logits (last).
+    std::vector<float>  mtp_logits_buf;
+    int64_t             mtp_n_drafts = 0;
+    int64_t             mtp_n_pos    = 0;
+    bool                mtp_logits_valid = false;
+
+    // Per-token intermediate state info captured by delta-net layers during a
+    // multi-token batch decode. Used by llama_rollback_delta_net_state to
+    // restore the cache cell to a specific post-accept-j state on partial
+    // reject. Must be cleared at the top of each llama_decode (vector outlives
+    // graph build in ik_llama — no llm_graph_result equivalent).
+    struct delta_net_state_info {
+        struct ggml_tensor * result;              // dn_result_keep (persistent copy of delta_net output)
+        struct ggml_tensor * cache_s_l;           // ssm_states_all for this layer's recurrent slot
+        int64_t S_v;
+        int64_t H_v;
+        int64_t n_tokens;
+        int64_t n_seqs;
+        int64_t kv_head;                          // cache cell index where tail state lives
+        struct ggml_tensor * conv_states_keep;    // persistent copy of initial conv_states [d_conv-1, conv_channels, n_seqs]
+        struct ggml_tensor * qkv_mixed_keep;      // persistent copy of qkv_mixed [conv_channels, n_tokens, n_seqs]
+        struct ggml_tensor * conv_states_all;     // conv state cache cell (same buffer as cache_s_l in ik_llama unified layout)
+        int64_t d_conv;
+        int64_t conv_channels;
+    };
+    std::vector<delta_net_state_info> delta_net_intermediates;
+
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;

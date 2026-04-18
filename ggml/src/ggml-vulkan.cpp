@@ -1034,6 +1034,7 @@ struct vk_op_delta_net_push_constants {
     uint32_t v_nb2;         // v stride for head  (in floats)
     uint32_t v_nb3;         // v stride for batch (in floats)
     uint32_t dst_state_offset;
+    uint32_t emit_intermediates;
 };
 
 // Push constants for the GROUPED_TOPK shader. Layout matches the GLSL block
@@ -9751,6 +9752,7 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.v_nb2            = (uint32_t)(src2->nb[2] / sizeof(float));
     pc.v_nb3            = (uint32_t)(src2->nb[3] / sizeof(float));
     pc.dst_state_offset = output_size;
+    pc.emit_intermediates = (uint32_t)(dst->op_params[2] != 0 ? 1 : 0);
 
     auto * src0_buf = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     auto * src1_buf = (ggml_backend_vk_buffer_context *)src1->buffer->context;

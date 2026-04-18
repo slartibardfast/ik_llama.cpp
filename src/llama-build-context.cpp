@@ -4806,86 +4806,190 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     // Single-pass MTP: build MTP head inline in the same graph.
     // Runs ALWAYS (both prompt eval and token gen) — no n_tokens guard.
     // The MTP KV cache is populated transparently via standard attention infrastructure.
+    //
+    // Chained rollout (n_rollout > 1): unroll N MTP iterations, each feeding
+    // its argmax + post-FFN hidden to the next. Stack logits via ggml_concat
+    // along dim 1. Gated by env var LLAMA_MTP_ROLLOUT (default from hparams).
     if (has_mtp_inline) {
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
 
         if (mtp_layer.nextn.eh_proj != nullptr) {
-            // Greedy token selection for MTP embedding input.
-            // Compute full-position logits from unfiltered hidden state so argmax
-            // produces n_tokens entries matching the MTP hidden state dimensions.
-            // This matches the fork's approach (qwen35.cpp:441-442).
+            // Resolve rollout count
+            uint32_t n_rollout = hparams.nextn_predict_layers;
+            if (const char * e = std::getenv("LLAMA_MTP_ROLLOUT")) {
+                const int v = std::atoi(e);
+                if (v > 0) n_rollout = (uint32_t) v;
+            }
+            if (n_rollout == 0) n_rollout = 1;
+
             // FastMTP: trim lm_head to top-32K tokens (frequency-ordered).
             // Reduces the two 248K matmuls to 32K — ~7.8x faster each.
             const int64_t mtp_vocab_size = 32768;
 
-            ggml_tensor * greedy_logits;
-            if (inp_out_ids != nullptr) {
-                // Prompt eval: main logits are filtered — recompute from unfiltered state
-                ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams,
-                        model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
-                ggml_tensor * greedy_head = model.output;
-                if (greedy_head->ne[1] > mtp_vocab_size) {
-                    greedy_head = ggml_view_2d(ctx0, greedy_head,
-                            greedy_head->ne[0], mtp_vocab_size, greedy_head->nb[1], 0);
+            if (n_rollout == 1) {
+                // === ORIGINAL SINGLE-PASS PATH — unchanged from baseline ===
+                ggml_tensor * greedy_logits;
+                if (inp_out_ids != nullptr) {
+                    // Prompt eval: main logits are filtered — recompute from unfiltered state
+                    ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams,
+                            model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
+                    ggml_tensor * greedy_head = model.output;
+                    if (greedy_head->ne[1] > mtp_vocab_size) {
+                        greedy_head = ggml_view_2d(ctx0, greedy_head,
+                                greedy_head->ne[0], mtp_vocab_size, greedy_head->nb[1], 0);
+                    }
+                    greedy_logits = llm_build_lora_mm(lctx, ctx0, greedy_head, full_normed);
+                } else {
+                    greedy_logits = cur;
                 }
-                greedy_logits = llm_build_lora_mm(lctx, ctx0, greedy_head, full_normed);
+                greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
+                ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
+                cb(greedy_tokens, "mtp_greedy_tokens", -1);
+
+                ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
+                if (tok_embd == nullptr) tok_embd = model.tok_embd;
+                ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, greedy_tokens);
+                cb(emb, "mtp_token_embd", il_mtp);
+
+                ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                ggml_tensor * h_norm = llm_build_norm(ctx0, mtp_hidden_state, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
+                cb(combined, "mtp_concat", il_mtp);
+                ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+
+                cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+                cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
+                        mtp_layer.ffn_up,   NULL, NULL,
+                        mtp_layer.ffn_gate, NULL, NULL,
+                        mtp_layer.ffn_down, NULL, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+
+                if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                    cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                } else {
+                    cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                }
+
+                ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+                if (mtp_head == nullptr) mtp_head = model.output;
+                if (mtp_head->ne[1] > mtp_vocab_size) {
+                    mtp_head = ggml_view_2d(ctx0, mtp_head,
+                            mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
+                }
+
+                cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+                cb(cur_mtp, "mtp_logits", -1);
+                ggml_set_output(cur_mtp);
+                ggml_build_forward_expand(gf, cur_mtp);
+
+                lctx.mtp_logits_tensor = cur_mtp;
             } else {
-                // Token gen: main logits cover all positions (full vocab for main sampling)
-                greedy_logits = cur;
+                // === CHAINED ROLLOUT PATH (n_rollout > 1) ===
+                ggml_tensor * greedy_logits;
+                if (inp_out_ids != nullptr) {
+                    ggml_tensor * full_normed = llm_build_norm(ctx0, mtp_hidden_state, hparams,
+                            model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
+                    ggml_tensor * greedy_head = model.output;
+                    if (greedy_head->ne[1] > mtp_vocab_size) {
+                        greedy_head = ggml_view_2d(ctx0, greedy_head,
+                                greedy_head->ne[0], mtp_vocab_size, greedy_head->nb[1], 0);
+                    }
+                    greedy_logits = llm_build_lora_mm(lctx, ctx0, greedy_head, full_normed);
+                } else {
+                    greedy_logits = cur;
+                }
+                // No clamp — trained LM head produces logprobs in [-10, -0.5]
+                // range (verified via tests/mtp-matrix/semantics/test-logit-sanity.sh);
+                // nowhere near ±1e4. An extra kernel dispatch per decode for dead code.
+                ggml_tensor * current_greedy = ggml_argmax(ctx0, greedy_logits);
+                // No set_input / set_output — GPU-only intermediate. The
+                // single-pass path at :4847 follows the same pattern.
+                // Producer: ggml_argmax on GPU. Consumer:
+                // ggml_get_rows(tok_embd, current_greedy) next iter. No CPU
+                // side reads or writes this tensor. Either marker would
+                // force Vulkan to host-stage it per iteration, adding a
+                // scheduler split per rollout step.
+                cb(current_greedy, "mtp_greedy_tokens", -1);
+
+                ggml_tensor * current_hidden = mtp_hidden_state;
+
+                std::vector<ggml_tensor *> rollout_logits;
+                rollout_logits.reserve(n_rollout);
+
+                for (uint32_t k = 0; k < n_rollout; ++k) {
+                    ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
+                    if (tok_embd == nullptr) tok_embd = model.tok_embd;
+                    ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, current_greedy);
+                    cb(emb, "mtp_token_embd", il_mtp);
+
+                    ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    ggml_tensor * h_norm = llm_build_norm(ctx0, current_hidden, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
+                    cb(combined, "mtp_concat", il_mtp);
+                    ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+
+                    cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                            KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+                    cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
+                            mtp_layer.ffn_up,   NULL, NULL,
+                            mtp_layer.ffn_gate, NULL, NULL,
+                            mtp_layer.ffn_down, NULL, NULL,
+                            NULL,
+                            LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+
+                    // Capture post-FFN hidden BEFORE output norm/LM head — this
+                    // is what feeds the NEXT iteration's h_norm. cur_mtp gets
+                    // transformed into logits shape below and can't be reused.
+                    ggml_tensor * mtp_hidden_next = cur_mtp;
+
+                    if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                        cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    } else {
+                        cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    }
+
+                    ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+                    if (mtp_head == nullptr) mtp_head = model.output;
+                    if (mtp_head->ne[1] > mtp_vocab_size) {
+                        mtp_head = ggml_view_2d(ctx0, mtp_head,
+                                mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
+                    }
+                    cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+                    cb(cur_mtp, "mtp_logits", il_mtp);
+                    ggml_build_forward_expand(gf, cur_mtp);
+
+                    rollout_logits.push_back(cur_mtp);
+
+                    if (k + 1 < n_rollout) {
+                        // No clamp — see note on greedy_logits above.
+                        current_greedy = ggml_argmax(ctx0, cur_mtp);
+                        // No markers — see note on mtp_greedy_tokens above.
+                        cb(current_greedy, "mtp_greedy_next", il_mtp);
+                        current_hidden = mtp_hidden_next;
+                    }
+                }
+
+                // Stack iteration-major [vocab, n_rollout * n_tokens] via
+                // concat chain. Attempted a pre-alloc + cpy-to-view pattern,
+                // but ggml's scheduler requires the output tensor to be backed
+                // by an op so it can assign a backend; a bare new_tensor filled
+                // by views fails assert in ggml_backend_sched_split_graph.
+                // The concat cascade adds N-1 nodes which is a minor cost.
+                ggml_tensor * stacked = rollout_logits[0];
+                for (size_t i = 1; i < rollout_logits.size(); ++i) {
+                    stacked = ggml_concat(ctx0, stacked, rollout_logits[i], 1);
+                }
+                cb(stacked, "mtp_logits_stacked", -1);
+                ggml_set_output(stacked);
+                ggml_build_forward_expand(gf, stacked);
+
+                lctx.mtp_logits_tensor = stacked;
             }
-            greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
-            ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
-            // Don't mark as input/output — let the allocator keep it on GPU
-            // to avoid Vulkan_Host placement and extra graph splits.
-            cb(greedy_tokens, "mtp_greedy_tokens", -1);
-
-            // Embed greedy tokens — shape [n_embd, n_tokens] matching hidden_state
-            ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
-            if (tok_embd == nullptr) tok_embd = model.tok_embd;
-            ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, greedy_tokens);
-            cb(emb, "mtp_token_embd", il_mtp);
-
-            // Normalize and project: concat(enorm(emb), hnorm(hidden)) → eh_proj
-            ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            ggml_tensor * h_norm = llm_build_norm(ctx0, mtp_hidden_state, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
-            cb(combined, "mtp_concat", il_mtp);
-            ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
-
-            // Standard attention + FFN (same code path as main layers)
-            cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
-                    KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
-
-            cur_mtp = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur_mtp,
-                    mtp_layer.ffn_up,   NULL, NULL,
-                    mtp_layer.ffn_gate, NULL, NULL,
-                    mtp_layer.ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
-
-            // Output norm + LM head → MTP logits
-            if (mtp_layer.nextn.shared_head_norm != nullptr) {
-                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            } else {
-                cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
-            }
-
-            ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
-            if (mtp_head == nullptr) mtp_head = model.output;
-
-            // FastMTP: trim output head to top-32K tokens
-            if (mtp_head->ne[1] > mtp_vocab_size) {
-                mtp_head = ggml_view_2d(ctx0, mtp_head,
-                        mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
-            }
-
-            cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
-            cb(cur_mtp, "mtp_logits", -1);
-            ggml_set_output(cur_mtp);
-            ggml_build_forward_expand(gf, cur_mtp);
-
-            lctx.mtp_logits_tensor = cur_mtp;
         }
     }
 

@@ -2520,6 +2520,19 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // Like ggml_delta_net, but with emit_intermediates=true the output
+    // tensor includes per-token recurrent state snapshots (T copies instead of 1).
+    // Used for MTP speculative decode rollback without rerunning the model.
+    GGML_API struct ggml_tensor * ggml_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            bool                  emit_intermediates);
+
     // custom operators
 
     typedef void (*ggml_unary_op_f32_t) (const int, float *, const float *);

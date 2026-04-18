@@ -9974,6 +9974,56 @@ struct ggml_tensor * ggml_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        bool                  emit_intermediates) {
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t head_dim = q->ne[0];
+    const int64_t n_tokens = q->ne[1];
+    const int64_t n_heads  = v->ne[2];
+    const int64_t n_seqs   = q->ne[3];
+    const int64_t S_v      = v->ne[0];
+
+    GGML_ASSERT(v->ne[2] % q->ne[2] == 0);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v * n_heads);
+
+    const int64_t output_size = S_v * n_heads * n_tokens * n_seqs;
+    const int64_t state_size  = S_v * S_v * n_heads * n_seqs;
+    const int64_t n_state_copies = emit_intermediates ? n_tokens : 1;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+        output_size + state_size * n_state_copies);
+
+    result->op     = GGML_OP_DELTA_NET;
+    // op_params[0] = repeat_type (default 0)
+    // op_params[1] = state_inplace (default 0, incompatible with intermediates)
+    result->op_params[2] = emit_intermediates ? 1 : 0;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+
+    return result;
+}
+
 // ggml_fused_gate_prep
 
 struct ggml_tensor * ggml_fused_gate_prep(
@@ -22762,6 +22812,9 @@ static void ggml_compute_forward_delta_net_f32(
     // instead of to dst[output_size..]. Allows the graph builder to skip
     // the CONT+CONCAT+CPY state writeback chain.
     const bool state_inplace = dst->op_params[1] != 0;
+    const int32_t emit_intermediates = dst->op_params[2];
+    // state_inplace and emit_intermediates are mutually exclusive
+    GGML_ASSERT(!(state_inplace && emit_intermediates));
     float * state_out = state_inplace ? (float *) src5->data : out_data + output_size;
 
     const int ith = params->ith;
@@ -22769,14 +22822,16 @@ static void ggml_compute_forward_delta_net_f32(
 
     int repeat_type = dst->op_params[0];
 
-    if (iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+    // Skip IQK fast path when intermediate states are requested — the fast
+    // path doesn't know about per-token state output.
+    if (!emit_intermediates &&
+        iqk_fused_delta_net(head_dim, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
                 src2->nb[1]/sizeof(float), src2->nb[2]/sizeof(float), src2->nb[3]/sizeof(float),
                 q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_out, ith, nth)) {
         return;
     }
 
-    // TODO: fix this in case we need to fall back to it.
     const int64_t total_heads = n_heads * n_seqs;
     const int64_t heads_per_thread = (total_heads + nth - 1) / nth;
     const int64_t h_start = ith * heads_per_thread;
@@ -22784,6 +22839,15 @@ static void ggml_compute_forward_delta_net_f32(
 
     const float eps = 1e-12f;
     const float scale = 1.0f / sqrtf((float) head_dim);
+
+    // v/g/beta arrive as permuted views of pre-permute memory (no ggml_cont);
+    // their logical strides encode the physical layout. Use nb[] instead of
+    // hardcoded shape-contiguous offsets — the IQK fast path above does the
+    // same. Matches slow path to its fast-path counterpart for v; matches the
+    // permute patterns in llama-delta-net.cpp:108-110 for g/beta.
+    const size_t vnb1 = src2->nb[1]/sizeof(float);
+    const size_t vnb2 = src2->nb[2]/sizeof(float);
+    const size_t vnb3 = src2->nb[3]/sizeof(float);
 
     float * v_new_buf = (float *) malloc(head_dim * sizeof(float));
     GGML_ASSERT(v_new_buf);
@@ -22793,27 +22857,37 @@ static void ggml_compute_forward_delta_net_f32(
         const int64_t head_idx  = h_idx % n_heads;
         const int64_t head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
 
-        const int64_t qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
         const int64_t qkv_head_offset_kq = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int64_t qkv_token_stride = head_dim;
-        const int64_t g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int64_t g_batch_offset   = batch_idx * n_tokens * n_heads;
         const int64_t state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int64_t out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int64_t out_token_stride = head_dim * n_heads;
 
-        for (int64_t i = 0; i < head_dim * head_dim; ++i) {
-            state_out[state_head_offset + i] = state_in[state_head_offset + i];
+        // When emit_intermediates=1, use the last token's slot as working buffer
+        // to avoid aliasing with earlier intermediate slots.
+        const int64_t state_per_head = head_dim * head_dim;
+        const int64_t state_per_batch = state_per_head * n_heads * n_seqs;
+        float * state_work;
+        if (emit_intermediates) {
+            state_work = out_data + output_size + (n_tokens - 1) * state_per_batch + state_head_offset;
+        } else {
+            state_work = state_out + state_head_offset;
         }
 
-        float * state = state_out + state_head_offset;
+        for (int64_t i = 0; i < head_dim * head_dim; ++i) {
+            state_work[i] = state_in[state_head_offset + i];
+        }
+
+        float * state = state_work;
 
         for (int64_t t = 0; t < n_tokens; ++t) {
             const float * q_t = q_data + qkv_head_offset_kq + t * qkv_token_stride;
             const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
-            const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
+            const float * v_t = v_data + batch_idx * vnb3 + head_idx * vnb2 + t * vnb1;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = g_data[g_batch_offset + t * n_heads + head_idx];
+            const float beta_raw = beta_data[g_batch_offset + t * n_heads + head_idx];
 
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
@@ -22859,6 +22933,14 @@ static void ggml_compute_forward_delta_net_f32(
                     s = decay * s + v_new_buf[row] * k_col;
                     state[row + col * head_dim] = fminf(fmaxf(s, -1e6f), 1e6f);
                 }
+            }
+
+            // Write per-token intermediate state for MTP rollback.
+            // state_per_head and state_per_batch (= per_head * n_heads * n_seqs)
+            // are declared at function scope above.
+            if (emit_intermediates) {
+                float * s_dst = out_data + output_size + t * state_per_batch + state_head_offset;
+                memcpy(s_dst, state, state_per_head * sizeof(float));
             }
         }
     }

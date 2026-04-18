@@ -233,8 +233,12 @@ void server_context::init() {
 
         bool can_spec = true;
         if (!params_base.dry_run) {
-            can_spec = common_speculative_is_compat(ctx);
-        }  
+            // MTP models go through their own speculative path; the 2-token
+            // compat probe has no value here and on Vulkan its mid-init decode
+            // triggers a scheduler reserve_n that tips a RADV driver heap bug.
+            // Skip the probe when MTP is active.
+            can_spec = slot.has_mtp ? true : common_speculative_is_compat(ctx);
+        }
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -2842,13 +2846,38 @@ void server_context::add_sampled_tokens() {
             // Use model capability check (not per-decode logit check) to avoid fallback cascade.
             const bool model_has_inline_mtp = slot.has_mtp &&
                 llama_model_n_nextn_layer(llama_get_model(ctx)) > 0;
-            llama_token mtp_inline_draft = model_has_inline_mtp ? llama_get_mtp_draft_token(ctx) : LLAMA_TOKEN_NULL;
+
+            // MTP-IR: when LLAMA_MTP_IR=1, read up to LLAMA_MTP_IR_K drafts
+            // (default 3) from the MTP logits at the last batch position — so
+            // the main verifier processes [sampled, D1..Dk] in a single batch.
+            // On partial reject, the intermediate-rollback path in llama.cpp
+            // should be invoked (not yet wired in this server path — the
+            // rollback API `llama_rollback_delta_net_state` is ported but
+            // needs the verifier-level call site).
+            static const bool mtp_ir_enabled = [](){
+                const char * e = std::getenv("LLAMA_MTP_IR");
+                return e && std::atoi(e) != 0;
+            }();
+            static const int mtp_ir_k_max = [](){
+                const char * e = std::getenv("LLAMA_MTP_IR_K");
+                int v = e ? std::atoi(e) : 3;
+                return v > 0 ? v : 3;
+            }();
 
             llama_tokens draft;
-            if (mtp_inline_draft != LLAMA_TOKEN_NULL) {
-                // Use inline MTP draft (no separate decode needed)
-                draft.push_back(mtp_inline_draft);
-            } else if (!model_has_inline_mtp) {
+            bool mtp_inline_used = false;
+            if (model_has_inline_mtp) {
+                if (mtp_ir_enabled) {
+                    draft = common_mtp_read_drafts(ctx, mtp_ir_k_max, -1);
+                }
+                if (draft.empty()) {
+                    llama_token d = llama_get_mtp_draft_token(ctx);
+                    if (d != LLAMA_TOKEN_NULL) draft.push_back(d);
+                }
+                mtp_inline_used = !draft.empty();
+            }
+
+            if (!mtp_inline_used && !model_has_inline_mtp) {
                 // Fallback: two-pass MTP or external draft model
                 if (slot.has_mtp) {
                     if (!slot.mtp_hidden_state.empty()) {

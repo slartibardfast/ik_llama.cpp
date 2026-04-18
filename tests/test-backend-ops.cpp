@@ -2228,6 +2228,83 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT chain — multiple sequential concats along the same
+// dim, mirroring the MTP chained-rollout output stacking pattern.
+// This was isolated as a potential trigger for the Vulkan RADV heap
+// corruption observed at LLAMA_MTP_ROLLOUT>=2.
+struct test_concat_chain : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_single;
+    const int dim;
+    const int chain_len;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne_single, dim, chain_len);
+    }
+
+    test_concat_chain(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_single = {32768, 8, 1, 1},
+            int dim = 1, int chain_len = 3)
+        : type(type), ne_single(ne_single), dim(dim), chain_len(chain_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(chain_len >= 2);
+        ggml_tensor * acc = ggml_new_tensor(ctx, type, 4, ne_single.data());
+        ggml_set_name(acc, "concat_chain_0");
+        for (int i = 1; i < chain_len; ++i) {
+            ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_single.data());
+            ggml_set_name(b, (std::string("concat_chain_in_") + std::to_string(i)).c_str());
+            acc = ggml_concat(ctx, acc, b, dim);
+            ggml_set_name(acc, (std::string("concat_chain_") + std::to_string(i)).c_str());
+        }
+        return acc;
+    }
+};
+
+// Argmax → get_rows chain. Exercises the MTP pattern of
+// `greedy = ggml_argmax(logits); emb = ggml_get_rows(tok_embd, greedy);`
+// across iterations. Validates scheduler preservation of intermediate
+// tensors used in subsequent iteration steps.
+struct test_argmax_getrows : public test_case {
+    const ggml_type logits_type;
+    const ggml_type embd_type;
+    const int64_t vocab;
+    const int64_t n_tokens;
+    const int64_t embd_dim;
+
+    std::string vars() override {
+        return VARS_TO_STR5(logits_type, embd_type, vocab, n_tokens, embd_dim);
+    }
+
+    test_argmax_getrows(ggml_type logits_type = GGML_TYPE_F32,
+            ggml_type embd_type = GGML_TYPE_F32,
+            int64_t vocab = 32768, int64_t n_tokens = 8, int64_t embd_dim = 1024)
+        : logits_type(logits_type), embd_type(embd_type),
+          vocab(vocab), n_tokens(n_tokens), embd_dim(embd_dim) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t logits_ne[4] = { vocab, n_tokens, 1, 1 };
+        ggml_tensor * logits = ggml_new_tensor(ctx, logits_type, 4, logits_ne);
+        ggml_set_name(logits, "logits");
+
+        ggml_tensor * clamped = ggml_clamp(ctx, logits, -1e4f, 1e4f);
+        ggml_set_name(clamped, "clamped");
+
+        ggml_tensor * greedy = ggml_argmax(ctx, clamped);
+        ggml_set_name(greedy, "greedy");
+        ggml_set_input(greedy);
+        ggml_set_output(greedy);
+
+        int64_t embd_ne[4] = { embd_dim, vocab, 1, 1 };
+        ggml_tensor * tok_embd = ggml_new_tensor(ctx, embd_type, 4, embd_ne);
+        ggml_set_name(tok_embd, "tok_embd");
+
+        ggml_tensor * out = ggml_get_rows(ctx, tok_embd, greedy);
+        ggml_set_name(out, "emb_out");
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -3382,6 +3459,31 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+
+    // MTP chained-rollout concat pattern: stack multiple [vocab, N] tensors
+    // along dim=1. Covers chain lengths 2..5 across all dims for boundary.
+    for (int chain_len : { 2, 3, 4, 5 }) {
+        for (int dim : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_concat_chain(GGML_TYPE_F32, {32768, 8, 1, 1}, dim, chain_len));
+        }
+        // smaller-scale sanity at dim=1 only
+        test_cases.emplace_back(new test_concat_chain(GGML_TYPE_F32, {1024, 5, 1, 1}, 1, chain_len));
+    }
+
+    // MTP argmax→get_rows pattern with set_input/set_output markers on the
+    // intermediate (the polaris pattern Fix A ported).
+    test_cases.emplace_back(new test_argmax_getrows(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 1, 1024));
+    test_cases.emplace_back(new test_argmax_getrows(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 5, 1024));
+    test_cases.emplace_back(new test_argmax_getrows(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 32, 1024));
+
+    // MTP LM-head scale matmul: hidden [1024, N] @ lm_head [1024, 32768] → [32768, N]
+    // with N in {1, 5, 32}. Covers the chained-rollout's per-iteration LM head.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 1, 1024, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 5, 1024, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32768, 32, 1024, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, 1, 1024, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, 5, 1024, {1,1}, {1,1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, 32, 1024, {1,1}, {1,1}));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {8, 1, 1, 1}, order));

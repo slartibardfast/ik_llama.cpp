@@ -4013,6 +4013,14 @@ static int llama_decode_internal(
         // Clear inline MTP extracted logits (repopulated after compute)
         lctx.mtp_logits_extracted.clear();
         lctx.mtp_n_vocab = 0;
+        // MTP-IR: clear per-decode intermediate state + multi-position logits.
+        // (No llm_graph_result equivalent in ik_llama — vector outlives graph
+        // build; must clear per-decode or stale tensor pointers accumulate.)
+        lctx.delta_net_intermediates.clear();
+        lctx.mtp_logits_buf.clear();
+        lctx.mtp_logits_valid = false;
+        lctx.mtp_n_pos = 0;
+        lctx.mtp_n_drafts = 0;
 
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
@@ -4037,7 +4045,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (!ggml_backend_sched_alloc_graph(lctx.sched, gf)) {
+                LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph failed (n_tokens=%d)\n",
+                        __func__, (int)u_batch.n_tokens);
+                return 1;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -4089,13 +4101,24 @@ static int llama_decode_internal(
                     }
                 }
             }
-            // Find in-graph MTP logits tensor (single-pass MTP)
+            // Find in-graph MTP logits tensor. For chained rollout (n_rollout>1)
+            // the graph has N per-iteration tensors named "mtp_logits" plus ONE
+            // final stacked output named "mtp_logits_stacked"; the stacked one
+            // is what the readback expects. Single-pass MTP has only "mtp_logits".
             if (has_mtp && cparams.mtp_op_type == MTP_OP_NONE) {
                 lctx.mtp_logits_tensor = nullptr;
                 for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (strcmp(gf->nodes[i]->name, "mtp_logits") == 0) {
+                    if (strcmp(gf->nodes[i]->name, "mtp_logits_stacked") == 0) {
                         lctx.mtp_logits_tensor = gf->nodes[i];
                         break;
+                    }
+                }
+                if (!lctx.mtp_logits_tensor) {
+                    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                        if (strcmp(gf->nodes[i]->name, "mtp_logits") == 0) {
+                            lctx.mtp_logits_tensor = gf->nodes[i];
+                            break;
+                        }
                     }
                 }
             }
@@ -4237,21 +4260,80 @@ static int llama_decode_internal(
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
         }
-        // Extract single-pass MTP logits (if available)
+        // Extract single-pass MTP logits (if available).
+        // MTP-IR: retain ALL batch positions in `mtp_logits_buf` with
+        // layout [n_pos][n_drafts][n_vocab] so llama_get_mtp_logits_ith(i)
+        // can serve any position. `mtp_logits_extracted` keeps the
+        // last-position-only copy for backwards compat.
         if (lctx.mtp_logits_tensor && cparams.mtp_op_type == MTP_OP_NONE) {
             ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.mtp_logits_tensor);
             if (backend_mtp) {
-                const int64_t mtp_n_vocab = lctx.mtp_logits_tensor->ne[0];
-                const int64_t mtp_n_tokens = lctx.mtp_logits_tensor->ne[1];
-                const int64_t last_pos = mtp_n_tokens - 1;
+                const int64_t mtp_n_vocab  = lctx.mtp_logits_tensor->ne[0];
+                const int64_t stacked_cols = lctx.mtp_logits_tensor->ne[1];
+                const int64_t n_tok        = (int64_t) n_tokens;
+                // Chained rollout: tensor is [vocab, n_rollout * n_tokens] iter-major.
+                // Single-pass (n_rollout=1): tensor is [vocab, n_tokens].
+                const int64_t n_rollout = (n_tok > 0) ? (stacked_cols / n_tok) : 1;
 
-                // Extract only the last position's logits
-                lctx.mtp_logits_extracted.resize(mtp_n_vocab);
-                ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
-                        lctx.mtp_logits_extracted.data(),
-                        last_pos * mtp_n_vocab * sizeof(float),
-                        mtp_n_vocab * sizeof(float));
-                lctx.mtp_n_vocab = mtp_n_vocab;
+                if (n_rollout == 1) {
+                    // === SINGLE-PASS READBACK — byte-identical to baseline ===
+                    const int64_t mtp_n_tokens = stacked_cols;
+                    const int64_t last_pos     = mtp_n_tokens - 1;
+                    const int64_t n_drafts     = 1;
+
+                    const size_t total_elems = (size_t)(mtp_n_tokens * n_drafts * mtp_n_vocab);
+                    lctx.mtp_logits_buf.resize(total_elems);
+                    ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
+                            lctx.mtp_logits_buf.data(),
+                            0,
+                            total_elems * sizeof(float));
+                    lctx.mtp_n_vocab  = mtp_n_vocab;
+                    lctx.mtp_n_pos    = mtp_n_tokens;
+                    lctx.mtp_n_drafts = n_drafts;
+                    lctx.mtp_logits_valid = true;
+
+                    lctx.mtp_logits_extracted.resize(mtp_n_vocab);
+                    ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
+                            lctx.mtp_logits_extracted.data(),
+                            last_pos * mtp_n_vocab * sizeof(float),
+                            mtp_n_vocab * sizeof(float));
+                } else {
+                    // === CHAINED-ROLLOUT READBACK — rearrange iter-major → pos-major ===
+                    std::vector<float> iter_major((size_t) stacked_cols * mtp_n_vocab);
+                    ggml_backend_tensor_get_async(backend_mtp, lctx.mtp_logits_tensor,
+                            iter_major.data(), 0, iter_major.size() * sizeof(float));
+                    // Force the async GPU→host copy to complete before we
+                    // memcpy from iter_major. Without this, the subsequent
+                    // reads race the Vulkan DMA which can produce stale data
+                    // and (depending on driver buffer bookkeeping) trip
+                    // glibc heap-corruption detection in a LATER allocation.
+                    ggml_backend_synchronize(backend_mtp);
+
+                    lctx.mtp_logits_buf.resize((size_t) n_tok * n_rollout * mtp_n_vocab);
+                    for (int64_t pos = 0; pos < n_tok; ++pos) {
+                        for (int64_t k = 0; k < n_rollout; ++k) {
+                            const int64_t src_col = k * n_tok + pos;
+                            const int64_t dst_row = pos * n_rollout + k;
+                            std::memcpy(lctx.mtp_logits_buf.data() + (size_t) dst_row * mtp_n_vocab,
+                                        iter_major.data() + (size_t) src_col * mtp_n_vocab,
+                                        mtp_n_vocab * sizeof(float));
+                        }
+                    }
+                    lctx.mtp_n_vocab      = mtp_n_vocab;
+                    lctx.mtp_n_pos        = n_tok;
+                    lctx.mtp_n_drafts     = n_rollout;
+                    lctx.mtp_logits_valid = true;
+
+                    // Backward-compat buffer: first-draft row at last position
+                    const int64_t last_pos = n_tok - 1;
+                    lctx.mtp_logits_extracted.resize(mtp_n_vocab);
+                    if (last_pos >= 0) {
+                        std::memcpy(lctx.mtp_logits_extracted.data(),
+                                    lctx.mtp_logits_buf.data()
+                                        + (size_t) last_pos * n_rollout * mtp_n_vocab,
+                                    mtp_n_vocab * sizeof(float));
+                    }
+                }
             }
         }
 
@@ -5856,8 +5938,16 @@ struct llama_context * llama_init_from_model(
 
         // graph outputs buffer
         {
-            // resized during inference when a batch uses more outputs
-            if (llama_output_reserve(*ctx, params.n_seq_max) < params.n_seq_max) {
+            // Pre-reserve worst-case (n_batch) to avoid mid-session realloc.
+            // llama_output_reserve frees lctx.buf_output and reallocates when
+            // a decode needs more capacity. The scheduler's cached graph
+            // allocations then hold stale pointers into the freed buffer, and
+            // the next alloc_splits crashes with backend_ids_changed=1.
+            // This especially bites MTP models where the server enables
+            // embeddings post-init → bigger buffer needed → mid-session
+            // realloc → crash. Pre-reserving avoids the whole path.
+            const size_t reserve_n = std::max<size_t>(params.n_batch, params.n_seq_max);
+            if (llama_output_reserve(*ctx, reserve_n) < reserve_n) {
                 LLAMA_LOG_ERROR("%s: failed to reserve initial output buffer\n", __func__);
                 llama_free(ctx);
                 return nullptr;
@@ -5906,15 +5996,36 @@ struct llama_context * llama_init_from_model(
 
             llama_repack_up_gate_exps(*ctx);
 
-            // build worst-case graph
-            int n_past = cparams.n_ctx - n_tokens;
-            llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-            ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true, cparams.worst_graph_tokens);
+            // build worst-case graph(s)
+            // For MTP chained rollout (LLAMA_MTP_ROLLOUT>=2), runtime decodes
+            // use varying n_tokens values (1 for gen, 2 for compat probe, N
+            // for prompts) producing graphs with different n_nodes counts.
+            // A single-shape init reserve leaves the scheduler needing to
+            // call `ggml_gallocr_reserve_n` after the first decode, which
+            // trips a RADV Vulkan driver heap-corruption bug. Reserve at
+            // multiple shapes BEFORE any compute runs so that galloc state
+            // covers every runtime shape; combined with the grow-only
+            // tracking in reserve_n, the runtime never needs to reserve_n.
+            int32_t worst_tokens = n_tokens;
+            if (cparams.worst_graph_tokens > 0) {
+                worst_tokens = cparams.worst_graph_tokens;
+            }
+            if (cparams.mtp) {
+                uint32_t n_rollout = ctx->model.hparams.nextn_predict_layers;
+                if (const char * e = std::getenv("LLAMA_MTP_ROLLOUT")) {
+                    int v = std::atoi(e);
+                    if (v > 0) n_rollout = (uint32_t) v;
+                }
+                if (n_rollout > 1) {
+                    worst_tokens = std::max<int32_t>(worst_tokens, (int32_t) cparams.n_batch);
+                }
+            }
+            int n_past = cparams.n_ctx - worst_tokens;
+            llama_token token = llama_token_bos(&ctx->model);
+            ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, llama_batch_get_one(&token, worst_tokens, n_past, 0), true, worst_tokens);
 
-            // initialize scheduler with the worst-case graph
             bool gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
-            if (!gf_success)
-            {
+            if (!gf_success) {
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
@@ -9260,14 +9371,137 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
     ctx->draft_input_hidden_state = hidden_state;
 }
 
-// Single-pass MTP: get the inline MTP logits from the last decode
+// Single-pass MTP: get the inline MTP logits from the last decode.
+// When MTP-IR is active `mtp_logits_buf` holds all batch positions; return
+// the LAST position for backward compat. Otherwise fall through to the
+// single-position buffer `mtp_logits_extracted`.
 const float * llama_get_mtp_logits(struct llama_context * ctx) {
+    if (ctx->mtp_logits_valid && ctx->mtp_n_pos > 0) {
+        const int64_t stride = ctx->mtp_n_drafts * ctx->mtp_n_vocab;
+        return ctx->mtp_logits_buf.data() + (ctx->mtp_n_pos - 1) * stride;
+    }
     if (ctx->mtp_logits_extracted.empty()) return nullptr;
     return ctx->mtp_logits_extracted.data();
 }
 
+// MTP-IR: return logits at batch position `i` from the multi-position buffer.
+// Returns nullptr if `i` out of range or MTP-IR logits weren't retained.
+const float * llama_get_mtp_logits_ith(struct llama_context * ctx, int32_t i) {
+    if (!ctx->mtp_logits_valid) return nullptr;
+    if (i < 0 || (int64_t)i >= ctx->mtp_n_pos) return nullptr;
+    const int64_t stride = ctx->mtp_n_drafts * ctx->mtp_n_vocab;
+    return ctx->mtp_logits_buf.data() + (int64_t)i * stride;
+}
+
+int64_t llama_get_mtp_n_drafts(struct llama_context * ctx) {
+    return ctx->mtp_n_drafts;
+}
+
 int64_t llama_get_mtp_n_vocab(struct llama_context * ctx) {
     return ctx->mtp_n_vocab;
+}
+
+// MTP-IR: rollback recurrent+conv state to the per-token intermediate captured
+// at `token_idx`. Ported from polaris src/llama-context.cpp:3457-3541.
+// Caller must still call llama_kv_cache_seq_rm(ctx, seq_id, target_pos+1, -1)
+// to trim the KV cache of rejected positions.
+bool llama_rollback_delta_net_state(struct llama_context * ctx, int32_t token_idx,
+                                    llama_seq_id seq_id, llama_pos target_pos) {
+    (void) seq_id; (void) target_pos; // ik_llama has no set_tail_pos equivalent; rely on caller's seq_rm
+    if (!ctx || ctx->delta_net_intermediates.empty()) {
+        LLAMA_LOG_WARN("%s: no delta-net intermediates available\n", __func__);
+        return false;
+    }
+
+    // Synchronize the scheduler to ensure all compute is done before reading.
+    ggml_backend_sched_synchronize(ctx->sched);
+
+    for (const auto & info : ctx->delta_net_intermediates) {
+        if (token_idx < 0 || token_idx >= (int32_t) info.n_tokens) {
+            LLAMA_LOG_ERROR("%s: token_idx %d out of range [0, %" PRId64 ")\n",
+                    __func__, token_idx, info.n_tokens);
+            return false;
+        }
+
+        // --- Delta-net (SSM) state rollback ---
+        // Result layout (emit_intermediates=1):
+        //   [ output(S_v*H_v*n_tokens*n_seqs) | state_t0(n_embd_s*n_seqs) | ... | state_t{n_tokens-1}(...) ]
+        const int64_t n_embd_s       = info.S_v * info.S_v * info.H_v;
+        const int64_t state_copy_size = n_embd_s * info.n_seqs;
+        const int64_t output_size     = info.S_v * info.H_v * info.n_tokens * info.n_seqs;
+
+        const size_t src_offset = (size_t)(output_size + (int64_t)token_idx * state_copy_size) * sizeof(float);
+        const size_t copy_bytes = (size_t) state_copy_size * sizeof(float);
+
+        std::vector<float> buf(state_copy_size);
+        ggml_backend_tensor_get(info.result, buf.data(), src_offset, copy_bytes);
+
+        // ik_llama cache layout: state_storage is [state_dim, qnext_state_slots]
+        // where state_dim = conv_state_dim + ssm_state_dim. The ssm portion
+        // lives at offset conv_state_dim per row. Cell kv_head = state_seq_id_local.
+        const int64_t state_row_size    = info.cache_s_l->nb[1] / sizeof(float); // floats per row
+        const int64_t conv_state_dim    = (info.d_conv - 1) * info.conv_channels;
+        const size_t  ssm_dst_offset_bytes = ((size_t)info.kv_head * state_row_size + conv_state_dim) * sizeof(float);
+        ggml_backend_tensor_set(info.cache_s_l, buf.data(), ssm_dst_offset_bytes, copy_bytes);
+
+        // --- Conv state rollback (ik_llama layout) ---
+        // Sliding window after processing token `token_idx`:
+        //   effective_seq = [conv_states_keep(cols 0..d_conv-2) | qkv_mixed_keep(cols 0..token_idx)]
+        // Cache's conv portion stores the LAST d_conv-1 cols of that window.
+        // So for cache slot c ∈ [0, d_conv-1): source col = token_idx+1+c from the effective sequence.
+        //   If source_col < d_conv-1 → read from conv_states_keep[col=source_col]
+        //   Else                     → read from qkv_mixed_keep[col=source_col-(d_conv-1)]
+        //
+        // Shapes:
+        //   conv_states_keep : [d_conv-1, conv_channels, n_seqs] (ne[0]=3, ne[1]=6144, ne[2]=1)
+        //   qkv_mixed_keep   : [conv_channels, n_tokens, n_seqs]  (ne[0]=6144, ne[1]=2, ne[2]=1)
+        //   Note layout difference: conv_states has col-fastest, qkv_mixed has channel-fastest.
+        // Cache layout per cell: [(d_conv-1)*channels, n_seqs], with
+        //   cache[s * n_conv_cell + ch * d_conv_m1 + c] (matches polaris).
+        if (info.conv_states_keep && info.qkv_mixed_keep && info.conv_states_all) {
+            const int64_t d_conv_m1   = info.d_conv - 1;
+            const int64_t n_conv_cell = d_conv_m1 * info.conv_channels;
+
+            const size_t cs_nelems = ggml_nelements(info.conv_states_keep);
+            std::vector<float> cs(cs_nelems);
+            ggml_backend_tensor_get(info.conv_states_keep, cs.data(), 0, cs_nelems * sizeof(float));
+
+            const size_t qm_nelems = ggml_nelements(info.qkv_mixed_keep);
+            std::vector<float> qm(qm_nelems);
+            ggml_backend_tensor_get(info.qkv_mixed_keep, qm.data(), 0, qm_nelems * sizeof(float));
+
+            std::vector<float> conv_cache(n_conv_cell * info.n_seqs);
+            for (int64_t s = 0; s < info.n_seqs; s++) {
+                for (int64_t ch = 0; ch < info.conv_channels; ch++) {
+                    for (int64_t c = 0; c < d_conv_m1; c++) {
+                        const int64_t src_col = token_idx + 1 + c;
+                        float v;
+                        if (src_col < d_conv_m1) {
+                            // From conv_states_keep: layout [d_conv_m1, channels, n_seqs]
+                            //   col-fastest: cs[s*channels*d_conv_m1 + ch*d_conv_m1 + src_col]
+                            const size_t idx = s * info.conv_channels * d_conv_m1 + ch * d_conv_m1 + src_col;
+                            v = cs[idx];
+                        } else {
+                            // From qkv_mixed_keep: layout [channels, n_tokens, n_seqs]
+                            //   channel-fastest: qm[s*n_tokens*channels + token*channels + ch]
+                            const int64_t token = src_col - d_conv_m1;
+                            const size_t idx = s * info.n_tokens * info.conv_channels
+                                             + token * info.conv_channels + ch;
+                            v = qm[idx];
+                        }
+                        const size_t cc_idx = s * n_conv_cell + ch * d_conv_m1 + c;
+                        conv_cache[cc_idx] = v;
+                    }
+                }
+            }
+
+            const size_t conv_dst_offset_bytes = (size_t)(info.kv_head * state_row_size) * sizeof(float);
+            const size_t conv_dst_bytes        = (size_t)(n_conv_cell * info.n_seqs) * sizeof(float);
+            ggml_backend_tensor_set(info.conv_states_all, conv_cache.data(), conv_dst_offset_bytes, conv_dst_bytes);
+        }
+    }
+
+    return true;
 }
 
 // Single-pass MTP: pick the best draft token from inline MTP logits (last position)

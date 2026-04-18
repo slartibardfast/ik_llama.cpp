@@ -186,6 +186,20 @@ add_executable(test-backend-ops test-backend-ops.cpp)
 target_link_libraries(test-backend-ops PRIVATE ggml)
 install(TARGETS test-backend-ops RUNTIME)
 
+add_executable(test-gdn-intermediate-state test-gdn-intermediate-state.cpp)
+target_link_libraries(test-gdn-intermediate-state PRIVATE ggml)
+
+add_executable(test-mtp-block-vulkan test-mtp-block-vulkan.cpp)
+target_link_libraries(test-mtp-block-vulkan PRIVATE ggml)
+if (GGML_VULKAN)
+    target_compile_definitions(test-mtp-block-vulkan PRIVATE GGML_USE_VULKAN)
+endif()
+add_test(NAME test-mtp-block-vulkan COMMAND $<TARGET_FILE:test-mtp-block-vulkan>)
+set_property(TEST test-mtp-block-vulkan PROPERTY LABELS "manual")
+
+llama_build_and_test(test-intermediate-rollback.cpp LABEL "manual-hybrid")
+llama_build_and_test(test-mtp-logits-ith.cpp       LABEL "manual-hybrid")
+
 llama_build_and_test(test-chat-parser.cpp)
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 #llama_build_and_test(test-chat-template.cpp)

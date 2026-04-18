@@ -1266,3 +1266,41 @@ void mtp_accept_tokens(
 
     llama_batch_free(accepted_batch);
 }
+// MTP-IR: read up to k_max drafts from the MTP logits tensor produced by the
+// last llama_decode. `pos < 0` reads the last batch position (same as
+// llama_get_mtp_logits); `pos >= 0` reads position `pos` via
+// llama_get_mtp_logits_ith. Ported from polaris common/speculative.cpp:1087-1141.
+std::vector<llama_token> common_mtp_read_drafts(struct llama_context * ctx_tgt, int k_max, int pos) {
+    std::vector<llama_token> result;
+    if (k_max <= 0) return result;
+
+    const float * mtp_logits = (pos < 0)
+        ? llama_get_mtp_logits(ctx_tgt)
+        : llama_get_mtp_logits_ith(ctx_tgt, pos);
+    if (mtp_logits == nullptr) return result;
+
+    const int64_t mtp_n_vocab  = llama_get_mtp_n_vocab(ctx_tgt);
+    const int64_t mtp_n_drafts = llama_get_mtp_n_drafts(ctx_tgt);
+    if (mtp_n_vocab <= 0 || mtp_n_drafts <= 0) return result;
+
+    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+
+    const int64_t k = std::min<int64_t>(mtp_n_drafts, (int64_t) k_max);
+    result.reserve((size_t) k);
+
+    for (int64_t j = 0; j < k; j++) {
+        const float * row = mtp_logits + j * mtp_n_vocab;
+        llama_token best = 0;
+        float       best_logit = row[0];
+        for (int64_t i = 1; i < mtp_n_vocab; i++) {
+            if (row[i] > best_logit) {
+                best_logit = row[i];
+                best       = (llama_token) i;
+            }
+        }
+        if (llama_vocab_is_eog(vocab, best)) break;
+        result.push_back(best);
+    }
+
+    return result;
+}

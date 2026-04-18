@@ -66,6 +66,7 @@ layout(push_constant) uniform PushConstants {
     uint v_nb2;            // v stride for head  (in floats)
     uint v_nb3;            // v stride for batch (in floats)
     uint dst_state_offset; // = head_dim * H_v * n_tokens * n_seqs (output_size)
+    uint emit_intermediates; // if != 0, write per-token state snapshots
 } p;
 
 // Per-token cooperative loads of q and k.
@@ -170,18 +171,27 @@ void main() {
             my_state[c] = clamp(s, -1.0e6f, 1.0e6f);
         }
 
+        // Write per-token intermediate state for MTP rollback
+        if (p.emit_intermediates != 0u) {
+            const uint state_stride = HEAD_DIM * HEAD_DIM * p.n_heads * p.n_seqs;
+            const uint s_t_off = p.dst_state_offset + t * state_stride + state_off;
+            [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+                data_dst[s_t_off + c * HEAD_DIM + my_row] = my_state[c];
+            }
+        }
+
         barrier(); // ensure k_shared/q_shared can be overwritten next iter
     }
 
-    // Write final state back. Same strided pattern as the load.
-    // STATE_INPLACE: write directly to the input state buffer (= KV cache)
-    // instead of the dst tensor's state region. Eliminates the downstream
-    // CONT+CONCAT+CPY chain that copies state from dst to KV cache.
-    [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
+    // Write final state back (only when NOT emitting intermediates —
+    // the last intermediate slot already contains the final state).
+    if (p.emit_intermediates == 0u) {
+        [[unroll]] for (uint c = 0u; c < HEAD_DIM; ++c) {
 #ifdef STATE_INPLACE
-        data_state[state_off + c * HEAD_DIM + my_row] = my_state[c];
+            data_state[state_off + c * HEAD_DIM + my_row] = my_state[c];
 #else
-        data_dst[p.dst_state_offset + state_off + c * HEAD_DIM + my_row] = my_state[c];
+            data_dst[p.dst_state_offset + state_off + c * HEAD_DIM + my_row] = my_state[c];
 #endif
+        }
     }
 }

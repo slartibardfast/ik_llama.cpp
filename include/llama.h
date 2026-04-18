@@ -1540,6 +1540,29 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int64_t       llama_get_mtp_n_vocab(struct llama_context * ctx);
     LLAMA_API llama_token   llama_get_mtp_draft_token(struct llama_context * ctx);
 
+    // MTP-IR (intermediate rollback) API: returns MTP logits for a specific
+    // batch position in the last decode. Used on partial reject to draft from
+    // the j_mismatch position (last accepted token) rather than the rejected
+    // last position. Returns nullptr if `i` is out of range or MTP logits
+    // weren't retained for this decode.
+    LLAMA_API const float * llama_get_mtp_logits_ith(struct llama_context * ctx, int32_t i);
+    // Number of drafts per position in the MTP logits buffer (1 for
+    // single-draft MTP; higher for chained-rollout MTP).
+    LLAMA_API int64_t       llama_get_mtp_n_drafts (struct llama_context * ctx);
+
+    // Rollback recurrent + conv state to the intermediate captured at
+    // `token_idx` within the last multi-token decode. Writes the per-token
+    // intermediate into the cache cell for `seq_id`, and updates the cell's
+    // tail position to `target_pos`. Returns false if no intermediates are
+    // available (e.g. single-token decode or non-delta-net model).
+    // Caller must still call `llama_kv_cache_seq_rm(ctx, seq_id, target_pos+1, -1)`
+    // to trim the KV cache of rejected positions.
+    LLAMA_API bool          llama_rollback_delta_net_state(
+                               struct llama_context * ctx,
+                                             int32_t   token_idx,
+                                        llama_seq_id   seq_id,
+                                           llama_pos   target_pos);
+
 #ifdef __cplusplus
 }
 #endif

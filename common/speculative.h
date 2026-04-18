@@ -51,6 +51,15 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     int32_t n_past,
     llama_seq_id seq_id);
 
+// MTP-IR: read up to k_max drafts from the MTP logits tensor produced by the
+// LAST llama_decode. `pos = -1` (default) reads the last batch position (same
+// as llama_get_mtp_logits); `pos >= 0` reads position `pos` via
+// llama_get_mtp_logits_ith. Filters out EOG tokens.
+std::vector<llama_token> common_mtp_read_drafts(
+    struct llama_context * ctx_tgt,
+    int                    k_max,
+    int                    pos = -1);
+
 void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup);
 
 void mtp_accept_tokens(
