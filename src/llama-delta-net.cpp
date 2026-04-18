@@ -433,11 +433,16 @@ ggml_tensor * delta_net::build_qkv(llama_context & lctx, ggml_context * ctx0,
     if (emit_intermediates) {
         // Persistent copy of the delta-net result FIRST — before any consumer
         // that could let the scheduler reclaim fused_result's buffer.
-        // Without the keep-copy, rollback reads garbage (Step 8 fix in polaris).
-        const int64_t total_elems = fused_result->ne[0];
-        ggml_tensor * dn_result_keep = ggml_cpy(ctx0, fused_result,
-                ggml_new_tensor_1d(ctx0, fused_result->type, total_elems));
+        // Without the keep-copy, rollback reads garbage.
+        // Using ggml_scale(x, 1.0f) instead of ggml_cpy — ggml_cpy into a
+        // new_tensor_1d did not reliably copy the state region of fused_result
+        // in ik_llama's scheduler (kernel writes tiny values to fused_result
+        // slot 0, but dn_result_keep reads large unrelated values at same
+        // offset). ggml_scale is an op-backed lineage that the scheduler
+        // can't elide / buffer-alias the same way.
+        ggml_tensor * dn_result_keep = ggml_scale(ctx0, fused_result, 1.0f);
         ggml_set_name(dn_result_keep, "dn_result_keep");
+        ggml_set_output(dn_result_keep);
         ggml_build_forward_expand(gf, dn_result_keep);
 
         // SSM state writeback: copy the final state (= last intermediate slot
