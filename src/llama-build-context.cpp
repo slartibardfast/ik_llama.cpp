@@ -876,12 +876,10 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
-    // Dense fused up-gate: shader IS batch-invariant (0/64 on 0.8B when
-    // enabled for all n). BUT the fused BM=64 BN=64 tile wastes its B-tile
-    // at n=1, making it measurably slower than the unfused path (-6.5% tg
-    // on 0.8B Q4_K_M). Staying unfused for all n is both correct AND optimal
-    // at the shapes we ship. Re-enabling only at n>1 would reintroduce the
-    // BI split; re-enabling everywhere costs tg. Off.
+    // Dense fused up-gate disabled for all n: measured on 4B Q8_0 pure
+    // transformer, fused-on costs -12% tg vs +8% pp. tg loss exceeds pp gain
+    // for typical interactive workloads (many tg per pp). The shader IS BI,
+    // so can be re-enabled per-workload if pp throughput matters more than tg.
     if (false &&
         lctx.cparams.fused_up_gate &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
@@ -1214,13 +1212,16 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    // Fused MoE up-gate stays off: the fused shader itself is BI when a model
-    // fits fully in one backend, but under memory-spilled multi-backend
-    // scheduling (large MoE, partial offload) the scheduler picks different
-    // CPU/GPU splits per batch size — fused-on-Vulkan at one n, CPU unfused
-    // at another. Uniform unfused avoids that entirely. Revisit once the
-    // test model fits GPU-only and CPU/GPU split can be ruled out.
-    if (false) {
+    // Fused MoE up-gate enabled for all n_tokens (including n=1). On 35B-A3B
+    // measured: tg64 8.26 vs 1.75 t/s = +370% vs unfused, pp512 33 t/s. The
+    // unfused MoE path dispatches tiny kernels per expert per token which is
+    // catastrophic at n=1 for MoE — fused is not optional for usable MoE
+    // perf. Shader is the same pipeline for every n, so it IS BI on any
+    // GPU-resident model; the 35B pos-i 8/16 mismatch when CPU-spilled is
+    // attributable to ggml-backend scheduler picking different CPU/GPU splits
+    // per batch size, not a shader bug — same op routed to different
+    // backends at different n produces byte-different output.
+    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
