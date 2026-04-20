@@ -34,7 +34,7 @@ vec2 cache_b_ds;
 #include "mul_mat_vecq_funcs.comp"
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i) {
-    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+    for (uint j = 0; j < p.num_cols; ++j) {
         const uint col = i*BLOCK_SIZE + tid*K_PER_ITER;
 
         // Preload data_b block
@@ -91,7 +91,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
             temp[j][n] = FLOAT_TYPE(0.0f);
         }
     }

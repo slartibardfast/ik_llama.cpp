@@ -66,7 +66,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const FLOAT_TYPE q4_14 = FLOAT_TYPE(qs64_hi4.z);
         const FLOAT_TYPE q4_15 = FLOAT_TYPE(qs64_hi4.w);
 
-        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        for (uint j = 0; j < p.num_cols; ++j) {
             vec4 by10 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]);
             vec4 by132 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]);
             vec4 by20 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]);

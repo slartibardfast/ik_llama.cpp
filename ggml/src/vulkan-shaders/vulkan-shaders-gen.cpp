@@ -270,6 +270,52 @@ void string_to_spv_func(const std::string& _name, const std::string& in_fname, c
             return;
         }
 
+        // PHASE 1b FIX: post-process mul_mat_vec SPVs to inject NoContraction
+        // decoration on every OpFMul/OpFAdd result id. glslc does not emit
+        // NoContraction from the GLSL `precise` keyword (verified via
+        // spirv-dis: zero decorations present), and ACO's default behavior is
+        // to apply mul+add→FMA fusion with variable precision across pipeline
+        // specializations, which causes ~5% batch-variance at K≥2048 for
+        // quantized types. Injecting NoContraction prevents that fusion and
+        // should make col-0 output byte-identical across NUM_COLS variants.
+        // PHASE 1b: inject NoContraction decoration on every OpFMul/OpFAdd
+        // result id in mul_mat_vec shaders. Background:
+        //   * GLSL `precise` is silently dropped by glslc 2026.1 (verified via
+        //     spirv-dis — zero NoContraction decorations ever present in
+        //     stock output).
+        //   * Without NoContraction, ACO (RADV's AMD compiler) aggressively
+        //     fuses mul+add → FMA and may auto-vectorize to packed f16 ops
+        //     at high register pressure. The precision/scheduling diverges
+        //     across pipeline specializations (NUM_COLS=1 vs NUM_COLS=N) and
+        //     produces ~5% col-0 output divergence at K≥2048 on quantized
+        //     types — breaking sequential-equivalence for speculative decode.
+        //   * Post-processing via spirv-dis → inject decorations → spirv-as
+        //     plants NoContraction in the SPV blob that gets embedded.
+        // Status on Mesa 26.0.99 / RDNA2 NAVI21: the decorations land in the
+        // final SPV (verified by disassembling the embedded bytes) but ACO
+        // IGNORES them — output is bit-identical to the un-decorated build.
+        // Kept anyway as the architecturally-correct fix; will activate when
+        // upstream ACO starts honoring NoContraction for quantized mat-vec.
+        // See tests/mtp-matrix/35b/BI-matrix.md for the tracking record.
+        if (name.find("mul_mat_vec") != std::string::npos) {
+            std::string script_path = join_paths(input_dir, "scripts/inject_no_contraction.py");
+            std::string asm_fname     = out_fname + ".preinj.asm";
+            std::string patched_fname = out_fname + ".inj.asm";
+            std::string patched_spv   = out_fname + ".inj.spv";
+            std::string full_cmd =
+                "set -e; "
+                "spirv-dis '" + out_fname + "' -o '" + asm_fname + "'; "
+                "python3 '" + script_path + "' '" + asm_fname + "' '" + patched_fname + "' 2>/dev/null; "
+                "spirv-as --target-env vulkan1.2 '" + patched_fname + "' -o '" + patched_spv + "'; "
+                "mv -f '" + patched_spv + "' '" + out_fname + "'; "
+                "rm -f '" + asm_fname + "' '" + patched_fname + "'";
+            std::string pp_stdout, pp_stderr;
+            execute_command(full_cmd, pp_stdout, pp_stderr);
+            if (!pp_stderr.empty()) {
+                std::cerr << "[no-contraction-inject] " << name << ": " << pp_stderr;
+            }
+        }
+
         std::lock_guard<std::mutex> guard(lock);
         shader_fnames.push_back(std::make_pair(name, out_fname));
     } catch (const std::exception& e) {
