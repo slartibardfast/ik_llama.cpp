@@ -6758,28 +6758,8 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
         { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, pc, { 1, (uint32_t)ne01, (uint32_t)ne12 });
 }
 
-// GGML_VK_FORCE_BATCH_INVARIANT=1 forces ALL MUL_MAT through the mat-mat
-// path (ggml_vk_mul_mat_q_f16) regardless of batch size. This sidesteps the
-// mul_mat_vec NUM_COLS specialization divergence (documented by
-// test-backend-ops -o BATCH_INVARIANCE: q4_K/q8_0 at K>=2048 with NUM_COLS>1
-// produces ~5% different pos-0 output vs NUM_COLS=1 on RDNA2). The mat_mat
-// path uses a single shader variant across all batch sizes so pos-0 is
-// byte-identical whether we decode 1 token or N tokens. Opt-in: the default
-// path is unchanged to preserve tg throughput.
-static inline bool ggml_vk_force_batch_invariant() {
-    static const bool v = []() {
-        const char * e = std::getenv("GGML_VK_FORCE_BATCH_INVARIANT");
-        return e && e[0] && e[0] != '0';
-    }();
-    return v;
-}
-
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
-    if (ggml_vk_force_batch_invariant()) {
-        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, dryrun);
-        return;
-    }
     if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
         src0->nb[0] <= src0->nb[2] &&
@@ -7452,14 +7432,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
-    // GGML_VK_FORCE_BATCH_INVARIANT=1: skip mat-vec-id at n=1 too. MoE matmul
-    // falls through to the mat-mat-id path which uses one shader variant for
-    // all batch sizes — required for strict sequential-equivalence in
-    // speculative decoding.
-    const bool force_bi = ggml_vk_force_batch_invariant();
-    if (!force_bi && src2->ne[1] == 1 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
-        ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, src0, src1, src2, dst, dryrun);
-    } else {
+    // Route everything through the mat-mat-id path. The mat-vec-id fast path
+    // (taken historically when src2->ne[1]==1) produced byte-different output
+    // from mat-mat-id for the same inputs — so mixing them across batch
+    // sizes broke batch-invariance. Until mat-vec-id is extended to match
+    // mat-mat-id output exactly at every ne11, keep one path for everyone.
+    {
         // Split based on number of ids, to fit in shared memory
         const uint32_t nei0 = (uint32_t)src2->ne[0];
         const uint32_t nei1 = (uint32_t)src2->ne[1];
@@ -7631,18 +7609,16 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         GGML_ASSERT(0);
     }
 
-    if (N == 1 && qk_ratio > 1 && qk_ratio <= max_gqa &&
-        qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
-        // grouped query attention - make the N dimension equal to gqa_ratio, reduce
-        // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
-        // and change addressing calculations to index Q's dimension 2.
-        gqa_ratio = qk_ratio;
-        N = gqa_ratio;
-        workgroups_y /= N;
-    }
+    // GQA N=1 remap (gqa_ratio parallelization) and small_rows tile selection
+    // both pick a different pipeline / dispatch shape based on N. Mixing them
+    // across batch sizes breaks byte-level batch-invariance: the pos-0 output
+    // differs by ~1e-8 (full head dim) because of FP re-order between tile
+    // variants. Keep the code path uniform for every N until the variants are
+    // rewired to produce byte-identical output at every batch shape.
+    (void)max_gqa;
 
     vk_pipeline *pipelines;
-    bool small_rows = N <= get_fa_num_small_rows(path);
+    bool small_rows = false;
 
     // coopmat1 does not actually support "small rows" (it needs 16 rows).
     // So use scalar instead.
@@ -7712,21 +7688,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t split_kv = KV;
     uint32_t split_k = 1;
 
-    // Use a placeholder core count if one isn't available. split_k is a big help for perf.
-    const uint32_t shader_core_count = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
-
-    // Try to use split_k when KV is large enough to be worth the overhead
-    if (workgroups_x == 1 && shader_core_count > 0) {
-        // Try to run two workgroups per SM.
-        split_k = shader_core_count * 2 / (workgroups_y * workgroups_z);
-        if (split_k > 1) {
-            // Try to evenly split KV into split_k chunks, but it needs to be a multiple
-            // of "align", so recompute split_k based on that.
-            split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), pipelines[1]->align);
-            split_k = CEIL_DIV(KV, split_kv);
-            workgroups_x = split_k;
-        }
-    }
+    // split_k fires only at workgroups_x == 1 (i.e. N == 1) and splits KV into
+    // chunks processed in parallel, then combines via a separate reduce pass.
+    // Its accumulation order differs from the N>1 path, producing ~1e-8 pos-0
+    // output drift vs the non-split path. Keep split_k disabled so every batch
+    // size runs the same in-kernel accumulation.
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.

@@ -5,19 +5,32 @@ Run: `./build-vk/bin/test-backend-ops -o BATCH_INVARIANCE -b Vulkan0`
 
 Hardware: AMD Radeon RX 6800 XT (RADV NAVI21), RDNA2.
 
-## Current state (after Phase 1 mul_mat_vec pipeline collapse landed)
+## Current state — 101/101 PASS, Backend Vulkan0 OK, no env flags
 
-| Op | Variants tested | PASS | FAIL | Failure fingerprint |
-|---|---|---:|---:|---|
-| **MUL_MAT** | F16 / Q4_K / Q8_0 × K∈{256,512,1024,2048,2048,2048,2048} × M∈{...} × N∈{2,4} | **42** | **0** | All pass byte-identical after Phase 1 collapse (prev: 26/42) |
-| **SOFT_MAX** | K∈{64,512,4096} × N∈{2,4} | 6 | 0 | — |
-| **RMS_NORM** | K∈{64,128,256} × N∈{2,4} | 6 | 0 | — |
-| **UNARY (SILU/GELU/RELU)** | K=1024 × N=4 | 3 | 0 | — |
-| **FUSED_UP_GATE** (dense) | Q4_K / Q8_0 × K∈{256,2048} × M∈{256,512} × N∈{2,4} | 8 | 0 | — |
-| **MOE_FUSED_UP_GATE** | Q4_K / Q8_0 × K∈{256,2048} × M∈{256,512} × n_experts=16 × n_used=2 × N∈{2,4} | 8 | 0 | — |
-| **MUL_MAT_ID** | Q4_K / Q8_0 × K∈{256,2048} × M∈{256,512} × n_experts=16 × n_used=2 × N∈{2,4} | 0 | **16** | **ALL fail.** Every token-0 output element differs. K=2048 max\|Δ\|≈0.1–0.17; K=256 max\|Δ\|≈0.015–0.018 |
-| **FLASH_ATTN** | hs=128 × nh_q=16 × nh_kv∈{8,2} × kv=512 × N∈{2,4,8} × {f16acc,f32acc} × mask=1 | 0 | **12** | **ALL fail.** max\|Δ\|≈7–9e-09 (near ULP). ~1637/2048 (nh_kv=2) or ~1671/2048 (nh_kv=8) elements differ |
-| **TOTAL** | | **73** | **28** | MUL_MAT family now green without env flags |
+| Op | Variants tested | PASS | FAIL |
+|---|---|---:|---:|
+| **MUL_MAT** | F16 / Q4_K / Q8_0 × K∈{256,512,1024,2048,2048,2048,2048} × M × N∈{2,4} | **42** | 0 |
+| **SOFT_MAX** | K∈{64,512,4096} × N∈{2,4} | 6 | 0 |
+| **RMS_NORM** | K∈{64,128,256} × N∈{2,4} | 6 | 0 |
+| **UNARY (SILU/GELU/RELU)** | K=1024 × N=4 | 3 | 0 |
+| **FUSED_UP_GATE** (dense) | Q4_K / Q8_0 × K × M × N∈{2,4} | 8 | 0 |
+| **MOE_FUSED_UP_GATE** | Q4_K / Q8_0 × K × M × n_experts=16 × n_used=2 × N∈{2,4} | 8 | 0 |
+| **MUL_MAT_ID** | Q4_K / Q8_0 × K × M × n_experts=16 × n_used=2 × N∈{2,4} | **16** | 0 |
+| **FLASH_ATTN** | hs=128 × nh_q=16 × nh_kv∈{8,2} × kv=512 × N∈{2,4,8} × {f16acc,f32acc} × mask=1 | **12** | 0 |
+| **TOTAL** | | **101** | **0** |
+
+## Completion notes (2026-04-20)
+
+All four routing-split classes are uniform now:
+
+| Op | Split that broke BI | Uniform choice |
+|---|---|---|
+| MUL_MAT | n=1 → MMVQ shader, n=N → dequant-mmv | MMVQ disabled in source; both hit dequant-mmv |
+| MUL_MAT | n=1..8 → separate NUM_COLS spec-const pipelines | NUM_COLS=max spec-const everywhere, runtime `p.num_cols` loop bound → one ISA for all n |
+| MUL_MAT_ID | n=1 → mat-vec-id shader, n=N → mat-mat-id | mat-vec-id routing removed; all n → mat-mat-id |
+| FLASH_ATTN | n=1 → split-K reduce, small-rows tile, gqa_ratio remap; n=N → large-rows single-pass | split_k forced off, `small_rows=false`, GQA n=1 remap disabled → uniform large-rows single-pass |
+
+`GGML_VK_FORCE_BATCH_INVARIANT` env flag and its helper function deleted. `GGML_VK_DISABLE_MMVQ` no longer needed. `-no-fmoe` / `-no-fug` no longer needed for invariance.
 
 ## Phase 1 landing notes (2026-04-20)
 
