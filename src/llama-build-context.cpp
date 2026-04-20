@@ -876,12 +876,11 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
-    // Dense fused up-gate disabled for all n: measured on 4B Q8_0 pure
-    // transformer, fused-on costs -12% tg vs +8% pp. tg loss exceeds pp gain
-    // for typical interactive workloads (many tg per pp). The shader IS BI,
-    // so can be re-enabled per-workload if pp throughput matters more than tg.
-    if (false &&
-        lctx.cparams.fused_up_gate &&
+    // Dense fused up-gate: gated by cparams.fused_up_gate (default true,
+    // turn off with --no-fused-up-gate). Shader IS batch-invariant when it
+    // fires, but the BM=64 BN=64 tile wastes most of its B-tile at n=1, so
+    // on 4B Q8_0 fused-on gives -12% tg and +8% pp — a per-workload choice.
+    if (lctx.cparams.fused_up_gate &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1217,10 +1216,12 @@ llm_expert_gating_func_type   gating_op,
     // unfused MoE path dispatches tiny kernels per expert per token which is
     // catastrophic at n=1 for MoE — fused is not optional for usable MoE
     // perf. Shader is the same pipeline for every n, so it IS BI on any
-    // GPU-resident model; the 35B pos-i 8/16 mismatch when CPU-spilled is
-    // attributable to ggml-backend scheduler picking different CPU/GPU splits
-    // per batch size, not a shader bug — same op routed to different
-    // backends at different n produces byte-different output.
+    // GPU-resident model (op test 105/105 including K=5120 M=2560 n_exp=128
+    // n_used=8). The 35B full-model drift under --fit on 16 GB is a
+    // scheduler-level effect we could not isolate with a buffer-residency
+    // check at build-graph time (the diagnostic printf showed every layer
+    // reporting on Vulkan even under memory pressure). Users needing BI
+    // under CPU-spilled 35B opt out with -no-fmoe.
     if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
