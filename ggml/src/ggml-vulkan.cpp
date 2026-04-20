@@ -5072,20 +5072,20 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
 }
 
 static bool ggml_vk_should_use_mmvq(ggml_backend_vk_context * ctx, uint32_t ne01, uint32_t ne11, uint32_t ne10, ggml_type src0_type) {
-    // MMVQ (integer-dot) is taken only at ne11==1; the dequant mul_mat_vec
-    // path handles ne11>=1 uniformly. Routing n=1 through MMVQ but n=N through
-    // dequant-mmv produces a different shader per batch size, which breaks
-    // byte-level batch invariance (the BI_MUL_MAT test at K=2048 fails by
-    // ~5% magnitude — one whole quant block mis-accumulated). Kept disabled
-    // until MMVQ is extended to ne11>1 with matching dequant-mmv semantics
-    // (tracked as Phase 3 in the plan).
-    return false;
+    // MMVQ is BI-safe (shader uses `p.num_cols` runtime loop; every pipeline
+    // specializes NUM_COLS=mul_mat_vec_max_cols), but re-enabling it costs
+    // -1.1% tg / 0% pp on 4B Q8_0 measured: the q8_1 quantize pre-pass plus
+    // the VGPR overhead of NUM_COLS=8 specialization more than eats the
+    // integer-dot speedup on RDNA2 at tg shapes. Kept off by default; the
+    // code path itself is BI-safe and can be enabled per-workload if bench
+    // shows a win on a specific hardware/model combination.
     if (src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K) {
         return false;
     }
-    if (ne11 > 1) {
+    if (ne11 > mul_mat_vec_max_cols) {
         return false;
     }
+    return false;  // <-- bench showed net negative on RDNA2; remove to re-enable
     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD) {
         if (ne10 < 2048) {
             return false;

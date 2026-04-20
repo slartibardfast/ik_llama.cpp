@@ -876,16 +876,14 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
-    // Dense FUSED_UP_GATE only fires at cur->ne[1] > 1; ne[1] == 1 falls through
-    // to the unfused 2×mul_mat + mul_unary path. Mixing the two across batch
-    // sizes breaks byte-level batch-invariance — different shader, different
-    // accumulation order. Until the fused kernel produces byte-identical output
-    // to the unfused path at every batch size, keep the unfused path for all.
-    // (Historic gate retained inline; activation restored once the fused
-    // variant is rewired for batch-invariant output.)
+    // Dense fused up-gate: shader IS batch-invariant (0/64 on 0.8B when
+    // enabled for all n). BUT the fused BM=64 BN=64 tile wastes its B-tile
+    // at n=1, making it measurably slower than the unfused path (-6.5% tg
+    // on 0.8B Q4_K_M). Staying unfused for all n is both correct AND optimal
+    // at the shapes we ship. Re-enabling only at n>1 would reintroduce the
+    // BI split; re-enabling everywhere costs tg. Off.
     if (false &&
         lctx.cparams.fused_up_gate &&
-        cur->ne[1] > 1 &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || (type_op == LLM_FFN_GELU && !act_scales))) {
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1216,13 +1214,12 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    // Fused MoE up-gate only fires at n_tokens > 1; n_tokens == 1 falls through
-    // to the unfused 2×mul_mat_id + mul_unary path. Mixing the two across batch
-    // sizes breaks byte-level batch-invariance — different shader, different
-    // accumulation order. Until the fused kernel is rewired to produce
-    // byte-identical output to the unfused path at every n_tokens, keep the
-    // unfused path for everyone. (Historic gate: `can_use_fmoe &&
-    // lctx.cparams.fused_moe_up_gate && n_tokens > 1 && up_type == gate_type`.)
+    // Fused MoE up-gate stays off: the fused shader itself is BI when a model
+    // fits fully in one backend, but under memory-spilled multi-backend
+    // scheduling (large MoE, partial offload) the scheduler picks different
+    // CPU/GPU splits per batch size — fused-on-Vulkan at one n, CPU unfused
+    // at another. Uniform unfused avoids that entirely. Revisit once the
+    // test model fits GPU-only and CPU/GPU split can be ruled out.
     if (false) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
