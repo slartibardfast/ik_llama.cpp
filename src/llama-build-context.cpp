@@ -876,12 +876,15 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
 
-    // FUSED_UP_GATE uses a matrix-matrix tile shader (BM=64, BN=64) which wastes
-    // ~98% of the B tile when N=1 (token generation). On Vulkan, the unfused path
-    // (2x mat_vec + ggml_fused_mul_unary) is several times faster for N=1 because
-    // mat_vec is geometry-optimized for narrow workloads. Fusion remains beneficial
-    // for prompt processing (N>1) where the matrix-matrix tile pays off.
-    if (lctx.cparams.fused_up_gate &&
+    // Dense FUSED_UP_GATE only fires at cur->ne[1] > 1; ne[1] == 1 falls through
+    // to the unfused 2×mul_mat + mul_unary path. Mixing the two across batch
+    // sizes breaks byte-level batch-invariance — different shader, different
+    // accumulation order. Until the fused kernel produces byte-identical output
+    // to the unfused path at every batch size, keep the unfused path for all.
+    // (Historic gate retained inline; activation restored once the fused
+    // variant is rewired for batch-invariant output.)
+    if (false &&
+        lctx.cparams.fused_up_gate &&
         cur->ne[1] > 1 &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || (type_op == LLM_FFN_GELU && !act_scales))) {
@@ -1213,11 +1216,14 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    // For token gen (n_tokens=1), the fused MoE up_gate uses matrix-matrix tile
-    // geometry per expert that wastes the B tile when only 1 token activates each
-    // expert. Fall through to the unfused path (2x mul_mat_id + fused_mul_unary)
-    // which uses geometry-optimized mat_vec_id for narrow workloads.
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && n_tokens > 1 && up_exps->type == gate_exps->type) {
+    // Fused MoE up-gate only fires at n_tokens > 1; n_tokens == 1 falls through
+    // to the unfused 2×mul_mat_id + mul_unary path. Mixing the two across batch
+    // sizes breaks byte-level batch-invariance — different shader, different
+    // accumulation order. Until the fused kernel is rewired to produce
+    // byte-identical output to the unfused path at every n_tokens, keep the
+    // unfused path for everyone. (Historic gate: `can_use_fmoe &&
+    // lctx.cparams.fused_moe_up_gate && n_tokens > 1 && up_type == gate_type`.)
+    if (false) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -4692,6 +4698,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     }
 
     // Save raw hidden state for MTP before output norm is applied.
+    ggml_tensor * mtp_hidden_state = inpL;
     if (hparams.nextn_predict_layers > 0) {
         cb(inpL, "result_embd_pooled", -1);
         ggml_set_output(inpL);
@@ -4700,7 +4707,158 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
     cb(cur, "result_output", -1);
 
+    // Mark main logits as output to prevent the graph allocator from reusing
+    // its buffer for MTP operations (which would corrupt the main logits).
+    ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
+
+    // Inline MTP: mirrors build_qwen35 but routes the MTP-layer FFN through
+    // MoE when the MTP layer has router weights (general case: dense MTP head
+    // on either dense or MoE base — ffn_gate_inp gates the selection).
+    const bool has_mtp_inline = hparams.nextn_predict_layers > 0 && cparams.mtp;
+    if (has_mtp_inline) {
+        const int il_mtp = hparams.n_layer - 1;
+        const auto & mtp_layer = model.layers[il_mtp];
+
+        if (mtp_layer.nextn.eh_proj != nullptr) {
+            uint32_t n_rollout = hparams.nextn_predict_layers;
+            if (const char * e = std::getenv("LLAMA_MTP_ROLLOUT")) {
+                const int v = std::atoi(e);
+                if (v > 0) n_rollout = (uint32_t) v;
+            }
+            if (n_rollout == 0) n_rollout = 1;
+
+            const int64_t mtp_vocab_size = 32768;
+
+            auto build_mtp_ffn = [&](ggml_tensor * in, int il) -> ggml_tensor * {
+                if (mtp_layer.ffn_gate_inp != nullptr) {
+                    return llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, in,
+                            mtp_layer.ffn_gate_inp,  NULL,
+                            mtp_layer.ffn_up_exps,   NULL,
+                            mtp_layer.ffn_gate_exps, NULL,
+                            mtp_layer.ffn_down_exps, NULL,
+                            mtp_layer.ffn_exp_probs_b,
+                            mtp_layer.ffn_up_shexp,    nullptr,
+                            mtp_layer.ffn_gate_shexp,  nullptr,
+                            mtp_layer.ffn_down_shexp,  nullptr,
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, true, false, 0.0f,
+                            LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                            LLM_FFN_SILU, cb, il, gf, true,
+                            mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
+                }
+                return llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, in,
+                        mtp_layer.ffn_up,   NULL, NULL,
+                        mtp_layer.ffn_gate, NULL, NULL,
+                        mtp_layer.ffn_down, NULL, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+            };
+
+            if (n_rollout == 1) {
+                ggml_tensor * greedy_tokens = ggml_argmax(ctx0, cur);
+                cb(greedy_tokens, "mtp_greedy_tokens", -1);
+
+                ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
+                if (tok_embd == nullptr) tok_embd = model.tok_embd;
+                ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, greedy_tokens);
+                cb(emb, "mtp_token_embd", il_mtp);
+
+                ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                ggml_tensor * h_norm = llm_build_norm(ctx0, mtp_hidden_state, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
+                cb(combined, "mtp_concat", il_mtp);
+                ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+
+                cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+                cur_mtp = build_mtp_ffn(cur_mtp, il_mtp);
+
+                if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                    cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                } else {
+                    cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                }
+
+                ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+                if (mtp_head == nullptr) mtp_head = model.output;
+                if (mtp_head->ne[1] > mtp_vocab_size) {
+                    mtp_head = ggml_view_2d(ctx0, mtp_head,
+                            mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
+                }
+
+                cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+                cb(cur_mtp, "mtp_logits", -1);
+                ggml_set_output(cur_mtp);
+                ggml_build_forward_expand(gf, cur_mtp);
+
+                lctx.mtp_logits_tensor = cur_mtp;
+            } else {
+                ggml_tensor * current_greedy = ggml_argmax(ctx0, cur);
+                cb(current_greedy, "mtp_greedy_tokens", -1);
+
+                ggml_tensor * current_hidden = mtp_hidden_state;
+
+                std::vector<ggml_tensor *> rollout_logits;
+                rollout_logits.reserve(n_rollout);
+
+                for (uint32_t k = 0; k < n_rollout; ++k) {
+                    ggml_tensor * tok_embd = mtp_layer.nextn.embed_tokens;
+                    if (tok_embd == nullptr) tok_embd = model.tok_embd;
+                    ggml_tensor * emb = ggml_get_rows(ctx0, tok_embd, current_greedy);
+                    cb(emb, "mtp_token_embd", il_mtp);
+
+                    ggml_tensor * e_norm = llm_build_norm(ctx0, emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    ggml_tensor * h_norm = llm_build_norm(ctx0, current_hidden, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    ggml_tensor * combined = ggml_concat(ctx0, e_norm, h_norm, 0);
+                    cb(combined, "mtp_concat", il_mtp);
+                    ggml_tensor * cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+
+                    cur_mtp = build_std_attention(gf, mtp_layer.attn_norm, cur_mtp, inp_pos, nullptr, nullptr,
+                            KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il_mtp, true, false, true, false, true);
+
+                    cur_mtp = build_mtp_ffn(cur_mtp, il_mtp);
+
+                    ggml_tensor * mtp_hidden_next = cur_mtp;
+
+                    if (mtp_layer.nextn.shared_head_norm != nullptr) {
+                        cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    } else {
+                        cur_mtp = llm_build_norm(ctx0, cur_mtp, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+                    }
+
+                    ggml_tensor * mtp_head = mtp_layer.nextn.shared_head_head;
+                    if (mtp_head == nullptr) mtp_head = model.output;
+                    if (mtp_head->ne[1] > mtp_vocab_size) {
+                        mtp_head = ggml_view_2d(ctx0, mtp_head,
+                                mtp_head->ne[0], mtp_vocab_size, mtp_head->nb[1], 0);
+                    }
+                    cur_mtp = llm_build_lora_mm(lctx, ctx0, mtp_head, cur_mtp);
+                    cb(cur_mtp, "mtp_logits", il_mtp);
+                    ggml_build_forward_expand(gf, cur_mtp);
+
+                    rollout_logits.push_back(cur_mtp);
+
+                    if (k + 1 < n_rollout) {
+                        current_greedy = ggml_argmax(ctx0, cur_mtp);
+                        cb(current_greedy, "mtp_greedy_next", il_mtp);
+                        current_hidden = mtp_hidden_next;
+                    }
+                }
+
+                ggml_tensor * stacked = rollout_logits[0];
+                for (size_t i = 1; i < rollout_logits.size(); ++i) {
+                    stacked = ggml_concat(ctx0, stacked, rollout_logits[i], 1);
+                }
+                cb(stacked, "mtp_logits_stacked", -1);
+                ggml_set_output(stacked);
+                ggml_build_forward_expand(gf, stacked);
+
+                lctx.mtp_logits_tensor = stacked;
+            }
+        }
+    }
 
     return gf;
 }

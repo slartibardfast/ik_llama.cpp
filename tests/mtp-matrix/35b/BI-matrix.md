@@ -21,7 +21,7 @@ Hardware: AMD Radeon RX 6800 XT (RADV NAVI21), RDNA2.
 
 ## Completion notes (2026-04-20)
 
-All four routing-split classes are uniform now:
+All six routing-split classes are uniform now:
 
 | Op | Split that broke BI | Uniform choice |
 |---|---|---|
@@ -29,8 +29,29 @@ All four routing-split classes are uniform now:
 | MUL_MAT | n=1..8 → separate NUM_COLS spec-const pipelines | NUM_COLS=max spec-const everywhere, runtime `p.num_cols` loop bound → one ISA for all n |
 | MUL_MAT_ID | n=1 → mat-vec-id shader, n=N → mat-mat-id | mat-vec-id routing removed; all n → mat-mat-id |
 | FLASH_ATTN | n=1 → split-K reduce, small-rows tile, gqa_ratio remap; n=N → large-rows single-pass | split_k forced off, `small_rows=false`, GQA n=1 remap disabled → uniform large-rows single-pass |
+| FUSED_MOE_UP_GATE | n_tokens > 1 → fused `ggml_moe_up_gate` path, n_tokens == 1 → unfused mul_mat_id + mul_unary | fused branch disabled at build-context level; all n → unfused path |
+| FUSED_UP_GATE (dense) | cur->ne[1] > 1 → fused `ggml_fused_up_gate` path, ne[1] == 1 → unfused | fused branch disabled at build-context level; all n → unfused path |
 
-`GGML_VK_FORCE_BATCH_INVARIANT` env flag and its helper function deleted. `GGML_VK_DISABLE_MMVQ` no longer needed. `-no-fmoe` / `-no-fug` no longer needed for invariance.
+`GGML_VK_FORCE_BATCH_INVARIANT` env flag and its helper function deleted. `GGML_VK_DISABLE_MMVQ` no longer needed. `-no-fmoe` / `-no-fug` no longer needed for invariance (the gate is off in source).
+
+## 35B-A3B validation (2026-04-20, MTP-Dynamic.gguf, --fit, Vulkan0, no env flags)
+
+| Test | Result |
+|---|---|
+| `test-35b-pos-i-sequential-equivalence` pairs=4 batch=4 | 0/16 mismatches |
+| `test-35b-pos-i-sequential-equivalence` pairs=8 batch=8 | 0/64 mismatches |
+| `test-35b-batch-invariance-sweep` | 0/5 mismatches |
+| `test-35b-trajectory-drift` 20 steps | byte-identical |
+| `test-35b-full-accept-drift` 20 steps | byte-identical (historic FAIL step 4) |
+| `test-35b-server-flow-drift` 20 steps | byte-identical (historic FAIL step 10) |
+
+## Perf posture
+
+- 0.8B tg128 Q4_K_M: 20.88 ± 0.02 t/s (matches the 20.50 baseline within noise)
+- 35B-A3B tg64 (CPU-spilled on 16GB GPU): 1.75 t/s
+- 35B PP throughput expected to be lower due to disabled fused-MoE / fused-up-gate pp kernels; not measured.
+
+Perf restoration (rewire fused kernels to produce byte-identical output to the unfused path at every batch size) is future work. Correctness is non-negotiable; these paths stay off until they can be proven BI.
 
 ## Phase 1 landing notes (2026-04-20)
 
