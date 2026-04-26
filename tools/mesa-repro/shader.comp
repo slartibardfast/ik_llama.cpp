@@ -1,0 +1,132 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+// Spec constant: matches ggml-vulkan's NUM_COLS parameter. The RADV
+// ACO backend is expected (per project_mmvq_batch_invariance memo) to
+// produce different column-0 f32 output for NUM_COLS={1,2,4} on NAVI21.
+layout(constant_id = 0) const uint NUM_COLS = 1;
+
+// Matches the Q8_0 mul_mat_vecq hot path:
+//   * 128 threads per workgroup, wave32 -> 4 subgroups
+//   * K = 4096
+//   * K_PER_ITER = 8, so 4 outer iters per thread
+//   * NUM_ROWS = 2 — forces a temp[NUM_COLS][NUM_ROWS] 2D accumulator
+//     and per-column loads of 2 different weight rows per inner body,
+//     reshaping register pressure when NUM_COLS grows.
+#define LSIZE 128u
+#define K_ELEMS 4096u
+#define K_PER_ITER 8u
+#define BLOCK 32u
+#define NBLOCKS (K_ELEMS / BLOCK)       // 128
+#define NUM_ROWS 2u
+#define MAX_COLS 4u
+#define NSUB 4u
+
+layout(local_size_x = int(LSIZE), local_size_y = 1, local_size_z = 1) in;
+
+// Runtime num_rows — mirrors ggml's compute_outputs(first_row, runtime_rows)
+// path. Keeps the column-0 accumulation inside a runtime-bound inner loop
+// so ACO cannot fully unroll past it, raising sensitivity to NUM_COLS
+// spec-constant changes.
+layout(push_constant) uniform Push { uint rt_num_rows; } pc;
+
+layout(std430, binding = 0) readonly buffer Weights {
+    int32_t w_packed[]; // [MAX_COLS * NUM_ROWS * K_ELEMS/4]
+};
+layout(std430, binding = 1) readonly buffer Scales {
+    float16_t scales[]; // [MAX_COLS * NUM_ROWS * NBLOCKS]
+};
+layout(std430, binding = 2) readonly buffer B_qs {
+    int32_t b_qs[]; // [MAX_COLS * K_ELEMS/4] — one activation row per column
+};
+layout(std430, binding = 3) readonly buffer B_ds {
+    float16_t b_ds[]; // [MAX_COLS * NBLOCKS]
+};
+
+layout(std430, binding = 4) writeonly buffer Output {
+    float y[]; // [MAX_COLS * NUM_ROWS]
+};
+
+shared float s_partial[NSUB][MAX_COLS][NUM_ROWS];
+
+// Hoisted b-side cache (one entry per column, shared across the NUM_ROWS
+// inner loop) — this is the shape that gives ACO register pressure
+// proportional to NUM_COLS, which is the knob the bug is keyed on.
+int32_t cache_b_qs[MAX_COLS][K_PER_ITER / 4u];
+float cache_b_ds[MAX_COLS];
+
+void iter_outer(inout float temp[MAX_COLS][NUM_ROWS], const uint tid, const uint outer_i, const uint nrows) {
+    const uint col = outer_i * LSIZE * K_PER_ITER + tid * K_PER_ITER;
+    const uint pack0 = col / 4u;
+    const uint blk   = col / BLOCK;
+
+    // Preload b-side for every column for this outer iter.
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        cache_b_qs[j][0] = b_qs[j * (K_ELEMS / 4u) + pack0 + 0u];
+        cache_b_qs[j][1] = b_qs[j * (K_ELEMS / 4u) + pack0 + 1u];
+        cache_b_ds[j]    = float(b_ds[j * NBLOCKS + blk]);
+    }
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        // Runtime-bound inner loop over rows — prevents ACO from
+        // fully unrolling away the j*n cross term.
+        for (uint r = 0; r < nrows; ++r) {
+            const uint wpack_base = (j * NUM_ROWS + r) * (K_ELEMS / 4u) + pack0;
+            const int32_t wq0 = w_packed[wpack_base + 0u];
+            const int32_t wq1 = w_packed[wpack_base + 1u];
+            const float sa = float(scales[(j * NUM_ROWS + r) * NBLOCKS + blk]);
+
+            int32_t q = 0;
+            q = dotPacked4x8AccSatEXT(wq0, cache_b_qs[j][0], q);
+            q = dotPacked4x8AccSatEXT(wq1, cache_b_qs[j][1], q);
+            temp[j][r] = fma(sa * cache_b_ds[j], float(q), temp[j][r]);
+        }
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg_id = gl_SubgroupID;
+    const uint sg_ln = gl_SubgroupInvocationID;
+
+    float temp[MAX_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < MAX_COLS; ++j) {
+        [[unroll]] for (uint r = 0; r < NUM_ROWS; ++r) { temp[j][r] = 0.0; }
+    }
+
+    const uint num_iters = K_ELEMS / (LSIZE * K_PER_ITER); // 4
+    [[unroll]] for (uint i = 0; i < num_iters; ++i) {
+        iter_outer(temp, tid, i, pc.rt_num_rows);
+    }
+
+    // Per-subgroup reduce.
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        for (uint r = 0; r < pc.rt_num_rows; ++r) {
+            float rr = subgroupAdd(temp[j][r]);
+            if (sg_ln == 0) {
+                s_partial[sg_id][j][r] = rr;
+            }
+        }
+    }
+
+    barrier();
+
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            for (uint r = 0; r < pc.rt_num_rows; ++r) {
+                float acc = 0.0;
+                [[unroll]] for (uint sidx = 0; sidx < NSUB; ++sidx) {
+                    acc += s_partial[sidx][j][r];
+                }
+                y[j * NUM_ROWS + r] = acc;
+            }
+        }
+    }
+}
