@@ -1793,6 +1793,850 @@ struct test_mul_multi_add : public test_case {
     }
 };
 
+// BATCH_INVARIANCE probes — run the SAME op on the SAME backend twice, once
+// with n_tokens=1 and once with n_tokens=N (seeded so that position 0 sees
+// identical input in both runs), then compare the output at position 0
+// byte-identical. Any divergence means the op has a batch-shape-dependent
+// code path that breaks sequential equivalence, which propagates drift in
+// speculative decoding (see test-35b-pos-i-sequential-equivalence).
+
+// Seeded uniform fill to keep test deterministic across runs and libstdc++.
+static inline void bi_fill(float * data, size_t n, float lo, float hi, uint32_t seed) {
+    uint32_t s = seed;
+    for (size_t i = 0; i < n; i++) {
+        s = s * 1664525u + 1013904223u;
+        const float u = (float)s / (float)0xFFFFFFFFu;
+        data[i] = lo + (hi - lo) * u;
+    }
+}
+
+// test_batch_invariance_mul_mat: plain MUL_MAT (W @ x) at n=1 vs n=N.
+//   Weight: [K, M] type_a.  Input: [K, N] f32.  Output: [M, N] f32.
+//   Fills position 0 of input with a fixed seed; positions 1..N-1 with a
+//   different seed. Weight is shared between both runs.
+//   Compares output[:, 0] byte-identical.
+struct test_batch_invariance_mul_mat {
+    const ggml_type type_a;
+    const int64_t K;
+    const int64_t M;
+    const int64_t N;   // n_tokens for the "batch=N" run
+
+    test_batch_invariance_mul_mat(ggml_type type_a = GGML_TYPE_Q8_0,
+            int64_t K = 256, int64_t M = 256, int64_t N = 4)
+        : type_a(type_a), K(K), M(M), N(N) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_MUL_MAT(type_a=%s,K=%lld,M=%lld,N=%lld): ",
+               ggml_type_name(type_a), (long long)K, (long long)M, (long long)N);
+        fflush(stdout);
+
+        // Weight is shared across both runs — quantize once.
+        std::vector<uint8_t> w_bytes(ggml_row_size(type_a, K) * M);
+        {
+            std::vector<float> tmp(K * M);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_quantize_chunk(type_a, tmp.data(), w_bytes.data(), 0, M, K, nullptr);
+        }
+
+        // Input at position 0 (shared between both runs).
+        std::vector<float> x0(K);
+        bi_fill(x0.data(), K, -0.5f, 0.5f, 0xB);
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, K, M);
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            ggml_build_forward_expand(gf, y);
+
+            if (!ggml_backend_supports_op(backend, y)) {
+                printf("not supported\n"); ggml_free(ctx); return false;
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+
+            ggml_backend_tensor_set(w, w_bytes.data(), 0, w_bytes.size());
+
+            std::vector<float> x_host((size_t)K * n_tokens);
+            // Position 0: shared seed.
+            memcpy(x_host.data(), x0.data(), K * sizeof(float));
+            // Positions 1..N-1: different seed to exercise the batch.
+            if (n_tokens > 1) {
+                bi_fill(x_host.data() + K, K * (n_tokens - 1), -0.5f, 0.5f, 0xC);
+            }
+            ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * sizeof(float));
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            out_pos0.resize(M);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, M * sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1a, y1b, yN;
+        // Run A: n=1 baseline.
+        if (!run_one(1, y1a)) return true;
+        // Run B: n=1 again, same inputs. If y1a != y1b, the shader is
+        // non-deterministic at the GPU level — same pipeline, same buffers,
+        // same dispatch grid produces different output. That's a deeper
+        // problem than batch-variance.
+        if (!run_one(1, y1b)) return true;
+        // Run C: n=N, pos-0 should equal n=1 output.
+        if (!run_one(N, yN)) return true;
+
+        auto cmp = [](const std::vector<float> & a, const std::vector<float> & b, int64_t M) {
+            size_t diff_count = 0; double max_abs = 0.0;
+            for (size_t i = 0; i < (size_t)M; i++) {
+                if (a[i] != b[i]) {
+                    diff_count++;
+                    double d = std::fabs((double)a[i] - (double)b[i]);
+                    if (d > max_abs) max_abs = d;
+                }
+            }
+            return std::make_pair(diff_count, max_abs);
+        };
+
+        auto [det_diff, det_max] = cmp(y1a, y1b, M);
+        auto [bi_diff, bi_max]   = cmp(y1a, yN, M);
+
+        if (det_diff != 0) {
+            printf("\033[1;33mNONDETERMINISTIC\033[0m A!=B diff=%zu max|Δ|=%.3g  (BI also: diff=%zu max|Δ|=%.3g)\n",
+                   det_diff, det_max, bi_diff, bi_max);
+            return false;
+        }
+        if (bi_diff == 0) {
+            printf("\033[1;32mOK\033[0m (byte-identical, det=OK)\n");
+            return true;
+        }
+        printf("\033[1;31mFAIL\033[0m BI diff=%zu/%lld max|Δ|=%.3g (det=OK: same-input → same-output)\n",
+               bi_diff, (long long)M, bi_max);
+        return false;
+    }
+};
+
+// test_batch_invariance_soft_max: SOFT_MAX along axis-0 of [K, N].
+struct test_batch_invariance_soft_max {
+    const int64_t K;   // row length (softmax axis)
+    const int64_t N;   // n_tokens
+
+    test_batch_invariance_soft_max(int64_t K = 512, int64_t N = 4) : K(K), N(N) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_SOFT_MAX(K=%lld,N=%lld): ", (long long)K, (long long)N);
+        fflush(stdout);
+
+        std::vector<float> x0(K);
+        bi_fill(x0.data(), K, -5.0f, 5.0f, 0xB);
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+            ggml_tensor * y = ggml_soft_max(ctx, x);
+            ggml_build_forward_expand(gf, y);
+
+            if (!ggml_backend_supports_op(backend, y)) {
+                printf("not supported\n"); ggml_free(ctx); return false;
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+
+            std::vector<float> x_host((size_t)K * n_tokens);
+            memcpy(x_host.data(), x0.data(), K * sizeof(float));
+            if (n_tokens > 1) {
+                bi_fill(x_host.data() + K, K * (n_tokens - 1), -5.0f, 5.0f, 0xC);
+            }
+            ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * sizeof(float));
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            out_pos0.resize(K);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, K * sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < (size_t)K; i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%lld max|Δ|=%.3g\n", diff_count, (long long)K, max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_rms_norm: RMS_NORM along axis-0 of [K, N].
+struct test_batch_invariance_rms_norm {
+    const int64_t K;
+    const int64_t N;
+
+    test_batch_invariance_rms_norm(int64_t K = 512, int64_t N = 4) : K(K), N(N) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_RMS_NORM(K=%lld,N=%lld): ", (long long)K, (long long)N);
+        fflush(stdout);
+
+        std::vector<float> x0(K);
+        bi_fill(x0.data(), K, -1.0f, 1.0f, 0xB);
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+            ggml_tensor * y = ggml_rms_norm(ctx, x, 1e-5f);
+            ggml_build_forward_expand(gf, y);
+
+            if (!ggml_backend_supports_op(backend, y)) {
+                printf("not supported\n"); ggml_free(ctx); return false;
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+
+            std::vector<float> x_host((size_t)K * n_tokens);
+            memcpy(x_host.data(), x0.data(), K * sizeof(float));
+            if (n_tokens > 1) bi_fill(x_host.data() + K, K * (n_tokens - 1), -1.0f, 1.0f, 0xC);
+            ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * sizeof(float));
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            out_pos0.resize(K);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, K * sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < (size_t)K; i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%lld max|Δ|=%.3g\n", diff_count, (long long)K, max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_unary: SILU / GELU / RELU at n=1 vs n=N.
+struct test_batch_invariance_unary {
+    const ggml_unary_op op;
+    const int64_t K;
+    const int64_t N;
+
+    test_batch_invariance_unary(ggml_unary_op op = GGML_UNARY_OP_SILU,
+            int64_t K = 512, int64_t N = 4) : op(op), K(K), N(N) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_UNARY(op=%d,K=%lld,N=%lld): ", (int)op, (long long)K, (long long)N);
+        fflush(stdout);
+
+        std::vector<float> x0(K);
+        bi_fill(x0.data(), K, -3.0f, 3.0f, 0xB);
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+            ggml_tensor * y = ggml_unary(ctx, x, op);
+            ggml_build_forward_expand(gf, y);
+
+            if (!ggml_backend_supports_op(backend, y)) {
+                printf("not supported\n"); ggml_free(ctx); return false;
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+
+            std::vector<float> x_host((size_t)K * n_tokens);
+            memcpy(x_host.data(), x0.data(), K * sizeof(float));
+            if (n_tokens > 1) bi_fill(x_host.data() + K, K * (n_tokens - 1), -3.0f, 3.0f, 0xC);
+            ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * sizeof(float));
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            out_pos0.resize(K);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, K * sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < (size_t)K; i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%lld max|Δ|=%.3g\n", diff_count, (long long)K, max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_fused_up_gate: dense FUSED_UP_GATE at n=1 vs n=N.
+//   up/gate: [K, M] quantized. b: [K, N] f32. op: activation.
+//   Compares the pos-0 row of the output byte-identical.
+struct test_batch_invariance_fused_up_gate {
+    const ggml_type type_a;
+    const int64_t K;
+    const int64_t M;
+    const int64_t N;
+    const ggml_unary_op op;
+
+    test_batch_invariance_fused_up_gate(ggml_type type_a = GGML_TYPE_Q8_0,
+            int64_t K = 2048, int64_t M = 512, int64_t N = 4,
+            ggml_unary_op op = GGML_UNARY_OP_SILU)
+        : type_a(type_a), K(K), M(M), N(N), op(op) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_FUSED_UP_GATE(type_a=%s,K=%lld,M=%lld,N=%lld,op=%d): ",
+               ggml_type_name(type_a), (long long)K, (long long)M, (long long)N, (int)op);
+        fflush(stdout);
+
+        std::vector<uint8_t> up_bytes(ggml_row_size(type_a, K) * M);
+        std::vector<uint8_t> gate_bytes(ggml_row_size(type_a, K) * M);
+        {
+            std::vector<float> tmp(K * M);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_quantize_chunk(type_a, tmp.data(), up_bytes.data(), 0, M, K, nullptr);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xD);
+            ggml_quantize_chunk(type_a, tmp.data(), gate_bytes.data(), 0, M, K, nullptr);
+        }
+        std::vector<float> b0(K);
+        bi_fill(b0.data(), K, -0.5f, 0.5f, 0xB);
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_tensor * up   = ggml_new_tensor_2d(ctx, type_a, K, M);
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, type_a, K, M);
+            ggml_tensor * b    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+            ggml_tensor * y    = ggml_fused_up_gate(ctx, up, gate, b, op);
+            ggml_build_forward_expand(gf, y);
+            if (!ggml_backend_supports_op(backend, y)) { printf("not supported\n"); ggml_free(ctx); return false; }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+            ggml_backend_tensor_set(up,   up_bytes.data(),   0, up_bytes.size());
+            ggml_backend_tensor_set(gate, gate_bytes.data(), 0, gate_bytes.size());
+            std::vector<float> b_host((size_t)K * n_tokens);
+            memcpy(b_host.data(), b0.data(), K * sizeof(float));
+            if (n_tokens > 1) bi_fill(b_host.data() + K, K * (n_tokens - 1), -0.5f, 0.5f, 0xC);
+            ggml_backend_tensor_set(b, b_host.data(), 0, b_host.size() * sizeof(float));
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            out_pos0.resize(M);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, M * sizeof(float));
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < (size_t)M; i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%lld max|Δ|=%.3g\n", diff_count, (long long)M, max_abs);
+        return false;
+    }
+};
+
+// test_pos1_invariance_moe_fused_up_gate: probes an op-level BI bug that
+// pos-0-only testing misses. The fused_moe shader handles pos=0 correctly
+// (matches sequential) but positions 1+ in a batched dispatch diverge from
+// what an isolated n_tokens=1 call would produce with the same pos-1 input.
+// Full-model evidence: decode(N=4).logits[pos=1] differs from
+// sequential-through-pos-1.logits[0] by max|Δ|=5.1 on qwen35-A3B.
+struct test_pos1_invariance_moe_fused_up_gate {
+    const ggml_type type_a;
+    const int64_t K;
+    const int64_t M;
+    const int64_t n_experts;
+    const int64_t n_expert_used;
+    const ggml_unary_op op;
+
+    test_pos1_invariance_moe_fused_up_gate(ggml_type type_a = GGML_TYPE_Q4_K,
+            int64_t K = 256, int64_t M = 256,
+            int64_t n_experts = 16, int64_t n_expert_used = 2,
+            ggml_unary_op op = GGML_UNARY_OP_SILU)
+        : type_a(type_a), K(K), M(M), n_experts(n_experts),
+          n_expert_used(n_expert_used), op(op) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_MOE_FUSED_UP_GATE_POS1(type_a=%s,K=%lld,M=%lld,n_exp=%lld,n_used=%lld): ",
+               ggml_type_name(type_a), (long long)K, (long long)M,
+               (long long)n_experts, (long long)n_expert_used);
+        fflush(stdout);
+
+        const size_t leaf_bytes = (size_t)ggml_row_size(type_a, K) * (size_t)M * (size_t)n_experts;
+        if (leaf_bytes > (size_t)1 << 30) {
+            printf("\033[1;33mSKIP\033[0m (tensor %.2f GiB > 1 GiB)\n", (double)leaf_bytes / (double)(1ULL<<30));
+            return true;
+        }
+
+        std::vector<uint8_t> up_bytes(ggml_row_size(type_a, K) * M * n_experts);
+        std::vector<uint8_t> gate_bytes(ggml_row_size(type_a, K) * M * n_experts);
+        {
+            std::vector<float> tmp(K * M * n_experts);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_quantize_chunk(type_a, tmp.data(), up_bytes.data(), 0, M * n_experts, K, nullptr);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xD);
+            ggml_quantize_chunk(type_a, tmp.data(), gate_bytes.data(), 0, M * n_experts, K, nullptr);
+        }
+        // Two independent input vectors, fixed across runs.
+        std::vector<float> b_pos0(K), b_pos1(K);
+        bi_fill(b_pos0.data(), K, -0.5f, 0.5f, 0xB);
+        bi_fill(b_pos1.data(), K, -0.5f, 0.5f, 0xC);
+        // Fixed expert ids per position (token-0 uses ids_pos0, token-1 uses ids_pos1).
+        std::vector<int32_t> ids_pos0(n_expert_used), ids_pos1(n_expert_used);
+        for (int e = 0; e < n_expert_used; e++) {
+            ids_pos0[e] = (int32_t)((e * 7 + 3) % n_experts);
+            ids_pos1[e] = (int32_t)((e * 11 + 5) % n_experts);
+        }
+
+        // run_one: ggml_moe_up_gate with n_tokens=nt; input[pos]=b_pos, ids[pos]=ids_pos.
+        auto run_one = [&](int nt, const std::vector<std::vector<float>> & bs,
+                           const std::vector<std::vector<int32_t>> & idss,
+                           std::vector<std::vector<float>> & out_per_pos) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_tensor * up   = ggml_new_tensor_3d(ctx, type_a, K, M, n_experts);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_a, K, M, n_experts);
+            ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, nt);
+            ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, nt);
+            ggml_tensor * y    = ggml_moe_up_gate(ctx, up, gate, b, ids, op);
+            ggml_build_forward_expand(gf, y);
+            if (!ggml_backend_supports_op(backend, y)) { printf("not supported\n"); ggml_free(ctx); return false; }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+            ggml_backend_tensor_set(up,   up_bytes.data(),   0, up_bytes.size());
+            ggml_backend_tensor_set(gate, gate_bytes.data(), 0, gate_bytes.size());
+            std::vector<float> b_host((size_t)K * nt);
+            std::vector<int32_t> ids_host((size_t)n_expert_used * nt);
+            for (int t = 0; t < nt; t++) {
+                memcpy(b_host.data() + t * K, bs[t].data(), K * sizeof(float));
+                memcpy(ids_host.data() + t * n_expert_used, idss[t].data(), n_expert_used * sizeof(int32_t));
+            }
+            ggml_backend_tensor_set(b, b_host.data(), 0, b_host.size() * sizeof(float));
+            ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            const size_t per_pos = (size_t)M * n_expert_used;
+            out_per_pos.assign(nt, std::vector<float>(per_pos));
+            for (int t = 0; t < nt; t++) {
+                ggml_backend_tensor_get(y, out_per_pos[t].data(), t * per_pos * sizeof(float), per_pos * sizeof(float));
+            }
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            return true;
+        };
+
+        // Batched: N=2 with [b_pos0, b_pos1] / [ids_pos0, ids_pos1].
+        std::vector<std::vector<float>>   bs_batched   = { b_pos0, b_pos1 };
+        std::vector<std::vector<int32_t>> idss_batched = { ids_pos0, ids_pos1 };
+        std::vector<std::vector<float>>   out_batched;
+        if (!run_one(2, bs_batched, idss_batched, out_batched)) return true;
+
+        // Solo-at-pos-1: N=1 with [b_pos1] / [ids_pos1].
+        std::vector<std::vector<float>>   bs_solo   = { b_pos1 };
+        std::vector<std::vector<int32_t>> idss_solo = { ids_pos1 };
+        std::vector<std::vector<float>>   out_solo;
+        if (!run_one(1, bs_solo, idss_solo, out_solo)) return true;
+
+        // Compare batched[pos=1] vs solo[pos=0].
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < out_batched[1].size(); i++) {
+            if (out_batched[1][i] != out_solo[0][i]) {
+                diff_count++;
+                double d = std::fabs((double)out_batched[1][i] - (double)out_solo[0][i]);
+                if (d > max_abs) max_abs = d;
+            }
+        }
+        if (diff_count == 0) {
+            printf("\033[1;32mOK\033[0m (pos-1 byte-identical to solo run)\n");
+            return true;
+        }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%zu max|Δ|=%.3g  (op produces non-BI pos-1 output in batched mode)\n",
+               diff_count, out_batched[1].size(), max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_moe_fused_up_gate: MoE FUSED_UP_GATE at n=1 vs n=N.
+//   up/gate: [K, M, n_experts] quantized. b: [K, 1, n_tokens] f32. ids: [n_used, n_tokens] i32.
+//   Expert routing is deterministic per fixed seed; pos-0 (token 0) sees same experts in both runs.
+struct test_batch_invariance_moe_fused_up_gate {
+    const ggml_type type_a;
+    const int64_t K;
+    const int64_t M;
+    const int64_t n_experts;
+    const int64_t n_expert_used;
+    const int64_t N;
+    const ggml_unary_op op;
+
+    test_batch_invariance_moe_fused_up_gate(ggml_type type_a = GGML_TYPE_Q8_0,
+            int64_t K = 2048, int64_t M = 512,
+            int64_t n_experts = 16, int64_t n_expert_used = 2,
+            int64_t N = 4, ggml_unary_op op = GGML_UNARY_OP_SILU)
+        : type_a(type_a), K(K), M(M), n_experts(n_experts),
+          n_expert_used(n_expert_used), N(N), op(op) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_MOE_FUSED_UP_GATE(type_a=%s,K=%lld,M=%lld,n_exp=%lld,n_used=%lld,N=%lld): ",
+               ggml_type_name(type_a), (long long)K, (long long)M,
+               (long long)n_experts, (long long)n_expert_used, (long long)N);
+        fflush(stdout);
+
+        // Skip shapes that exceed the conservative 1 GiB single-buffer limit
+        // most Vulkan drivers report. We print an explicit SKIP so the large-
+        // shape coverage gap is visible in the test output rather than a
+        // silent pass after a ggml-level "tensor too large" error.
+        const size_t leaf_bytes = (size_t)ggml_row_size(type_a, K) * (size_t)M * (size_t)n_experts;
+        const size_t kMaxBufferBytes = (size_t)1 << 30;  // 1 GiB
+        if (leaf_bytes > kMaxBufferBytes) {
+            printf("\033[1;33mSKIP\033[0m (expert-weight tensor %.2f GiB > 1 GiB buffer limit)\n",
+                   (double)leaf_bytes / (double)(1ULL << 30));
+            return true;
+        }
+
+        std::vector<uint8_t> up_bytes(ggml_row_size(type_a, K) * M * n_experts);
+        std::vector<uint8_t> gate_bytes(ggml_row_size(type_a, K) * M * n_experts);
+        {
+            std::vector<float> tmp(K * M * n_experts);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_quantize_chunk(type_a, tmp.data(), up_bytes.data(), 0, M * n_experts, K, nullptr);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xD);
+            ggml_quantize_chunk(type_a, tmp.data(), gate_bytes.data(), 0, M * n_experts, K, nullptr);
+        }
+        std::vector<float> b0(K);
+        bi_fill(b0.data(), K, -0.5f, 0.5f, 0xB);
+        // Token 0's expert ids — randomized to exercise arbitrary routing
+        // across the full expert grid (real models rarely pick [0,1,...,k-1]).
+        // Still identical between N=1 and N=N runs so token-0 comparison is
+        // meaningful. Deterministic LCG seeded from the test shape.
+        std::vector<int32_t> ids0(n_expert_used);
+        {
+            uint32_t s = 0x600D ^ (uint32_t)K ^ ((uint32_t)M << 8) ^ ((uint32_t)n_experts << 16);
+            std::vector<bool> used(n_experts, false);
+            for (int e = 0; e < n_expert_used; e++) {
+                int32_t pick;
+                do {
+                    s = s * 1664525u + 1013904223u;
+                    pick = (int32_t)(s % n_experts);
+                } while (used[pick]);
+                used[pick] = true;
+                ids0[e] = pick;
+            }
+        }
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_tensor * up   = ggml_new_tensor_3d(ctx, type_a, K, M, n_experts);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_a, K, M, n_experts);
+            ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+            ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * y    = ggml_moe_up_gate(ctx, up, gate, b, ids, op);
+            ggml_build_forward_expand(gf, y);
+            if (!ggml_backend_supports_op(backend, y)) { printf("not supported\n"); ggml_free(ctx); return false; }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+            ggml_backend_tensor_set(up,   up_bytes.data(),   0, up_bytes.size());
+            ggml_backend_tensor_set(gate, gate_bytes.data(), 0, gate_bytes.size());
+            std::vector<float> b_host((size_t)K * n_tokens);
+            memcpy(b_host.data(), b0.data(), K * sizeof(float));
+            if (n_tokens > 1) bi_fill(b_host.data() + K, K * (n_tokens - 1), -0.5f, 0.5f, 0xC);
+            ggml_backend_tensor_set(b, b_host.data(), 0, b_host.size() * sizeof(float));
+            // Token 0's ids fixed; other tokens get random routing.
+            std::vector<int32_t> ids_host((size_t)n_expert_used * n_tokens);
+            memcpy(ids_host.data(), ids0.data(), n_expert_used * sizeof(int32_t));
+            for (int t = 1; t < n_tokens; t++) {
+                uint32_t s = 0xE + t;
+                for (int e = 0; e < n_expert_used; e++) {
+                    s = s * 1664525u + 1013904223u;
+                    ids_host[t * n_expert_used + e] = (int32_t)(s % n_experts);
+                }
+            }
+            ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            // Output is [M, n_expert_used, n_tokens]. Read token-0 slice = first M*n_expert_used floats.
+            const size_t token0_n = (size_t)M * n_expert_used;
+            out_pos0.resize(token0_n);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, token0_n * sizeof(float));
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < y1.size(); i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%zu max|Δ|=%.3g\n", diff_count, y1.size(), max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_mul_mat_id: non-fused MoE mat-mat routing at n=1 vs n=N.
+//   as:  [K, M, n_experts] quantized.
+//   b:   [K, 1, n_tokens]  f32 (broadcast over n_expert_used).
+//   ids: [n_expert_used, n_tokens] i32. Token-0's ids fixed across runs.
+//   Output [M, n_expert_used, n_tokens]. Compares token-0 slice byte-identical.
+struct test_batch_invariance_mul_mat_id {
+    const ggml_type type_a;
+    const int64_t K;
+    const int64_t M;
+    const int64_t n_experts;
+    const int64_t n_expert_used;
+    const int64_t N;
+
+    test_batch_invariance_mul_mat_id(ggml_type type_a = GGML_TYPE_Q8_0,
+            int64_t K = 2048, int64_t M = 512,
+            int64_t n_experts = 16, int64_t n_expert_used = 2,
+            int64_t N = 4)
+        : type_a(type_a), K(K), M(M), n_experts(n_experts),
+          n_expert_used(n_expert_used), N(N) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_MUL_MAT_ID(type_a=%s,K=%lld,M=%lld,n_exp=%lld,n_used=%lld,N=%lld): ",
+               ggml_type_name(type_a), (long long)K, (long long)M,
+               (long long)n_experts, (long long)n_expert_used, (long long)N);
+        fflush(stdout);
+
+        std::vector<uint8_t> as_bytes(ggml_row_size(type_a, K) * M * n_experts);
+        {
+            std::vector<float> tmp(K * M * n_experts);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_quantize_chunk(type_a, tmp.data(), as_bytes.data(), 0, M * n_experts, K, nullptr);
+        }
+        std::vector<float> b0(K);
+        bi_fill(b0.data(), K, -0.5f, 0.5f, 0xB);
+        // Token 0's expert ids — fixed, identical across runs.
+        std::vector<int32_t> ids0(n_expert_used);
+        for (int e = 0; e < n_expert_used; e++) ids0[e] = e;
+
+        auto run_one = [&](int64_t n_tokens, std::vector<float> & out_pos0) -> bool {
+            ggml_init_params p = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, K, M, n_experts);
+            ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * y   = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_build_forward_expand(gf, y);
+            if (!ggml_backend_supports_op(backend, y)) { printf("not supported\n"); ggml_free(ctx); return false; }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+            ggml_backend_tensor_set(as, as_bytes.data(), 0, as_bytes.size());
+            std::vector<float> b_host((size_t)K * n_tokens);
+            memcpy(b_host.data(), b0.data(), K * sizeof(float));
+            if (n_tokens > 1) bi_fill(b_host.data() + K, K * (n_tokens - 1), -0.5f, 0.5f, 0xC);
+            ggml_backend_tensor_set(b, b_host.data(), 0, b_host.size() * sizeof(float));
+            std::vector<int32_t> ids_host((size_t)n_expert_used * n_tokens);
+            memcpy(ids_host.data(), ids0.data(), n_expert_used * sizeof(int32_t));
+            for (int t = 1; t < n_tokens; t++) {
+                uint32_t s = 0xE + t;
+                for (int e = 0; e < n_expert_used; e++) {
+                    s = s * 1664525u + 1013904223u;
+                    ids_host[t * n_expert_used + e] = (int32_t)(s % n_experts);
+                }
+            }
+            ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+            // Output [M, n_expert_used, n_tokens] row-major in ne order. Token-0 slice = first M*n_expert_used floats.
+            const size_t token0_n = (size_t)M * n_expert_used;
+            out_pos0.resize(token0_n);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, token0_n * sizeof(float));
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < y1.size(); i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%zu max|Δ|=%.3g\n", diff_count, y1.size(), max_abs);
+        return false;
+    }
+};
+
+// test_batch_invariance_flash_attn: FLASH_ATTN_EXT at nb=1 vs nb=N.
+//   q:    [hs, nb,  nh_q, 1] f32
+//   k/v:  [hs, kv,  nh_kv, 1] f16
+//   mask: [kv, GGML_PAD(nb, GGML_KQ_MASK_PAD), 1, 1] f16 (optional)
+//   Compares pos-0 output slice (first HSV * nh_q floats) byte-identical.
+//   Covers Vulkan pipeline variants: {cm2/cm1/scalar} × {f16acc/f32acc} ×
+//   {small_rows/large_rows} × {aligned/unaligned}. The path actually selected
+//   depends on backend capability + N + KV; setting prec and varying nb
+//   drives a representative subset.
+struct test_batch_invariance_flash_attn {
+    const int64_t hs;        // head size (Q/K dim 0)
+    const int64_t nh_q;      // num query heads
+    const int64_t nh_kv;     // num kv heads (for GQA)
+    const int64_t kv;        // kv ctx len
+    const int64_t N;         // nb: query batch size for the "batch=N" run
+    const bool    f32acc;    // GGML_PREC_F32 accumulator vs default F16
+    const bool    use_mask;  // whether to provide a mask
+
+    test_batch_invariance_flash_attn(int64_t hs = 128, int64_t nh_q = 16,
+            int64_t nh_kv = 8, int64_t kv = 512, int64_t N = 4,
+            bool f32acc = false, bool use_mask = true)
+        : hs(hs), nh_q(nh_q), nh_kv(nh_kv), kv(kv), N(N),
+          f32acc(f32acc), use_mask(use_mask) {}
+
+    bool eval(ggml_backend_t backend) {
+        printf("  BI_FLASH_ATTN(hs=%lld,nh_q=%lld,nh_kv=%lld,kv=%lld,N=%lld,f32acc=%d,mask=%d): ",
+               (long long)hs, (long long)nh_q, (long long)nh_kv,
+               (long long)kv, (long long)N, (int)f32acc, (int)use_mask);
+        fflush(stdout);
+
+        GGML_ASSERT(nh_q % nh_kv == 0);
+
+        const int64_t hs_padded = hs; // f16 KV → blck_size 1
+        const float scale = 1.0f / sqrtf((float)hs);
+
+        // K, V shared between both runs.
+        std::vector<ggml_fp16_t> k_host((size_t)hs_padded * kv * nh_kv);
+        std::vector<ggml_fp16_t> v_host((size_t)hs_padded * kv * nh_kv);
+        {
+            std::vector<float> tmp(hs_padded * kv * nh_kv);
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xA);
+            ggml_fp32_to_fp16_row(tmp.data(), k_host.data(), tmp.size());
+            bi_fill(tmp.data(), tmp.size(), -0.5f, 0.5f, 0xD);
+            ggml_fp32_to_fp16_row(tmp.data(), v_host.data(), tmp.size());
+        }
+
+        // Q at position 0 (shared across runs).
+        std::vector<float> q0((size_t)hs_padded * nh_q);
+        bi_fill(q0.data(), q0.size(), -0.5f, 0.5f, 0xB);
+
+        auto run_one = [&](int64_t nb, std::vector<float> & out_pos0) -> bool {
+            const int64_t nb_pad = GGML_PAD(nb, GGML_KQ_MASK_PAD);
+
+            ggml_init_params p = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), NULL, true };
+            ggml_context * ctx = ggml_init(p);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+
+            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs_padded, nb,     nh_q,  1);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs_padded, kv,     nh_kv, 1);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs_padded, kv,     nh_kv, 1);
+            ggml_tensor * m = use_mask
+                ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb_pad, 1, 1)
+                : nullptr;
+            ggml_tensor * y = ggml_flash_attn_ext(ctx, q, k, v, m, scale, 0.0f, 0.0f);
+            if (f32acc) ggml_flash_attn_ext_set_prec(y, GGML_PREC_F32);
+            ggml_build_forward_expand(gf, y);
+
+            if (!ggml_backend_supports_op(backend, y)) {
+                printf("not supported\n"); ggml_free(ctx); return false;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) { printf("alloc fail\n"); ggml_free(ctx); return false; }
+
+            ggml_backend_tensor_set(k, k_host.data(), 0, k_host.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(v, v_host.data(), 0, v_host.size() * sizeof(ggml_fp16_t));
+
+            // Q: position 0 shared, positions 1..nb-1 differ across the batch.
+            // Layout: [hs, nb, nh_q, 1] — for each head, nb rows of hs floats.
+            // Token 0 = row 0 of each head.
+            std::vector<float> q_host((size_t)hs_padded * nb * nh_q);
+            for (int64_t h = 0; h < nh_q; h++) {
+                // Pos-0 row for head h.
+                memcpy(q_host.data() + h * hs_padded * nb,
+                       q0.data() + h * hs_padded,
+                       hs_padded * sizeof(float));
+                // Remaining rows (pos 1..nb-1) — different seed per head.
+                if (nb > 1) {
+                    bi_fill(q_host.data() + h * hs_padded * nb + hs_padded,
+                            hs_padded * (nb - 1), -0.5f, 0.5f, 0xC + (uint32_t)h);
+                }
+            }
+            ggml_backend_tensor_set(q, q_host.data(), 0, q_host.size() * sizeof(float));
+
+            if (m) {
+                // Uniform zero mask (all keys attended). Pos-0 row is identical
+                // across runs, which is what the BI check requires.
+                std::vector<ggml_fp16_t> m_host((size_t)kv * nb_pad, ggml_fp32_to_fp16(0.0f));
+                ggml_backend_tensor_set(m, m_host.data(), 0, m_host.size() * sizeof(ggml_fp16_t));
+            }
+
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_synchronize(backend);
+
+            // Output y has shape {hs, nh_q, nb, 1} per ggml_flash_attn_ext.
+            //   ne[0]=hs, ne[1]=nh_q, ne[2]=nb. Linear index: t*(nh_q*hs) + h*hs + d.
+            //   Token-0 slice = the first hs*nh_q floats.
+            const size_t token0_n = (size_t)hs * nh_q;
+            out_pos0.resize(token0_n);
+            ggml_backend_tensor_get(y, out_pos0.data(), 0, token0_n * sizeof(float));
+
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            return true;
+        };
+
+        std::vector<float> y1, yN;
+        if (!run_one(1, y1)) return true;
+        if (!run_one(N, yN)) return true;
+
+        size_t diff_count = 0; double max_abs = 0.0;
+        for (size_t i = 0; i < y1.size(); i++) {
+            if (y1[i] != yN[i]) { diff_count++; double d = std::fabs((double)y1[i] - (double)yN[i]); if (d > max_abs) max_abs = d; }
+        }
+        if (diff_count == 0) { printf("\033[1;32mOK\033[0m (byte-identical)\n"); return true; }
+        printf("\033[1;31mFAIL\033[0m diff=%zu/%zu max|Δ|=%.3g\n", diff_count, y1.size(), max_abs);
+        return false;
+    }
+};
+
 // GGML_OP_MULTI_ADD — uses custom eval (like test_fused_up_gate) because
 // the op expects a strided view_2d input that the standard test framework
 // doesn't initialize correctly.
@@ -3605,6 +4449,102 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             if (fug_ok != fug_total) {
                 n_ok = 0; // force overall failure
             }
+        }
+
+        // BATCH_INVARIANCE probes — hunt for ops whose pos-0 output
+        // differs between n_tokens=1 and n_tokens=N on the same backend.
+        if (op_name == nullptr || std::string(op_name) == "BATCH_INVARIANCE") {
+            printf("\n  === BATCH_INVARIANCE (same backend, n=1 vs n=N, pos-0 byte-identical) ===\n");
+            size_t bi_ok = 0, bi_total = 0;
+
+            // MUL_MAT: narrow search to find which shape/pipeline triggers the bug.
+            for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                for (int64_t N : {2, 4}) {
+                    bi_total++; if (test_batch_invariance_mul_mat(ta,  256,  256, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta,  512,  512, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta, 1024,  512, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta, 2048,  128, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta, 2048,  256, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta, 2048,  512, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat(ta, 2048, 1024, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // SOFT_MAX: small (fits wg=64), larger (triggers wg512 variant).
+            for (int64_t K : {64, 512, 4096}) {
+                for (int64_t N : {2, 4}) {
+                    bi_total++; if (test_batch_invariance_soft_max(K, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // RMS_NORM: Qwen-like head_dim.
+            for (int64_t K : {64, 128, 256}) {
+                for (int64_t N : {2, 4}) {
+                    bi_total++; if (test_batch_invariance_rms_norm(K, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // Unary activations.
+            for (ggml_unary_op uop : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU, GGML_UNARY_OP_RELU}) {
+                bi_total++; if (test_batch_invariance_unary(uop, 1024, 4).eval(backend)) bi_ok++;
+            }
+
+            // FUSED_UP_GATE (dense) — same spec-const pipeline-variant pattern as mul_mat_vec.
+            for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                for (int64_t N : {2, 4}) {
+                    bi_total++; if (test_batch_invariance_fused_up_gate(ta, 256, 256, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_fused_up_gate(ta, 2048, 512, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // MOE_FUSED_UP_GATE — MoE expert-routed variant.
+            for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                for (int64_t N : {2, 4, 8}) {
+                    bi_total++; if (test_batch_invariance_moe_fused_up_gate(ta, 256, 256, 16, 2, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_moe_fused_up_gate(ta, 2048, 512, 16, 2, N).eval(backend)) bi_ok++;
+                    // Qwen3.5-35B-A3B-ish shape: K=5120, M=2560, n_experts=128, n_used=8.
+                    bi_total++; if (test_batch_invariance_moe_fused_up_gate(ta, 5120, 2560, 128, 8, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // Per-position BI: fused_moe's pos-1 output in a batched dispatch
+            // must match a solo-at-pos-1 call. The pos-0-only test above
+            // misses a shader bug where pos-1+ outputs diverge massively from
+            // their sequential counterparts (full-model evidence max|Δ|=5.1
+            // between batched pos=1 and sequential-through-1 on 35B-A3B).
+            for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                bi_total++; if (test_pos1_invariance_moe_fused_up_gate(ta, 256, 256, 16, 2).eval(backend)) bi_ok++;
+                bi_total++; if (test_pos1_invariance_moe_fused_up_gate(ta, 2048, 512, 16, 2).eval(backend)) bi_ok++;
+                bi_total++; if (test_pos1_invariance_moe_fused_up_gate(ta, 5120, 2560, 128, 8).eval(backend)) bi_ok++;
+            }
+
+            // MUL_MAT_ID — non-fused MoE mat-mat (the `-no-fmoe` path).
+            for (ggml_type ta : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                for (int64_t N : {2, 4}) {
+                    bi_total++; if (test_batch_invariance_mul_mat_id(ta,  256, 256, 16, 2, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat_id(ta,  256, 512, 16, 2, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat_id(ta, 2048, 256, 16, 2, N).eval(backend)) bi_ok++;
+                    bi_total++; if (test_batch_invariance_mul_mat_id(ta, 2048, 512, 16, 2, N).eval(backend)) bi_ok++;
+                }
+            }
+
+            // FLASH_ATTN — exercise Vulkan pipeline variants on RDNA2:
+            //   {cm2/cm1/scalar} × {f16acc/f32acc} × {small_rows/large_rows} × {aligned/unaligned}.
+            // Qwen3.5 shapes: head_dim=128, nh_q=16, nh_kv∈{8,2} (GQA), kv_ctx=512.
+            // N∈{1,2,4,8} drives small_rows vs large_rows pipeline selection.
+            for (bool f32acc : {false, true}) {
+                for (int64_t nh_kv : {8, 2}) {
+                    for (int64_t N : {2, 4, 8}) {
+                        bi_total++; if (test_batch_invariance_flash_attn(
+                            /*hs=*/128, /*nh_q=*/16, /*nh_kv=*/nh_kv,
+                            /*kv=*/512, /*N=*/N, /*f32acc=*/f32acc,
+                            /*use_mask=*/true).eval(backend)) bi_ok++;
+                    }
+                }
+            }
+
+            printf("  BATCH_INVARIANCE: %zu/%zu passed\n", bi_ok, bi_total);
+            if (bi_ok != bi_total) n_ok = 0;
         }
 
         // MOE_FUSED_UP_GATE — MoE variant of FUSED_UP_GATE (compare-vs-CPU)

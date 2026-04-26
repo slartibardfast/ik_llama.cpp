@@ -116,6 +116,13 @@ struct server_slot {
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
 
+    // Inline MTP draft-position hint: set by the verify-accept step when a
+    // partial reject occurred so the next cycle's draft read picks the
+    // post-reject-aligned batch position from mtp_logits_buf instead of the
+    // default last (= rejected draft) position. -1 means "use last position"
+    // (no prior partial reject, or first decode after prompt).
+    int last_verify_n_accepted = -1;
+
     json json_schema;
 
     common_chat_format chat_format = COMMON_CHAT_FORMAT_CONTENT_ONLY;

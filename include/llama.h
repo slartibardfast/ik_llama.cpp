@@ -1540,6 +1540,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int64_t       llama_get_mtp_n_vocab(struct llama_context * ctx);
     LLAMA_API llama_token   llama_get_mtp_draft_token(struct llama_context * ctx);
 
+    // Same as llama_get_mtp_draft_token but reads MTP logits at a specific
+    // batch position index. Needed after a partial-reject verify decode:
+    // the server's SSM state is rolled back to "after position n_accepted-1",
+    // so the correct draft for the NEXT cycle comes from the MTP logits at
+    // that same position index (not the default last position = rejected
+    // draft slot). Returns LLAMA_TOKEN_NULL if `i` is out of range, the
+    // buffer is invalid, or the argmax lands on an EOG token.
+    LLAMA_API llama_token   llama_get_mtp_draft_token_at(struct llama_context * ctx, int32_t i);
+
     // MTP-IR (intermediate rollback) API: returns MTP logits for a specific
     // batch position in the last decode. Used on partial reject to draft from
     // the j_mismatch position (last accepted token) rather than the rejected

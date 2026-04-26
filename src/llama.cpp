@@ -9501,6 +9501,14 @@ bool llama_rollback_delta_net_state(struct llama_context * ctx, int32_t token_id
         }
     }
 
+    // Drain backend command queues after the tensor_get/set burst. Each
+    // delta-net layer submits 5+ Vulkan commands (several gets + sets); over
+    // many reject cycles this exhausts RADV's command-buffer pool and the
+    // driver eventually returns ErrorOutOfDeviceMemory → DeviceLost. One
+    // synchronize here lets the driver recycle those buffers before the next
+    // decode step.
+    ggml_backend_sched_synchronize(ctx->sched);
+
     return true;
 }
 
@@ -9522,6 +9530,29 @@ llama_token llama_get_mtp_draft_token(struct llama_context * ctx) {
     }
 
     // Don't propose EOG tokens as drafts
+    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), best)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return best;
+}
+
+// Position-addressed variant of llama_get_mtp_draft_token. See llama.h.
+llama_token llama_get_mtp_draft_token_at(struct llama_context * ctx, int32_t i) {
+    if (!ctx) return LLAMA_TOKEN_NULL;
+    const float * logits = llama_get_mtp_logits_ith(ctx, i);
+    if (!logits || ctx->mtp_n_vocab == 0) return LLAMA_TOKEN_NULL;
+
+    const int64_t n_vocab = ctx->mtp_n_vocab;
+
+    llama_token best = 0;
+    float best_logit = logits[0];
+    for (int64_t j = 1; j < n_vocab; j++) {
+        if (logits[j] > best_logit) {
+            best_logit = logits[j];
+            best = (llama_token) j;
+        }
+    }
+
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), best)) {
         return LLAMA_TOKEN_NULL;
     }

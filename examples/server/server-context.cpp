@@ -2871,10 +2871,25 @@ void server_context::add_sampled_tokens() {
                     draft = common_mtp_read_drafts(ctx, mtp_ir_k_max, -1);
                 }
                 if (draft.empty()) {
-                    llama_token d = llama_get_mtp_draft_token(ctx);
+                    // After a partial-reject verify decode the SSM state was
+                    // rolled back to "post token n_accepted-1"; the MTP draft
+                    // we feed into the next verify must come from that same
+                    // position in mtp_logits_buf, not the stale last
+                    // (rejected) position. last_verify_n_accepted is set in
+                    // speculative_decoding_accept; -1 means no prior reject.
+                    llama_token d;
+                    if (slot.last_verify_n_accepted > 0) {
+                        d = llama_get_mtp_draft_token_at(
+                                ctx, slot.last_verify_n_accepted - 1);
+                    } else {
+                        d = llama_get_mtp_draft_token(ctx);
+                    }
                     if (d != LLAMA_TOKEN_NULL) draft.push_back(d);
                 }
                 mtp_inline_used = !draft.empty();
+                // Consume the hint so the next post-prompt or post-accept
+                // draft read uses the default last-position behavior.
+                slot.last_verify_n_accepted = -1;
             }
 
             if (!mtp_inline_used && !model_has_inline_mtp) {
@@ -3503,6 +3518,30 @@ void server_context::speculative_decoding_accept() {
         slot.cache_tokens.insert({ ids.begin(), ids.end() - 1 });
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
+
+        // Hybrid-model SSM state rollback. On delta-net models the verify
+        // decode advanced the recurrent state through ALL batched tokens
+        // (accepted + rejected). llama_kv_cache_seq_rm only trims KV-cell
+        // metadata — it does not undo SSM/conv state writes. Without an
+        // explicit rollback the cache holds post-last-token state; future
+        // decodes read the wrong SSM context and the greedy trajectory
+        // drifts (see tests/test-35b-trajectory-drift).
+        const int n_verify_batch = (int) n_draft + 1;
+        const int n_accepted     = (int) ids.size();
+        if (n_accepted < n_verify_batch &&
+                (llama_model_is_hybrid(llama_get_model(ctx)) ||
+                 llama_model_is_recurrent(llama_get_model(ctx)))) {
+            // token_idx is the index of the last accepted token within the
+            // verify batch (0-indexed). Rollback restores SSM state to the
+            // per-token intermediate captured after that token.
+            llama_rollback_delta_net_state(ctx, /*token_idx=*/n_accepted - 1,
+                    slot.id, /*target_pos=*/slot.n_past - 1);
+            // Tell the next draft read to use this position from
+            // mtp_logits_buf (avoids the stale last/rejected-draft slot).
+            slot.last_verify_n_accepted = n_accepted;
+        } else {
+            slot.last_verify_n_accepted = -1;
+        }
 
         llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
 

@@ -391,7 +391,15 @@ ggml_tensor * delta_net::build_qkv(llama_context & lctx, ggml_context * ctx0,
 
     // MTP-IR: emit per-token intermediate states when batching drafts (n_tok > 1).
     // Required for llama_rollback_delta_net_state on partial reject.
-    const bool emit_intermediates = (n_tok > 1);
+    //
+    // Note: emit_intermediates=0 switches ggml_compute_forward_delta_net to
+    // the IQK fast path (see ggml.c:22827), while emit_intermediates=1 forces
+    // the slow path. The two paths produce slightly different float results,
+    // so using different paths at batch=1 vs batch>1 causes position-0 state
+    // to diverge by O(epsilon) — which compounds over many batch>1 + rollback
+    // cycles and eventually flips argmax. Force slow path for both batch sizes
+    // to keep batch=1 and batch>1 numerically identical.
+    const bool emit_intermediates = true;
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type, emit_intermediates);
 
     cb(output, "attn_output", il);
