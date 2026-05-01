@@ -4723,7 +4723,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                    op->src[1]->ne[0] == op->src[0]->ne[1] &&
                    op->src[3]->ne[0] == op->src[0]->ne[2];
         case GGML_OP_DELTA_NET:
-            return true;
+            // CUDA kernel asserts dst has output_size + state_size elements.
+            // ggml_delta_net_ext sizes dst with state_size * n_tokens when
+            // emit_intermediates (op_params[2]) is set — fall back to CPU
+            // unless emit_intermediates is off, or n_tokens (q->ne[1]) is 1.
+            return op->op_params[2] == 0 || op->src[0]->ne[1] == 1;
         case GGML_OP_FLASH_ATTN_EXT:
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
             return (op->src[0]->ne[0] == 64 && op->src[1]->type == GGML_TYPE_F16) || op->src[0]->ne[0] == 128;
