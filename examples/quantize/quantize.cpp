@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "ggml.h"
 
 #include <cstdio>
 #include <cstring>
@@ -202,12 +203,136 @@ static void usage(const char * executable) {
     exit(1);
 }
 
+// Load a modern GGUF-format imatrix (general.type=="imatrix") and convert it
+// to the same flat per-tensor map the legacy .dat loader produces.
+//
+// GGUF imatrix layout (see e.g. unsloth's imatrix_unsloth.gguf_file):
+//   - per weight tensor T:
+//       T.in_sum2  shape=[D]    or [D, E]   (E = expert count for MoE)
+//       T.counts   shape=[1]    or [1, E]
+//   - imatrix.datasets : STRING or ARRAY<UINT8> raw bytes
+//   - imatrix.chunk_count : u32
+//
+// The legacy loader stores per-tensor *means* of squared activations (after
+// applying `v /= ncall`). Mirror that by computing in_sum2 / count, with
+// per-expert counts on MoE tensors so each expert's channels are weighted
+// independently.
+static int load_imatrix_gguf(const std::string & imatrix_file,
+                             std::string & imatrix_dataset,
+                             std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
+    struct ggml_context * meta_ctx = NULL;
+    struct gguf_init_params gp = { /*no_alloc=*/false, /*ctx=*/&meta_ctx };
+    struct gguf_context * gctx = gguf_init_from_file(imatrix_file.c_str(), gp);
+    if (!gctx) {
+        printf("%s: failed to parse %s as GGUF imatrix\n", __func__, imatrix_file.c_str());
+        exit(1);
+    }
+
+    int t_idx = gguf_find_key(gctx, "general.type");
+    if (t_idx >= 0 && std::string(gguf_get_val_str(gctx, t_idx)) != "imatrix") {
+        printf("%s: GGUF general.type='%s', expected 'imatrix'\n", __func__, gguf_get_val_str(gctx, t_idx));
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        exit(1);
+    }
+
+    int chunk_count = 0;
+    int cc_idx = gguf_find_key(gctx, "imatrix.chunk_count");
+    if (cc_idx >= 0) {
+        chunk_count = (int) gguf_get_val_u32(gctx, cc_idx);
+    }
+
+    int ds_idx = gguf_find_key(gctx, "imatrix.datasets");
+    if (ds_idx >= 0) {
+        gguf_type kt = gguf_get_kv_type(gctx, ds_idx);
+        if (kt == GGUF_TYPE_STRING) {
+            imatrix_dataset = gguf_get_val_str(gctx, ds_idx);
+        } else if (kt == GGUF_TYPE_ARRAY) {
+            gguf_type at = gguf_get_arr_type(gctx, ds_idx);
+            int n = gguf_get_arr_n(gctx, ds_idx);
+            if (at == GGUF_TYPE_STRING && n > 0) {
+                imatrix_dataset = gguf_get_arr_str(gctx, ds_idx, 0);
+            } else if (at == GGUF_TYPE_UINT8 && n > 0) {
+                const void * data = gguf_get_arr_data(gctx, ds_idx);
+                imatrix_dataset.assign((const char *) data, (size_t) n);
+            }
+        }
+    }
+
+    int n_tensors = gguf_get_n_tensors(gctx);
+    int collected = 0;
+    int skipped_partial = 0;
+
+    const std::string suffix = ".in_sum2";
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * cname = gguf_get_tensor_name(gctx, i);
+        std::string tname(cname);
+        if (tname.size() < suffix.size() ||
+            tname.compare(tname.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        std::string base = tname.substr(0, tname.size() - suffix.size());
+        std::string counts_name = base + ".counts";
+
+        struct ggml_tensor * t_sum = meta_ctx ? ggml_get_tensor(meta_ctx, cname) : NULL;
+        struct ggml_tensor * t_cnt = meta_ctx ? ggml_get_tensor(meta_ctx, counts_name.c_str()) : NULL;
+        if (!t_sum || !t_cnt) {
+            skipped_partial++;
+            continue;
+        }
+        if (t_sum->type != GGML_TYPE_F32 || t_cnt->type != GGML_TYPE_F32) {
+            skipped_partial++;
+            continue;
+        }
+
+        const int64_t D = t_sum->ne[0];
+        const int64_t E = t_sum->ne[1] > 0 ? t_sum->ne[1] : 1;
+
+        const float * sums = (const float *) t_sum->data;
+        const float * cnts = (const float *) t_cnt->data;
+
+        std::vector<float> values((size_t)(D * E));
+        for (int64_t e = 0; e < E; ++e) {
+            float c = (E > 1) ? cnts[e] : cnts[0];
+            float inv = (c > 0.0f) ? (1.0f / c) : 1.0f;
+            const float * row_in = sums + e * D;
+            float * row_out = values.data() + e * D;
+            for (int64_t d = 0; d < D; ++d) {
+                row_out[d] = row_in[d] * inv;
+            }
+        }
+        imatrix_data[base] = std::move(values);
+        ++collected;
+    }
+
+    gguf_free(gctx);
+    if (meta_ctx) ggml_free(meta_ctx);
+
+    printf("%s: loaded %d importance matrix entries from %s (GGUF imatrix, %d chunks)\n",
+           __func__, collected, imatrix_file.c_str(), chunk_count);
+    if (skipped_partial > 0) {
+        printf("%s: skipped %d in_sum2 tensors with no matching counts or wrong dtype\n",
+               __func__, skipped_partial);
+    }
+    if (!imatrix_dataset.empty()) {
+        printf("%s: imatrix dataset='%s'\n", __func__, imatrix_dataset.c_str());
+    }
+    return chunk_count > 0 ? chunk_count : 1;
+}
+
 static int load_imatrix(const std::string & imatrix_file, std::string & imatrix_dataset, std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
     std::ifstream in(imatrix_file.c_str(), std::ios::binary);
     if (!in) {
         printf("%s: failed to open %s\n",__func__, imatrix_file.c_str());
         exit(1);
     }
+    char magic[4] = {0};
+    in.read(magic, 4);
+    if (in.gcount() == 4 && std::memcmp(magic, "GGUF", 4) == 0) {
+        in.close();
+        return load_imatrix_gguf(imatrix_file, imatrix_dataset, imatrix_data);
+    }
+    in.seekg(0, std::ios::beg);
     int n_entries;
     in.read((char *)&n_entries, sizeof(n_entries));
     if (in.fail() || n_entries < 1) {
