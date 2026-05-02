@@ -1510,7 +1510,18 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const int compute_capability = ggml_cuda_info().devices[id].cc;
 
-    if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    // BF16 native path: on sm_80+ cuBLAS picks BF16 tensor cores via CUBLAS_COMPUTE_32F.
+    // On sm_75 (Turing) cuBLAS has no BF16 TC and falls back to magma_sgemmEx (FP32
+    // compute, no TC) — fine at batch=1 (cublasGemv is well-tuned and beats FP16 path
+    // due to no conversion overhead) but catastrophic at batch>1 (verify forwards in
+    // MTP draft+verify), where it dominated wall time on Qwen 3.5.
+    //
+    // For sm_75, route batch>1 BF16 GEMMs to the FP16-conversion HMMA path below.
+    // Batch=1 keeps the BF16-native path (preserves baseline tg). Range overflow is
+    // not a concern for inference activations on this model class.
+    const bool bf16_native_eligible =
+        compute_capability >= CC_AMPERE || src1_ncols == 1;
+    if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && bf16_native_eligible) {
 
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
