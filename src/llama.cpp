@@ -4269,26 +4269,14 @@ static void llama_graph_compute(
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_tensor * dst = lctx.inp_mtp_states;
 
-#ifdef GGML_USE_CUDA
-    // Device-side fast path: when the previous DRAFT_GEN forward captured the
-    // residual into lctx.draft_residual_dev (also on CUDA), and dst lives on the
-    // same CUDA device, do a D2D copy and skip the host bounce.
-    if (lctx.draft_residual_dev_valid && lctx.draft_residual_dev != nullptr) {
-        ggml_backend_buffer_t dst_buf = dst->buffer;
-        const char * dbname = dst_buf ? ggml_backend_buffer_name(dst_buf) : nullptr;
-        if (dbname && strstr(dbname, "CUDA") != nullptr) {
-            int dd = 0;
-            const char * num_str = dbname + 4;
-            if (*num_str >= '0' && *num_str <= '9') dd = atoi(num_str);
-            if (dd == lctx.draft_residual_dev_device) {
-                const size_t want = ggml_nbytes(dst);
-                const size_t have = lctx.draft_residual_dev_nbytes;
-                ggml_backend_cuda_memcpy_d2d(dst->data, lctx.draft_residual_dev, std::min(want, have), dd);
-                return true;
-            }
-        }
-    }
-#endif
+    // NOTE: a device-resident residual fast-path was tried at commit 70150c6d
+    // (capture embd from DRAFT_GEN's post-MTP-layer output, replay via D2D into
+    // inp_mtp_states) but the captured residual is semantically wrong — the next
+    // DRAFT_GEN needs the main-forward residual (post-24-layer pre-MTP), not the
+    // DRAFT_GEN forward's own output. With the fast path enabled, draft acceptance
+    // collapsed from 0.85 → 0.03 (256-token greedy bench) and tg dropped from 145
+    // → 79 t/s. The buffer fields stay on lctx for ABI stability; the path is
+    // permanently inert. The host bounce remains.
 
     const float * src = lctx.draft_input_hidden_state;
     if (!src) {
@@ -4778,41 +4766,10 @@ static int llama_decode_internal(
                             GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd <= (int64_t) lctx.embd_size);
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new_embd*n_embd*sizeof(float));
 
-#ifdef GGML_USE_CUDA
-                            // Capture a device-resident copy of the residual for the next
-                            // MTP DRAFT_GEN iteration. The host bounce
-                            // (llama_get_embeddings_ith → llama_set_draft_input_hidden_state →
-                            // ggml_backend_tensor_set in prepare_mtp_graph_inputs) cost ~1.5 ms
-                            // per draft event; D2D between persistent buffer and inp_mtp_states
-                            // eliminates the trip through host memory.
-                            if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN) {
-                                ggml_backend_buffer_t embd_buf = embd->buffer;
-                                const char * ebname = embd_buf ? ggml_backend_buffer_name(embd_buf) : nullptr;
-                                if (ebname && strstr(ebname, "CUDA") != nullptr) {
-                                    int cd = 0;
-                                    const char * num_str = ebname + 4;
-                                    if (*num_str >= '0' && *num_str <= '9') cd = atoi(num_str);
-                                    const size_t needed = (size_t)n_outputs_new_embd * n_embd * sizeof(float);
-                                    if (needed > lctx.draft_residual_dev_capacity || cd != lctx.draft_residual_dev_device) {
-                                        if (lctx.draft_residual_dev) ggml_backend_cuda_free(lctx.draft_residual_dev);
-                                        lctx.draft_residual_dev = ggml_backend_cuda_malloc(needed, cd);
-                                        lctx.draft_residual_dev_capacity = lctx.draft_residual_dev ? needed : 0;
-                                        lctx.draft_residual_dev_device   = cd;
-                                    }
-                                    if (lctx.draft_residual_dev) {
-                                        // The scheduler stream was already running compute that produced embd->data.
-                                        // ggml_backend_synchronize waits for it before our D2D copy on the legacy
-                                        // default stream.
-                                        ggml_backend_synchronize(backend_embd);
-                                        ggml_backend_cuda_memcpy_d2d(lctx.draft_residual_dev, embd->data, needed, cd);
-                                        lctx.draft_residual_dev_nbytes = needed;
-                                        lctx.draft_residual_dev_valid  = true;
-                                    }
-                                }
-                            } else {
-                                lctx.draft_residual_dev_valid = false;
-                            }
-#endif
+                            // NOTE: a device-resident residual capture (commit 70150c6d) was
+                            // tried here. It introduced a stale-data path that broke draft
+                            // acceptance on subsequent runs. The path is permanently inert —
+                            // see prepare_mtp_graph_inputs for details.
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
