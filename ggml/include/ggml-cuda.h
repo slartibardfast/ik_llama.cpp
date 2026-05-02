@@ -66,6 +66,20 @@ GGML_API GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
     float   * host_probs_out,
     int device);
 
+// Synchronous device-to-device copy on the legacy default stream.
+// Used by llama_kv_cache / MTP plumbing in src/llama.cpp without needing a
+// cuda_runtime.h dependency.
+GGML_API GGML_CALL void ggml_backend_cuda_memcpy_d2d(
+    void * dst_dev,
+    const void * src_dev,
+    size_t nbytes,
+    int device);
+
+// Allocate persistent device buffer (cudaMalloc) of `nbytes` and return the pointer.
+// Returns nullptr on failure. Caller frees with ggml_backend_cuda_free.
+GGML_API GGML_CALL void * ggml_backend_cuda_malloc(size_t nbytes, int device);
+GGML_API GGML_CALL void   ggml_backend_cuda_free(void * ptr);
+
 // Device-side per-step state restore for delta-net / SSM checkpoint rollback.
 // Reconstructs n_layers worth of recurrent state (conv portion + ssm portion) entirely
 // on-device, eliminating the CPU-roundtrip that the host-side fallback in

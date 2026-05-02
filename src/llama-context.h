@@ -265,6 +265,16 @@ struct llama_context {
 
     const float * draft_input_hidden_state = nullptr;
 
+    // MTP DRAFT_GEN device-side residual cache: populated by the embedding-extract
+    // path on a CUDA backend (D2D copy from the cgraph's `embd` tensor) so the
+    // next iteration's prepare_mtp_graph_inputs can refill inp_mtp_states without
+    // the D2H+H2D bounce that ate ~1.5 ms per draft event.
+    void *  draft_residual_dev          = nullptr;
+    size_t  draft_residual_dev_nbytes   = 0;  // currently-populated payload size
+    size_t  draft_residual_dev_capacity = 0;  // allocated buffer size (grows on demand)
+    int     draft_residual_dev_device   = -1;
+    bool    draft_residual_dev_valid    = false;
+
     // MTP DRAFT_GEN argmax cache: populated by the on-device CUDA kernel after
     // a DRAFT_GEN forward pass to skip the per-draft logits D2H. Sampler
     // (common_sampler_sample_speculative) checks draft_argmax_valid first.

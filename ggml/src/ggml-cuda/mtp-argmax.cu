@@ -170,3 +170,31 @@ extern "C" GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
     CUDA_CHECK(cudaMemcpy(host_ids_out,   cached_ids_dev[device],   n_rows * sizeof(int32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(host_probs_out, cached_probs_dev[device], n_rows * sizeof(float),   cudaMemcpyDeviceToHost));
 }
+
+extern "C" GGML_CALL void ggml_backend_cuda_memcpy_d2d(
+    void * dst_dev,
+    const void * src_dev,
+    size_t nbytes,
+    int device) {
+
+    if (nbytes == 0 || dst_dev == nullptr || src_dev == nullptr) return;
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaMemcpyAsync(dst_dev, src_dev, nbytes, cudaMemcpyDeviceToDevice, /*stream=*/nullptr));
+}
+
+extern "C" GGML_CALL void * ggml_backend_cuda_malloc(size_t nbytes, int device) {
+    if (nbytes == 0) return nullptr;
+    ggml_cuda_set_device(device);
+    void * p = nullptr;
+    cudaError_t err = cudaMalloc(&p, nbytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return p;
+}
+
+extern "C" GGML_CALL void ggml_backend_cuda_free(void * ptr) {
+    if (ptr == nullptr) return;
+    cudaFree(ptr);
+}
