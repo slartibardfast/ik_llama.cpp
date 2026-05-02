@@ -1595,15 +1595,65 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     if (compute_capability >= CC_VOLTA && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
+        //
+        // Weight conversion cache: src0 (the weight matrix) is immutable across
+        // GEMM calls — its device pointer is stable across forwards. Re-converting
+        // BF16→FP16 every call cost 49% of MTP GPU time on sm_75. Cache the
+        // conversion keyed on (data_ptr, row_low, row_high, src0_type, device).
+        // First call allocates + converts; subsequent calls reuse.
+        struct fp16_cache_key { const void * data; int64_t row_low; int64_t row_high; int type; int device; };
+        struct fp16_cache_entry { half * ptr; size_t nelems; };
+        struct fp16_cache_hash { size_t operator()(const fp16_cache_key & k) const noexcept {
+            return ((uintptr_t)k.data) ^ ((size_t)k.row_low << 1) ^ ((size_t)k.row_high << 17)
+                 ^ ((size_t)k.type << 31) ^ ((size_t)k.device << 47);
+        }};
+        struct fp16_cache_eq { bool operator()(const fp16_cache_key & a, const fp16_cache_key & b) const noexcept {
+            return a.data == b.data && a.row_low == b.row_low && a.row_high == b.row_high
+                && a.type == b.type && a.device == b.device;
+        }};
+        static std::unordered_map<fp16_cache_key, fp16_cache_entry, fp16_cache_hash, fp16_cache_eq> fp16_cache;
+        static std::mutex fp16_cache_mu;
+
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
-        if (src0->type != GGML_TYPE_F16) {
-            const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
-            GGML_ASSERT(to_fp16_cuda != nullptr);
-            size_t ne = row_diff*ne00;
-            src0_as_f16.alloc(ne);
-            to_fp16_cuda(src0_dd_i, src0_as_f16.get(), row_diff, ne00, stream);
+        const half * src0_ptr = nullptr;
+        if (src0->type == GGML_TYPE_F16) {
+            src0_ptr = (const half *) src0_dd_i;
+        } else {
+            const fp16_cache_key key{ src0_dd_i, row_low, row_high, (int)src0->type, id };
+            half * cached = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(fp16_cache_mu);
+                auto it = fp16_cache.find(key);
+                if (it != fp16_cache.end()) {
+                    cached = it->second.ptr;
+                }
+            }
+            if (cached) {
+                src0_ptr = cached;
+            } else {
+                const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+                GGML_ASSERT(to_fp16_cuda != nullptr);
+                size_t ne = row_diff*ne00;
+
+                ggml_cuda_set_device(id);
+                half * persistent = nullptr;
+                cudaError_t err = cudaMalloc((void**)&persistent, ne * sizeof(half));
+                if (err == cudaSuccess && persistent != nullptr) {
+                    to_fp16_cuda(src0_dd_i, persistent, row_diff, ne00, stream);
+                    {
+                        std::lock_guard<std::mutex> lock(fp16_cache_mu);
+                        fp16_cache[key] = { persistent, ne };
+                    }
+                    src0_ptr = persistent;
+                } else {
+                    // Out-of-memory fallback: per-call conversion via pool.
+                    (void)cudaGetLastError();
+                    src0_as_f16.alloc(ne);
+                    to_fp16_cuda(src0_dd_i, src0_as_f16.get(), row_diff, ne00, stream);
+                    src0_ptr = src0_as_f16.get();
+                }
+            }
         }
-        const half * src0_ptr = src0->type == GGML_TYPE_F16 ? (const half *) src0_dd_i : src0_as_f16.get();
 
         ggml_cuda_pool_alloc<half> src1_as_f16(ctx.pool(id));
         if (src1->type != GGML_TYPE_F16) {
