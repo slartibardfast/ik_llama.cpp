@@ -795,6 +795,17 @@ common_grammar_trigger common_grammar_trigger::from_json(const json& in) {
 llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob) {
     GGML_UNUSED(gsmpl);
 
+    // Fast path: device-computed argmax cached during the MTP DRAFT_GEN forward.
+    // Avoids the per-draft logits D2H (~2 MB at vocab=248,320 × 2 outputs).
+    {
+        int32_t cached_id;
+        float   cached_prob;
+        if (llama_get_draft_argmax(ctx, idx, &cached_id, &cached_prob)) {
+            if (out_prob) *out_prob = cached_prob;
+            return (llama_token)cached_id;
+        }
+    }
+
     float * logits = llama_get_logits_ith(ctx, idx);
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));
 

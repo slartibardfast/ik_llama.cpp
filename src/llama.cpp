@@ -4656,6 +4656,10 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            // Invalidate any stale draft-argmax cache from a previous decode.
+            lctx.draft_argmax_valid = false;
+            lctx.draft_argmax_n     = 0;
+
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP &&
                 cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
@@ -4665,6 +4669,42 @@ static int llama_decode_internal(
 
                 float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
                 const int32_t n_outputs_new = lctx.n_outputs;
+
+#ifdef GGML_USE_CUDA
+                // MTP DRAFT_GEN fast path: argmax + softmax-prob on device, then 8 B/row
+                // D2H instead of vocab*4 B/row. Sampler reads via llama_get_draft_argmax.
+                if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN && n_outputs_new > 0 && res->ne[1] > 0) {
+                    ggml_backend_buffer_t res_buf = res->buffer;
+                    const char * res_buf_name = res_buf ? ggml_backend_buffer_name(res_buf) : nullptr;
+                    if (res_buf_name && strstr(res_buf_name, "CUDA") != nullptr) {
+                        int cuda_device = 0;
+                        const char * num_str = res_buf_name + 4;
+                        if (*num_str >= '0' && *num_str <= '9') cuda_device = atoi(num_str);
+
+                        const int rows_to_pull = (int)res->ne[1];
+                        lctx.draft_argmax_ids.resize(rows_to_pull);
+                        lctx.draft_argmax_probs.resize(rows_to_pull);
+
+                        // Ensure backend compute that produced res->data is complete before
+                        // the (default-stream) argmax kernel reads it. Scheduler streams are
+                        // non-blocking and don't implicitly sync with the default stream.
+                        ggml_backend_synchronize(backend_res);
+
+                        ggml_backend_cuda_mtp_argmax_with_prob_to_host(
+                            res->data,
+                            rows_to_pull,
+                            n_vocab,
+                            lctx.draft_argmax_ids.data(),
+                            lctx.draft_argmax_probs.data(),
+                            cuda_device);
+
+                        lctx.draft_argmax_valid = true;
+                        lctx.draft_argmax_n     = rows_to_pull;
+
+                        goto logits_extract_done;
+                    }
+                }
+#endif
 
                 if (n_outputs_new) {
                     GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
@@ -4687,6 +4727,9 @@ static int llama_decode_internal(
                     }
                 }
             }
+#ifdef GGML_USE_CUDA
+        logits_extract_done:;
+#endif
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("get_result(...): %d us\n", int(tim2-tim1));
@@ -9913,6 +9956,16 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
     ctx->draft_input_hidden_state = hidden_state;
+}
+
+bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob) {
+    if (ctx == nullptr || !ctx->draft_argmax_valid) return false;
+    int32_t idx = i;
+    if (idx < 0) idx = ctx->draft_argmax_n + idx;
+    if (idx < 0 || idx >= ctx->draft_argmax_n) return false;
+    if (out_id)   *out_id   = ctx->draft_argmax_ids[idx];
+    if (out_prob) *out_prob = ctx->draft_argmax_probs[idx];
+    return true;
 }
 
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts) {

@@ -1085,6 +1085,11 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Returns true if a device-computed argmax+prob is cached for output index `i`
+    // (only populated after MTP DRAFT_GEN forwards on a CUDA backend). When true,
+    // *out_id and *out_prob are filled and the caller can skip pulling logits.
+    LLAMA_API bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

@@ -265,6 +265,14 @@ struct llama_context {
 
     const float * draft_input_hidden_state = nullptr;
 
+    // MTP DRAFT_GEN argmax cache: populated by the on-device CUDA kernel after
+    // a DRAFT_GEN forward pass to skip the per-draft logits D2H. Sampler
+    // (common_sampler_sample_speculative) checks draft_argmax_valid first.
+    bool                  draft_argmax_valid = false;
+    int32_t               draft_argmax_n     = 0;
+    std::vector<int32_t>  draft_argmax_ids;     // [n_outputs]
+    std::vector<float>    draft_argmax_probs;   // [n_outputs]
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]

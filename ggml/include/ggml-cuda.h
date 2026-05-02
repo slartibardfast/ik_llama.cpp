@@ -43,6 +43,29 @@ GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
+// Device-side argmax + softmax-prob over [n_rows, n_vocab] logits.
+// Replaces the host-side argmax loop in common_sampler_sample_speculative when
+// running greedy MTP draft sampling on a CUDA backend. Eliminates per-draft
+// logits D2H (~2 MB at vocab=248,320 × 2 outputs) in favour of a tiny 8 B/row
+// (id, prob) result.
+GGML_API GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob(
+    const void * logits_dev,    // float*, [n_rows, n_vocab] device pointer
+    int n_rows,
+    int n_vocab,
+    void * dst_ids_dev,         // int32_t*, [n_rows] device pointer
+    void * dst_probs_dev,       // float*,   [n_rows] device pointer
+    int device);
+
+// Single-call variant: handles per-device scratch alloc + kernel launch + D2H to
+// caller-provided host buffers. Synchronous (host buffers are valid on return).
+GGML_API GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
+    const void * logits_dev,
+    int n_rows,
+    int n_vocab,
+    int32_t * host_ids_out,
+    float   * host_probs_out,
+    int device);
+
 // Device-side per-step state restore for delta-net / SSM checkpoint rollback.
 // Reconstructs n_layers worth of recurrent state (conv portion + ssm portion) entirely
 // on-device, eliminating the CPU-roundtrip that the host-side fallback in
