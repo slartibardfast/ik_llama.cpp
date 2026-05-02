@@ -42,6 +42,27 @@ GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, si
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
+
+// Device-side per-step state restore for delta-net / SSM checkpoint rollback.
+// Reconstructs n_layers worth of recurrent state (conv portion + ssm portion) entirely
+// on-device, eliminating the CPU-roundtrip that the host-side fallback in
+// llama_kv_cache::per_step_restore performed via ggml_backend_tensor_get/set per layer.
+//
+// All pointer arrays must point to device memory on `device`. Pass nullptr for any
+// shadow_ptrs[i] when no shadow conv state is available (early-step path).
+GGML_API GGML_CALL void ggml_backend_cuda_per_step_restore_layers(
+    int n_layers,
+    void * const * dst_ptrs,            // s_l[il]->data
+    const void * const * ssm_ptrs,      // per_step_ssm[il]->data (full per-step buffer)
+    const void * const * qkv_ptrs,      // per_step_qkv[il]->data
+    const void * const * shadow_ptrs,   // s_l_shadow[il]->data (or nullptr)
+    int step,
+    int64_t conv_state_dim,             // = (d_conv-1) * conv_dim (elements)
+    int64_t conv_dim,
+    int32_t d_conv,
+    int64_t ssm_state_dim,              // elements per layer
+    int device);
+
 #ifdef  __cplusplus
 }
 #endif

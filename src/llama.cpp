@@ -1541,6 +1541,77 @@ bool llama_kv_cache::per_step_restore(int step) {
     const int32_t d_conv         = ckpt.per_step_d_conv;
     if (ssm_state_dim <= 0 || conv_dim <= 0 || d_conv <= 1) return false;
 
+    const uint32_t n_layer = (uint32_t)s_l.size();
+
+#ifdef GGML_USE_CUDA
+    // Fast path: when all layers' state tensors live on the same CUDA device, do the
+    // entire stitch on-device with one kernel launch instead of per-layer host-roundtrip
+    // tensor_get/tensor_set pairs.
+    {
+        bool all_cuda_same_device = true;
+        int  cuda_device = -1;
+        for (uint32_t il = 0; il < n_layer && all_cuda_same_device; ++il) {
+            if (s_l[il] == nullptr || ckpt.per_step_ssm[il] == nullptr) continue;
+            if (s_l[il]->extra != nullptr) { all_cuda_same_device = false; break; }
+            ggml_backend_buffer_t buf = s_l[il]->buffer;
+            if (buf == nullptr) { all_cuda_same_device = false; break; }
+            const char * name = ggml_backend_buffer_name(buf);
+            if (name == nullptr || strstr(name, "CUDA") == nullptr) {
+                all_cuda_same_device = false; break;
+            }
+            // Best-effort: pull device id from the buffer's name suffix "CUDA<n>".
+            int dev = 0;
+            const char * num_str = name + 4;
+            if (*num_str >= '0' && *num_str <= '9') dev = atoi(num_str);
+            if (cuda_device < 0) cuda_device = dev;
+            else if (dev != cuda_device) { all_cuda_same_device = false; break; }
+            // All companion buffers must be on the same device too.
+            ggml_backend_buffer_t b1 = ckpt.per_step_ssm[il]->buffer;
+            ggml_backend_buffer_t b2 = ckpt.per_step_qkv[il] ? ckpt.per_step_qkv[il]->buffer : buf;
+            ggml_backend_buffer_t b3 = ckpt.s_l_shadow[il]   ? ckpt.s_l_shadow[il]->buffer   : buf;
+            for (ggml_backend_buffer_t bx : { b1, b2, b3 }) {
+                const char * bn = bx ? ggml_backend_buffer_name(bx) : nullptr;
+                if (bn == nullptr || strstr(bn, "CUDA") == nullptr) {
+                    all_cuda_same_device = false; break;
+                }
+                int bd = 0;
+                const char * bn_num = bn + 4;
+                if (*bn_num >= '0' && *bn_num <= '9') bd = atoi(bn_num);
+                if (bd != cuda_device) { all_cuda_same_device = false; break; }
+            }
+        }
+
+        if (all_cuda_same_device && cuda_device >= 0) {
+            std::vector<void *>       dst_ptrs(n_layer, nullptr);
+            std::vector<const void *> ssm_ptrs(n_layer, nullptr);
+            std::vector<const void *> qkv_ptrs(n_layer, nullptr);
+            std::vector<const void *> shadow_ptrs(n_layer, nullptr);
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (s_l[il] == nullptr || ckpt.per_step_ssm[il] == nullptr) continue;
+                if (s_l[il]->extra != nullptr) continue;
+                dst_ptrs[il]    = s_l[il]->data;
+                ssm_ptrs[il]    = ckpt.per_step_ssm[il]->data;
+                qkv_ptrs[il]    = ckpt.per_step_qkv[il] ? ckpt.per_step_qkv[il]->data : nullptr;
+                shadow_ptrs[il] = ckpt.s_l_shadow[il]   ? ckpt.s_l_shadow[il]->data   : nullptr;
+            }
+            ggml_backend_cuda_per_step_restore_layers(
+                (int)n_layer,
+                dst_ptrs.data(),
+                ssm_ptrs.data(),
+                qkv_ptrs.data(),
+                shadow_ptrs.data(),
+                step,
+                conv_state_dim,
+                conv_dim,
+                d_conv,
+                ssm_state_dim,
+                cuda_device);
+            return true;
+        }
+    }
+#endif
+
+    // Host fallback path (cross-device, non-CUDA backends, or split tensors).
     const int64_t ssm_bytes  = ssm_state_dim * sizeof(float);
     const int64_t conv_bytes = conv_state_dim * sizeof(float);
     const int32_t d_conv_m1  = d_conv - 1;  // number of columns in conv state
@@ -1551,7 +1622,6 @@ bool llama_kv_cache::per_step_restore(int step) {
     const int64_t qkv_needed = (int64_t)(step + 1) * conv_dim;
     std::vector<float> qkv_buf(qkv_needed);
 
-    const uint32_t n_layer = (uint32_t)s_l.size();
     int n_restored = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (s_l[il] == nullptr || ckpt.per_step_ssm[il] == nullptr) continue;
