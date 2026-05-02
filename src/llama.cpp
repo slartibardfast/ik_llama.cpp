@@ -1259,9 +1259,19 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
         }
     }
 
-    if (!nonsplit_entries.empty()) {
+    // Group nonsplit entries by their primary tensor's buft so each shadow co-locates
+    // with its source tensor. This avoids forced D2H/H2D on every checkpoint save and
+    // restore — particularly hot in MTP draft loops where checkpoints fire per draft
+    // iteration.
+    std::map<ggml_backend_buffer_type_t, std::vector<tensor_entry>> nonsplit_buft_entries;
+    for (auto & entry : nonsplit_entries) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(entry.primary->buffer);
+        nonsplit_buft_entries[buft].push_back(entry);
+    }
+
+    for (auto & [buft, entries] : nonsplit_buft_entries) {
         ggml_init_params params = {
-            /*.mem_size   =*/ nonsplit_entries.size() * ggml_tensor_overhead(),
+            /*.mem_size   =*/ entries.size() * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -1271,24 +1281,27 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
             return false;
         }
 
-        for (auto & entry : nonsplit_entries) {
-            // Only need the conv portion when per-step is active.
-            const int64_t nelems = conv_only_shadow
-                ? ckpt.per_step_conv_state_dim
-                : (int64_t)ggml_nelements(entry.primary);
+        for (auto & entry : entries) {
+            // Co-locating shadow with primary lets ggml_backend_tensor_copy operate D2D.
+            // That requires identical sizes, so the prior conv_only_shadow shrink is dropped
+            // — the saved VRAM was modest (the conv portion is a small fraction of the full
+            // recurrent state) and the D2D speedup eliminates the dominant per-checkpoint
+            // PCIe roundtrip in MTP draft loops.
+            const int64_t nelems = (int64_t)ggml_nelements(entry.primary);
             ggml_tensor * shadow = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelems);
             ggml_format_name(shadow, "shadow_s_l%d", entry.il);
             ckpt.s_l_shadow[entry.il] = shadow;
         }
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate CPU buffer for shadow tensors\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer for shadow tensors\n", __func__);
             ggml_free(ctx);
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: CPU shadow buffer = %8.2f MiB (%s)\n", __func__,
+        LLAMA_LOG_INFO("%s: %10s shadow buffer = %8.2f MiB (%s)\n", __func__,
+                       ggml_backend_buffer_name(buf),
                        ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
                        conv_only_shadow ? "conv-state only" : "full recurrent state");
         ckpt.shadow_ctxs.push_back(ctx);
@@ -1383,8 +1396,10 @@ bool llama_kv_cache::checkpoint_save() {
             }
             split_s_idx++;
         } else {
-            const size_t nbytes = ggml_nbytes(ckpt.s_l_shadow[il]);
-            ggml_backend_tensor_get(s_l[il], ckpt.s_l_shadow[il]->data, 0, nbytes);
+            // Use tensor_copy (buft-aware) instead of tensor_get (forced D2H) — when the
+            // shadow buffer co-locates with the primary, this becomes a D2D op, eliminating
+            // the per-checkpoint PCIe roundtrip that dominated MTP draft-loop wall time.
+            ggml_backend_tensor_copy(s_l[il], ckpt.s_l_shadow[il]);
         }
     }
 
