@@ -4081,8 +4081,25 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 #ifdef USE_CUDA_GRAPH
 
+// Topology hash: stable across calls with identical (n_nodes, per-node op, per-node ne dims).
+// Replaces the pointer-as-key approach so a given topology hits the same cache slot
+// regardless of where the allocator places nodes[0] on each call. Returned as void * so
+// the existing unordered_map<const void*, ...> type stays unchanged.
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    uint64_t h = 0xcbf29ce484222325ULL;        // FNV-1a 64-bit init
+    const uint64_t prime = 0x100000001b3ULL;
+    h ^= (uint64_t)cgraph->n_nodes;
+    h *= prime;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        h ^= (uint64_t)n->op;
+        h *= prime;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            h ^= (uint64_t)n->ne[d];
+            h *= prime;
+        }
+    }
+    return reinterpret_cast<const void *>((uintptr_t)h);
 }
 
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
@@ -4241,6 +4258,8 @@ static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_gra
 static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph * cgraph) {
 
     bool cuda_graph_update_required = false;
+    int  first_mismatch_idx = -1;
+    int  first_mismatch_op = -1;
 
     if (graph->instance == nullptr) {
         cuda_graph_update_required = true;
@@ -4260,9 +4279,20 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
             has_matching_properties = ggml_graph_node_has_matching_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
         }
         if (!has_matching_properties) {
+            if (first_mismatch_idx == -1) {
+                first_mismatch_idx = i;
+                first_mismatch_op  = cgraph->nodes[i]->op;
+            }
             cuda_graph_update_required = true;
         }
         set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
+    }
+
+    static const bool debug_graph_updates = (getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr);
+    if (debug_graph_updates && cuda_graph_update_required) {
+        fprintf(stderr, "[graph-update] n_nodes=%d first_mismatch_idx=%d op=%s\n",
+                cgraph->n_nodes, first_mismatch_idx,
+                first_mismatch_op >= 0 ? ggml_op_name((ggml_op)first_mismatch_op) : "size_or_first");
     }
 
     return cuda_graph_update_required;
