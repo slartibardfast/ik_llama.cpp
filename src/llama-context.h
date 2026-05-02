@@ -278,10 +278,21 @@ struct llama_context {
     // MTP DRAFT_GEN argmax cache: populated by the on-device CUDA kernel after
     // a DRAFT_GEN forward pass to skip the per-draft logits D2H. Sampler
     // (common_sampler_sample_speculative) checks draft_argmax_valid first.
+    // Also reused for the verify-step (MTP_OP_NONE + cparams.mtp) when the
+    // caller has set fast_argmax_for_verify and guarantees a trivial sampler.
     bool                  draft_argmax_valid = false;
     int32_t               draft_argmax_n     = 0;
     std::vector<int32_t>  draft_argmax_ids;     // [n_outputs]
     std::vector<float>    draft_argmax_probs;   // [n_outputs]
+
+    // Caller-controlled enable for the verify-step argmax-cache fast path.
+    // The server sets this true before decode iff the slot's effective sampler
+    // is "trivial" (greedy temp=0, no penalties, no grammar, no biases, no
+    // rbudget, no DRY/mirostat/XTC/etc.). When true, the verify decode skips
+    // the full logits D2H and populates draft_argmax_* the same way DRAFT_GEN
+    // does. Auto-cleared at the next decode entry; caller must re-arm per
+    // decode.
+    bool fast_argmax_for_verify = false;
 
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]

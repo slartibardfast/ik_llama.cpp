@@ -4668,6 +4668,11 @@ static int llama_decode_internal(
             // Invalidate any stale draft-argmax cache from a previous decode.
             lctx.draft_argmax_valid = false;
             lctx.draft_argmax_n     = 0;
+            // Snapshot+consume the verify-fast-path arming so the caller must
+            // re-arm per decode (matches llama_set_draft_input_hidden_state's
+            // single-shot semantics).
+            const bool fast_verify_armed = lctx.fast_argmax_for_verify;
+            lctx.fast_argmax_for_verify  = false;
 
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP &&
@@ -4680,9 +4685,16 @@ static int llama_decode_internal(
                 const int32_t n_outputs_new = lctx.n_outputs;
 
 #ifdef GGML_USE_CUDA
-                // MTP DRAFT_GEN fast path: argmax + softmax-prob on device, then 8 B/row
-                // D2H instead of vocab*4 B/row. Sampler reads via llama_get_draft_argmax.
-                if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN && n_outputs_new > 0 && res->ne[1] > 0) {
+                // MTP fast path: argmax + softmax-prob on device, then 8 B/row
+                // D2H instead of vocab*4 B/row. Sampler reads via
+                // llama_get_draft_argmax. Triggered for:
+                //   - DRAFT_GEN forwards (always: only argmax is consumed)
+                //   - VERIFY forwards (MTP_OP_NONE + cparams.mtp) when the
+                //     caller has explicitly armed fast_argmax_for_verify and
+                //     therefore committed to a trivial sampler.
+                const bool draftgen_fast = (cparams.mtp_op_type == MTP_OP_DRAFT_GEN);
+                const bool verify_fast   = (cparams.mtp_op_type == MTP_OP_NONE && cparams.mtp && fast_verify_armed);
+                if ((draftgen_fast || verify_fast) && n_outputs_new > 0 && res->ne[1] > 0) {
                     ggml_backend_buffer_t res_buf = res->buffer;
                     const char * res_buf_name = res_buf ? ggml_backend_buffer_name(res_buf) : nullptr;
                     if (res_buf_name && strstr(res_buf_name, "CUDA") != nullptr) {
@@ -9980,6 +9992,11 @@ bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out
     if (out_id)   *out_id   = ctx->draft_argmax_ids[idx];
     if (out_prob) *out_prob = ctx->draft_argmax_probs[idx];
     return true;
+}
+
+void llama_set_fast_argmax_for_verify(struct llama_context * ctx, bool enable) {
+    if (ctx == nullptr) return;
+    ctx->fast_argmax_for_verify = enable;
 }
 
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts) {

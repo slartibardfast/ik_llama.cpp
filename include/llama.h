@@ -1090,6 +1090,13 @@ extern "C" {
     // *out_id and *out_prob are filled and the caller can skip pulling logits.
     LLAMA_API bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob);
 
+    // Enable the verify-step fast-argmax path for the next llama_decode call.
+    // Caller must guarantee that the sampler used after the decode is "trivial"
+    // (greedy temp=0, no penalties/grammar/biases). Auto-cleared at decode
+    // entry — re-arm per decode. No-op when MTP is not active or when the
+    // backend does not support the on-device kernel.
+    LLAMA_API void llama_set_fast_argmax_for_verify(struct llama_context * ctx, bool enable);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

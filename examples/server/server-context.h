@@ -346,6 +346,12 @@ struct server_context {
 
     void apply_server_biases(server_slot& slot);
 
+    // True iff the slot's effective sampler (current sparams + grammar +
+    // logit_bias + positional_bans + allowlist + rbudget) reduces to argmax.
+    // When all slots in the next decode are trivial, the verify-step can
+    // populate the on-device argmax cache instead of D2H-ing full logits.
+    bool slot_sampler_is_trivial(const server_slot & slot) const;
+
     void request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens&& inputs);
 
     void request_cancel(int id_task);

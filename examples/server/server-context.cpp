@@ -2220,6 +2220,46 @@ void server_context::apply_server_biases(server_slot& slot) {
     }
 }
 
+bool server_context::slot_sampler_is_trivial(const server_slot & slot) const {
+    const common_params_sampling & sp = slot.sparams;
+
+    // Greedy only: any temperature path runs the dist sampler.
+    if (sp.temp > 0.0f)                      return false;
+    if (sp.dynatemp_range != 0.0f)           return false;
+
+    // Repetition / DRY / mirostat / XTC / top-n-sigma / adaptive / CFG.
+    if (sp.penalty_repeat  != 1.0f)          return false;
+    if (sp.penalty_freq    != 0.0f)          return false;
+    if (sp.penalty_present != 0.0f)          return false;
+    if (sp.dry_multiplier  != 0.0f)          return false;
+    if (sp.mirostat        != 0)             return false;
+    if (sp.xtc_probability != 0.0f)          return false;
+    if (sp.top_n_sigma     != 0.0f)          return false;
+    if (sp.adaptive_target >= 0.0f)          return false;
+    if (sp.cfg_scale       != 1.0f)          return false;
+    if (sp.use_penalty_prompt_tokens)        return false;
+
+    // n_probs > 0 makes populate_token_probs read cur_p, which the fast path
+    // does not populate.
+    if (sp.n_probs > 0)                      return false;
+
+    // Reasoning budget can force tokens; logit_bias rewrites argmax target.
+    if (sp.reasoning_budget_tokens >= 0)     return false;
+    if (!sp.logit_bias.empty())              return false;
+
+    // Grammar can constrain the result away from argmax.
+    if (!sp.grammar.empty())                 return false;
+    if (slot.ctx_sampling && slot.ctx_sampling->grammar != nullptr) return false;
+
+    // Server-side bias paths.
+    if (!slot.logit_bias.empty())            return false;
+    if (slot.allow_idx < slot.allow_biasess.size()) return false;
+    auto pb = slot.positional_bans.find(slot.n_past);
+    if (pb != slot.positional_bans.end() && !pb->second.empty()) return false;
+
+    return true;
+}
+
 void server_context::request_completion(int id_task, int id_multi, json data, bool infill, bool embedding, server_tokens&& inputs) {
     server_task task;
     task.id = id_task;
@@ -4475,6 +4515,25 @@ void server_context::update_slots() {
                 SLT_WRN(slot, "%s", "failed to save spec checkpoint\n");
             }
         }
+    }
+
+    // Arm the verify-step fast-argmax cache iff MTP is on AND every slot that
+    // is going to sample after this decode has a trivial sampler. The flag is
+    // single-shot — consumed by the next llama_decode entry. A slot's "going
+    // to sample" state is signalled either by slot.i_batch >= 0 (non-spec
+    // path, or after spec-falls-back) or by a non-empty i_batch_dft (the
+    // verify-step path; speculative_decoding_accept will sample via the
+    // i_batch_dft indices). Skip the scan when MTP isn't active.
+    if (params_base.has_mtp) {
+        bool any_target  = false;
+        bool all_trivial = true;
+        for (const auto & slot : slots) {
+            const bool will_sample = (slot.i_batch >= 0) || !slot.i_batch_dft.empty();
+            if (!will_sample) continue;
+            any_target = true;
+            if (!slot_sampler_is_trivial(slot)) { all_trivial = false; break; }
+        }
+        llama_set_fast_argmax_for_verify(ctx, any_target && all_trivial);
     }
 
     // process the created batch of tokens

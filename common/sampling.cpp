@@ -663,7 +663,19 @@ llama_token common_sampler_sample(
     struct llama_context * ctx_main,
     const int idx,
     bool grammar_first) {
-    // Call the implementation function with is_resampling set to false by default
+    // Verify-step fast path: when an upstream caller (e.g. server) has armed
+    // fast_argmax_for_verify and committed to a trivial sampler, the verify
+    // decode populated draft_argmax_* with on-device argmax and skipped the
+    // logits D2H. The sampler must not pull logits in that case — they aren't
+    // there. The arming check is the caller's responsibility; we just trust a
+    // cache hit and return the cached id.
+    {
+        int32_t cached_id = 0;
+        float   cached_prob = 0.0f;
+        if (llama_get_draft_argmax(ctx_main, idx, &cached_id, &cached_prob)) {
+            return (llama_token)cached_id;
+        }
+    }
     return llama_sampling_sample_impl(ctx_sampling, ctx_main, nullptr, idx, /* is_resampling= */ grammar_first);
 }
 
