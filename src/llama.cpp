@@ -2714,6 +2714,217 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
     return std::make_pair(std::move(result), max_compute);
 }
 
+// PHASE32: apply recast metadata (per-tensor / per-channel scales, Hadamard
+// rotation) AFTER tensor data is loaded onto its target buffer. Walks
+// model.tensors_by_name; for each tensor named in the recast metadata, it
+// downloads the FP16 weights, applies the inverse transform in FP32, and
+// uploads. Tier T1 has no scale metadata and is a no-op.
+//
+// Requires --no-mmap: writes to host buffers via ggml_backend_tensor_set,
+// which would write through to the mmap'd file otherwise.
+static void llm_apply_recast(struct llama_model & model, llama_model_loader & ml) {
+    const int kid_tier = gguf_find_key(ml.meta, "recast.tier");
+    if (kid_tier < 0) {
+        return; // not a recast GGUF
+    }
+    const char * tier_str = gguf_get_val_str(ml.meta, kid_tier);
+    if (ml.use_mmap) {
+        const int kid_n = gguf_find_key(ml.meta, "recast.scales.names");
+        const int kid_pn = gguf_find_key(ml.meta, "recast.per_channel.names");
+        const int kid_hn = gguf_find_key(ml.meta, "recast.hadamard.names");
+        if (kid_n >= 0 || kid_pn >= 0 || kid_hn >= 0) {
+            throw std::runtime_error(
+                std::string("recast metadata present (tier=") + tier_str +
+                ") but model loaded with mmap; rerun with --no-mmap");
+        }
+        LLAMA_LOG_INFO("recast: tier=%s, no scales/rotation; mmap-safe\n", tier_str);
+        return;
+    }
+
+    // Per-tensor scales.
+    std::unordered_map<std::string, float> scales;
+    {
+        const int kid_n = gguf_find_key(ml.meta, "recast.scales.names");
+        const int kid_v = gguf_find_key(ml.meta, "recast.scales.values");
+        if (kid_n >= 0 && kid_v >= 0) {
+            const int n = gguf_get_arr_n(ml.meta, kid_n);
+            const float * vals = (const float *) gguf_get_arr_data(ml.meta, kid_v);
+            for (int i = 0; i < n; ++i) {
+                scales.emplace(gguf_get_arr_str(ml.meta, kid_n, i), vals[i]);
+            }
+        }
+    }
+
+    // Per-channel scales (T4): names + lengths + flat values.
+    std::unordered_map<std::string, std::vector<float>> pc_scales;
+    {
+        const int kid_n = gguf_find_key(ml.meta, "recast.per_channel.names");
+        const int kid_l = gguf_find_key(ml.meta, "recast.per_channel.lengths");
+        const int kid_v = gguf_find_key(ml.meta, "recast.per_channel.values");
+        if (kid_n >= 0 && kid_l >= 0 && kid_v >= 0) {
+            const int n = gguf_get_arr_n(ml.meta, kid_n);
+            const int32_t * lens = (const int32_t *) gguf_get_arr_data(ml.meta, kid_l);
+            const float * vals = (const float *) gguf_get_arr_data(ml.meta, kid_v);
+            int64_t off = 0;
+            for (int i = 0; i < n; ++i) {
+                const std::string name = gguf_get_arr_str(ml.meta, kid_n, i);
+                const int len = lens[i];
+                pc_scales[name] = std::vector<float>(vals + off, vals + off + len);
+                off += len;
+            }
+        }
+    }
+
+    // Hadamard sizes (T5).
+    std::unordered_map<std::string, int> had_sizes;
+    {
+        const int kid_n = gguf_find_key(ml.meta, "recast.hadamard.names");
+        const int kid_v = gguf_find_key(ml.meta, "recast.hadamard.values");
+        if (kid_n >= 0 && kid_v >= 0) {
+            const int n = gguf_get_arr_n(ml.meta, kid_n);
+            const uint32_t * vals = (const uint32_t *) gguf_get_arr_data(ml.meta, kid_v);
+            for (int i = 0; i < n; ++i) {
+                had_sizes.emplace(gguf_get_arr_str(ml.meta, kid_n, i), (int) vals[i]);
+            }
+        }
+    }
+
+    if (scales.empty() && pc_scales.empty() && had_sizes.empty()) {
+        LLAMA_LOG_INFO("recast: tier=%s, no transforms to apply\n", tier_str);
+        return;
+    }
+
+    // Fast in-place Walsh-Hadamard transform (butterfly, O(d log d)).
+    // d must be power of 2. Normalised by 1/sqrt(d) so H @ H.T = I.
+    auto walsh_hadamard_inplace = [](float * x, int d) {
+        // Sylvester WHT: stages of length 1, 2, 4, ..., d/2.
+        for (int h = 1; h < d; h *= 2) {
+            for (int i = 0; i < d; i += h * 2) {
+                for (int j = i; j < i + h; ++j) {
+                    const float a = x[j];
+                    const float b = x[j + h];
+                    x[j]     = a + b;
+                    x[j + h] = a - b;
+                }
+            }
+        }
+        const float norm = 1.0f / std::sqrt((float) d);
+        for (int i = 0; i < d; ++i) {
+            x[i] *= norm;
+        }
+    };
+
+    int n_scaled = 0, n_pc = 0, n_rotated = 0;
+    std::vector<uint8_t> hbuf;
+    std::vector<float> fp32_buf;
+    std::unordered_set<std::string> done; // tensors_by_name may have duplicates (tied embeddings)
+
+    LLAMA_LOG_INFO("recast: tier=%s, applying %zu per-tensor / %zu per-channel / %zu Hadamard transforms\n",
+                   tier_str, scales.size(), pc_scales.size(), had_sizes.size());
+
+    for (auto & it : model.tensors_by_name) {
+        ggml_tensor * t = it.second;
+        const std::string & name = it.first;
+        if (!done.insert(name).second) {
+            continue; // tensors_by_name can have duplicate entries (tied embeddings)
+        }
+
+        const auto sit = scales.find(name);
+        const auto pit = pc_scales.find(name);
+        const auto hit = had_sizes.find(name);
+        if (sit == scales.end() && pit == pc_scales.end() && hit == had_sizes.end()) {
+            continue;
+        }
+
+        if (!t) {
+            LLAMA_LOG_WARN("recast: %s tensor pointer is NULL — skipping\n", name.c_str());
+            continue;
+        }
+        if (!t->buffer) {
+            LLAMA_LOG_WARN("recast: %s has no buffer — skipping\n", name.c_str());
+            continue;
+        }
+
+        // Recast metadata is only emitted for FP16 tensors today.
+        if (t->type != GGML_TYPE_F16) {
+            LLAMA_LOG_WARN("recast: skipping %s (type=%s, expected F16)\n",
+                           name.c_str(), ggml_type_name(t->type));
+            continue;
+        }
+
+        const size_t  n_bytes  = ggml_nbytes(t);
+        const int64_t n_elems  = ggml_nelements(t);
+        const int64_t in_dim   = t->ne[0];
+        const int64_t out_dim  = (ggml_n_dims(t) >= 2) ? t->ne[1] : 1;
+
+        hbuf.resize(n_bytes);
+        ggml_backend_tensor_get(t, hbuf.data(), 0, n_bytes);
+
+        // FP16 → FP32
+        fp32_buf.resize(n_elems);
+        const ggml_fp16_t * fp16_data = (const ggml_fp16_t *) hbuf.data();
+        for (int64_t i = 0; i < n_elems; ++i) {
+            fp32_buf[i] = ggml_fp16_to_fp32(fp16_data[i]);
+        }
+
+        // Step 1: per-tensor scale (multiply back to recover magnitude).
+        if (sit != scales.end()) {
+            const float scale = sit->second;
+            for (int64_t i = 0; i < n_elems; ++i) {
+                fp32_buf[i] *= scale;
+            }
+            ++n_scaled;
+        }
+
+        // Step 2: per-channel scale.
+        if (pit != pc_scales.end()) {
+            const auto & rs = pit->second;
+            if ((int64_t) rs.size() != out_dim) {
+                LLAMA_LOG_WARN("recast: %s per-channel scale size mismatch (%zu vs %lld out)\n",
+                               name.c_str(), rs.size(), (long long) out_dim);
+            } else {
+                for (int64_t r = 0; r < out_dim; ++r) {
+                    const float s = rs[r];
+                    for (int64_t c = 0; c < in_dim; ++c) {
+                        fp32_buf[r * in_dim + c] *= s;
+                    }
+                }
+                ++n_pc;
+            }
+        }
+
+        // Step 3: Hadamard un-rotation. W' was rotated as W @ H in Tool 3
+        // (using a normalised symmetric Walsh-Hadamard with H @ H = I).
+        // Inverse: W = W' @ H. Apply fast in-place WHT per row.
+        if (hit != had_sizes.end()) {
+            const int d = hit->second;
+            if (d > in_dim) {
+                LLAMA_LOG_WARN("recast: %s hadamard d=%d > in_dim=%lld; skipping rotation\n",
+                               name.c_str(), d, (long long) in_dim);
+            } else if ((d & (d - 1)) != 0) {
+                LLAMA_LOG_WARN("recast: %s hadamard d=%d not power-of-two; skipping rotation\n",
+                               name.c_str(), d);
+            } else {
+                for (int64_t r = 0; r < out_dim; ++r) {
+                    walsh_hadamard_inplace(fp32_buf.data() + r * in_dim, d);
+                }
+                ++n_rotated;
+            }
+        }
+
+        // FP32 → FP16
+        ggml_fp16_t * fp16_out = (ggml_fp16_t *) hbuf.data();
+        for (int64_t i = 0; i < n_elems; ++i) {
+            fp16_out[i] = ggml_fp32_to_fp16(fp32_buf[i]);
+        }
+
+        ggml_backend_tensor_set(t, hbuf.data(), 0, n_bytes);
+    }
+
+    LLAMA_LOG_INFO("recast: tier=%s, applied per-tensor scales=%d, per-channel=%d, rotations=%d\n",
+                   tier_str, n_scaled, n_pc, n_rotated);
+}
+
 // Returns false if cancelled by progress_callback
 static bool llm_load_tensors(
         llama_model_loader & ml,
@@ -3288,6 +3499,12 @@ static bool llm_load_tensors(
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
         }
+    }
+
+    if (!dry_run) {
+        // PHASE32 recast hook: apply per-tensor / per-channel scales /
+        // Hadamard un-rotation if metadata is present. No-op for normal GGUFs.
+        llm_apply_recast(model, ml);
     }
 
     if (model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_MISTRAL4) {
