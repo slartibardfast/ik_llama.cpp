@@ -2748,9 +2748,20 @@ static void llm_apply_recast(struct llama_model & model, llama_model_loader & ml
         const int kid_v = gguf_find_key(ml.meta, "recast.scales.values");
         if (kid_n >= 0 && kid_v >= 0) {
             const int n = gguf_get_arr_n(ml.meta, kid_n);
+            const int n_v = gguf_get_arr_n(ml.meta, kid_v);
+            if (n != n_v) {
+                throw std::runtime_error(format(
+                    "recast.scales: names array length %d != values array length %d", n, n_v));
+            }
             const float * vals = (const float *) gguf_get_arr_data(ml.meta, kid_v);
             for (int i = 0; i < n; ++i) {
                 scales.emplace(gguf_get_arr_str(ml.meta, kid_n, i), vals[i]);
+            }
+            // Sanity: log first 3 entries to confirm parsing.
+            int dump = 0;
+            for (const auto & e : scales) {
+                if (dump++ >= 3) break;
+                LLAMA_LOG_INFO("recast: scale[%s] = %g\n", e.first.c_str(), e.second);
             }
         }
     }
@@ -2817,7 +2828,8 @@ static void llm_apply_recast(struct llama_model & model, llama_model_loader & ml
     int n_scaled = 0, n_pc = 0, n_rotated = 0;
     std::vector<uint8_t> hbuf;
     std::vector<float> fp32_buf;
-    std::unordered_set<std::string> done; // tensors_by_name may have duplicates (tied embeddings)
+    std::unordered_set<std::string> done_names; // for orphan diagnostic
+    std::unordered_set<const void *> done_ptrs; // dedup by pointer — same tensor can appear under multiple names
 
     LLAMA_LOG_INFO("recast: tier=%s, applying %zu per-tensor / %zu per-channel / %zu Hadamard transforms\n",
                    tier_str, scales.size(), pc_scales.size(), had_sizes.size());
@@ -2825,8 +2837,9 @@ static void llm_apply_recast(struct llama_model & model, llama_model_loader & ml
     for (auto & it : model.tensors_by_name) {
         ggml_tensor * t = it.second;
         const std::string & name = it.first;
-        if (!done.insert(name).second) {
-            continue; // tensors_by_name can have duplicate entries (tied embeddings)
+        done_names.insert(name);
+        if (!t || !done_ptrs.insert((const void *) t).second) {
+            continue; // already processed this tensor (under another name) or null
         }
 
         const auto sit = scales.find(name);
@@ -2923,6 +2936,33 @@ static void llm_apply_recast(struct llama_model & model, llama_model_loader & ml
 
     LLAMA_LOG_INFO("recast: tier=%s, applied per-tensor scales=%d, per-channel=%d, rotations=%d\n",
                    tier_str, n_scaled, n_pc, n_rotated);
+
+    // Report any scale entries that didn't get applied — name mismatches
+    // are silent failures that produce NaN/Inf during inference.
+    int n_orphan = 0;
+    for (const auto & sk : scales) {
+        if (done_names.find(sk.first) == done_names.end()) {
+            LLAMA_LOG_ERROR("recast: ORPHAN scale entry %s (scale=%g) — no tensor of that name found in model\n",
+                            sk.first.c_str(), sk.second);
+            ++n_orphan;
+        }
+    }
+    for (const auto & pk : pc_scales) {
+        if (done_names.find(pk.first) == done_names.end()) {
+            LLAMA_LOG_ERROR("recast: ORPHAN per-channel %s — no tensor of that name found\n", pk.first.c_str());
+            ++n_orphan;
+        }
+    }
+    for (const auto & hk : had_sizes) {
+        if (done_names.find(hk.first) == done_names.end()) {
+            LLAMA_LOG_ERROR("recast: ORPHAN hadamard %s d=%d — no tensor of that name found\n",
+                            hk.first.c_str(), hk.second);
+            ++n_orphan;
+        }
+    }
+    if (n_orphan > 0) {
+        LLAMA_LOG_WARN("recast: %d orphan entries (tensor names not in model). Run with -mtp to load MTP head, or remove these from Tool 3 emit when MTP not active.\n", n_orphan);
+    }
 }
 
 // Returns false if cancelled by progress_callback
