@@ -4260,7 +4260,35 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
+        // when off. Per-batch-shape histogram dumped every 100 decodes. Used
+        // for verify@K latency scaling probes during MTP optimisation.
+        static const bool _prof_decode = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+        struct decode_stat { long long sum_ns = 0; long long n = 0; long long min_ns = 0; long long max_ns = 0; };
+        static std::map<int, decode_stat> _prof_stats;
+        std::chrono::high_resolution_clock::time_point _prof_t0;
+        if (_prof_decode) _prof_t0 = std::chrono::high_resolution_clock::now();
+
         const int ret = llama_decode(ctx, batch_view);
+
+        if (_prof_decode) {
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const long long dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - _prof_t0).count();
+            auto & s = _prof_stats[(int)n_tokens];
+            s.sum_ns += dt; ++s.n;
+            if (s.n == 1 || dt < s.min_ns) s.min_ns = dt;
+            if (s.n == 1 || dt > s.max_ns) s.max_ns = dt;
+            if (s.n > 0 && (s.n % 100 == 0)) {
+                fprintf(stderr, "[decode-prof:verify]");
+                for (auto & kv : _prof_stats) {
+                    fprintf(stderr, " n=%d count=%lld mean=%.3fms min=%.3fms max=%.3fms",
+                        kv.first, kv.second.n,
+                        (double)kv.second.sum_ns / kv.second.n / 1e6,
+                        kv.second.min_ns / 1e6, kv.second.max_ns / 1e6);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;

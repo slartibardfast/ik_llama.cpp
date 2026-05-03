@@ -282,8 +282,15 @@ struct llama_context {
     // caller has set fast_argmax_for_verify and guarantees a trivial sampler.
     bool                  draft_argmax_valid = false;
     int32_t               draft_argmax_n     = 0;
-    std::vector<int32_t>  draft_argmax_ids;     // [n_outputs]
-    std::vector<float>    draft_argmax_probs;   // [n_outputs]
+    std::vector<int32_t>  draft_argmax_ids;       // [n_outputs] — top-1 token ids
+    std::vector<float>    draft_argmax_probs;     // [n_outputs] — top-1 softmax probabilities
+
+    // Optional top-2 cache (LLAMA_PROBE_TOP2 / tree-K=2 path). Non-empty only
+    // when caller arms via llama_arm_draft_top2(). Allocating switches the
+    // logits-extract kernel to its top-2 variant (~1.2% MTP tg cost when
+    // armed, zero when off — default).
+    bool                  draft_top2_armed = false;
+    std::vector<int32_t>  draft_argmax_top2_ids;  // [n_outputs] — top-2 token ids
 
     // Caller-controlled enable for the verify-step argmax-cache fast path.
     // The server sets this true before decode iff the slot's effective sampler

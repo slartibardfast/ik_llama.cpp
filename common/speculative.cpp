@@ -4,6 +4,8 @@
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
+
+extern "C" void probe_top2_push(int32_t t1, int32_t t2);
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
@@ -1369,6 +1371,16 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     common_sampler_reset(smpl);
 
+    // One-shot: arm top-2 device cache iff α(top-2) probe is requested.
+    {
+        static const bool _probe_top2 = (getenv("LLAMA_PROBE_TOP2") != nullptr);
+        static bool _armed = false;
+        if (_probe_top2 && !_armed) {
+            llama_arm_draft_top2(ctx, true);
+            _armed = true;
+        }
+    }
+
     llama_batch mtp_batch = llama_batch_init(1, 0, 1);
     llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
 
@@ -1379,14 +1391,49 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         mtp_batch.n_tokens = 0;
         common_batch_add(mtp_batch, current_input_id, current_n_past, {seq_id}, true);
 
+        // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
+        // when off. DRAFT_GEN forwards are always batch=1 in MTP, so a
+        // single histogram bucket suffices.
+        static const bool _prof_draft = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+        struct draft_stat { long long sum_ns = 0; long long n = 0; long long min_ns = 0; long long max_ns = 0; };
+        static draft_stat _draft_stat;
+        std::chrono::high_resolution_clock::time_point _draft_t0;
+        if (_prof_draft) _draft_t0 = std::chrono::high_resolution_clock::now();
+
         if (llama_decode(ctx, mtp_batch) != 0) {
             break;
+        }
+
+        if (_prof_draft) {
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const long long dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - _draft_t0).count();
+            _draft_stat.sum_ns += dt; ++_draft_stat.n;
+            if (_draft_stat.n == 1 || dt < _draft_stat.min_ns) _draft_stat.min_ns = dt;
+            if (_draft_stat.n == 1 || dt > _draft_stat.max_ns) _draft_stat.max_ns = dt;
+            if (_draft_stat.n % 100 == 0) {
+                fprintf(stderr, "[decode-prof:draft] count=%lld mean=%.3fms min=%.3fms max=%.3fms\n",
+                    _draft_stat.n,
+                    (double)_draft_stat.sum_ns / _draft_stat.n / 1e6,
+                    _draft_stat.min_ns / 1e6, _draft_stat.max_ns / 1e6);
+            }
         }
 
         float prob;
         llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, &prob);
 
         drafts.push_back(id_next);
+
+        // α(top-2) probe push (LLAMA_PROBE_TOP2). Reads top-2 from the device
+        // cache populated by the armed top-2 kernel variant.
+        {
+            static const bool _probe_top2 = (getenv("LLAMA_PROBE_TOP2") != nullptr);
+            if (_probe_top2) {
+                int32_t t2_id = -1;
+                if (llama_get_draft_top2(ctx, 0, &t2_id)) {
+                    probe_top2_push((int32_t)id_next, t2_id);
+                }
+            }
+        }
 
         const float * emb = llama_get_embeddings_ith(ctx, 0);
         if (emb) {

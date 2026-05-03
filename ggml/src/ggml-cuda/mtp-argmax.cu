@@ -105,12 +105,131 @@ __global__ void mtp_argmax_with_prob_f32_kernel(
     }
 }
 
+// Optional top-2 variant: identical pass-2 (sum_exp) but pass 1 carries a
+// (best, second) pair through warp/block reduction via packed (val, id) in
+// __ulonglong (sign-flipped float bits in hi 32 + id in lo 32 → unsigned
+// ordering matches signed-float ordering). Halves shfl ops vs naive (val,id)
+// pairs separately. Default API path (top-1 only) is unchanged from HEAD —
+// this kernel is only invoked when the caller supplies dst_top2_ids_dev.
+__device__ __forceinline__ unsigned long long _mtp_pack_val_id(float v, int id) {
+    unsigned int u = __float_as_uint(v);
+    u ^= (int(u) >> 31) | 0x80000000u;
+    return ((unsigned long long)u << 32) | (unsigned int)id;
+}
+__device__ __forceinline__ int _mtp_unpack_id(unsigned long long p) {
+    return (int)(unsigned int)(p & 0xffffffffu);
+}
+
+template <int BLOCK_SIZE>
+__global__ void mtp_argmax_with_prob_top2_f32_kernel(
+    const float * __restrict__ logits,
+    int32_t *     __restrict__ dst_ids,
+    float   *     __restrict__ dst_probs,
+    int32_t *     __restrict__ dst_top2_ids,
+    const int n_vocab) {
+
+    const int row = blockIdx.x;
+    const float * row_logits = logits + (size_t)row * n_vocab;
+
+    constexpr int n_warps = BLOCK_SIZE / WARP_SIZE;
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+
+    // ---------- Pass 1: top-2 packed argmax ----------
+    unsigned long long t_best = _mtp_pack_val_id(-FLT_MAX, 0);
+    unsigned long long t_scnd = _mtp_pack_val_id(-FLT_MAX, 0);
+    for (int i = tid; i < n_vocab; i += BLOCK_SIZE) {
+        const unsigned long long p = _mtp_pack_val_id(row_logits[i], i);
+        if (p > t_best) { t_scnd = t_best; t_best = p; }
+        else if (p > t_scnd) { t_scnd = p; }
+    }
+
+    auto merge_top2 = [&](unsigned long long ob, unsigned long long os) {
+        const unsigned long long pairs[4] = { t_best, t_scnd, ob, os };
+        int b_idx = 0;
+        #pragma unroll
+        for (int k = 1; k < 4; k++) if (pairs[k] > pairs[b_idx]) b_idx = k;
+        int s_idx = (b_idx == 0) ? 1 : 0;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) if (k != b_idx && pairs[k] > pairs[s_idx]) s_idx = k;
+        t_best = pairs[b_idx];
+        t_scnd = pairs[s_idx];
+    };
+
+    #pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        const unsigned long long ob = __shfl_xor_sync(0xffffffff, t_best, off, WARP_SIZE);
+        const unsigned long long os = __shfl_xor_sync(0xffffffff, t_scnd, off, WARP_SIZE);
+        merge_top2(ob, os);
+    }
+
+    __shared__ unsigned long long s_warp_best[n_warps];
+    __shared__ unsigned long long s_warp_scnd[n_warps];
+    if (lane == 0) {
+        s_warp_best[warp] = t_best;
+        s_warp_scnd[warp] = t_scnd;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        if (lane < n_warps) { t_best = s_warp_best[lane]; t_scnd = s_warp_scnd[lane]; }
+        else { t_best = _mtp_pack_val_id(-FLT_MAX, 0); t_scnd = _mtp_pack_val_id(-FLT_MAX, 0); }
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            const unsigned long long ob = __shfl_xor_sync(0xffffffff, t_best, off, WARP_SIZE);
+            const unsigned long long os = __shfl_xor_sync(0xffffffff, t_scnd, off, WARP_SIZE);
+            merge_top2(ob, os);
+        }
+        if (lane == 0) {
+            s_warp_best[0] = t_best;
+            s_warp_scnd[0] = t_scnd;
+        }
+    }
+    __syncthreads();
+
+    // unpack maxval for pass 2
+    unsigned int u_best = (unsigned int)(s_warp_best[0] >> 32);
+    u_best ^= (int(u_best) >> 31) | 0x80000000u;
+    const float maxval = __uint_as_float(u_best);
+    const int   argmax     = _mtp_unpack_id(s_warp_best[0]);
+    const int   argmax_top2 = _mtp_unpack_id(s_warp_scnd[0]);
+
+    // ---------- Pass 2: sum_exp(logits[i] - maxval) ----------
+    float t_sum = 0.0f;
+    for (int i = tid; i < n_vocab; i += BLOCK_SIZE) {
+        t_sum += expf(row_logits[i] - maxval);
+    }
+    #pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        t_sum += __shfl_xor_sync(0xffffffff, t_sum, off, WARP_SIZE);
+    }
+
+    __shared__ float s_warp_sum[n_warps];
+    if (lane == 0) s_warp_sum[warp] = t_sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        t_sum = (lane < n_warps) ? s_warp_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            t_sum += __shfl_xor_sync(0xffffffff, t_sum, off, WARP_SIZE);
+        }
+        if (lane == 0) {
+            dst_ids[row]      = argmax;
+            dst_probs[row]    = 1.0f / t_sum;
+            dst_top2_ids[row] = argmax_top2;
+        }
+    }
+}
+
 extern "C" GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob(
     const void * logits_dev,    // float*, [n_rows, n_vocab]
     int n_rows,
     int n_vocab,
     void * dst_ids_dev,         // int32_t*, [n_rows]
     void * dst_probs_dev,       // float*,   [n_rows]
+    void * dst_top2_ids_dev,    // int32_t*, [n_rows] OR nullptr to skip top-2
     int device) {
 
     if (n_rows <= 0 || n_vocab <= 0) return;
@@ -120,11 +239,22 @@ extern "C" GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob(
     constexpr int BLOCK_SIZE = 256;  // n_warps = 8 on sm_75
     cudaStream_t stream = nullptr;   // legacy default stream — synchronizes with prior async work
 
-    mtp_argmax_with_prob_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
-        (const float *)logits_dev,
-        (int32_t *)dst_ids_dev,
-        (float *)dst_probs_dev,
-        n_vocab);
+    if (dst_top2_ids_dev == nullptr) {
+        // Default fast path: kernel and behaviour identical to HEAD.
+        mtp_argmax_with_prob_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
+            (const float *)logits_dev,
+            (int32_t *)dst_ids_dev,
+            (float *)dst_probs_dev,
+            n_vocab);
+    } else {
+        // Probe / tree-K=2 path: top-2 reduction adds ~1.2% kernel cost.
+        mtp_argmax_with_prob_top2_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
+            (const float *)logits_dev,
+            (int32_t *)dst_ids_dev,
+            (float *)dst_probs_dev,
+            (int32_t *)dst_top2_ids_dev,
+            n_vocab);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -139,36 +269,54 @@ extern "C" GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
     int n_vocab,
     int32_t * host_ids_out,
     float   * host_probs_out,
+    int32_t * host_top2_ids_out,  // optional; nullptr to skip top-2 (default fast path)
     int device) {
 
     if (n_rows <= 0 || n_vocab <= 0) return;
 
     ggml_cuda_set_device(device);
 
-    static int32_t * cached_ids_dev[GGML_CUDA_MAX_DEVICES]   = {0};
-    static float   * cached_probs_dev[GGML_CUDA_MAX_DEVICES] = {0};
-    static int       cached_capacity[GGML_CUDA_MAX_DEVICES]  = {0};
+    static int32_t * cached_ids_dev[GGML_CUDA_MAX_DEVICES]      = {0};
+    static float   * cached_probs_dev[GGML_CUDA_MAX_DEVICES]    = {0};
+    static int32_t * cached_top2_ids_dev[GGML_CUDA_MAX_DEVICES] = {0};
+    static int       cached_capacity[GGML_CUDA_MAX_DEVICES]     = {0};
 
     if (n_rows > cached_capacity[device]) {
-        if (cached_ids_dev[device])   cudaFree(cached_ids_dev[device]);
-        if (cached_probs_dev[device]) cudaFree(cached_probs_dev[device]);
-        CUDA_CHECK(cudaMalloc((void**)&cached_ids_dev[device],   n_rows * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&cached_probs_dev[device], n_rows * sizeof(float)));
+        if (cached_ids_dev[device])      cudaFree(cached_ids_dev[device]);
+        if (cached_probs_dev[device])    cudaFree(cached_probs_dev[device]);
+        if (cached_top2_ids_dev[device]) cudaFree(cached_top2_ids_dev[device]);
+        CUDA_CHECK(cudaMalloc((void**)&cached_ids_dev[device],      n_rows * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void**)&cached_probs_dev[device],    n_rows * sizeof(float)));
+        CUDA_CHECK(cudaMalloc((void**)&cached_top2_ids_dev[device], n_rows * sizeof(int32_t)));
         cached_capacity[device] = n_rows;
     }
 
     constexpr int BLOCK_SIZE = 256;
     cudaStream_t stream = nullptr;
 
-    mtp_argmax_with_prob_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
-        (const float *)logits_dev,
-        cached_ids_dev[device],
-        cached_probs_dev[device],
-        n_vocab);
+    if (host_top2_ids_out == nullptr) {
+        // Default fast path: HEAD-equivalent kernel.
+        mtp_argmax_with_prob_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
+            (const float *)logits_dev,
+            cached_ids_dev[device],
+            cached_probs_dev[device],
+            n_vocab);
+    } else {
+        // Probe path: writes top-2 alongside top-1.
+        mtp_argmax_with_prob_top2_f32_kernel<BLOCK_SIZE><<<n_rows, BLOCK_SIZE, 0, stream>>>(
+            (const float *)logits_dev,
+            cached_ids_dev[device],
+            cached_probs_dev[device],
+            cached_top2_ids_dev[device],
+            n_vocab);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaMemcpy(host_ids_out,   cached_ids_dev[device],   n_rows * sizeof(int32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(host_probs_out, cached_probs_dev[device], n_rows * sizeof(float),   cudaMemcpyDeviceToHost));
+    if (host_top2_ids_out != nullptr) {
+        CUDA_CHECK(cudaMemcpy(host_top2_ids_out, cached_top2_ids_dev[device], n_rows * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    }
 }
 
 extern "C" GGML_CALL void ggml_backend_cuda_memcpy_d2d(

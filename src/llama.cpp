@@ -4706,6 +4706,15 @@ static int llama_decode_internal(
                         lctx.draft_argmax_ids.resize(rows_to_pull);
                         lctx.draft_argmax_probs.resize(rows_to_pull);
 
+                        // Top-2 buffer only sized when caller has armed the
+                        // top-2 variant. nullptr below preserves the HEAD
+                        // fast path identical to before.
+                        int32_t * top2_out = nullptr;
+                        if (lctx.draft_top2_armed) {
+                            lctx.draft_argmax_top2_ids.resize(rows_to_pull);
+                            top2_out = lctx.draft_argmax_top2_ids.data();
+                        }
+
                         // Ensure backend compute that produced res->data is complete before
                         // the (default-stream) argmax kernel reads it. Scheduler streams are
                         // non-blocking and don't implicitly sync with the default stream.
@@ -4717,6 +4726,7 @@ static int llama_decode_internal(
                             n_vocab,
                             lctx.draft_argmax_ids.data(),
                             lctx.draft_argmax_probs.data(),
+                            top2_out,
                             cuda_device);
 
                         lctx.draft_argmax_valid = true;
@@ -9991,6 +10001,24 @@ bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out
     if (idx < 0 || idx >= ctx->draft_argmax_n) return false;
     if (out_id)   *out_id   = ctx->draft_argmax_ids[idx];
     if (out_prob) *out_prob = ctx->draft_argmax_probs[idx];
+    return true;
+}
+
+void llama_arm_draft_top2(struct llama_context * ctx, bool enable) {
+    if (ctx == nullptr) return;
+    ctx->draft_top2_armed = enable;
+    if (!enable) {
+        ctx->draft_argmax_top2_ids.clear();
+    }
+}
+
+bool llama_get_draft_top2(struct llama_context * ctx, int32_t i, int32_t * out_id) {
+    if (ctx == nullptr || !ctx->draft_argmax_valid) return false;
+    if ((int32_t)ctx->draft_argmax_top2_ids.size() < ctx->draft_argmax_n) return false;
+    int32_t idx = i;
+    if (idx < 0) idx = ctx->draft_argmax_n + idx;
+    if (idx < 0 || idx >= ctx->draft_argmax_n) return false;
+    if (out_id) *out_id = ctx->draft_argmax_top2_ids[idx];
     return true;
 }
 

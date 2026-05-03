@@ -1485,6 +1485,23 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     }
 }
 
+// src1 conversion redundancy counter (LLAMA_DEBUG_CONV) — env-gated, no cost
+// when off. Per-graph-compute (src1_ddf_i, ncols, ne10) tuple dedup count.
+// Reset at ggml_backend_cuda_graph_compute entry so pool-allocator pointer
+// reuse across graph_computes doesn't conflate distinct activations.
+struct iter_conv_probe_entry { const void * p; int64_t n; int64_t ne; };
+static thread_local std::vector<iter_conv_probe_entry> g_conv_seen_bf16;
+static thread_local std::vector<iter_conv_probe_entry> g_conv_seen_f16;
+static thread_local int g_conv_dups_bf16_per_compute  = 0;
+static thread_local int g_conv_dups_f16_per_compute   = 0;
+static thread_local int g_conv_calls_bf16_per_compute = 0;
+static thread_local int g_conv_calls_f16_per_compute  = 0;
+static thread_local long long g_conv_total_dups_bf16  = 0;
+static thread_local long long g_conv_total_dups_f16   = 0;
+static thread_local long long g_conv_total_calls_bf16 = 0;
+static thread_local long long g_conv_total_calls_f16  = 0;
+static thread_local int g_conv_compute_count = 0;
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1530,6 +1547,18 @@ static void ggml_cuda_op_mul_mat_cublas(
             size_t ne = src1_ncols*ne10;
             src1_as_bf16.alloc(ne);
             to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), src1_ncols, ne10, stream);
+
+            // [conv-redundancy probe] LLAMA_DEBUG_CONV
+            static const bool _cv_dbg = (getenv("LLAMA_DEBUG_CONV") != nullptr);
+            if (_cv_dbg) {
+                bool found = false;
+                for (auto & e : g_conv_seen_bf16) {
+                    if (e.p == src1_ddf_i && e.n == src1_ncols && e.ne == ne10) { found = true; break; }
+                }
+                if (found) g_conv_dups_bf16_per_compute++;
+                else g_conv_seen_bf16.push_back({src1_ddf_i, src1_ncols, ne10});
+                g_conv_calls_bf16_per_compute++;
+            }
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
@@ -1662,6 +1691,18 @@ static void ggml_cuda_op_mul_mat_cublas(
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
             to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), src1_ncols, ne10, stream);
+
+            // [conv-redundancy probe] LLAMA_DEBUG_CONV
+            static const bool _cv_dbg = (getenv("LLAMA_DEBUG_CONV") != nullptr);
+            if (_cv_dbg) {
+                bool found = false;
+                for (auto & e : g_conv_seen_f16) {
+                    if (e.p == src1_ddf_i && e.n == src1_ncols && e.ne == ne10) { found = true; break; }
+                }
+                if (found) g_conv_dups_f16_per_compute++;
+                else g_conv_seen_f16.push_back({src1_ddf_i, src1_ncols, ne10});
+                g_conv_calls_f16_per_compute++;
+            }
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
         ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
@@ -4436,6 +4477,34 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
 
     if (use_cuda_graph) {
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            // Graph-cache miss logger (LLAMA_DEBUG_GRAPH_CACHE) — env-gated,
+            // no cost when off. Auto-stops after 50 misses to avoid log
+            // spam on long-running servers. Identifies topology variants
+            // that fragment the cuda_graphs cache.
+            static const bool _gcd_dbg = (getenv("LLAMA_DEBUG_GRAPH_CACHE") != nullptr);
+            static int _gcd_count = 0;
+            if (_gcd_dbg && _gcd_count < 50) {
+                _gcd_count++;
+                fprintf(stderr, "[graph-cache] miss#%d n_nodes=%d ops=", _gcd_count, cgraph->n_nodes);
+                int nshow = cgraph->n_nodes < 6 ? cgraph->n_nodes : 6;
+                for (int i = 0; i < nshow; ++i) {
+                    fprintf(stderr, "%s%s",
+                        ggml_op_name(cgraph->nodes[i]->op),
+                        i + 1 < nshow ? "," : "");
+                }
+                if (cgraph->n_nodes > 0) {
+                    auto * n0 = cgraph->nodes[0];
+                    fprintf(stderr, " n0_ne=[%lld,%lld,%lld,%lld]",
+                        (long long)n0->ne[0], (long long)n0->ne[1],
+                        (long long)n0->ne[2], (long long)n0->ne[3]);
+                    auto * nL = cgraph->nodes[cgraph->n_nodes - 1];
+                    fprintf(stderr, " nL_op=%s nL_ne=[%lld,%lld,%lld,%lld]",
+                        ggml_op_name(nL->op),
+                        (long long)nL->ne[0], (long long)nL->ne[1],
+                        (long long)nL->ne[2], (long long)nL->ne[3]);
+                }
+                fprintf(stderr, "\n");
+            }
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
         if (cuda_graph_update_required) { // Update graph executable
@@ -4449,8 +4518,42 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     }
 }
 
+// Reset hook for the LLAMA_DEBUG_CONV per-graph-compute redundancy counter.
+// Inlined into ggml_backend_cuda_graph_compute below so per-graph state
+// boundaries match (pool-allocator pointer reuse across graph_computes
+// would otherwise inflate the dedup-redundancy numbers spuriously).
+static inline void _conv_probe_reset_per_graph() {
+    static const bool _cv_dbg = (getenv("LLAMA_DEBUG_CONV") != nullptr);
+    if (!_cv_dbg) return;
+    g_conv_compute_count++;
+    if (g_conv_calls_bf16_per_compute > 0 || g_conv_calls_f16_per_compute > 0) {
+        g_conv_total_dups_bf16  += g_conv_dups_bf16_per_compute;
+        g_conv_total_dups_f16   += g_conv_dups_f16_per_compute;
+        g_conv_total_calls_bf16 += g_conv_calls_bf16_per_compute;
+        g_conv_total_calls_f16  += g_conv_calls_f16_per_compute;
+        if (g_conv_compute_count <= 5 || g_conv_compute_count % 25 == 0) {
+            fprintf(stderr, "[conv-prof] last_compute: bf16 %d/%d dup, f16 %d/%d dup. RUNNING TOTAL %d computes: bf16 %lld/%lld (%.1f%%) f16 %lld/%lld (%.1f%%)\n",
+                g_conv_dups_bf16_per_compute, g_conv_calls_bf16_per_compute,
+                g_conv_dups_f16_per_compute,  g_conv_calls_f16_per_compute,
+                g_conv_compute_count,
+                g_conv_total_dups_bf16, g_conv_total_calls_bf16,
+                g_conv_total_calls_bf16 ? 100.0 * g_conv_total_dups_bf16 / (double)g_conv_total_calls_bf16 : 0.0,
+                g_conv_total_dups_f16,  g_conv_total_calls_f16,
+                g_conv_total_calls_f16  ? 100.0 * g_conv_total_dups_f16  / (double)g_conv_total_calls_f16  : 0.0);
+        }
+    }
+    g_conv_seen_bf16.clear();
+    g_conv_seen_f16.clear();
+    g_conv_dups_bf16_per_compute  = 0;
+    g_conv_dups_f16_per_compute   = 0;
+    g_conv_calls_bf16_per_compute = 0;
+    g_conv_calls_f16_per_compute  = 0;
+}
+
 GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    _conv_probe_reset_per_graph();
 
     ggml_cuda_set_device(cuda_ctx->device);
 

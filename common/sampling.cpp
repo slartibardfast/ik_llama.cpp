@@ -5,8 +5,48 @@
 #include "reasoning-budget.cpp"
 
 #include <random>
+#include <deque>
+#include <mutex>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 using json = nlohmann::ordered_json;
+
+// α(top-2) probe (LLAMA_PROBE_TOP2) — env-gated, no cost when off. Push
+// (top1, top2) from the draft path; consume + tally at verify time. Used
+// to measure tree-K=2 acceptance ceiling without committing tree drafts.
+namespace {
+struct probe_top2_entry { int32_t t1; int32_t t2; };
+std::deque<probe_top2_entry> g_probe_top2_queue;
+std::mutex g_probe_top2_mu;
+long long g_probe_total = 0;
+long long g_probe_top1_hit = 0;
+long long g_probe_top2_extra = 0;
+inline bool probe_top2_enabled() {
+    static const bool on = (getenv("LLAMA_PROBE_TOP2") != nullptr);
+    return on;
+}
+}
+extern "C" void probe_top2_push(int32_t t1, int32_t t2) {
+    if (!probe_top2_enabled()) return;
+    std::lock_guard<std::mutex> lock(g_probe_top2_mu);
+    g_probe_top2_queue.push_back({t1, t2});
+}
+extern "C" void probe_top2_consume(int32_t verified) {
+    if (!probe_top2_enabled()) return;
+    std::lock_guard<std::mutex> lock(g_probe_top2_mu);
+    if (g_probe_top2_queue.empty()) return;
+    auto e = g_probe_top2_queue.front();
+    g_probe_top2_queue.pop_front();
+    ++g_probe_total;
+    if (verified == e.t1) ++g_probe_top1_hit;
+    else if (verified == e.t2) ++g_probe_top2_extra;
+    if ((g_probe_total % 100) == 0) {
+        const double a1 = (double)g_probe_top1_hit / (double)g_probe_total;
+        const double a2 = a1 + (double)g_probe_top2_extra / (double)g_probe_total;
+        fprintf(stderr, "[probe-top2] total=%lld α(top1)=%.4f α(top2)=%.4f Δ=%.4f\n",
+            g_probe_total, a1, a2, a2 - a1);
+    }
+}
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -756,6 +796,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        probe_top2_consume(id);
 
         common_sampler_accept(gsmpl, ctx, id, true);
 

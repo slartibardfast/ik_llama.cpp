@@ -1090,6 +1090,13 @@ extern "C" {
     // *out_id and *out_prob are filled and the caller can skip pulling logits.
     LLAMA_API bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob);
 
+    // Optional top-2 cache, populated only after llama_arm_draft_top2(ctx, true).
+    // While armed, the on-device argmax kernel switches to its top-2 variant
+    // (small kernel-cost overhead). Used for tree-K=2 drafts and the α(top-2)
+    // measurement probe. Returns true iff the cache is valid for output index `i`.
+    LLAMA_API void llama_arm_draft_top2(struct llama_context * ctx, bool enable);
+    LLAMA_API bool llama_get_draft_top2(struct llama_context * ctx, int32_t i, int32_t * out_id);
+
     // Enable the verify-step fast-argmax path for the next llama_decode call.
     // Caller must guarantee that the sampler used after the decode is "trivial"
     // (greedy temp=0, no penalties/grammar/biases). Auto-cleared at decode

@@ -54,16 +54,19 @@ GGML_API GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob(
     int n_vocab,
     void * dst_ids_dev,         // int32_t*, [n_rows] device pointer
     void * dst_probs_dev,       // float*,   [n_rows] device pointer
+    void * dst_top2_ids_dev,    // int32_t*, [n_rows] device pointer; nullptr for default top-1-only path
     int device);
 
 // Single-call variant: handles per-device scratch alloc + kernel launch + D2H to
 // caller-provided host buffers. Synchronous (host buffers are valid on return).
+// Pass host_top2_ids_out=nullptr for the default top-1-only fast path.
 GGML_API GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
     const void * logits_dev,
     int n_rows,
     int n_vocab,
     int32_t * host_ids_out,
     float   * host_probs_out,
+    int32_t * host_top2_ids_out,  // optional; nullptr to skip top-2 D2H
     int device);
 
 // Synchronous device-to-device copy on the legacy default stream.
