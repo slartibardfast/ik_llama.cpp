@@ -4,6 +4,7 @@
 #include "llama-cparams.h"
 #include "llama-sampling.h"
 #include "qnext-state-slot-allocator.h"
+#include "qnext-seq-pattern.h"
 
 struct llama_model;
 

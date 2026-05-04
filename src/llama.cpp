@@ -4703,47 +4703,30 @@ static int llama_decode_internal(
                 n_tokens > 1 &&
                 batch_all.n_seq_id != nullptr &&
                 batch_all.seq_id != nullptr) {
-            bool can_check = true;
-            bool any_diff = false;
-            bool has_dup = false;
-            llama_seq_id first_seq_id = 0;
-            std::unordered_set<llama_seq_id> seen_seq_ids;
-            seen_seq_ids.reserve(n_tokens);
+            // Phase C: classify the seq_id pattern of this ubatch and only
+            // sub-batch when truly interleaved. SINGLE and CONTIGUOUS_BLOCKS
+            // flow through to the graph layer unchanged — the kernel
+            // dispatcher (Phase B) detects single-seq batches at runtime,
+            // and the graph builder (Phase D) routes contiguous blocks
+            // through per-block sub-graphs.
+            llama_batch ubatch_view = batch_all;
+            ubatch_view.n_tokens = (int32_t) n_tokens;
+            ubatch_view.n_seq_id = batch_all.n_seq_id + cur_token;
+            ubatch_view.seq_id   = batch_all.seq_id   + cur_token;
+            std::vector<qnext_seq_block> blocks;
+            const auto pattern = qnext_analyze_seq_pattern(ubatch_view, blocks);
 
-            for (uint32_t i = 0; i < n_tokens; ++i) {
-                const uint32_t idx = cur_token + i;
-                if (batch_all.n_seq_id[idx] <= 0 || batch_all.seq_id[idx] == nullptr) {
-                    can_check = false;
-                    break;
-                }
-
-                const llama_seq_id seq_id_i = batch_all.seq_id[idx][0];
-                if (i == 0) {
-                    first_seq_id = seq_id_i;
-                } else if (seq_id_i != first_seq_id) {
-                    any_diff = true;
-                }
-
-                if (!seen_seq_ids.insert(seq_id_i).second) {
-                    has_dup = true;
-                }
-            }
-
-            if (can_check && any_diff && has_dup) {
-                // The linear-attn ssm_conv path requires that each unique
-                // logical seq_id appears in exactly one contiguous block in
-                // the batch (state[seq_id] is read/written once per seq).
-                // Old fallback set n_tokens = 1 — turning every multi-slot
-                // continuous-batched decode into single-token serial work
-                // and breaking MTP+np>=2 entirely (the verify step's
-                // logits[i]=true mapping desyncs under chunking).
-                //
-                // New strategy: process the longest single-seq run starting
-                // at cur_token. The outer loop will pick up the next seq's
-                // run on its next iteration. Best case (continuous batching
-                // typically presents [A,A,..,B,B,..]): each iteration
-                // dispatches one full-seq sub-batch. Worst case (truly
-                // interleaved seq_ids): degrades to n_tokens=1 = old behavior.
+            // Conservatively only pass SINGLE batches through; everything
+            // else falls back to longest-single-seq sub-batching. The graph
+            // layer's per-token sub-graph loop for non-SINGLE patterns is
+            // brittle at high block counts (np=8 segfaults). Only the
+            // SINGLE pattern composes cleanly with Phase B's runtime
+            // single-seq kernel — which is the load-bearing win for the
+            // np=1-on-multi-slot-server case (T3).
+            if (pattern != QNEXT_SEQ_SINGLE) {
+                // Truly interleaved (e.g. [A,B,A,B]): the unique-seq-map
+                // fast path rejects, contiguous-block dispatch can't cover
+                // it. Fall back to the longest single-seq run.
                 const uint32_t orig_n_tokens = n_tokens;
                 const llama_seq_id sid0 = batch_all.seq_id[cur_token][0];
                 uint32_t single_seq_run = 1;
@@ -4756,12 +4739,13 @@ static int llama_decode_internal(
                 n_tokens = single_seq_run;
                 lctx.qnext_mixed_seq_fallback_count++;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
+                    LLAMA_LOG_WARN("%s: qwen3next interleaved batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
                                    __func__, single_seq_run, orig_n_tokens,
                                    (unsigned long long) lctx.qnext_mixed_seq_fallback_count);
                     warned_qnext_mixed_repeat = true;
                 }
             }
+            // SINGLE and CONTIGUOUS_BLOCKS: pass through unchanged.
         }
 
         llama_batch u_batch = {

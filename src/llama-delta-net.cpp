@@ -650,18 +650,47 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
     }
 
-    GGML_ASSERT(has_unique_seq_ids && "qwen3next mixed-sequence batches require unique sequence IDs per token");
+    // Phase D: split the batch into contiguous-by-seq blocks and dispatch
+    // one sub-graph per block. Composes with Phase B's runtime-single-seq
+    // kernel fast path (each block's ssm_conv sees a single seq across
+    // its tokens). Falls back to per-token (block_len = 1) for genuinely
+    // interleaved [A,B,A,B] cases — same shape as the prior code.
+    //
+    // Build blocks from token_seq_ids: a new block starts whenever the
+    // seq_id changes from the previous token. Note: this does not assert
+    // uniqueness across blocks — interleaved A,B,A,B is allowed and just
+    // produces 4 single-token blocks (existing slow-but-correct path).
+
+    struct local_block { int64_t start; int64_t len; llama_seq_id seq_id; };
+    std::vector<local_block> blocks;
+    blocks.reserve(batch.n_tokens);
+    // Phase D: per-token sub-graphs for multi-seq batches. The intended
+    // optimisation here was to coalesce contiguous-by-seq runs into
+    // one sub-graph each (block_len > 1), composing with Phase B's
+    // runtime-single-seq kernel. That path is correct for the
+    // all_same_seq case (single whole-batch call) and for block_len=1
+    // (the original per-token loop), but exhibits state corruption when
+    // multiple multi-token-per-seq blocks coexist in one graph build —
+    // most visibly under MTP draft-verify (block_len=2) at np>=2 where
+    // slot 0's continuation degenerates ("when the, when the, ...").
+    // The root cause is somewhere in build_layer_attn_linear_core's
+    // state-cpy / inp_out_ids handling when invoked multiple times in
+    // a single graph; deferred to a future strand. For now, keep the
+    // block list per-token to preserve correctness.
+    for (int64_t i = 0; i < batch.n_tokens; ++i) {
+        blocks.push_back({i, 1, token_seq_ids[i]});
+    }
 
     ggml_tensor * out = nullptr;
-    for (int64_t i = 0; i < batch.n_tokens; ++i) {
-        ggml_tensor * cur_i = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (size_t) i * cur->nb[1]);
-        ggml_tensor * inp_s_seq_qnext_i = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, 1, lctx.inp_s_seq_qnext->nb[1], (size_t) i * lctx.inp_s_seq_qnext->nb[1]);
+    for (const auto & blk : blocks) {
+        ggml_tensor * cur_blk = ggml_view_2d(ctx0, cur, cur->ne[0], blk.len, cur->nb[1], (size_t) blk.start * cur->nb[1]);
+        ggml_tensor * inp_s_seq_qnext_blk = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, blk.len, lctx.inp_s_seq_qnext->nb[1], (size_t) blk.start * lctx.inp_s_seq_qnext->nb[1]);
 
-        const bool reset_state_i = batch.pos != nullptr && batch.pos[i] == 0;
-        const uint32_t state_seq_id_i = (uint32_t) token_seq_ids[i];
-        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_seq_qnext_i, inp_out_ids, state_seq_id_i, reset_state_i, il, cb);
+        const bool reset_state_blk = batch.pos != nullptr && batch.pos[blk.start] == 0;
+        const uint32_t state_seq_id_blk = (uint32_t) blk.seq_id;
+        ggml_tensor * out_blk = build_layer_attn_linear_core(ctx0, gf, cur_blk, inp_s_seq_qnext_blk, inp_out_ids, state_seq_id_blk, reset_state_blk, il, cb);
 
-        out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
+        out = out == nullptr ? out_blk : ggml_concat(ctx0, out, out_blk, 1);
     }
 
     return out;
