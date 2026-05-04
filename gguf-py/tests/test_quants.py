@@ -235,3 +235,132 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     do_test(args.libggml, args.quick)
+
+
+# ----------------------------------------------------------------------
+# pytest cases for Q4_0_AR16 (PHASE32 Stage 2, Phase 1.C)
+#
+# These exercise the numpy reference in gguf.quants.Q4_0_AR16 against the
+# Allium contract at /home/llm/yarn-agentic/q4_0_ar16.allium. They run
+# without a built libggml -- pure numpy.
+# ----------------------------------------------------------------------
+
+from gguf.quants import Q4_0_AR16  # noqa: E402
+
+
+def test_q4_0_ar16_roundtrip():
+    np.random.seed(0)
+    x = np.random.randn(64, 16).astype(np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    assert blocks.shape == (64, 10)
+    assert blocks.dtype == np.uint8
+    y = Q4_0_AR16.dequantize_blocks(blocks)
+    assert y.shape == (64, 16)
+    assert y.dtype == np.float32
+
+    # Sym INT4 with positive scale = absmax/8 has the worst-case
+    # per-element error at the positive-max element (code clipped from
+    # 8 -> 7), exactly block_max/8 in fp32. Storing d as fp16 adds at
+    # most ~7 * d * 2^-10 of slack on top.
+    per_block_max = np.abs(x).max(axis=1, keepdims=True)
+    err = np.abs(x - y)
+    tol = per_block_max / 8 + per_block_max * 1e-2
+    assert np.all(err <= tol), f"max err {err.max()} > tol {tol.max()}"
+
+
+def test_q4_0_ar16_deterministic():
+    np.random.seed(1)
+    x = np.random.randn(32, 16).astype(np.float32)
+    a = Q4_0_AR16.quantize_blocks(x)
+    b = Q4_0_AR16.quantize_blocks(x)
+    assert np.array_equal(a, b)
+
+
+def test_q4_0_ar16_col_perm_16_aligned_lossless():
+    # The Allium @invariant col_perm_equivalence_16_aligned: any
+    # permutation of 16-element column chunks of the source row
+    # reshuffles whole blocks bit-exactly.
+    np.random.seed(42)
+    n_blocks = 32
+    x = np.random.randn(n_blocks, 16).astype(np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    perm = np.random.permutation(n_blocks)
+
+    # Path A: permute blocks (16-element chunks), then dequantize.
+    a_blocks = blocks[perm]
+    a = Q4_0_AR16.dequantize_blocks(a_blocks)
+
+    # Path B: dequantize, then permute the same way (16-aligned chunks).
+    b_full = Q4_0_AR16.dequantize_blocks(blocks)
+    b = b_full[perm]
+
+    assert np.array_equal(a, b)
+
+
+def test_q4_0_ar16_zero_block():
+    # Allium @invariant ZeroBlockHandling: all-zero block -> scale 0,
+    # codes all 8, dequantize to 0.0.
+    x = np.zeros((1, 16), dtype=np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    # d bytes (positions 0..2) zero, all qs bytes encode 8|8<<4 = 0x88.
+    assert blocks[0, 0] == 0 and blocks[0, 1] == 0
+    assert np.all(blocks[0, 2:] == 0x88)
+    y = Q4_0_AR16.dequantize_blocks(blocks)
+    assert np.all(y == 0.0)
+
+
+def _hand_pack_q4_0_ar16(values: np.ndarray) -> np.ndarray:
+    """Reference implementation derived directly from the Allium spec
+    and the Q4_0 packing convention. Used only by the spec-parity test;
+    deliberately written without numpy vectorisation tricks so a
+    spec-savvy reader can verify it line-by-line."""
+    assert values.shape == (16,)
+    block_max = float(np.abs(values).max())
+    scale = block_max / 8.0
+    out = np.zeros(10, dtype=np.uint8)
+    out[0:2] = np.array([np.float16(scale)], dtype=np.float16).view(np.uint8)
+    if scale == 0.0:
+        # All codes -> 8; nibble pack 8 | (8 << 4) = 0x88 per byte.
+        out[2:10] = 0x88
+        return out
+    inv = 1.0 / scale
+    codes = np.empty(16, dtype=np.int32)
+    for k in range(16):
+        # Banker's rounding: matches numpy.rint and the C round-nearest-even.
+        c = int(np.rint(values[k] * inv))
+        if c < -8:
+            c = -8
+        if c > 7:
+            c = 7
+        codes[k] = c + 8
+    # Q4_0 half-split convention: byte j packs codes[j] (low) and codes[8+j] (high).
+    for j in range(8):
+        out[2 + j] = (codes[j] & 0x0F) | ((codes[8 + j] & 0x0F) << 4)
+    return out
+
+
+def test_q4_0_ar16_spec_parity_fixtures():
+    # 5 hand-derived fixtures. Each exercises a different facet of the
+    # spec: pure positive ramp (asymmetric clipping at block_max),
+    # pure negative ramp, mixed sign, the zero block, and a fixture
+    # with a single dominant element forcing scale = that element / 8.
+    fixtures = [
+        # Positive ramp: max at index 15 = 1.5 -> scale = 1.5/8 = 0.1875.
+        np.linspace(0.0, 1.5, 16, dtype=np.float32),
+        # Negative ramp.
+        np.linspace(0.0, -1.5, 16, dtype=np.float32),
+        # Mixed sign symmetric.
+        np.array([-2.0, -1.5, -1.0, -0.5, -0.25, -0.125, -0.0625, 0.0,
+                  0.0, 0.0625, 0.125, 0.25, 0.5, 1.0, 1.5, 2.0], dtype=np.float32),
+        # All-zero.
+        np.zeros(16, dtype=np.float32),
+        # Single dominant element.
+        np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0,
+                  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    ]
+    for i, x in enumerate(fixtures):
+        expected = _hand_pack_q4_0_ar16(x)
+        got = Q4_0_AR16.quantize_blocks(x.reshape(1, 16))[0]
+        assert np.array_equal(got, expected), (
+            f"fixture {i}: got {got.tolist()} expected {expected.tolist()}"
+        )
