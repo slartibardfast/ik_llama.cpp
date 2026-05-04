@@ -252,6 +252,19 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         return (d * qs.astype(np.float32))
 
 
+class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
+    # PHASE32 Stage 2 foundation. Numpy reference packing/unpacking lands
+    # in Phase 1.C; foundation registers the type so GGUF I/O can recognise
+    # and round-trip the bytes structurally.
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("Q4_0_AR16.quantize_blocks: Phase 1.C")
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("Q4_0_AR16.dequantize_blocks: Phase 1.C")
+
+
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

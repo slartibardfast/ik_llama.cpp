@@ -1621,6 +1621,21 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 4,
     },
+    [GGML_TYPE_Q4_0_AR16] = {
+        // PHASE32 Stage 2 foundation. Quant/dequant/vec_dot land in Phase 1.A;
+        // current stubs abort loudly if invoked.
+        .type_name                = "q4_0_ar16",
+        .blck_size                = QK_AR16,
+        .type_size                = sizeof(block_q4_0_ar16),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0_ar16,
+        .from_float               = quantize_row_q4_0_ar16,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ar16_ref,
+        .vec_dot                  = ggml_vec_dot_q4_0_ar16_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_IQ2_KT] = {
         .type_name                = "iq2_kt",
         .blck_size                = QK_K,

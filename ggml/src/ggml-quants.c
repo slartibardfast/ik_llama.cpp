@@ -15579,3 +15579,38 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+// =====================================================================
+// Q4_0_AR16 — PHASE32 Stage 2 foundation stubs.
+// Phase 1.A (CPU/AVX) will replace these with reference + SIMD impls.
+// All entry points abort loudly so accidental invocation is caught.
+// =====================================================================
+
+void quantize_row_q4_0_ar16_ref(const float * restrict x, block_q4_0_ar16 * restrict y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("Q4_0_AR16: quantize_row_q4_0_ar16_ref not yet implemented (Phase 1.A)");
+}
+
+void quantize_row_q4_0_ar16(const float * restrict x, void * restrict y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("Q4_0_AR16: quantize_row_q4_0_ar16 not yet implemented (Phase 1.A)");
+}
+
+size_t quantize_q4_0_ar16(const float * restrict src, void * restrict dst, int64_t nrow, int64_t n_per_row,
+                          const float * imatrix, const struct quantize_user_data * user_data) {
+    GGML_UNUSED(src); GGML_UNUSED(dst); GGML_UNUSED(nrow); GGML_UNUSED(n_per_row);
+    GGML_UNUSED(imatrix); GGML_UNUSED(user_data);
+    GGML_ABORT("Q4_0_AR16: quantize_q4_0_ar16 not yet implemented (Phase 1.A)");
+}
+
+void dequantize_row_q4_0_ar16(const block_q4_0_ar16 * restrict x, float * restrict y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("Q4_0_AR16: dequantize_row_q4_0_ar16 not yet implemented (Phase 1.A)");
+}
+
+void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx,
+                                 const void * restrict vy, size_t by, int nrc) {
+    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(bs); GGML_UNUSED(vx); GGML_UNUSED(bx);
+    GGML_UNUSED(vy); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    GGML_ABORT("Q4_0_AR16: ggml_vec_dot_q4_0_ar16_q8_0 not yet implemented (Phase 1.A)");
+}

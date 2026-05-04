@@ -170,6 +170,19 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+// Q4_0_AR16: 16-element-block 4-bit symmetric quant (PHASE32 Stage 2).
+// Identical packing convention to Q4_0 (per-block fp16 d, low/high nibble
+// per even/odd k) but with a 16-wide block so it is lossless under
+// 16-element-aligned column permutations. Used to preserve Intel
+// AutoRound INT4 W4G128 calibration through a V-col reorder where Q4_0's
+// 32-element block straddles the 16-element permutation boundary.
+#define QK_AR16 16
+typedef struct {
+    ggml_half d;             // delta (fp16)
+    uint8_t qs[QK_AR16 / 2]; // nibbles / quants — 8 bytes total
+} block_q4_0_ar16;
+static_assert(sizeof(block_q4_0_ar16) == sizeof(ggml_half) + QK_AR16 / 2, "wrong q4_0_ar16 block size/padding");
+
 #define QK4_1 32
 typedef struct {
     GGML_SCALE_TYPE1(m, dm);

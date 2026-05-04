@@ -454,6 +454,7 @@ extern "C" {
         GGML_TYPE_IQ3_KS  = 156,
         GGML_TYPE_IQ2_KL  = 157,
         GGML_TYPE_IQ1_KT  = 158,
+        GGML_TYPE_Q4_0_AR16 = 159,  // 16-element 4-bit blocks for AutoRound col-perm-respect
 
         GGML_TYPE_Q4_0_R8   = 202,
         GGML_TYPE_Q5_0_R4   = 206,
