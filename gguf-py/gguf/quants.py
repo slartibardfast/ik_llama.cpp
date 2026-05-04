@@ -253,16 +253,59 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
 
 
 class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
-    # PHASE32 Stage 2 foundation. Numpy reference packing/unpacking lands
-    # in Phase 1.C; foundation registers the type so GGUF I/O can recognise
-    # and round-trip the bytes structurally.
+    # PHASE32 Stage 2. 16-element-block 4-bit symmetric quant.
+    #
+    # Layout per block (10 bytes total): bytes 0..2 fp16 d, bytes 2..10 the
+    # 8-byte nibble payload qs. Code k lives in the low nibble of qs[k/2]
+    # for even k and the high nibble for odd k -- the Q4_0 packing
+    # convention, just with a 16-wide block.
+    #
+    # Quantize follows q4_0_ar16.allium's QuantizeFormula exactly:
+    #   block_max = max(abs(values_in_block))
+    #   scale     = block_max / 8     (positive, sym INT4)
+    #   code_k    = clamp(rne(values[k] / scale), -8, 7) + 8
+    # Dequant is (code - 8) * fp32(d).
+
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("Q4_0_AR16.quantize_blocks: Phase 1.C")
+        n_blocks = blocks.shape[0]
+
+        # Per-block absmax -> positive scale = absmax / 8.
+        block_max = np.abs(blocks).max(axis=-1, keepdims=True)
+        d = (block_max / 8).astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv_d = np.where(d == 0, np.float32(0), np.float32(1) / d)
+
+        # Round-nearest-even into [-8, 7], then offset by +8 -> [0, 15].
+        # np.rint is banker's (RNE). Cast to int32 first to avoid uint8
+        # wrap on the still-signed intermediate.
+        scaled = blocks.astype(np.float32) * inv_d
+        codes_signed = np.rint(scaled).astype(np.int32)
+        codes_signed = np.clip(codes_signed, -8, 7)
+        qs = (codes_signed + 8).astype(np.uint8)  # [0, 15]
+
+        # Pack pairs into bytes: even k -> low nibble, odd k -> high nibble.
+        # Same trick as Q4_0: reshape to (n_blocks, 2, block_size/2) where
+        # the leading length-2 axis splits even/odd, then OR.
+        qs = qs.reshape((n_blocks, 2, cls.block_size // 2))
+        qs = qs[..., 0, :] | (qs[..., 1, :] << np.uint8(4))
+
+        d_bytes = d.astype(np.float16).view(np.uint8)
+        return np.concatenate([d_bytes, qs], axis=-1)
 
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("Q4_0_AR16.dequantize_blocks: Phase 1.C")
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+        d = d.view(np.float16).astype(np.float32)
+
+        # Unpack: each qs byte -> (low nibble, high nibble) for codes
+        # (k even, k odd). Mirror Q4_0's broadcasting trick exactly.
+        qs = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
+
+        return d * qs.astype(np.float32)
 
 
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
