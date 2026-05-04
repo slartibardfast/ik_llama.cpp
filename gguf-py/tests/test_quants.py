@@ -310,10 +310,11 @@ def test_q4_0_ar16_zero_block():
 
 
 def _hand_pack_q4_0_ar16(values: np.ndarray) -> np.ndarray:
-    """Reference implementation derived directly from the Allium spec
-    and the Q4_0 packing convention. Used only by the spec-parity test;
-    deliberately written without numpy vectorisation tricks so a
-    spec-savvy reader can verify it line-by-line."""
+    """Reference implementation derived directly from the Allium spec.
+    Used only by the spec-parity test; deliberately written without
+    numpy vectorisation tricks so a spec-savvy reader can verify it
+    line-by-line. Q4_0_AR16 uses INTERLEAVED nibble packing (NOT
+    Q4_0's split-halves layout)."""
     assert values.shape == (16,)
     block_max = float(np.abs(values).max())
     scale = block_max / 8.0
@@ -333,9 +334,10 @@ def _hand_pack_q4_0_ar16(values: np.ndarray) -> np.ndarray:
         if c > 7:
             c = 7
         codes[k] = c + 8
-    # Q4_0 half-split convention: byte j packs codes[j] (low) and codes[8+j] (high).
+    # Interleaved convention (per Allium spec, C kernel, CUDA kernel):
+    # byte j packs codes[2j] (low nibble) and codes[2j+1] (high nibble).
     for j in range(8):
-        out[2 + j] = (codes[j] & 0x0F) | ((codes[8 + j] & 0x0F) << 4)
+        out[2 + j] = (codes[2 * j] & 0x0F) | ((codes[2 * j + 1] & 0x0F) << 4)
     return out
 
 
@@ -364,3 +366,39 @@ def test_q4_0_ar16_spec_parity_fixtures():
         assert np.array_equal(got, expected), (
             f"fixture {i}: got {got.tolist()} expected {expected.tolist()}"
         )
+
+
+def test_q4_0_ar16_byte_layout_literal():
+    # Literal byte <-> code-vector cross-check that pins the
+    # interleaved nibble layout independently of any python helper.
+    # Catches Python-vs-C/CUDA layout disagreement (the Phase 2 bug).
+    #
+    # Construct a block whose unsigned codes (after the +8 offset) are
+    # exactly [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    # i.e. signed codes [-8, -7, ..., 7]. With scale = 1.0, values are
+    # just signed codes as floats.
+    signed = np.arange(-8, 8, dtype=np.float32)  # [-8..7]
+    block_max = 8.0
+    scale = block_max / 8.0  # 1.0
+    # NOTE: at +max_val=7, code +7 is fine; at -max_val=-8, code -8 fine.
+    # absmax is 8 -> scale 1.0; clamp to [-8,7] hits -8 and 7.
+    blocks = Q4_0_AR16.quantize_blocks(signed.reshape(1, 16))
+    # First 2 bytes: fp16(scale=1.0).
+    d_back = blocks[0, 0:2].copy().view(np.float16)[0]
+    assert float(d_back) == 1.0, f"expected d=1.0, got {float(d_back)}"
+    # Codes after offset: [0, 1, 2, ..., 15]. Interleaved packing
+    # gives byte j = (2j) | ((2j+1) << 4):
+    #   byte 0 = 0 | (1 << 4) = 0x10
+    #   byte 1 = 2 | (3 << 4) = 0x32
+    #   byte 2 = 4 | (5 << 4) = 0x54
+    #   byte 3 = 6 | (7 << 4) = 0x76
+    #   byte 4 = 8 | (9 << 4) = 0x98
+    #   byte 5 = 10| (11<< 4) = 0xBA
+    #   byte 6 = 12| (13<< 4) = 0xDC
+    #   byte 7 = 14| (15<< 4) = 0xFE
+    expected_qs = np.array([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
+                           dtype=np.uint8)
+    assert np.array_equal(blocks[0, 2:10], expected_qs), (
+        f"interleaved layout mismatch: got {blocks[0, 2:10].tolist()} "
+        f"expected {expected_qs.tolist()}"
+    )
