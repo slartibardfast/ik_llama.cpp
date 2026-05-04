@@ -7516,7 +7516,16 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    return llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    const bool ok = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    // Phase 2: release the qnext-state slot when this seq has been fully cleared.
+    // Bulk clears (p0<=0 && p1<0) imply the seq is done — return its slot to the
+    // free-list. Partial removals (e.g. spec rollback) must NOT release; the seq
+    // continues to need its slot on the next decode.
+    if (ok && seq_id >= 0 && p0 <= 0 && p1 < 0 &&
+        ctx->qnext_slot_alloc.n_slots > 0) {
+        ctx->qnext_slot_alloc.release(seq_id);
+    }
+    return ok;
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -7524,6 +7533,14 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
         return;
     }
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
+    // Phase 2: ensure dst has an allocator slot. The cells[].src + do_copy
+    // machinery (set above by llama_kv_cache_seq_cp on the cache) handles the
+    // physical state-row copy via llama_set_s_copy at decode time; this keeps
+    // the allocator map consistent so the fill-site sees the right slot index
+    // for seq_id_dst on its next batch.
+    if (seq_id_dst >= 0 && ctx->qnext_slot_alloc.n_slots > 0) {
+        ctx->qnext_slot_alloc.alloc(seq_id_dst);
+    }
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
