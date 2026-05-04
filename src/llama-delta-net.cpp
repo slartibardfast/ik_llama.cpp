@@ -663,22 +663,18 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     struct local_block { int64_t start; int64_t len; llama_seq_id seq_id; };
     std::vector<local_block> blocks;
-    blocks.reserve(batch.n_tokens);
-    // Phase D: per-token sub-graphs for multi-seq batches. The intended
-    // optimisation here was to coalesce contiguous-by-seq runs into
-    // one sub-graph each (block_len > 1), composing with Phase B's
-    // runtime-single-seq kernel. That path is correct for the
-    // all_same_seq case (single whole-batch call) and for block_len=1
-    // (the original per-token loop), but exhibits state corruption when
-    // multiple multi-token-per-seq blocks coexist in one graph build —
-    // most visibly under MTP draft-verify (block_len=2) at np>=2 where
-    // slot 0's continuation degenerates ("when the, when the, ...").
-    // The root cause is somewhere in build_layer_attn_linear_core's
-    // state-cpy / inp_out_ids handling when invoked multiple times in
-    // a single graph; deferred to a future strand. For now, keep the
-    // block list per-token to preserve correctness.
-    for (int64_t i = 0; i < batch.n_tokens; ++i) {
-        blocks.push_back({i, 1, token_seq_ids[i]});
+    blocks.reserve(8);
+    {
+        int64_t run_start = 0;
+        llama_seq_id run_sid = token_seq_ids[0];
+        for (int64_t i = 1; i < batch.n_tokens; ++i) {
+            if (token_seq_ids[i] != run_sid) {
+                blocks.push_back({run_start, i - run_start, run_sid});
+                run_start = i;
+                run_sid   = token_seq_ids[i];
+            }
+        }
+        blocks.push_back({run_start, batch.n_tokens - run_start, run_sid});
     }
 
     ggml_tensor * out = nullptr;

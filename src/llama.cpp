@@ -4716,14 +4716,7 @@ static int llama_decode_internal(
             std::vector<qnext_seq_block> blocks;
             const auto pattern = qnext_analyze_seq_pattern(ubatch_view, blocks);
 
-            // Conservatively only pass SINGLE batches through; everything
-            // else falls back to longest-single-seq sub-batching. The graph
-            // layer's per-token sub-graph loop for non-SINGLE patterns is
-            // brittle at high block counts (np=8 segfaults). Only the
-            // SINGLE pattern composes cleanly with Phase B's runtime
-            // single-seq kernel — which is the load-bearing win for the
-            // np=1-on-multi-slot-server case (T3).
-            if (pattern != QNEXT_SEQ_SINGLE) {
+            if (pattern == QNEXT_SEQ_INTERLEAVED) {
                 // Truly interleaved (e.g. [A,B,A,B]): the unique-seq-map
                 // fast path rejects, contiguous-block dispatch can't cover
                 // it. Fall back to the longest single-seq run.
