@@ -201,6 +201,7 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 llama_build_and_test(test-regex-partial.cpp)
+llama_build_and_test(test-q4-0-ar16-cpu.cpp)
 if (GGML_CUDA)
     llama_build_and_test(test-q4-0-ar16-cuda.cpp)
 endif()
