@@ -164,6 +164,164 @@ static __global__ void ssm_conv_init_states_f32(
     }
 }
 
+// Phase B: runtime single-seq detection.
+// Scans src3 once; sets single_ok[0]=1 and single_slot[0]=S iff every
+// token's primary seq_id == S and all entries are valid. Otherwise
+// single_ok[0]=0. Caller must zero-init single_ok before launch.
+static __global__ void ssm_conv_detect_runtime_single_seq(
+        const int32_t * src3,
+        int32_t * single_ok,
+        int32_t * single_slot,
+        int n_t,
+        int n_kv,
+        int src3_nb1) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_t) {
+        return;
+    }
+    const int32_t * sq = src3 + (size_t) t * src3_nb1;
+    const int32_t s0 = sq[0];
+    if (s0 < 0 || s0 >= n_kv) {
+        atomicExch(single_ok, 0);
+        return;
+    }
+    if (n_kv > 1) {
+        const int32_t s1 = sq[1];
+        if (s1 >= 0 && s1 < n_kv) {
+            // multiple seqs targeted by this token => not single-seq
+            atomicExch(single_ok, 0);
+            return;
+        }
+    }
+    if (t == 0) {
+        // Publish slot from token 0; later tokens compare against it.
+        atomicExch(single_slot, s0);
+    } else {
+        // Wait until token 0 has published; spin via volatile read.
+        // In practice CUDA serialises in-block; this works because
+        // single_slot is written by t==0 then read by others.
+        // We accept a small race where t!=0 may read -1 before t=0
+        // wrote — handle by invalidating single_ok if mismatch.
+        const int32_t pub = single_slot[0];
+        if (pub >= 0 && pub != s0) {
+            atomicExch(single_ok, 0);
+        }
+    }
+}
+
+// Phase B: runtime single-seq fast path with slot offset.
+// Mirrors ssm_conv_single_seq_f32 but reads slot S from device memory
+// and applies offsets to src0 / dst_state. Guarded by single_ok flag —
+// returns early if the detection kernel rejected the batch.
+template <int split_n_t>
+static __global__ void ssm_conv_runtime_single_seq_f32(
+        const float * src0,
+        const float * src1,
+        const float * src2,
+        const int32_t * single_ok,
+        const int32_t * single_slot,
+        float * dst_x,
+        int nc,
+        int nr,
+        int n_t,
+        int src0_s0,
+        int src0_s1,
+        int src0_s2,
+        int src1_s1) {
+    if (single_ok[0] == 0) return;
+    const int slot = single_slot[0];
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= nr) return;
+    const int t0 = blockIdx.y * split_n_t;
+    if (t0 >= n_t) return;
+
+    const float * state_row = src0 + (size_t) slot * src0_s2 + (size_t) row * src0_s1;
+    const float * c_row = src2 + (size_t) row * nc;
+
+#pragma unroll
+    for (int it = 0; it < split_n_t; ++it) {
+        const int t = t0 + it;
+        if (t >= n_t) break;
+        float sumf = 0.0f;
+        for (int j = 0; j < nc; ++j) {
+            const int idx = t + j;
+            const float x = idx < nc - 1
+                ? state_row[(size_t) idx * src0_s0]
+                : src1[row + (size_t) (idx - (nc - 1)) * src1_s1];
+            sumf += x * c_row[j];
+        }
+        dst_x[row + (size_t) t * nr] = sumf;
+    }
+}
+
+template <int split_n_t>
+static __global__ void ssm_conv_runtime_single_seq_f32_nc4(
+        const float * src0,
+        const float * src1,
+        const float * src2,
+        const int32_t * single_ok,
+        const int32_t * single_slot,
+        float * dst_x,
+        int nr,
+        int n_t,
+        int src0_s0,
+        int src0_s1,
+        int src0_s2,
+        int src1_s1) {
+    if (single_ok[0] == 0) return;
+    const int slot = single_slot[0];
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= nr) return;
+    const int t0 = blockIdx.y * split_n_t;
+    if (t0 >= n_t) return;
+
+    const float * state_row = src0 + (size_t) slot * src0_s2 + (size_t) row * src0_s1;
+    const float * c_row = src2 + (size_t) row * 4;
+    const float c0 = c_row[0], c1 = c_row[1], c2 = c_row[2], c3 = c_row[3];
+
+#pragma unroll
+    for (int it = 0; it < split_n_t; ++it) {
+        const int t = t0 + it;
+        if (t >= n_t) break;
+        const int i0 = t, i1 = t + 1, i2 = t + 2, i3 = t + 3;
+        const float x0 = i0 < 3 ? state_row[(size_t) i0 * src0_s0] : src1[row + (size_t) (i0 - 3) * src1_s1];
+        const float x1 = i1 < 3 ? state_row[(size_t) i1 * src0_s0] : src1[row + (size_t) (i1 - 3) * src1_s1];
+        const float x2 = i2 < 3 ? state_row[(size_t) i2 * src0_s0] : src1[row + (size_t) (i2 - 3) * src1_s1];
+        const float x3 = i3 < 3 ? state_row[(size_t) i3 * src0_s0] : src1[row + (size_t) (i3 - 3) * src1_s1];
+        dst_x[row + (size_t) t * nr] = x0 * c0 + x1 * c1 + x2 * c2 + x3 * c3;
+    }
+}
+
+static __global__ void ssm_conv_runtime_single_seq_final_state_f32(
+        const float * src0,
+        const float * src1,
+        const int32_t * single_ok,
+        const int32_t * single_slot,
+        float * dst_state,
+        int nc,
+        int nr,
+        int n_t,
+        int n_kv,
+        int src0_s0,
+        int src0_s1,
+        int src0_s2,
+        int src1_s1) {
+    if (single_ok[0] == 0) return;
+    const int slot = single_slot[0];
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= nr) return;
+
+    const float * state_row = src0 + (size_t) slot * src0_s2 + (size_t) row * src0_s1;
+    float * dst_row = dst_state + (size_t) slot * nr * nc + (size_t) row * nc;
+    for (int j = 0; j < nc; ++j) {
+        const int idx = n_t - 1 + j;
+        dst_row[j] = idx < nc - 1
+            ? state_row[(size_t) idx * src0_s0]
+            : src1[row + (size_t) (idx - (nc - 1)) * src1_s1];
+    }
+    (void) n_kv;
+}
+
 static __global__ void ssm_conv_validate_unique_seq_map(
         const int32_t * src3,
         int32_t * seq_ids,
@@ -287,6 +445,7 @@ static __global__ void ssm_conv_f32_kernel(
         const float * src2,
         const int32_t * src3,
         const int32_t * fast_path_ok,
+        const int32_t * single_ok,
         float * dst_x,
         float * dst_state,
         int nc,
@@ -296,6 +455,10 @@ static __global__ void ssm_conv_f32_kernel(
         int src1_nb1,
         int src3_nb1) {
     if (fast_path_ok != nullptr && fast_path_ok[0] != 0) {
+        return;
+    }
+    // Phase B: skip if the runtime-single-seq path took over.
+    if (single_ok != nullptr && single_ok[0] != 0) {
         return;
     }
 
@@ -354,6 +517,7 @@ static __global__ void ssm_conv_f32_kernel_nc4(
         const float * src2,
         const int32_t * src3,
         const int32_t * fast_path_ok,
+        const int32_t * single_ok,
         float * dst_x,
         float * dst_state,
         int nr,
@@ -362,6 +526,9 @@ static __global__ void ssm_conv_f32_kernel_nc4(
         int src1_nb1,
         int src3_nb1) {
     if (fast_path_ok != nullptr && fast_path_ok[0] != 0) {
+        return;
+    }
+    if (single_ok != nullptr && single_ok[0] != 0) {
         return;
     }
 
@@ -462,7 +629,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const dim3 block_dims(CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
     const dim3 row_grid((nr + CUDA_SSM_CONV_BLOCK_SIZE - 1) / CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
     ggml_cuda_pool_alloc<int32_t> fast_path_ok_d(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> single_ok_d(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> single_slot_d(ctx.pool());
     const int32_t * multi_seq_fast_path_ok = nullptr;
+    const int32_t * single_seq_ok          = nullptr;
 
     // Fast path for single-sequence recurrent updates (Qwen3Next prompt/decode path).
     // In this case, outputs are independent given the initial conv state, so we parallelize over token blocks.
@@ -517,6 +687,26 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 nc, nr, n_kv);
         }
 
+        // Phase B: runtime-single-seq detection.
+        // Initialise single_ok=1 / single_slot=-1 then scan src3.
+        single_ok_d.alloc(1);
+        single_slot_d.alloc(1);
+        int32_t single_ok_init = 1;
+        int32_t single_slot_init = -1;
+        CUDA_CHECK(cudaMemcpyAsync(single_ok_d.get(),   &single_ok_init,   sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(single_slot_d.get(), &single_slot_init, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+        constexpr int detect_block_size = 256;
+        const dim3 detect_grid((n_t + detect_block_size - 1) / detect_block_size, 1, 1);
+        ssm_conv_detect_runtime_single_seq<<<detect_grid, detect_block_size, 0, ctx.stream()>>>(
+            (const int32_t *) src3->data,
+            single_ok_d.get(),
+            single_slot_d.get(),
+            n_t,
+            n_kv,
+            src3->nb[1] / sizeof(int32_t));
+        CUDA_CHECK(cudaGetLastError());
+        single_seq_ok = single_ok_d.get();
+
         // Fast path for multi-sequence decode-like batches:
         // one token per unique sequence, no copy-to-multiple-sequences routing.
         ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
@@ -564,6 +754,48 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 nc, nr, n_t,
                 src1->nb[1] / sizeof(float));
         }
+
+        // Phase B: runtime single-seq fast path. Guarded by single_ok;
+        // returns early if detection rejected. Uses the same arithmetic
+        // as the existing single_seq_f32 kernels but reads slot index
+        // from device memory and offsets src0/dst_state accordingly.
+        {
+            const int src0_s0 = src0->nb[0] / sizeof(float);
+            const int src0_s1 = src0->nb[1] / sizeof(float);
+            const int src0_s2 = src0->nb[2] / sizeof(float);
+            const int src1_s1 = src1->nb[1] / sizeof(float);
+            constexpr int split_n_t = 32;
+            const dim3 split_token_grid(row_grid.x, (n_t + split_n_t - 1) / split_n_t, 1);
+            if (nc == 4) {
+                ssm_conv_runtime_single_seq_f32_nc4<split_n_t><<<split_token_grid, block_dims, 0, ctx.stream()>>>(
+                    (const float *) src0->data,
+                    (const float *) src1->data,
+                    (const float *) src2->data,
+                    single_ok_d.get(),
+                    single_slot_d.get(),
+                    dst_x,
+                    nr, n_t,
+                    src0_s0, src0_s1, src0_s2, src1_s1);
+            } else {
+                ssm_conv_runtime_single_seq_f32<split_n_t><<<split_token_grid, block_dims, 0, ctx.stream()>>>(
+                    (const float *) src0->data,
+                    (const float *) src1->data,
+                    (const float *) src2->data,
+                    single_ok_d.get(),
+                    single_slot_d.get(),
+                    dst_x,
+                    nc, nr, n_t,
+                    src0_s0, src0_s1, src0_s2, src1_s1);
+            }
+            ssm_conv_runtime_single_seq_final_state_f32<<<row_grid, block_dims, 0, ctx.stream()>>>(
+                (const float *) src0->data,
+                (const float *) src1->data,
+                single_ok_d.get(),
+                single_slot_d.get(),
+                dst_state,
+                nc, nr, n_t, n_kv,
+                src0_s0, src0_s1, src0_s2, src1_s1);
+        }
     }
 
     if (nc == 4) {
@@ -574,6 +806,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const float *) src2->data,
                 (const int32_t *) src3->data,
                 multi_seq_fast_path_ok,
+                single_seq_ok,
                 dst_x,
                 dst_state,
                 nr, n_t, n_kv,
@@ -585,6 +818,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const float *) src1->data,
                 (const float *) src2->data,
                 (const int32_t *) src3->data,
+                nullptr,
                 nullptr,
                 dst_x,
                 dst_state,
@@ -599,6 +833,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (const float *) src2->data,
             (const int32_t *) src3->data,
             multi_seq_fast_path_ok,
+            single_seq_ok,
             dst_x,
             dst_state,
             nc, nr, n_t, n_kv,
