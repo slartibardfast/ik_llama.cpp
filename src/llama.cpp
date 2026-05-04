@@ -4754,9 +4754,11 @@ static int llama_decode_internal(
                     single_seq_run++;
                 }
                 n_tokens = single_seq_run;
+                lctx.qnext_mixed_seq_fallback_count++;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch — sub-batching by seq_id (first run=%u of %u tokens)\n",
-                                   __func__, single_seq_run, orig_n_tokens);
+                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
+                                   __func__, single_seq_run, orig_n_tokens,
+                                   (unsigned long long) lctx.qnext_mixed_seq_fallback_count);
                     warned_qnext_mixed_repeat = true;
                 }
             }

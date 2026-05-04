@@ -317,6 +317,10 @@ struct llama_context {
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
     qnext_state_slot_allocator qnext_slot_alloc; // per-seq slot allocator for the linear-attn recurrent state buffer (s_l[il]); maps llama_seq_id -> slot index
+    // Phase 3 instrumentation: count how many times the qwen3next mixed-seq
+    // chunking sub-batch was triggered (line ~4756). Should stay at 0 on
+    // continuous-batched traffic after the per-seq fill site lands.
+    uint64_t qnext_mixed_seq_fallback_count = 0;
     struct ggml_tensor * inp_pos_bucket;    // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
