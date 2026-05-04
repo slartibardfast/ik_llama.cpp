@@ -201,6 +201,9 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 llama_build_and_test(test-regex-partial.cpp)
+if (GGML_CUDA)
+    llama_build_and_test(test-q4-0-ar16-cuda.cpp)
+endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 

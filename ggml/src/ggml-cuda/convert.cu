@@ -102,6 +102,38 @@ static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t
     }
 }
 
+// Q4_0_AR16: 16-element 4-bit symmetric blocks. Per Allium spec
+// q4_0_ar16.allium: code k (0..15) lives in nibble k of qs — even k uses
+// the low nibble of qs[k/2], odd k uses the high nibble. Nibble-
+// interleaved layout (consecutive codes share a byte), distinct from
+// Q4_0's split layout where qs[j] holds codes j and j+16.
+//
+// Launch: one CUDA block per pair of ggml blocks (32 elements), 16
+// threads per CUDA block. tid/8 picks the ggml block within the pair,
+// tid%8 picks the byte within qs.
+template<typename dst_t>
+static __global__ void dequantize_block_q4_0_ar16(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb16) {
+    const int64_t i = blockIdx.x;
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid / 8;
+    const int64_t ir  = tid % 8;
+    const int64_t ib  = 2*i + il;
+    if (ib >= nb16) {
+        return;
+    }
+
+    const block_q4_0_ar16 * x = (const block_q4_0_ar16 *) vx + ib;
+    const float d = __half2float(x->d);
+    const float dm = -8.0f * d;
+
+    const uint8_t q = x->qs[ir];
+    dst_t * y = yy + 16*ib + 2*ir;
+
+    // even k = low nibble (code 2*ir), odd k = high nibble (code 2*ir+1)
+    y[0] = d * (q & 0xF) + dm;
+    y[1] = d * (q >>  4) + dm;
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
 
@@ -1503,6 +1535,15 @@ static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t n
 }
 
 template<typename dst_t>
+static void dequantize_row_q4_0_ar16_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb16 = k / 16;
+    // 2 ggml blocks per CUDA block; ceil division.
+    const int nb = (nb16 + 1) / 2;
+    dequantize_block_q4_0_ar16<<<nb, 16, 0, stream>>>(vx, y, nb16);
+}
+
+template<typename dst_t>
 static void dequantize_row_q6_0_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows * n_per_row;
     const int nb32 = k / 32;
@@ -1918,6 +1959,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
+        case GGML_TYPE_Q4_0_AR16:
+            return dequantize_row_q4_0_ar16_cuda;
         case GGML_TYPE_Q4_1:
             return dequantize_row_q4_1_cuda;
         case GGML_TYPE_Q5_0:
@@ -2024,6 +2067,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
+        case GGML_TYPE_Q4_0_AR16:
+            return dequantize_row_q4_0_ar16_cuda;
         case GGML_TYPE_Q4_1:
             return dequantize_row_q4_1_cuda;
         case GGML_TYPE_Q5_0:
