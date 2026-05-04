@@ -15581,36 +15581,199 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 }
 
 // =====================================================================
-// Q4_0_AR16 — PHASE32 Stage 2 foundation stubs.
-// Phase 1.A (CPU/AVX) will replace these with reference + SIMD impls.
-// All entry points abort loudly so accidental invocation is caught.
+// Q4_0_AR16 — PHASE32 Stage 2.
+// 16-element-block 4-bit symmetric quant. The Allium spec defines an
+// *interleaved* nibble layout (low nibble of qs[k/2] = even-k code,
+// high nibble = odd-k code), distinct from Q4_0's split-halves layout
+// (qs[j] = k=j and k=j+16).
+//
+// Per-block scale is +block_max / 8 (positive); codes are
+// clamp(round_nearest_even(x / scale), -8, 7) + 8 ∈ [0, 15].
+// Dequant is `(code - 8) * fp32(d)`.
 // =====================================================================
 
 void quantize_row_q4_0_ar16_ref(const float * restrict x, block_q4_0_ar16 * restrict y, int64_t k) {
-    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
-    GGML_ABORT("Q4_0_AR16: quantize_row_q4_0_ar16_ref not yet implemented (Phase 1.A)");
+    static const int qk = QK_AR16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (v > amax) amax = v;
+        }
+
+        const float d  = amax / 8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        // Pack per Allium spec: code k → low nibble of qs[k/2] (even k),
+        // high nibble (odd k).
+        for (int j = 0; j < qk/2; ++j) {
+            const float x0 = x[i*qk + 2*j + 0] * id;     // even k = 2j
+            const float x1 = x[i*qk + 2*j + 1] * id;     // odd  k = 2j+1
+
+            const int8_t  c0i = (int8_t) roundf(x0);
+            const int8_t  c1i = (int8_t) roundf(x1);
+            const uint8_t c0  = (uint8_t)(c0i < -8 ? 0 : (c0i > 7 ? 15 : c0i + 8));
+            const uint8_t c1  = (uint8_t)(c1i < -8 ? 0 : (c1i > 7 ? 15 : c1i + 8));
+
+            y[i].qs[j] = c0 | (c1 << 4);
+        }
+    }
 }
 
 void quantize_row_q4_0_ar16(const float * restrict x, void * restrict y, int64_t k) {
-    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
-    GGML_ABORT("Q4_0_AR16: quantize_row_q4_0_ar16 not yet implemented (Phase 1.A)");
+    quantize_row_q4_0_ar16_ref(x, (block_q4_0_ar16 *) y, k);
 }
 
 size_t quantize_q4_0_ar16(const float * restrict src, void * restrict dst, int64_t nrow, int64_t n_per_row,
                           const float * imatrix, const struct quantize_user_data * user_data) {
-    GGML_UNUSED(src); GGML_UNUSED(dst); GGML_UNUSED(nrow); GGML_UNUSED(n_per_row);
-    GGML_UNUSED(imatrix); GGML_UNUSED(user_data);
-    GGML_ABORT("Q4_0_AR16: quantize_q4_0_ar16 not yet implemented (Phase 1.A)");
+    GGML_UNUSED(imatrix);
+    GGML_UNUSED(user_data);
+    assert(n_per_row % QK_AR16 == 0);
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_0_AR16, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_0_ar16(src + row * n_per_row, qrow, n_per_row);
+        qrow += row_size;
+    }
+    return (size_t) nrow * row_size;
 }
 
 void dequantize_row_q4_0_ar16(const block_q4_0_ar16 * restrict x, float * restrict y, int64_t k) {
-    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
-    GGML_ABORT("Q4_0_AR16: dequantize_row_q4_0_ar16 not yet implemented (Phase 1.A)");
+    static const int qk = QK_AR16;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk/2; ++j) {
+            const int c0 = (x[i].qs[j] & 0x0F) - 8;   // even k = 2j
+            const int c1 = (x[i].qs[j] >>   4) - 8;   // odd  k = 2j+1
+            y[i*qk + 2*j + 0] = c0 * d;
+            y[i*qk + 2*j + 1] = c1 * d;
+        }
+    }
 }
 
+// vec_dot Q4_0_AR16 × Q8_0. Q8_0 has QK8_0 = 32 lanes per block, so
+// two consecutive AR16 blocks pair with one Q8_0 block.
 void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx,
                                  const void * restrict vy, size_t by, int nrc) {
-    GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(bs); GGML_UNUSED(vx); GGML_UNUSED(bx);
-    GGML_UNUSED(vy); GGML_UNUSED(by); GGML_UNUSED(nrc);
-    GGML_ABORT("Q4_0_AR16: ggml_vec_dot_q4_0_ar16_q8_0 not yet implemented (Phase 1.A)");
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    assert(nrc == 1);
+    assert(n % QK8_0 == 0);
+
+    const block_q4_0_ar16 * restrict x = vx;
+    const block_q8_0      * restrict y = vy;
+
+    const int nb = n / QK8_0;  // number of Q8_0 blocks; each pairs with 2 AR16 blocks
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    __m512 acc512 = _mm512_setzero_ps();
+    for (; ib < nb; ++ib) {
+        const block_q4_0_ar16 * a = &x[2*ib + 0];
+        const block_q4_0_ar16 * b = &x[2*ib + 1];
+
+        const __m128i a_qs = _mm_loadl_epi64((const __m128i *) a->qs);
+        const __m128i b_qs = _mm_loadl_epi64((const __m128i *) b->qs);
+        const __m128i mask = _mm_set1_epi8(0x0F);
+        const __m128i off  = _mm_set1_epi8(8);
+
+        const __m128i a_lo = _mm_and_si128(a_qs, mask);
+        const __m128i a_hi = _mm_and_si128(_mm_srli_epi16(a_qs, 4), mask);
+        const __m128i b_lo = _mm_and_si128(b_qs, mask);
+        const __m128i b_hi = _mm_and_si128(_mm_srli_epi16(b_qs, 4), mask);
+        const __m128i a_codes = _mm_sub_epi8(_mm_unpacklo_epi8(a_lo, a_hi), off);
+        const __m128i b_codes = _mm_sub_epi8(_mm_unpacklo_epi8(b_lo, b_hi), off);
+
+        const __m512 x_a_f = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(a_codes));
+        const __m512 x_b_f = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(b_codes));
+
+        const __m256i qy   = _mm256_loadu_si256((const __m256i *) y[ib].qs);
+        const __m128i qy_a = _mm256_castsi256_si128(qy);
+        const __m128i qy_b = _mm256_extracti128_si256(qy, 1);
+        const __m512 y_a_f = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(qy_a));
+        const __m512 y_b_f = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(qy_b));
+
+        const float yd = GGML_FP16_TO_FP32(y[ib].d);
+        const __m512 sa = _mm512_set1_ps(GGML_FP16_TO_FP32(a->d) * yd);
+        const __m512 sb = _mm512_set1_ps(GGML_FP16_TO_FP32(b->d) * yd);
+
+        acc512 = _mm512_fmadd_ps(sa, _mm512_mul_ps(x_a_f, y_a_f), acc512);
+        acc512 = _mm512_fmadd_ps(sb, _mm512_mul_ps(x_b_f, y_b_f), acc512);
+    }
+    sumf += _mm512_reduce_add_ps(acc512);
+#elif defined(__AVX2__)
+    for (; ib < nb; ++ib) {
+        const block_q4_0_ar16 * a = &x[2*ib + 0];
+        const block_q4_0_ar16 * b = &x[2*ib + 1];
+
+        const __m256i qy   = _mm256_loadu_si256((const __m256i *) y[ib].qs);
+        const __m128i qy_a = _mm256_castsi256_si128(qy);
+        const __m128i qy_b = _mm256_extracti128_si256(qy, 1);
+
+        const __m128i a_qs = _mm_loadl_epi64((const __m128i *) a->qs);
+        const __m128i b_qs = _mm_loadl_epi64((const __m128i *) b->qs);
+        const __m128i mask = _mm_set1_epi8(0x0F);
+        const __m128i off  = _mm_set1_epi8(8);
+
+        const __m128i a_lo = _mm_and_si128(a_qs, mask);
+        const __m128i a_hi = _mm_and_si128(_mm_srli_epi16(a_qs, 4), mask);
+        const __m128i b_lo = _mm_and_si128(b_qs, mask);
+        const __m128i b_hi = _mm_and_si128(_mm_srli_epi16(b_qs, 4), mask);
+
+        const __m128i a_codes = _mm_sub_epi8(_mm_unpacklo_epi8(a_lo, a_hi), off);
+        const __m128i b_codes = _mm_sub_epi8(_mm_unpacklo_epi8(b_lo, b_hi), off);
+
+        const __m128i ax_a = _mm_sign_epi8(a_codes, a_codes);
+        const __m128i sy_a = _mm_sign_epi8(qy_a,    a_codes);
+        const __m128i pa16 = _mm_maddubs_epi16(ax_a, sy_a);
+        const __m128i pa32 = _mm_madd_epi16(pa16, _mm_set1_epi16(1));
+
+        const __m128i ax_b = _mm_sign_epi8(b_codes, b_codes);
+        const __m128i sy_b = _mm_sign_epi8(qy_b,    b_codes);
+        const __m128i pb16 = _mm_maddubs_epi16(ax_b, sy_b);
+        const __m128i pb32 = _mm_madd_epi16(pb16, _mm_set1_epi16(1));
+
+        const __m128i pa64 = _mm_add_epi32(pa32, _mm_unpackhi_epi64(pa32, pa32));
+        const __m128i pa_h = _mm_add_epi32(pa64, _mm_shuffle_epi32(pa64, _MM_SHUFFLE(2,3,0,1)));
+        const int sum_a = _mm_cvtsi128_si32(pa_h);
+
+        const __m128i pb64 = _mm_add_epi32(pb32, _mm_unpackhi_epi64(pb32, pb32));
+        const __m128i pb_h = _mm_add_epi32(pb64, _mm_shuffle_epi32(pb64, _MM_SHUFFLE(2,3,0,1)));
+        const int sum_b = _mm_cvtsi128_si32(pb_h);
+
+        const float yd = GGML_FP16_TO_FP32(y[ib].d);
+        sumf += (float) sum_a * (GGML_FP16_TO_FP32(a->d) * yd);
+        sumf += (float) sum_b * (GGML_FP16_TO_FP32(b->d) * yd);
+    }
+#endif
+
+    // Scalar tail / non-x86 full path.
+    for (; ib < nb; ++ib) {
+        const block_q4_0_ar16 * a = &x[2*ib + 0];
+        const block_q4_0_ar16 * b = &x[2*ib + 1];
+
+        int sum_a = 0, sum_b = 0;
+        for (int j = 0; j < QK_AR16/2; ++j) {
+            const int a0 = (a->qs[j] & 0x0F) - 8;
+            const int a1 = (a->qs[j] >>   4) - 8;
+            const int b0 = (b->qs[j] & 0x0F) - 8;
+            const int b1 = (b->qs[j] >>   4) - 8;
+            sum_a += a0 * y[ib].qs[2*j + 0] + a1 * y[ib].qs[2*j + 1];
+            sum_b += b0 * y[ib].qs[QK_AR16 + 2*j + 0] + b1 * y[ib].qs[QK_AR16 + 2*j + 1];
+        }
+        const float yd = GGML_FP16_TO_FP32(y[ib].d);
+        sumf += sum_a * GGML_FP16_TO_FP32(a->d) * yd;
+        sumf += sum_b * GGML_FP16_TO_FP32(b->d) * yd;
+    }
+
+    *s = sumf;
 }
