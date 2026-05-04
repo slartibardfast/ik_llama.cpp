@@ -77,6 +77,27 @@
 #include <vector>
 #include <sstream>
 
+// NVTX cuBLAS-attribution profiling (Phase 0.C). When GGML_CUDA_NVTX_PROFILE
+// is defined at compile time (separate profile build), each cuBLAS dispatch
+// in ggml_cuda_mul_mat emits an NVTX range carrying the destination tensor
+// name and the dispatch-path label, so nsys stats can attribute cuBLAS GEMM
+// time per tensor. Zero overhead when the macro is undefined.
+#ifdef GGML_CUDA_NVTX_PROFILE
+#  include <nvtx3/nvToolsExt.h>
+   // Range label format: "<dispatch>|N=<batch>|<tensor>"
+   // N (== src1->ne[1]) lets post-processing split PP (N>1) from TG (N==1).
+#  define IK_NVTX_RANGE(label, name)                                       \
+       char _ik_nvtx_buf[256];                                             \
+       int  _ik_nvtx_n = (int)src1->ne[1];                                 \
+       snprintf(_ik_nvtx_buf, sizeof(_ik_nvtx_buf), "%s|N=%d|%s",          \
+                (label), _ik_nvtx_n, (name) ? (name) : "?");               \
+       nvtxRangePushA(_ik_nvtx_buf)
+#  define IK_NVTX_END()  nvtxRangePop()
+#else
+#  define IK_NVTX_RANGE(label, name) ((void)0)
+#  define IK_NVTX_END()              ((void)0)
+#endif
+
 #define IK_PRINT_TIMING 0
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2538,11 +2559,16 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1) {
-        return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
+        IK_NVTX_RANGE("mul_mat_q_or_mmvq_fast", dst->name);
+        int rc = ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
+        IK_NVTX_END();
+        return rc;
     }
 
     if (ggml_nrows(src0) == 1 && ggml_nrows(src1) == 1) { // && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+        IK_NVTX_RANGE("mul_mat_1row", dst->name);
         mul_mat_1row(src0, src1, dst, ctx);
+        IK_NVTX_END();
         return node_n;
     }
     bool debug = false; //src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32;
@@ -2558,28 +2584,42 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (any_gpus_with_slow_fp16 && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         if (debug) printf("%s(%s): using ggml_cuda_mul_mat_vec_p021\n", __func__, dst->name);
         // FP32 precision KQ single-batch for batch size 1 without FlashAttention
+        IK_NVTX_RANGE("mmv_p021", dst->name);
         ggml_cuda_mul_mat_vec_p021(ctx, src0, src1, dst);
+        IK_NVTX_END();
     } else if (any_gpus_with_slow_fp16 && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1) {
         if (debug) printf("%s(%s): using ggml_cuda_mul_mat_vec_nc\n", __func__, dst->name);
         // FP32 precision KQV single-batch for batch size 1 without FlashAttention
+        IK_NVTX_RANGE("mmv_nc", dst->name);
         ggml_cuda_mul_mat_vec_nc(ctx, src0, src1, dst);
+        IK_NVTX_END();
     } else if ((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) && (src1->type == src0->type || !any_gpus_with_slow_fp16)
                && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
         if (debug) printf("%s(%s): ggml_cuda_mul_mat_batched_cublas\n", __func__, dst->name);
         // KQ + KQV multi-batch without FlashAttention
+        IK_NVTX_RANGE("batched_cublas", dst->name);
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
+        IK_NVTX_END();
     } else if (use_dequantize_mul_mat_vec) {
         if (debug) printf("%s(%s): ggml_cuda_op_mul_mat(ggml_cuda_op_dequantize_mul_mat_vec)\n", __func__, dst->name);
+        IK_NVTX_RANGE("dmmv", dst->name);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_dequantize_mul_mat_vec, nullptr);
+        IK_NVTX_END();
     } else if (use_mul_mat_vec_q) {
         if (debug) printf("%s(%s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_vec_q)\n", __func__, dst->name);
+        IK_NVTX_RANGE("mmvq", dst->name);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
+        IK_NVTX_END();
     } else if (use_mul_mat_q) {
         if (debug) printf("%s(%s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_q)\n", __func__, dst->name);
+        IK_NVTX_RANGE("mmq", dst->name);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+        IK_NVTX_END();
     } else {
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
+        IK_NVTX_RANGE("op_mul_mat_cublas", dst->name);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        IK_NVTX_END();
     }
     return node_n;
 }

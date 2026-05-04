@@ -4350,9 +4350,56 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
         int32_t * data = (int32_t *) lctx.inp_s_seq_qnext->data;
 
+        // Lazy-init the per-seq state-slot allocator on first use. Slot
+        // count comes from the recurrent state buffer's second dim;
+        // kv_cache_init sized it to llama_qwen3next_state_slots(cparams, kv_size).
+        if (lctx.qnext_slot_alloc.n_slots == 0) {
+            int32_t n_slots = 0;
+            for (size_t il = 0; il < lctx.kv_self.s_l.size(); ++il) {
+                if (lctx.kv_self.s_l[il] != nullptr) {
+                    n_slots = (int32_t) lctx.kv_self.s_l[il]->ne[1];
+                    break;
+                }
+            }
+            if (n_slots <= 0) n_slots = (int32_t) std::max<uint32_t>(1, lctx.cparams.n_seq_max);
+            lctx.qnext_slot_alloc.init(n_slots);
+        }
+
+        // Map each token's seq_id to its allocated state slot. The
+        // first appearance of a seq_id allocates a slot; subsequent
+        // tokens with the same seq_id reuse it.
+        //
+        // Known limitation: a freshly-allocated slot (slot index != 0)
+        // starts with zero recurrent state, which the qwen3next SSM
+        // architecture treats as out-of-distribution. Empirically the
+        // first ~5 generated tokens for a fresh slot can be malformed
+        // (e.g. repeated `!`) before the recurrent state warms up
+        // through the prompt.
+        //
+        // Two attempted mitigations failed within Phase 1's surgical
+        // scope:
+        // - Host-staged ggml_backend_tensor_get/set: aborts on split
+        //   CUDA tensors (ggml_backend_cuda_split_buffer_get_tensor).
+        // - cells[sid].src = 0 + do_copy = true: triggers a server
+        //   crash; the do_copy machinery has additional preconditions
+        //   (cell.pos / has_seq_id state) that aren't satisfied at
+        //   fill-site time and must be set up via the full seq_cp
+        //   contract.
+        //
+        // Both are tractable but require Phase 2 lifecycle integration
+        // (proper seq_cp invocation at first allocation, or a new
+        // engine-level state-broadcast op). Deferred. The structural
+        // fix (per-seq state isolation) is still the core win — slots
+        // 1..N-1 produce coherent text after their cold-start prefix.
         for (int64_t j = 0; j < n_tokens; ++j) {
-            // qwen3next linear-attention path uses a single local recurrent state slot.
-            data[j] = 0;
+            llama_seq_id sid = 0;
+            if (batch.n_seq_id != nullptr && batch.seq_id != nullptr &&
+                batch.n_seq_id[j] > 0 && batch.seq_id[j] != nullptr) {
+                sid = batch.seq_id[j][0];
+            }
+            const int32_t slot = lctx.qnext_slot_alloc.alloc(sid);
+            GGML_ASSERT(slot >= 0 && slot < lctx.qnext_slot_alloc.n_slots);
+            data[j] = slot;
         }
     }
 
@@ -4683,9 +4730,33 @@ static int llama_decode_internal(
             }
 
             if (can_check && any_diff && has_dup) {
-                n_tokens = 1;
+                // The linear-attn ssm_conv path requires that each unique
+                // logical seq_id appears in exactly one contiguous block in
+                // the batch (state[seq_id] is read/written once per seq).
+                // Old fallback set n_tokens = 1 — turning every multi-slot
+                // continuous-batched decode into single-token serial work
+                // and breaking MTP+np>=2 entirely (the verify step's
+                // logits[i]=true mapping desyncs under chunking).
+                //
+                // New strategy: process the longest single-seq run starting
+                // at cur_token. The outer loop will pick up the next seq's
+                // run on its next iteration. Best case (continuous batching
+                // typically presents [A,A,..,B,B,..]): each iteration
+                // dispatches one full-seq sub-batch. Worst case (truly
+                // interleaved seq_ids): degrades to n_tokens=1 = old behavior.
+                const uint32_t orig_n_tokens = n_tokens;
+                const llama_seq_id sid0 = batch_all.seq_id[cur_token][0];
+                uint32_t single_seq_run = 1;
+                while (single_seq_run < orig_n_tokens) {
+                    const uint32_t idx = cur_token + single_seq_run;
+                    if (batch_all.n_seq_id[idx] <= 0 || batch_all.seq_id[idx] == nullptr) break;
+                    if (batch_all.seq_id[idx][0] != sid0) break;
+                    single_seq_run++;
+                }
+                n_tokens = single_seq_run;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
+                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch — sub-batching by seq_id (first run=%u of %u tokens)\n",
+                                   __func__, single_seq_run, orig_n_tokens);
                     warned_qnext_mixed_repeat = true;
                 }
             }

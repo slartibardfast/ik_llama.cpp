@@ -3860,40 +3860,75 @@ static void restore_speculative_checkpoint(
 }
 
 void server_context::speculative_decoding_accept() {
+    // Two-phase split: at np>=2 with MTP, the per-slot loop's mid-loop
+    // calls into restore_speculative_checkpoint / mtp_accept_tokens
+    // each issue their own llama_decode, which rebuilds lctx.output_ids.
+    // The next slot's read-from-verify-decode (sample_and_accept_n,
+    // get_embeddings_ith) then dereferences clobbered output_ids and
+    // crashes with "invalid logits id N".
+    //
+    // The engine's contract is "logits/embeddings valid until next
+    // llama_decode". Honor it by reading across all slots first
+    // (Phase A), then mutating across all slots (Phase B). Phase B's
+    // internal llama_decode calls clobber output_ids freely; Phase A
+    // is finished and no longer reads from it.
+    struct accepted_slot {
+        server_slot * slot;
+        size_t n_draft_pre;
+        std::vector<llama_token> ids;
+        int32_t mtp_n_past_base;
+        std::vector<float> mtp_hidden_state_pre;
+    };
+    std::vector<accepted_slot> accepted;
+    accepted.reserve(slots.size());
+
+    // ---- Phase A — read-only across all active slots ----
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
             continue;
         }
 
-        size_t n_draft = slot.drafted.size();
+        accepted_slot a;
+        a.slot = &slot;
+        a.n_draft_pre = slot.drafted.size();
 
         apply_server_biases(slot);
 
         // the accepted tokens from the speculation
-        const auto ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
+        a.ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
 
-        int32_t mtp_n_past_base = 0;
-        std::vector<float> mtp_hidden_state_pre;
+        a.mtp_n_past_base = 0;
         if (slot.has_mtp) {
-            mtp_n_past_base = slot.n_past - (slot.drafted.size() + 1);
+            a.mtp_n_past_base = slot.n_past - (slot.drafted.size() + 1);
 
             const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-            if (!ids.empty()) {
-                mtp_hidden_state_pre.resize(ids.size() * n_embd);
-                for (size_t i = 0; i < ids.size(); i++) {
+            if (!a.ids.empty()) {
+                a.mtp_hidden_state_pre.resize(a.ids.size() * n_embd);
+                for (size_t i = 0; i < a.ids.size(); i++) {
                     const float* emb_i = llama_get_embeddings_ith(ctx, slot.i_batch_dft[i]);
                     if (emb_i) {
-                        memcpy(mtp_hidden_state_pre.data() + i * n_embd, emb_i, n_embd * sizeof(float));
+                        memcpy(a.mtp_hidden_state_pre.data() + i * n_embd, emb_i, n_embd * sizeof(float));
                     }
                 }
             } else {
                 const float* emb0 = llama_get_embeddings_ith(ctx, 0);
                 if (emb0) {
-                    mtp_hidden_state_pre.resize(n_embd);
-                    memcpy(mtp_hidden_state_pre.data(), emb0, n_embd * sizeof(float));
+                    a.mtp_hidden_state_pre.resize(n_embd);
+                    memcpy(a.mtp_hidden_state_pre.data(), emb0, n_embd * sizeof(float));
                 }
             }
         }
+
+        accepted.push_back(std::move(a));
+    }
+
+    // ---- Phase B — state mutation across all captured slots ----
+    for (auto& a : accepted) {
+        server_slot & slot = *a.slot;
+        const auto & ids = a.ids;
+        const size_t n_draft = a.n_draft_pre;
+        const int32_t mtp_n_past_base = a.mtp_n_past_base;
+        std::vector<float> mtp_hidden_state_pre = std::move(a.mtp_hidden_state_pre);
 
         slot.i_batch_dft.clear();
         slot.drafted.clear();
@@ -3963,11 +3998,11 @@ void server_context::speculative_decoding_accept() {
 
             update_allowlist_state(slot);
         }
-        SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
+        SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)n_draft, slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
             {"id_slot", slot.id},
             {"accepted", (int)ids.size() - 1},
-            {"total", (int)slot.drafted.size()},
+            {"total", (int)n_draft},
             {"new_n_past", slot.n_past}
             });
     }
