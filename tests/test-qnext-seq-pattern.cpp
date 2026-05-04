@@ -5,7 +5,7 @@
 //
 // GREEN after Phase A: every assertion passes.
 
-#include "qnext-seq-pattern.h"
+#include "../src/qnext-seq-pattern.h"
 #include "llama.h"
 
 #include <cassert>
