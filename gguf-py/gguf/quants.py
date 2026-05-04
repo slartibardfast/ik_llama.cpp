@@ -257,8 +257,10 @@ class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
     #
     # Layout per block (10 bytes total): bytes 0..2 fp16 d, bytes 2..10 the
     # 8-byte nibble payload qs. Code k lives in the low nibble of qs[k/2]
-    # for even k and the high nibble for odd k -- the Q4_0 packing
-    # convention, just with a 16-wide block.
+    # for even k and the high nibble of qs[k/2] for odd k -- INTERLEAVED
+    # nibbles, matching the Allium spec, the C kernel, and the CUDA
+    # kernel. (NOT Q4_0's split-halves layout, where byte j packs codes
+    # [j] and [j+8].)
     #
     # Quantize follows q4_0_ar16.allium's QuantizeFormula exactly:
     #   block_max = max(abs(values_in_block))
@@ -284,11 +286,12 @@ class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
         codes_signed = np.clip(codes_signed, -8, 7)
         qs = (codes_signed + 8).astype(np.uint8)  # [0, 15]
 
-        # Pack pairs into bytes: even k -> low nibble, odd k -> high nibble.
-        # Same trick as Q4_0: reshape to (n_blocks, 2, block_size/2) where
-        # the leading length-2 axis splits even/odd, then OR.
-        qs = qs.reshape((n_blocks, 2, cls.block_size // 2))
-        qs = qs[..., 0, :] | (qs[..., 1, :] << np.uint8(4))
+        # Pack interleaved pairs into bytes: byte j gets codes[2j] in the
+        # low nibble and codes[2j+1] in the high nibble. Reshape to
+        # (n_blocks, block_size/2, 2) so the trailing length-2 axis is
+        # (even, odd), then OR.
+        qs = qs.reshape((n_blocks, cls.block_size // 2, 2))
+        qs = qs[..., 0] | (qs[..., 1] << np.uint8(4))
 
         d_bytes = d.astype(np.float16).view(np.uint8)
         return np.concatenate([d_bytes, qs], axis=-1)
@@ -300,9 +303,11 @@ class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
         d, qs = np.hsplit(blocks, [2])
         d = d.view(np.float16).astype(np.float32)
 
-        # Unpack: each qs byte -> (low nibble, high nibble) for codes
-        # (k even, k odd). Mirror Q4_0's broadcasting trick exactly.
-        qs = qs.reshape((n_blocks, -1, 1, cls.block_size // 2)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        # Unpack interleaved: each qs byte -> (low nibble = even k,
+        # high nibble = odd k). Reshape to (n_blocks, block_size/2, 1)
+        # then broadcast across [low, high] so the flat code order is
+        # [byte0_lo, byte0_hi, byte1_lo, byte1_hi, ...] = codes[0..16].
+        qs = qs.reshape((n_blocks, cls.block_size // 2, 1)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2))
         qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
 
         return d * qs.astype(np.float32)
