@@ -860,7 +860,12 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_graph * cur_graph = nullptr;
 
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Cache keyed by the cgraph topology hash (n_nodes + per-node op),
+    // not the shape hash. Multiple shape variants of the same topology
+    // share one entry; the existing is_cuda_graph_update_required +
+    // cudaGraphExecUpdate flow patches per-call ne/src into the cached
+    // executable. See ggml_cuda_graph_get_topology_key in ggml-cuda.cu.
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
 #endif
 

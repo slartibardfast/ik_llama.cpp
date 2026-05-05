@@ -1,10 +1,14 @@
-// CUDA graph cache: distinct shape coverage in hit_counter dump.
+// CUDA graph cache: hit_counter accumulates correctly under shape variation.
 //
-// Drives N distinct shapes and asserts the hit_counter probe dump
-// surfaces >= N distinct shape_key values.
+// Drives N distinct shapes that all share one topology (same op-sequence,
+// varying ne) and asserts the hit_counter dump captures the resulting
+// reuse: cache holds one entry (after topology-class keying), and that
+// entry's hits_total >= N.
 //
-// RED until the hit counter on cache entries and the JSONL dump
-// infrastructure both land.
+// Pre-topology-keying, the cache held one entry per shape (N entries,
+// hits_total = small per entry). Post-topology-keying, one entry
+// absorbs all N submissions. Either way, the probe correctly records
+// per-entry hit counts; this test asserts that property.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -20,7 +24,6 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -107,7 +110,8 @@ int main() {
         return 1;
     }
 
-    std::set<std::string> distinct_shape_keys;
+    int64_t max_hits = 0;
+    int n_records = 0;
     for (const auto & path : files) {
         std::ifstream f(path);
         std::string line;
@@ -116,8 +120,9 @@ int main() {
             try {
                 auto j = json::parse(line);
                 if (j.value("probe", "") != "hit_counter") continue;
-                std::string sk = j.value("shape_key", "");
-                if (!sk.empty()) distinct_shape_keys.insert(sk);
+                int64_t h = j.value("hits_total", (int64_t) 0);
+                if (h > max_hits) max_hits = h;
+                n_records++;
             } catch (...) {
                 printf("RESULT: RED — malformed JSONL line\n");
                 return 1;
@@ -125,10 +130,14 @@ int main() {
         }
     }
 
-    printf("  distinct shape_keys observed = %zu (expected >= %d)\n",
-           distinct_shape_keys.size(), N_DISTINCT_SHAPES);
-    if ((int) distinct_shape_keys.size() < N_DISTINCT_SHAPES) {
-        printf("RESULT: RED — fewer distinct shape_keys than driven shapes\n");
+    printf("  hit_counter records = %d  max hits_total = %lld\n",
+           n_records, (long long) max_hits);
+    if (n_records == 0) {
+        printf("RESULT: RED — no hit_counter records emitted\n");
+        return 1;
+    }
+    if (max_hits < N_DISTINCT_SHAPES) {
+        printf("RESULT: RED — entry hit count below number of driven shapes\n");
         return 1;
     }
     printf("RESULT: PASS\n");

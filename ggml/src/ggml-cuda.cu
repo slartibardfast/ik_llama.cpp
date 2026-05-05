@@ -602,10 +602,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     GGML_CUDA_LOG_INFO("%s: have %d graphs\n", __func__, int(cuda_graphs.size()));
 #endif
 
-    // Drain probe accumulators and unregister from the global context set
-    // before any cudaGraphExec destruction or stream teardown. The detached
-    // flusher thread iterates the global set; leaving a dangling pointer
-    // here is a UAF.
+    // Explicit early teardown of the cuda_graphs map: each entry's dtor
+    // emits a destroy vram_delta probe record. We need those records to
+    // be captured by the on_context_destroyed flush below — so destroy
+    // entries first, while being_destroyed is still false.
+    //
+    // Without this, the implicit member-wise destruction at end of dtor
+    // body fires the entry dtors AFTER on_context_destroyed has set
+    // being_destroyed=true, and record_vram silently no-ops on those
+    // events.
+#ifdef USE_CUDA_GRAPH
+    cuda_graphs.clear();
+#endif
+
+    // Drain probe accumulators (now including the just-emitted destroy
+    // events) and unregister from the global context set before any
+    // stream teardown. The detached flusher thread iterates the global
+    // set; leaving a dangling pointer here is a UAF.
     cuda_graph_probe::on_context_destroyed(*this);
 
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
@@ -4285,11 +4298,12 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 #ifdef USE_CUDA_GRAPH
 
-// Topology hash: stable across calls with identical (n_nodes, per-node op, per-node ne dims).
-// Replaces the pointer-as-key approach so a given topology hits the same cache slot
-// regardless of where the allocator places nodes[0] on each call. Returned as void * so
-// the existing unordered_map<const void*, ...> type stays unchanged.
-static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+// Shape-fingerprint hash: stable across calls with identical (n_nodes, per-node op,
+// per-node ne dims). After B.2 this is a telemetry annotation only — the cache map
+// is keyed by the topology hash (n_nodes + per-node op, see _get_topology_key
+// below). The shape key is recorded on each cache entry so the probe can report
+// which ne-fingerprint was last instantiated.
+static inline uint64_t ggml_cuda_graph_get_shape_key(ggml_cgraph * cgraph) {
     uint64_t h = 0xcbf29ce484222325ULL;        // FNV-1a 64-bit init
     const uint64_t prime = 0x100000001b3ULL;
     h ^= (uint64_t)cgraph->n_nodes;
@@ -4303,12 +4317,14 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
             h *= prime;
         }
     }
-    return reinterpret_cast<const void *>((uintptr_t)h);
+    return h;
 }
 
 // Topology-only hash: same FNV-1a as _get_key but skips the ne loop, so two
 // graphs that share (n_nodes, op-sequence) collide regardless of element-count
-// differences. Used as a telemetry annotation today; no cache routing yet.
+// differences. Now the primary cache key (was telemetry-only); cudaGraphExecUpdate
+// patches per-call ne / src pointers when topology hits an entry whose
+// captured shape differs from the current cgraph.
 static inline uint64_t ggml_cuda_graph_get_topology_key(ggml_cgraph * cgraph) {
     uint64_t h = 0xcbf29ce484222325ULL;
     const uint64_t prime = 0x100000001b3ULL;
@@ -4349,8 +4365,8 @@ static inline uint64_t ggml_cuda_graph_now_us() {
     return (uint64_t) duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key, ggml_cgraph * cgraph) {
-    auto it = ctx.cuda_graphs.find(key);
+static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, uint64_t topology_key, ggml_cgraph * cgraph) {
+    auto it = ctx.cuda_graphs.find(topology_key);
     if (it != ctx.cuda_graphs.end()) {
         auto * g = it->second.get();
         g->hits_total++;
@@ -4363,14 +4379,15 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
         // which frees the underlying cudaGraphExec / cudaGraph. Safe
         // because the cache is single-threaded per backend context and
         // we only get here when this thread has no in-flight reference
-        // to the entry being evicted (we just looked up `key` and missed).
+        // to the entry being evicted (we just looked up the topology key
+        // and missed).
         ctx.cuda_graphs.erase(ctx.cuda_graphs.begin());
     }
-    auto & graph = ctx.cuda_graphs[key];
+    auto & graph = ctx.cuda_graphs[topology_key];
     graph = std::make_unique<ggml_cuda_graph>();
     auto * g = graph.get();
-    g->shape_key    = (uint64_t) reinterpret_cast<uintptr_t>(key);
-    g->topology_key = ggml_cuda_graph_get_topology_key(cgraph);
+    g->topology_key = topology_key;
+    g->shape_key    = ggml_cuda_graph_get_shape_key(cgraph);
     g->hits_total   = 1;                          // count this miss as the first observation
     g->last_use_us  = ggml_cuda_graph_now_us();
     g->owner_ctx    = &ctx;
@@ -4617,7 +4634,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     [[maybe_unused]] const bool integrated = false; //ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
 #ifdef USE_CUDA_GRAPH
-    auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph), cgraph) : nullptr;
+    auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_topology_key(cgraph), cgraph) : nullptr;
 #endif
 
     //printf("======================== %s: graph with %d nodes on device %d. time = %ld\n", __func__, cgraph->n_nodes, cuda_ctx->device, ggml_time_us());
@@ -4720,6 +4737,12 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
         if (cuda_graph_update_required) { // Update graph executable
             update_cuda_graph_executable(graph);
         }
+        // Track the most recent shape installed on this topology entry.
+        // Lets the probe report current_shape_key per cache slot and gives
+        // future code (e.g. an optional per-(topology, op_params) failure
+        // blacklist) a stable handle on the shape variant a successful
+        // capture/Update is bound to.
+        graph->shape_key = ggml_cuda_graph_get_shape_key(cgraph);
         // Launch graph
         {
             const bool probe_launch = cuda_graph_probe::active();
@@ -4788,7 +4811,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
-        auto graph_key = ggml_cuda_graph_get_key(cgraph);
+        auto graph_key = ggml_cuda_graph_get_topology_key(cgraph);
         graph = ggml_cuda_get_graph(*cuda_ctx, graph_key, cgraph);
     }
     cuda_ctx->cur_graph = graph;
