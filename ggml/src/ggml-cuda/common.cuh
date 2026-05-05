@@ -839,6 +839,7 @@ struct ggml_tensor_extra_gpu {
 #endif
 
 struct ggml_cuda_graph;
+#include "cuda_graph_probe.cuh"
 
 struct ggml_backend_cuda_context {
     int device;
@@ -862,6 +863,10 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
 #endif
+
+    // Graph cache instrumentation accumulator. Zero-cost when
+    // GGML_CUDA_GRAPH_PROBE is unset.
+    cuda_graph_probe_state probe_state;
 
     void * copy_buffer = nullptr;
     size_t copy_size   = 0;

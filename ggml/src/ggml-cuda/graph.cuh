@@ -2,6 +2,10 @@
 
 #include "ggml.h"
 
+#include <cstdint>
+
+struct ggml_backend_cuda_context;
+
 struct ggml_graph_node_properties {
     void * node_address;
     ggml_op node_op;
@@ -13,14 +17,7 @@ struct ggml_graph_node_properties {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
-    ~ggml_cuda_graph() {
-        if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
-        }
-    }
+    ~ggml_cuda_graph();
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0;
@@ -38,6 +35,14 @@ struct ggml_cuda_graph {
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;
+
+    // Graph cache instrumentation fields. Populated only when the probe
+    // is active (GGML_CUDA_GRAPH_PROBE=1); otherwise left at defaults.
+    uint64_t topology_key = 0;     // hash(n_nodes, op[i] for i in nodes); skips ne
+    uint64_t shape_key    = 0;     // hash including ne[d] per node (current behaviour)
+    uint64_t hits_total   = 0;     // # successful lookups landing on this entry
+    uint64_t last_use_us  = 0;     // steady_clock micros at last hit
+    ggml_backend_cuda_context * owner_ctx = nullptr;  // back-pointer for dtor probe
 #endif
 };
 

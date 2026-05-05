@@ -9,6 +9,9 @@
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 
+#include <chrono>
+#include <set>
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -549,30 +552,46 @@ GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend) {
 #endif
 }
 
-// Phase 35 instrumentation surface — stubs landed in A.0; replaced by A.1–A.7.
+// CUDA graph cache instrumentation accessors — counter readbacks + a
+// synchronous flush trigger. The flush walks the per-context accumulator
+// and emits JSONL records into <dump_dir>/cuda<device>-<probe>.jsonl.
+
 GGML_CALL size_t ggml_backend_cuda_graph_topology_class_count(ggml_backend_t backend) {
+    if (backend == nullptr || backend->context == nullptr) return 0;
+#ifdef USE_CUDA_GRAPH
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    std::set<uint64_t> classes;
+    for (const auto & kv : ctx->cuda_graphs) {
+        if (kv.second) classes.insert(kv.second->topology_key);
+    }
+    return classes.size();
+#else
     (void) backend;
     return 0;
+#endif
 }
 
 GGML_CALL size_t ggml_backend_cuda_graph_disable_vram_pressure_count(ggml_backend_t backend) {
-    (void) backend;
-    return 0;
+    if (backend == nullptr || backend->context == nullptr) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return (size_t) ctx->probe_state.disable_vram_pressure_count.load(std::memory_order_relaxed);
 }
 
 GGML_CALL size_t ggml_backend_cuda_graph_update_failure_count(ggml_backend_t backend) {
-    (void) backend;
-    return 0;
+    if (backend == nullptr || backend->context == nullptr) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return (size_t) ctx->probe_state.update_failure_count.load(std::memory_order_relaxed);
 }
 
 GGML_CALL int ggml_backend_cuda_graph_probe_flush(ggml_backend_t backend) {
-    (void) backend;
-    return -1;
+    if (!cuda_graph_probe::active()) return -1;
+    if (backend == nullptr || backend->context == nullptr) return -1;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return cuda_graph_probe::flush_context(*ctx);
 }
 
 GGML_CALL int ggml_backend_cuda_graph_probe_active(void) {
-    const char * env = getenv("GGML_CUDA_GRAPH_PROBE");
-    return (env != nullptr && env[0] == '1') ? 1 : 0;
+    return cuda_graph_probe::active();
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -4281,6 +4300,22 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return reinterpret_cast<const void *>((uintptr_t)h);
 }
 
+// Topology-only hash: same FNV-1a as _get_key but skips the ne loop, so two
+// graphs that share (n_nodes, op-sequence) collide regardless of element-count
+// differences. Used as a telemetry annotation today; no cache routing yet.
+static inline uint64_t ggml_cuda_graph_get_topology_key(ggml_cgraph * cgraph) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint64_t prime = 0x100000001b3ULL;
+    h ^= (uint64_t)cgraph->n_nodes;
+    h *= prime;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        h ^= (uint64_t)n->op;
+        h *= prime;
+    }
+    return h;
+}
+
 // Bound on cuda_graphs cache to prevent unbounded growth under workloads
 // with shape-varying decode (multi-slot, MTP, prefill+decode mix). Each
 // entry holds a cudaGraphExec + cudaGraph; without a cap, distinct shapes
@@ -4303,10 +4338,18 @@ static size_t ggml_cuda_get_graph_cache_max() {
     return cached;
 }
 
-static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
+static inline uint64_t ggml_cuda_graph_now_us() {
+    using namespace std::chrono;
+    return (uint64_t) duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key, ggml_cgraph * cgraph) {
     auto it = ctx.cuda_graphs.find(key);
     if (it != ctx.cuda_graphs.end()) {
-        return it->second.get();
+        auto * g = it->second.get();
+        g->hits_total++;
+        g->last_use_us = ggml_cuda_graph_now_us();
+        return g;
     }
     const size_t cap = ggml_cuda_get_graph_cache_max();
     while (ctx.cuda_graphs.size() >= cap) {
@@ -4319,7 +4362,13 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
     }
     auto & graph = ctx.cuda_graphs[key];
     graph = std::make_unique<ggml_cuda_graph>();
-    return graph.get();
+    auto * g = graph.get();
+    g->shape_key    = (uint64_t) reinterpret_cast<uintptr_t>(key);
+    g->topology_key = ggml_cuda_graph_get_topology_key(cgraph);
+    g->hits_total   = 1;                          // count this miss as the first observation
+    g->last_use_us  = ggml_cuda_graph_now_us();
+    g->owner_ctx    = &ctx;
+    return g;
 }
 
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph * graph, ggml_cgraph * cgraph,
@@ -4545,7 +4594,7 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     [[maybe_unused]] const bool integrated = false; //ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
 #ifdef USE_CUDA_GRAPH
-    auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph)) : nullptr;
+    auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph), cgraph) : nullptr;
 #endif
 
     //printf("======================== %s: graph with %d nodes on device %d. time = %ld\n", __func__, cgraph->n_nodes, cuda_ctx->device, ggml_time_us());
@@ -4680,7 +4729,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
         auto graph_key = ggml_cuda_graph_get_key(cgraph);
-        graph = ggml_cuda_get_graph(*cuda_ctx, graph_key);
+        graph = ggml_cuda_get_graph(*cuda_ctx, graph_key, cgraph);
     }
     cuda_ctx->cur_graph = graph;
 
