@@ -199,6 +199,27 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // PHASE33 PROBE: name the offending operands just before the
+    // dtype-uniformity assert fires. Remove once the divergence site
+    // is identified.
+    if (!(src0->type == src1->type && src0->type == dst->type)) {
+        const int32_t dim_p = ((const int32_t *) dst->op_params)[0];
+        fprintf(stderr,
+                "[CONCAT-PROBE] dtype mismatch about to abort\n"
+                "  dst ='%s' type=%s ne=[%lld,%lld,%lld,%lld]\n"
+                "  src0='%s' type=%s ne=[%lld,%lld,%lld,%lld]\n"
+                "  src1='%s' type=%s ne=[%lld,%lld,%lld,%lld]\n"
+                "  dim=%d\n",
+                dst->name,  ggml_type_name(dst->type),
+                (long long) dst->ne[0],  (long long) dst->ne[1],  (long long) dst->ne[2],  (long long) dst->ne[3],
+                src0->name, ggml_type_name(src0->type),
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                src1->name, ggml_type_name(src1->type),
+                (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                dim_p);
+        fflush(stderr);
+    }
+
     GGML_ASSERT(src0->type == src1->type && src0->type == dst->type);
 
     cudaStream_t stream = ctx.stream();
