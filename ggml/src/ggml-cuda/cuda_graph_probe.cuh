@@ -65,6 +65,11 @@ struct cuda_graph_probe_state {
     // Cached counters surfaced via the C accessor API.
     std::atomic<uint64_t> update_failure_count{0};
     std::atomic<uint64_t> disable_vram_pressure_count{0};
+
+    // Set by on_context_destroyed before flush+unregister. Once set, every
+    // subsequent record_* call (e.g. from ~ggml_cuda_graph during the
+    // cuda_graphs map teardown) is a silent no-op.
+    std::atomic<bool> being_destroyed{false};
 };
 
 namespace cuda_graph_probe {

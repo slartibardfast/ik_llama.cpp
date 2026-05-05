@@ -152,12 +152,12 @@ void ensure_initialized() {
 int flush_all() {
     if (!active()) return -1;
     ensure_initialized();
-    std::vector<ggml_backend_cuda_context *> ctxs;
-    {
-        std::lock_guard<std::mutex> lk(g_ctx_mu);
-        ctxs.assign(g_ctx_set.begin(), g_ctx_set.end());
-    }
-    for (auto * c : ctxs) {
+    // Hold g_ctx_mu through the iteration. on_context_destroyed acquires the
+    // same lock via unregister_ctx, so this serializes ctx destruction with
+    // background flushing — without it, flush_context could be invoked on a
+    // ctx whose probe_state mutex is being destroyed.
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
+    for (auto * c : g_ctx_set) {
         flush_context(*c);
     }
     return 0;
@@ -271,16 +271,24 @@ int flush_context(ggml_backend_cuda_context & ctx) {
 }
 
 void on_context_destroyed(ggml_backend_cuda_context & ctx) {
+    // Lock order — g_ctx_mu before ctx.probe_state.mu — must match flush_all
+    // to avoid deadlock with the background flusher.
+    std::lock_guard<std::mutex> lk(g_ctx_mu);
     if (active()) {
         flush_context(ctx);
     }
-    unregister_ctx(ctx);
+    // Mark before erase so any record_* fired by ~ggml_cuda_graph (e.g.
+    // destroy-time vram_delta from cuda_graphs map teardown) becomes a silent
+    // no-op even if the bg flusher races to register_ctx.
+    ctx.probe_state.being_destroyed.store(true, std::memory_order_release);
+    g_ctx_set.erase(&ctx);
 }
 
 void record_timing(ggml_backend_cuda_context & ctx,
                    uint64_t topology_key, const char * event,
                    double duration_us, int n_nodes) {
     if (!active()) return;
+    if (ctx.probe_state.being_destroyed.load(std::memory_order_acquire)) return;
     ensure_initialized();
     register_ctx(ctx);
     std::lock_guard<std::mutex> lk(ctx.probe_state.mu);
@@ -291,6 +299,7 @@ void record_vram(ggml_backend_cuda_context & ctx,
                  uint64_t topology_key, const char * event,
                  int64_t free_before, int64_t free_after) {
     if (!active()) return;
+    if (ctx.probe_state.being_destroyed.load(std::memory_order_acquire)) return;
     ensure_initialized();
     register_ctx(ctx);
     std::lock_guard<std::mutex> lk(ctx.probe_state.mu);
@@ -301,6 +310,7 @@ void record_update_failure(ggml_backend_cuda_context & ctx,
                            uint64_t topology_key,
                            uint64_t shape_key_old, uint64_t shape_key_new) {
     if (!active()) return;
+    if (ctx.probe_state.being_destroyed.load(std::memory_order_acquire)) return;
     ensure_initialized();
     register_ctx(ctx);
     ctx.probe_state.update_failure_count.fetch_add(1, std::memory_order_relaxed);
@@ -311,6 +321,7 @@ void record_update_failure(ggml_backend_cuda_context & ctx,
 void record_disable_too_many(ggml_backend_cuda_context & ctx,
                              uint64_t topology_key, int consecutive_updates) {
     if (!active()) return;
+    if (ctx.probe_state.being_destroyed.load(std::memory_order_acquire)) return;
     ensure_initialized();
     register_ctx(ctx);
     std::lock_guard<std::mutex> lk(ctx.probe_state.mu);

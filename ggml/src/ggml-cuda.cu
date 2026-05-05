@@ -602,6 +602,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     GGML_CUDA_LOG_INFO("%s: have %d graphs\n", __func__, int(cuda_graphs.size()));
 #endif
 
+    // Drain probe accumulators and unregister from the global context set
+    // before any cudaGraphExec destruction or stream teardown. The detached
+    // flusher thread iterates the global set; leaving a dangling pointer
+    // here is a UAF.
+    cuda_graph_probe::on_context_destroyed(*this);
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter == 0; });
 
@@ -4560,6 +4566,8 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
 }
 
 static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
+    const bool probe = cuda_graph_probe::active() && (graph->owner_ctx != nullptr);
+    auto t0 = std::chrono::steady_clock::now();
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -4570,17 +4578,32 @@ static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
+    if (probe) {
+        auto t1 = std::chrono::steady_clock::now();
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        cuda_graph_probe::record_timing(*graph->owner_ctx, graph->topology_key, "update", us, (int) graph->num_nodes);
+    }
+
     if (stat == cudaErrorGraphExecUpdateFailure) {
 #ifndef NDEBUG
         GGML_CUDA_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
+        if (probe) {
+            cuda_graph_probe::record_update_failure(*graph->owner_ctx, graph->topology_key, graph->shape_key, graph->shape_key);
+        }
 
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        auto t2 = std::chrono::steady_clock::now();
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        if (probe) {
+            auto t3 = std::chrono::steady_clock::now();
+            double us = std::chrono::duration<double, std::micro>(t3 - t2).count();
+            cuda_graph_probe::record_timing(*graph->owner_ctx, graph->topology_key, "instantiate", us, (int) graph->num_nodes);
+        }
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -4622,7 +4645,16 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                 graph->graph = nullptr;
             }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            {
+                const bool probe_capture = cuda_graph_probe::active();
+                auto t0 = std::chrono::steady_clock::now();
+                CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                if (probe_capture) {
+                    auto t1 = std::chrono::steady_clock::now();
+                    double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                    cuda_graph_probe::record_timing(*cuda_ctx, graph->topology_key, "capture", us, cgraph->n_nodes);
+                }
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4664,13 +4696,41 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                 }
                 fprintf(stderr, "\n");
             }
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            {
+                const bool probe_inst = cuda_graph_probe::active();
+                int64_t free_before = 0, total = 0;
+                if (probe_inst) {
+                    cudaDeviceSynchronize();
+                    size_t f = 0, t = 0;
+                    cudaMemGetInfo(&f, &t); free_before = (int64_t) f; (void) total;
+                }
+                auto t0 = std::chrono::steady_clock::now();
+                CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+                if (probe_inst) {
+                    auto t1 = std::chrono::steady_clock::now();
+                    cudaDeviceSynchronize();
+                    size_t f = 0, t = 0;
+                    cudaMemGetInfo(&f, &t);
+                    double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                    cuda_graph_probe::record_timing(*cuda_ctx, graph->topology_key, "instantiate", us, cgraph->n_nodes);
+                    cuda_graph_probe::record_vram(*cuda_ctx, graph->topology_key, "insert", free_before, (int64_t) f);
+                }
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             update_cuda_graph_executable(graph);
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        {
+            const bool probe_launch = cuda_graph_probe::active();
+            auto t0 = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            if (probe_launch) {
+                auto t1 = std::chrono::steady_clock::now();
+                double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                cuda_graph_probe::record_timing(*cuda_ctx, graph->topology_key, "launch_submit", us, cgraph->n_nodes);
+            }
+        }
 #else
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
@@ -4767,6 +4827,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
         if (graph->number_consecutive_updates >= 4) {
             graph->disable_due_to_too_many_updates = true;
+            if (cuda_graph_probe::active()) {
+                cuda_graph_probe::record_disable_too_many(*cuda_ctx, graph->topology_key, graph->number_consecutive_updates);
+            }
             use_cuda_graph = false;
             cuda_ctx->cur_graph = nullptr;
 #ifndef NDEBUG
