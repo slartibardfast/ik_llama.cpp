@@ -261,11 +261,31 @@ int flush_context(ggml_backend_cuda_context & ctx) {
         f.flush(); f.close();
         ctx.probe_state.disable_too_many.clear();
     };
+    auto drain_compute_failures = [&]() {
+        if (ctx.probe_state.compute_failures.empty()) return;
+        std::ofstream f = open_for("compute_failure");
+        if (!f) { ctx.probe_state.compute_failures.clear(); return; }
+        for (const auto & r : ctx.probe_state.compute_failures) {
+            emit_common(f, "compute_failure", ctx, r.ts_ns);
+            f << ",\"op\":\""        << (r.op_name        ? r.op_name        : "?") << "\""
+              << ",\"dst_type\":\""  << (r.dst_type_name  ? r.dst_type_name  : "?") << "\""
+              << ",\"src0_type\":\"" << (r.src0_type_name ? r.src0_type_name : "?") << "\""
+              << ",\"src1_type\":\"" << (r.src1_type_name ? r.src1_type_name : "?") << "\""
+              << ",\"ne\":[" << (long long) r.ne[0]
+              << ","         << (long long) r.ne[1]
+              << ","         << (long long) r.ne[2]
+              << ","         << (long long) r.ne[3] << "]"
+              << "}\n";
+        }
+        f.flush(); f.close();
+        ctx.probe_state.compute_failures.clear();
+    };
 
     drain_timings();
     drain_vram();
     drain_updates();
     drain_disable();
+    drain_compute_failures();
 
     return 0;
 }
@@ -326,6 +346,36 @@ void record_disable_too_many(ggml_backend_cuda_context & ctx,
     register_ctx(ctx);
     std::lock_guard<std::mutex> lk(ctx.probe_state.mu);
     ctx.probe_state.disable_too_many.push_back({now_ns(), topology_key, consecutive_updates});
+}
+
+void record_compute_failure(ggml_backend_cuda_context & ctx,
+                            const char * op_name,
+                            const char * dst_type_name,
+                            const char * src0_type_name,
+                            const char * src1_type_name,
+                            const int64_t * ne_out_4) {
+    if (!active()) return;
+    if (ctx.probe_state.being_destroyed.load(std::memory_order_acquire)) return;
+    ensure_initialized();
+    register_ctx(ctx);
+    cuda_graph_probe_state::compute_failure_rec r{};
+    r.ts_ns          = now_ns();
+    r.op_name        = op_name;
+    r.dst_type_name  = dst_type_name;
+    r.src0_type_name = src0_type_name;
+    r.src1_type_name = src1_type_name;
+    if (ne_out_4) {
+        r.ne[0] = ne_out_4[0]; r.ne[1] = ne_out_4[1];
+        r.ne[2] = ne_out_4[2]; r.ne[3] = ne_out_4[3];
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx.probe_state.mu);
+        ctx.probe_state.compute_failures.push_back(r);
+    }
+    // Force an immediate flush so the record lands on disk before the
+    // imminent GGML_ASSERT crash takes the process down. flush_context
+    // re-acquires probe_state.mu — release first via the scope above.
+    flush_context(ctx);
 }
 
 } // namespace cuda_graph_probe

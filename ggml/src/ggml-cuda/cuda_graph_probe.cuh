@@ -55,12 +55,25 @@ struct cuda_graph_probe_state {
         uint64_t  topology_key;
         int       consecutive_updates;
     };
+    // Per-node compute failure: emitted right before any GGML_ASSERT site
+    // that's triggered by data-driven divergence (e.g. concat dtype
+    // mismatch). Captures the op + tensor types so the failure can be
+    // attributed to a specific data-path bug post-hoc.
+    struct compute_failure_rec {
+        uint64_t  ts_ns;
+        const char * op_name;       // string literal from ggml_op_name()
+        const char * dst_type_name; // string literal from ggml_type_name()
+        const char * src0_type_name;
+        const char * src1_type_name;
+        int64_t   ne[4];
+    };
 
     std::mutex mu;
-    std::vector<timing_rec>   timings;
-    std::vector<vram_rec>     vram_deltas;
-    std::vector<upd_fail_rec> update_failures;
-    std::vector<disable_rec>  disable_too_many;
+    std::vector<timing_rec>      timings;
+    std::vector<vram_rec>        vram_deltas;
+    std::vector<upd_fail_rec>    update_failures;
+    std::vector<disable_rec>     disable_too_many;
+    std::vector<compute_failure_rec> compute_failures;
 
     // Cached counters surfaced via the C accessor API.
     std::atomic<uint64_t> update_failure_count{0};
@@ -105,5 +118,15 @@ void record_update_failure(ggml_backend_cuda_context & ctx,
                            uint64_t shape_key_old, uint64_t shape_key_new);
 void record_disable_too_many(ggml_backend_cuda_context & ctx,
                              uint64_t topology_key, int consecutive_updates);
+// Records the operands of a per-node failure (e.g. concat dtype mismatch)
+// just before the assert that would crash the process fires. ne_out is
+// the destination tensor's ne[]; types are passed as string literals from
+// ggml_type_name(). Either src may be null.
+void record_compute_failure(ggml_backend_cuda_context & ctx,
+                            const char * op_name,
+                            const char * dst_type_name,
+                            const char * src0_type_name,
+                            const char * src1_type_name,
+                            const int64_t * ne_out_4);
 
 } // namespace cuda_graph_probe

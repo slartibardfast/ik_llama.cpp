@@ -6,6 +6,7 @@
 //
 
 #include "concat.cuh"
+#include "cuda_graph_probe.cuh"
 
 // contiguous kernels
 static __global__ void concat_f32_dim0(const float * x, const float * y, float * dst, const int64_t ne0, const int64_t ne00) {
@@ -203,6 +204,13 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // dtype-uniformity assert fires. Remove once the divergence site
     // is identified.
     if (!(src0->type == src1->type && src0->type == dst->type)) {
+        cuda_graph_probe::record_compute_failure(
+            ctx,
+            ggml_op_name(dst->op),
+            ggml_type_name(dst->type),
+            ggml_type_name(src0->type),
+            ggml_type_name(src1->type),
+            dst->ne);
         const int32_t dim_p = ((const int32_t *) dst->op_params)[0];
         fprintf(stderr,
                 "[CONCAT-PROBE] dtype mismatch about to abort\n"

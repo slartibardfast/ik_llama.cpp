@@ -94,6 +94,13 @@ static std::string validate(const json & j) {
         if (!record_has(j, "topology_key"))            return "disable_too_many missing topology_key";
         if (!record_has(j, "consecutive_updates") || !j["consecutive_updates"].is_number_integer())
             return "disable_too_many missing consecutive_updates";
+    } else if (probe == "compute_failure") {
+        if (!record_has(j, "op"))         return "compute_failure missing op";
+        if (!record_has(j, "dst_type"))   return "compute_failure missing dst_type";
+        if (!record_has(j, "src0_type"))  return "compute_failure missing src0_type";
+        if (!record_has(j, "src1_type"))  return "compute_failure missing src1_type";
+        if (!record_has(j, "ne") || !j["ne"].is_array() || j["ne"].size() != 4)
+            return "compute_failure missing ne[4]";
     } else {
         return "unknown probe type: " + probe;
     }
