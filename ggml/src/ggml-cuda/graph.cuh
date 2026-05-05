@@ -9,6 +9,8 @@ struct ggml_backend_cuda_context;
 struct ggml_graph_node_properties {
     void * node_address;
     ggml_op node_op;
+    ggml_type node_type;                       // dst tensor dtype
+    ggml_type src_type[GGML_MAX_SRC];          // per-src dtype (GGML_TYPE_COUNT = no src)
     int64_t ne[GGML_MAX_DIMS];
     size_t nb[GGML_MAX_DIMS];
     void * src_address[GGML_MAX_SRC];

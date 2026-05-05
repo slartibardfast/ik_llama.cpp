@@ -4491,12 +4491,14 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
     graph_node_properties->node_address = node->data;
     graph_node_properties->node_op = node->op;
+    graph_node_properties->node_type = node->type;
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         graph_node_properties->ne[i] = node->ne[i];
         graph_node_properties->nb[i] = node->nb[i];
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         graph_node_properties->src_address[i] = node->src[i] ? node->src[i]->data : nullptr;
+        graph_node_properties->src_type[i]    = node->src[i] ? node->src[i]->type : GGML_TYPE_COUNT;
     }
     memcpy(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS);
 }
@@ -4512,14 +4514,27 @@ static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_gra
         return false;
     }
 
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        if (node->ne[i] != graph_node_properties->ne[i]) {
-            return false;
-        }
-        if (node->nb[i] != graph_node_properties->nb[i]) {
+    // Tensor dtype is strict: a captured cudaGraphExec is bound to the
+    // kernel template selected for the original dtype. Letting a graph
+    // with a different node->type or src->type reuse the entry would
+    // submit mismatched-dtype bytes to the wrong kernel — the suspected
+    // mechanism behind the multi-slot concat.cu:202 GGML_ASSERT crash.
+    if (node->type != graph_node_properties->node_type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const ggml_type src_t = node->src[i] ? node->src[i]->type : GGML_TYPE_COUNT;
+        if (src_t != graph_node_properties->src_type[i]) {
             return false;
         }
     }
+
+    // ne / nb: not strict here. The captured cudaGraphExec can be
+    // patched via cudaGraphExecUpdate to absorb extent and stride
+    // changes for most ops; that's the whole point of the topology-keyed
+    // collapse. Update path is the existing
+    // update_cuda_graph_executable() which falls back to re-instantiate
+    // on cudaErrorGraphExecUpdateFailure.
 
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (node->src[i] &&
