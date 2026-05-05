@@ -208,6 +208,11 @@ endif()
 llama_build_and_test(test-qnext-seq-pattern.cpp)
 if (GGML_CUDA)
     llama_build_and_test(test-qnext-multislot-dispatch.cpp)
+    llama_build_and_test(test-cuda-graph-cache-bounded.cpp)
+    llama_build_and_test(test-phase35-A-monotonic.cpp)
+    llama_build_and_test(test-phase35-A-baseline-dump.cpp)
+    llama_build_and_test(test-phase35-A-destroy-frees.cpp)
+    llama_build_and_test(test-phase35-A-schema.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW

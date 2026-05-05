@@ -538,6 +538,43 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     }
 }
 
+GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend) {
+    if (backend == nullptr || backend->context == nullptr) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+#ifdef USE_CUDA_GRAPH
+    return ctx->cuda_graphs.size();
+#else
+    (void) ctx;
+    return 0;
+#endif
+}
+
+// Phase 35 instrumentation surface — stubs landed in A.0; replaced by A.1–A.7.
+GGML_CALL size_t ggml_backend_cuda_graph_topology_class_count(ggml_backend_t backend) {
+    (void) backend;
+    return 0;
+}
+
+GGML_CALL size_t ggml_backend_cuda_graph_disable_vram_pressure_count(ggml_backend_t backend) {
+    (void) backend;
+    return 0;
+}
+
+GGML_CALL size_t ggml_backend_cuda_graph_update_failure_count(ggml_backend_t backend) {
+    (void) backend;
+    return 0;
+}
+
+GGML_CALL int ggml_backend_cuda_graph_probe_flush(ggml_backend_t backend) {
+    (void) backend;
+    return -1;
+}
+
+GGML_CALL int ggml_backend_cuda_graph_probe_active(void) {
+    const char * env = getenv("GGML_CUDA_GRAPH_PROBE");
+    return (env != nullptr && env[0] == '1') ? 1 : 0;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 #ifdef USE_CUDA_GRAPH
@@ -4244,11 +4281,44 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return reinterpret_cast<const void *>((uintptr_t)h);
 }
 
+// Bound on cuda_graphs cache to prevent unbounded growth under workloads
+// with shape-varying decode (multi-slot, MTP, prefill+decode mix). Each
+// entry holds a cudaGraphExec + cudaGraph; without a cap, distinct shapes
+// accumulate device-resident state until cudaGraphInstantiate fails with
+// out_of_memory. Override via GGML_CUDA_GRAPH_MAX env (>= 1).
+//
+// Eviction is FIFO (drop oldest insertion) rather than true LRU — chosen
+// for simplicity. The map's iteration order is implementation-defined for
+// std::unordered_map but stable enough for "evict any one entry to make
+// room"; the goal here is a bound, not optimal locality.
+static size_t ggml_cuda_get_graph_cache_max() {
+    static const size_t cached = []() -> size_t {
+        const char * env = getenv("GGML_CUDA_GRAPH_MAX");
+        if (env && *env) {
+            long long v = atoll(env);
+            if (v >= 1) return (size_t) v;
+        }
+        return (size_t) 128;
+    }();
+    return cached;
+}
+
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
-    auto & graph = ctx.cuda_graphs[key];
-    if (!graph) {
-        graph = std::make_unique<ggml_cuda_graph>();
+    auto it = ctx.cuda_graphs.find(key);
+    if (it != ctx.cuda_graphs.end()) {
+        return it->second.get();
     }
+    const size_t cap = ggml_cuda_get_graph_cache_max();
+    while (ctx.cuda_graphs.size() >= cap) {
+        // Drop one entry to make room. Erasing destroys the unique_ptr,
+        // which frees the underlying cudaGraphExec / cudaGraph. Safe
+        // because the cache is single-threaded per backend context and
+        // we only get here when this thread has no in-flight reference
+        // to the entry being evicted (we just looked up `key` and missed).
+        ctx.cuda_graphs.erase(ctx.cuda_graphs.begin());
+    }
+    auto & graph = ctx.cuda_graphs[key];
+    graph = std::make_unique<ggml_cuda_graph>();
     return graph.get();
 }
 

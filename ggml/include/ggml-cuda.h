@@ -43,6 +43,20 @@ GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
+// Number of cached CUDA graphs currently held by this backend's context. The
+// graph cache is keyed on cgraph topology pointer; its size grows as decode
+// shapes vary. Exposed for tests that bound cache growth.
+GGML_API GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend);
+
+// Phase 35 instrumentation surface (see PHASE35-GRAPH-CACHE-REDESIGN.md §3.4).
+// All functions return 0 / -1 when GGML_CUDA_GRAPH_PROBE is unset or when the
+// underlying probe step has not yet landed. Tests treat any zero return as RED.
+GGML_API GGML_CALL size_t ggml_backend_cuda_graph_topology_class_count(ggml_backend_t backend);
+GGML_API GGML_CALL size_t ggml_backend_cuda_graph_disable_vram_pressure_count(ggml_backend_t backend);
+GGML_API GGML_CALL size_t ggml_backend_cuda_graph_update_failure_count(ggml_backend_t backend);
+GGML_API GGML_CALL int    ggml_backend_cuda_graph_probe_flush(ggml_backend_t backend);
+GGML_API GGML_CALL int    ggml_backend_cuda_graph_probe_active(void);
+
 // Device-side argmax + softmax-prob over [n_rows, n_vocab] logits.
 // Replaces the host-side argmax loop in common_sampler_sample_speculative when
 // running greedy MTP draft sampling on a CUDA backend. Eliminates per-draft
