@@ -98,6 +98,7 @@ static void glm45_flash_attention(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (K->type != GGML_TYPE_F16) {
         auto nelem = ggml_nelements(K);
         k_data.alloc(nelem);
+        if (k_data.get() == nullptr) return;  // pool soft-OOM; eval loop bubbles GGML_STATUS_ALLOC_FAILED
         auto to_fp_16 = ggml_get_to_fp16_cuda(K->type);
         to_fp_16(K->data, k_data.get(), 1, nelem, ctx.stream());
         local_K.type = GGML_TYPE_F16;
@@ -112,6 +113,7 @@ static void glm45_flash_attention(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (V->type != GGML_TYPE_F16) {
         auto nelem = ggml_nelements(V);
         v_data.alloc(nelem);
+        if (v_data.get() == nullptr) return;
         auto to_fp_16 = ggml_get_to_fp16_cuda(V->type);
         to_fp_16(V->data, v_data.get(), 1, nelem, ctx.stream());
         local_V.type = GGML_TYPE_F16;

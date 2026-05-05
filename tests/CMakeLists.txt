@@ -215,6 +215,7 @@ if (GGML_CUDA)
     llama_build_and_test(test-cuda-graph-probe-schema.cpp)
     llama_build_and_test(test-cuda-graph-update-state-mutation.cpp)
     llama_build_and_test(test-cuda-graph-comparator-op-params.cpp)
+    llama_build_and_test(test-cuda-pool-graceful-oom.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW

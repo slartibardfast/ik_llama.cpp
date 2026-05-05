@@ -898,6 +898,7 @@ void launch_fattn(
         const size_t ts = ggml_type_size(K->type);
 
         K_f16.alloc(ggml_nelements(K));
+        if (K_f16.get() == nullptr) return;  // pool soft-OOM; eval loop bubbles GGML_STATUS_ALLOC_FAILED
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16.ptr, 1, ggml_nelements(K), main_stream);
@@ -926,6 +927,7 @@ void launch_fattn(
         const size_t ts = ggml_type_size(V->type);
 
         V_f16.alloc(ggml_nelements(V));
+        if (V_f16.get() == nullptr) return;
         if (ggml_is_contiguously_allocated(V)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
             to_fp16(V_data, V_f16.ptr, 1, ggml_nelements(V), main_stream);
@@ -967,6 +969,7 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         KV_min_max.alloc(ne_KV_max);
+        if (KV_min_max.get() == nullptr) return;
         if (n_swa > 0) {
             flash_attn_mask_to_KV_min_max<ncols1, true><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
                 ((const half2 *) mask->data, KV_min_max.ptr, iter_k, s31, s33);
@@ -1022,7 +1025,9 @@ void launch_fattn(
 
     if (parallel_blocks > 1) {
         dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+        if (dst_tmp.get() == nullptr) return;
         dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        if (dst_tmp_meta.get() == nullptr) return;
     }
 
     float scale         = 1.0f;

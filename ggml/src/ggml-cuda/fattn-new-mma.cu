@@ -1856,6 +1856,7 @@ static void launch_fattn_new_mma(
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         K_f16.alloc(ggml_nelements(K));
+        if (K_f16.get() == nullptr) return;  // pool soft-OOM; eval loop bubbles GGML_STATUS_ALLOC_FAILED
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
         to_fp16(K_data, K_f16.ptr, 1, ggml_nelements(K), main_stream);
         K_data = (char *) K_f16.ptr;
@@ -1882,6 +1883,7 @@ static void launch_fattn_new_mma(
             V_data = K_data;
         } else {
             V_f16.alloc(ggml_nelements(V));
+            if (V_f16.get() == nullptr) return;
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
             to_fp16(V_data, V_f16.ptr, 1, ggml_nelements(V), main_stream);
             V_data = (char *) V_f16.ptr;
@@ -1920,6 +1922,7 @@ static void launch_fattn_new_mma(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         KV_max.alloc(ne_KV_max);
+        if (KV_max.get() == nullptr) return;
         flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
             ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
@@ -1945,6 +1948,7 @@ static void launch_fattn_new_mma(
         blocks_num.z = 1;
 
         dst_tmp_meta.alloc(blocks_num.x*ncols * (2*2 + DV) * sizeof(float));
+        if (dst_tmp_meta.get() == nullptr) return;
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
@@ -1983,7 +1987,9 @@ static void launch_fattn_new_mma(
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+            if (dst_tmp.get() == nullptr) return;
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+            if (dst_tmp_meta.get() == nullptr) return;
         }
     }
     float scale         = 1.0f;

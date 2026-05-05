@@ -777,6 +777,11 @@ int ggml_cuda_get_device();
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
+    // Returns nullptr on recoverable OOM (CUDA_ERROR_OUT_OF_MEMORY /
+    // cudaErrorMemoryAllocation). Callers MUST check the return; pool
+    // pressure becomes an HTTP 503 at the server boundary instead of
+    // a process abort. Other CUDA errors still abort (they indicate
+    // driver-state corruption, not a recoverable shortage).
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
 };
@@ -802,7 +807,9 @@ struct ggml_cuda_pool_alloc {
         }
     }
 
-    // size is in number of elements
+    // size is in number of elements.
+    // On pool OOM (recoverable) returns nullptr; ptr stays nullptr,
+    // dtor below no-ops. Callers MUST check the return.
     T * alloc(size_t size) {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);

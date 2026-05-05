@@ -323,6 +323,34 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// Per-thread recoverable-OOM signal. Set by pool_{leg,vmm}::alloc
+// when they return nullptr because of a real or synthetic OOM during
+// the current graph compute. Read (and reset) at the boundaries of
+// ggml_backend_cuda_graph_compute so the failure becomes
+// GGML_STATUS_ALLOC_FAILED at the top instead of a server-killing
+// abort.
+//
+// thread_local because graph compute is single-threaded per context
+// but multiple contexts may compute concurrently on different
+// threads (different devices) sharing the same pool.
+static thread_local bool g_cuda_pool_alloc_failed = false;
+
+// Debug hook: when the env var GGML_CUDA_POOL_FORCE_FAIL_NEXT is set
+// to a non-zero value, the next pool->alloc() call returns nullptr
+// synthetically (without calling CUDA); the env var is unset so
+// subsequent calls proceed normally. Lets the unit test
+// (test-cuda-pool-graceful-oom) drive the recoverable-OOM chain
+// deterministically. Costs nothing when the env var is not set.
+static bool ggml_cuda_pool_force_fail_consume() {
+    const char * env = getenv("GGML_CUDA_POOL_FORCE_FAIL_NEXT");
+    if (env && *env && env[0] != '0') {
+        unsetenv("GGML_CUDA_POOL_FORCE_FAIL_NEXT");
+        GGML_CUDA_LOG_WARN("%s: synthetic OOM (debug hook fired)\n", __func__);
+        return true;
+    }
+    return false;
+}
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -353,6 +381,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        if (ggml_cuda_pool_force_fail_consume()) {
+            g_cuda_pool_alloc_failed = true;
+            return nullptr;
+        }
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -394,7 +426,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
+        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        if (err == cudaErrorMemoryAllocation) {
+            (void) cudaGetLastError();  // clear sticky error so subsequent CUDA calls don't see it
+            GGML_CUDA_LOG_WARN("%s: cudaMalloc %.2f MiB failed on device %d (recoverable OOM)\n",
+                __func__, look_ahead_size / 1024.0 / 1024.0, device);
+            return nullptr;
+        }
+        CUDA_CHECK(err);  // other CUDA errors still abort
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -444,6 +483,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        if (ggml_cuda_pool_force_fail_consume()) {
+            return nullptr;
+        }
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
@@ -463,7 +505,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            CUresult cu_err = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (cu_err == CUDA_ERROR_OUT_OF_MEMORY) {
+                GGML_CUDA_LOG_WARN("%s: cuMemCreate %.2f MiB failed on device %d (recoverable OOM)\n",
+                    __func__, reserve_size / 1024.0 / 1024.0, device);
+                return nullptr;
+            }
+            CU_CHECK(cu_err);  // other CUresult values still abort
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -539,6 +587,27 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     } else{
         info->all_ctx[device] = this;
     }
+}
+
+// Test hook: drive a single backend pool allocation. See header for
+// purpose. Mirrors ggml_cuda_pool_alloc<T>::alloc but at the byte level
+// so tests can probe the soft-fail return without depending on a
+// specific op happening to call into the pool.
+GGML_CALL void * ggml_backend_cuda_pool_alloc_test(ggml_backend_t backend,
+                                                   size_t nbytes,
+                                                   size_t * actual_size_out) {
+    if (backend == nullptr || backend->context == nullptr) return nullptr;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    size_t actual = 0;
+    void * ptr = ctx->pool().alloc(nbytes, &actual);
+    if (actual_size_out) *actual_size_out = ptr ? actual : 0;
+    return ptr;
+}
+
+GGML_CALL void ggml_backend_cuda_pool_free_test(ggml_backend_t backend, void * ptr, size_t size) {
+    if (backend == nullptr || backend->context == nullptr || ptr == nullptr) return;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->pool().free(ptr, size);
 }
 
 GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend) {
@@ -4664,10 +4733,24 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                 if (ggml_is_noop(node)) continue;
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
+                if (g_cuda_pool_alloc_failed) {
+                    // Recoverable pool OOM: a kernel-launch path
+                    // returned early because pool->alloc returned
+                    // nullptr. The op may report ok=true since FA
+                    // launchers are void; the flag is the binding
+                    // signal. Abandon this graph evaluation; the
+                    // outer graph_compute reads the same flag and
+                    // bubbles GGML_STATUS_ALLOC_FAILED to the server,
+                    // which converts it to HTTP 503.
+                    GGML_CUDA_LOG_WARN("%s: pool alloc failed at %s (%s); refusing graph compute\n",
+                        __func__, node->name, ggml_op_name(node->op));
+                    graph_evaluated_or_captured = true;
+                    return;
+                }
                 if (!ok) {
                     GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
-                GGML_ASSERT(ok);
+                GGML_ASSERT(ok);  // op-not-supported is still a real bug; only OOM is recoverable
             }
         }
 #ifdef USE_CUDA_GRAPH
@@ -4812,6 +4895,12 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     _conv_probe_reset_per_graph();
 
+    // Reset the per-graph recoverable-OOM flag. Set by FA scratch
+    // alloc sites when ggml_cuda_pool_alloc<T>::alloc returns
+    // nullptr; read at end-of-evaluation to bubble
+    // GGML_STATUS_ALLOC_FAILED instead of asserting.
+    g_cuda_pool_alloc_failed = false;
+
     ggml_cuda_set_device(cuda_ctx->device);
 
 #ifdef USE_CUDA_GRAPH
@@ -4900,6 +4989,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, graph_evaluated_or_captured, use_cuda_graph, cuda_graph_update_required);
 
+    if (g_cuda_pool_alloc_failed) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
 }
 

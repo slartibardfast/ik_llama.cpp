@@ -97,6 +97,19 @@ GGML_API GGML_CALL void ggml_backend_cuda_memcpy_d2d(
 GGML_API GGML_CALL void * ggml_backend_cuda_malloc(size_t nbytes, int device);
 GGML_API GGML_CALL void   ggml_backend_cuda_free(void * ptr);
 
+// Test hook: drive a single allocation through the backend's scratch
+// pool and return the pointer (or nullptr on soft-fail). Returns the
+// allocated byte count via *actual_size_out. On success, the buffer
+// must be released with ggml_backend_cuda_pool_free_test. Used by
+// test-cuda-pool-graceful-oom to exercise the pool soft-fail
+// path independent of which op happens to call into the pool.
+GGML_API GGML_CALL void * ggml_backend_cuda_pool_alloc_test(ggml_backend_t backend,
+                                                           size_t nbytes,
+                                                           size_t * actual_size_out);
+GGML_API GGML_CALL void   ggml_backend_cuda_pool_free_test(ggml_backend_t backend,
+                                                          void * ptr,
+                                                          size_t size);
+
 // Device-side per-step state restore for delta-net / SSM checkpoint rollback.
 // Reconstructs n_layers worth of recurrent state (conv portion + ssm portion) entirely
 // on-device, eliminating the CPU-roundtrip that the host-side fallback in

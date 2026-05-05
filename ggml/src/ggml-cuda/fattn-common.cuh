@@ -782,6 +782,7 @@ void launch_fattn(
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         K_f16.alloc(ggml_nelements(K));
+        if (K_f16.get() == nullptr) return;  // pool soft-OOM; eval loop bubbles GGML_STATUS_ALLOC_FAILED
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
         to_fp16(K_data, K_f16.ptr, 1, ggml_nelements(K), main_stream);
         K_data = (char *) K_f16.ptr;
@@ -796,6 +797,7 @@ void launch_fattn(
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
         V_f16.alloc(ggml_nelements(V));
+        if (V_f16.get() == nullptr) return;
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
         to_fp16(V_data, V_f16.ptr, 1, ggml_nelements(V), main_stream);
         V_data = (char *) V_f16.ptr;
@@ -810,7 +812,9 @@ void launch_fattn(
 
     if (parallel_blocks > 1) {
         dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+        if (dst_tmp.get() == nullptr) return;
         dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        if (dst_tmp_meta.get() == nullptr) return;
     }
 
     const dim3 block_dim(WARP_SIZE, nwarps, 1);

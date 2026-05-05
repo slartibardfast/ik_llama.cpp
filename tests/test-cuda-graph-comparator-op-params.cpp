@@ -7,20 +7,17 @@
 //   graph1: ggml_add(F32, F32) → F32
 //   graph2: ggml_add(F16, F16) → F16
 //
-// Today (pre-Item 8.2): the comparator at
-// `ggml_graph_node_has_matching_properties` does NOT include
-// `node->type` or `src[i]->type` in the strict-check list. Result:
-// graph2 hits the cache entry instantiated for graph1, the captured
-// kernel was selected for F32 inputs, and submitting F16 bytes
-// produces silent corruption of the output. RED.
+// Without dtype strict-checks in
+// ggml_graph_node_has_matching_properties, graph2 hits the cache
+// entry instantiated for graph1, the captured kernel was selected
+// for F32 inputs, and submitting F16 bytes produces silent corruption
+// of the output. With strict node+src dtype checks, graph2 sees a
+// mismatch, takes the re-instantiate path, gets the F16-correct
+// kernel, and produces matching output.
 //
-// Post-Item 8.2: the comparator strict-checks node and src dtypes.
-// graph2 sees a mismatch, takes the re-instantiate path, gets the
-// F16-correct kernel, and produces matching output. GREEN.
-//
-// This is the smallest plausible reproducer for the suspected
-// PHASE 33 concat.cu:202 GGML_ASSERT(src0->type==src1->type==dst->type)
-// failure mode under multi-slot.
+// Smallest plausible reproducer for the multi-slot
+// concat.cu GGML_ASSERT(src0->type==src1->type==dst->type) class
+// of failure under cache mis-routing.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
