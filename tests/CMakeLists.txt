@@ -206,6 +206,9 @@ if (GGML_CUDA)
     llama_build_and_test(test-q4-0-ar16-cuda.cpp)
 endif()
 llama_build_and_test(test-qnext-seq-pattern.cpp)
+if (GGML_CUDA)
+    llama_build_and_test(test-qnext-multislot-dispatch.cpp)
+endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 
