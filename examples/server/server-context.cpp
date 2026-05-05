@@ -4327,8 +4327,22 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
+                const bool alloc_failed = (ret == GGML_STATUS_ALLOC_FAILED);
                 if (ret == user_cancel) {
                     LLAMA_LOG_INFO("Decode process is cancelled by user.\n");
+                }
+                else if (alloc_failed) {
+                    // Recoverable GPU pool OOM. The pool soft-failed, the
+                    // FA caller-site bailed, graph_compute returned
+                    // GGML_STATUS_ALLOC_FAILED. Release the slot so the
+                    // KV the prefill had reserved is freed; the client
+                    // gets a 503 with Retry-After: 5 (added in the HTTP
+                    // result layer); LiteLLM retries against the
+                    // now-decoded slot.
+                    LOG_WARNING("GPU pool allocation failed during decode; releasing slot for retry", {
+                        {"i",   i},
+                        {"ret", ret},
+                    });
                 }
                 else {
                     // if you get here, it means the KV cache is full - try increasing it via the context size
@@ -4345,7 +4359,13 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     slot.release();
                     if (ret != user_cancel) {
                         LLAMA_LOG_INFO("n_past = %d\n", (int)slot.cache_tokens.size());
-                        send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
+                        if (alloc_failed) {
+                            send_error(slot,
+                                "GPU memory allocation failed during inference; retrying may succeed",
+                                ERROR_TYPE_UNAVAILABLE);
+                        } else {
+                            send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
+                        }
                     }
                 }
                 break; // break loop of n_batch

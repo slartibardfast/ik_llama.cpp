@@ -410,6 +410,13 @@ auto res_err = [](httplib::Response& res, json error_data) {
     json final_response{ {"error", error_data} };
     res.set_content(safe_json_to_str(final_response), MIMETYPE_JSON);
     res.status = json_value(error_data, "code", 500);
+    if (res.status == 503) {
+        // Recoverable transient error (currently emitted on graph-compute
+        // ALLOC_FAILED bubbling out of llama_decode). 5-second hint lets
+        // LiteLLM (and well-behaved direct clients) wait for in-flight
+        // slots to release VRAM before retrying.
+        res.set_header("Retry-After", "5");
+    }
 };
 
 auto res_ok = [](httplib::Response& res, const json& data) {
