@@ -90,12 +90,19 @@ struct llama_kv_cache {
         std::vector<std::vector<ggml_tensor *>> split_s_l_shadow;
 
         // Per-step SSM state checkpoints for speculative decoding.
+        // For non-split layers: per_step_ssm[il] is the checkpoint tensor.
+        // For split layers: per_step_ssm[il] is nullptr; use per_step_ssm_split[il][device].
         std::vector<ggml_tensor *> per_step_ssm;
 
         // Per-step conv feature buffer: stores qkv_mixed features from the
         // verification forward pass so conv state can be reconstructed at any step.
         // One tensor per recurrent layer, each sized [conv_dim * max_tokens].
+        // For split layers: per_step_qkv[il] is nullptr; use per_step_qkv_split[il][device].
         std::vector<ggml_tensor *> per_step_qkv;
+
+        // Per-device per-step checkpoints for split recurrent layers.
+        std::vector<std::vector<ggml_tensor *>> per_step_ssm_split;
+        std::vector<std::vector<ggml_tensor *>> per_step_qkv_split;
 
         int32_t per_step_n_tokens = 0;
         int32_t per_step_max_allocated = 0;
