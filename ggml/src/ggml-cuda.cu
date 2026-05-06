@@ -4598,12 +4598,14 @@ static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_gra
         }
     }
 
-    // ne / nb: not strict here. The captured cudaGraphExec can be
-    // patched via cudaGraphExecUpdate to absorb extent and stride
-    // changes for most ops; that's the whole point of the topology-keyed
-    // collapse. Update path is the existing
-    // update_cuda_graph_executable() which falls back to re-instantiate
-    // on cudaErrorGraphExecUpdateFailure.
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (node->ne[i] != graph_node_properties->ne[i]) {
+            return false;
+        }
+        if (node->nb[i] != graph_node_properties->nb[i]) {
+            return false;
+        }
+    }
 
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (node->src[i] &&
