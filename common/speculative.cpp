@@ -1387,18 +1387,24 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     llama_token current_input_id = id_last;
     int32_t current_n_past = n_past;
 
+    // Per-draft-step component timing (LLAMA_PROFILE_DECODE) — env-gated.
+    // Three components: decode (whole forward), emb_d2h (host pull of next
+    // step's input hidden state), hidden_h2d (host push of that hidden
+    // state to the device-side draft input slot). Emitted as:
+    //   "mtp_draft_step_<comp>  <us>  step=<i>"
+    // where $2 is microseconds — matches scripts/profile-mtp-draft-cycle.sh
+    // awk pattern. A coarse aggregate decode line still prints every 100
+    // decodes for live observability.
+    static const bool _prof_draft = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+    struct draft_stat { long long sum_ns = 0; long long n = 0; long long min_ns = 0; long long max_ns = 0; };
+    static draft_stat _draft_stat;
+
     for (int i = 0; i < n_draft; ++i) {
         mtp_batch.n_tokens = 0;
         common_batch_add(mtp_batch, current_input_id, current_n_past, {seq_id}, true);
 
-        // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
-        // when off. DRAFT_GEN forwards are always batch=1 in MTP, so a
-        // single histogram bucket suffices.
-        static const bool _prof_draft = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
-        struct draft_stat { long long sum_ns = 0; long long n = 0; long long min_ns = 0; long long max_ns = 0; };
-        static draft_stat _draft_stat;
-        std::chrono::high_resolution_clock::time_point _draft_t0;
-        if (_prof_draft) _draft_t0 = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point _decode_t0;
+        if (_prof_draft) _decode_t0 = std::chrono::high_resolution_clock::now();
 
         if (llama_decode(ctx, mtp_batch) != 0) {
             break;
@@ -1406,10 +1412,12 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
         if (_prof_draft) {
             const auto t1 = std::chrono::high_resolution_clock::now();
-            const long long dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - _draft_t0).count();
-            _draft_stat.sum_ns += dt; ++_draft_stat.n;
-            if (_draft_stat.n == 1 || dt < _draft_stat.min_ns) _draft_stat.min_ns = dt;
-            if (_draft_stat.n == 1 || dt > _draft_stat.max_ns) _draft_stat.max_ns = dt;
+            const long long dt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - _decode_t0).count();
+            const long long dt_us = dt_ns / 1000;
+            fprintf(stderr, "mtp_draft_step_decode  %lld  step=%d\n", dt_us, i);
+            _draft_stat.sum_ns += dt_ns; ++_draft_stat.n;
+            if (_draft_stat.n == 1 || dt_ns < _draft_stat.min_ns) _draft_stat.min_ns = dt_ns;
+            if (_draft_stat.n == 1 || dt_ns > _draft_stat.max_ns) _draft_stat.max_ns = dt_ns;
             if (_draft_stat.n % 100 == 0) {
                 fprintf(stderr, "[decode-prof:draft] count=%lld mean=%.3fms min=%.3fms max=%.3fms\n",
                     _draft_stat.n,
@@ -1435,9 +1443,28 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             }
         }
 
+        std::chrono::high_resolution_clock::time_point _emb_t0;
+        if (_prof_draft) _emb_t0 = std::chrono::high_resolution_clock::now();
+
         const float * emb = llama_get_embeddings_ith(ctx, 0);
+
+        if (_prof_draft) {
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const long long dt_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - _emb_t0).count();
+            fprintf(stderr, "mtp_draft_step_emb_d2h  %lld  step=%d\n", dt_us, i);
+        }
+
         if (emb) {
+            std::chrono::high_resolution_clock::time_point _h2d_t0;
+            if (_prof_draft) _h2d_t0 = std::chrono::high_resolution_clock::now();
+
             llama_set_draft_input_hidden_state(ctx, emb);
+
+            if (_prof_draft) {
+                const auto t1 = std::chrono::high_resolution_clock::now();
+                const long long dt_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - _h2d_t0).count();
+                fprintf(stderr, "mtp_draft_step_hidden_h2d  %lld  step=%d\n", dt_us, i);
+            }
         }
 
         current_input_id = id_next;

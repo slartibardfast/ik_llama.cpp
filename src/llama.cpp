@@ -29,7 +29,21 @@
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 
+// IK_PRINT_TIMING gates the build/alloc/compute/HIT-MISS instrumentation in
+// llama_decode_internal. Default off; profile script enables via CLI
+// (-DCMAKE_CXX_FLAGS=-DIK_PRINT_TIMING=1). Guarded so the CLI value wins —
+// before this guard, the unconditional `#define ... 0` here silently
+// overrode the command-line definition.
+#ifndef IK_PRINT_TIMING
 #define IK_PRINT_TIMING 0
+#endif
+
+// can_reuse_graph last-MISS reason. 0 = last call was HIT. 1..10 = condition
+// number that failed (matches the order in llama_context::can_reuse_graph).
+// Always written so the function stays uniform; only consulted under
+// IK_PRINT_TIMING. Thread-local because llama_decode_internal can run on
+// multiple threads when host has multiple contexts.
+thread_local int g_can_reuse_last_miss_reason = 0;
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -558,16 +572,18 @@ void llama_context::reset_scheduler() {
 }
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
-    if (!prev || !prev->graph) return false;
-    if (u_batch.n_tokens > 1) return false;
-    if (u_batch.embd) return false;
-    if (!cparams.graph_reuse) return false;
-    return u_batch.all_seq_id == prev->all_seq_id &&
-           kv_self.head > 0 &&
-           kv_self.n == prev->n_kv &&
-           n_outputs == prev->n_outputs &&
-           cparams.mtp_op_type == prev->mtp_op_type &&
-           update_cache_copies();
+    if (!prev || !prev->graph)                    { g_can_reuse_last_miss_reason = 1;  return false; }
+    if (u_batch.n_tokens > 1)                     { g_can_reuse_last_miss_reason = 2;  return false; }
+    if (u_batch.embd)                             { g_can_reuse_last_miss_reason = 3;  return false; }
+    if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
+    if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
+    if (kv_self.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
+    if (kv_self.n != prev->n_kv)                  { g_can_reuse_last_miss_reason = 7;  return false; }
+    if (n_outputs != prev->n_outputs)             { g_can_reuse_last_miss_reason = 8;  return false; }
+    if (cparams.mtp_op_type != prev->mtp_op_type) { g_can_reuse_last_miss_reason = 9;  return false; }
+    if (!update_cache_copies())                   { g_can_reuse_last_miss_reason = 10; return false; }
+    g_can_reuse_last_miss_reason = 0;
+    return true;
 }
 
 bool llama_context::update_cache_copies() {
@@ -5048,7 +5064,41 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         ggml_cgraph * gf = nullptr;
-        if (!lctx.can_reuse_graph(u_batch)) {
+        const bool _can_reuse_hit = lctx.can_reuse_graph(u_batch);
+#if IK_PRINT_TIMING
+        {
+            // HIT/MISS counters with per-condition reason histogram. Reasons:
+            //   1=no_prev, 2=multi_token, 3=embd_input, 4=reuse_disabled,
+            //   5=seq_id_changed, 6=head_zero, 7=n_kv_changed,
+            //   8=n_outputs_changed, 9=mtp_op_changed, 10=cache_copies_failed.
+            // Reason 7 is the suspected per-draft killer (KV grows by 1 each
+            // step) — track it explicitly.
+            static long long g_can_reuse_hits = 0;
+            static long long g_can_reuse_miss[11] = {0};
+            if (_can_reuse_hit) {
+                ++g_can_reuse_hits;
+            } else {
+                const int r = (g_can_reuse_last_miss_reason >= 1 &&
+                               g_can_reuse_last_miss_reason <= 10)
+                              ? g_can_reuse_last_miss_reason : 0;
+                ++g_can_reuse_miss[r];
+            }
+            long long total_misses = 0;
+            for (int r = 0; r < 11; ++r) total_misses += g_can_reuse_miss[r];
+            const long long total = g_can_reuse_hits + total_misses;
+            if (total > 0 && total % 100 == 0) {
+                fprintf(stderr, "can_reuse_graph: HIT=%lld MISS=%lld",
+                        g_can_reuse_hits, total_misses);
+                for (int r = 1; r <= 10; ++r) {
+                    if (g_can_reuse_miss[r] > 0) {
+                        fprintf(stderr, " r%d=%lld", r, g_can_reuse_miss[r]);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+#endif
+        if (!_can_reuse_hit) {
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
