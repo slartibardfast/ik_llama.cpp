@@ -727,6 +727,48 @@ const func_builtins & value_string_t::get_builtins() const {
             res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
             return res;
         }},
+        {"find", [](const func_args & args) -> value {
+            // Python semantics: s.find(sub[, start[, end]]) -> lowest index, or -1.
+            args.ensure_count(2, 4);
+            args.ensure_vals<value_string, value_string, value_int, value_int>(true, true, false, false);
+            const std::string str = args.get_pos(0)->as_string().str();
+            const std::string sub = args.get_pos(1)->as_string().str();
+            const int64_t  n   = (int64_t) str.size();
+            int64_t start = args.count() > 2 ? args.get_pos(2)->as_int() : 0;
+            int64_t end   = args.count() > 3 ? args.get_pos(3)->as_int() : n;
+            if (start < 0) { start += n; if (start < 0) start = 0; }
+            if (end   < 0) { end   += n; if (end   < 0) end   = 0; }
+            if (end > n) end = n;
+            if (start > end) return mk_val<value_int>(-1);
+            // empty needle matches at start (Python behaviour)
+            if (sub.empty()) return mk_val<value_int>(start);
+            const std::string hay = str.substr((size_t) start, (size_t) (end - start));
+            const size_t pos = hay.find(sub);
+            if (pos == std::string::npos) return mk_val<value_int>(-1);
+            // ensure the match fits entirely within [start, end)
+            if (start + (int64_t) pos + (int64_t) sub.size() > end) return mk_val<value_int>(-1);
+            return mk_val<value_int>(start + (int64_t) pos);
+        }},
+        {"rfind", [](const func_args & args) -> value {
+            // Python semantics: s.rfind(sub[, start[, end]]) -> highest index, or -1.
+            args.ensure_count(2, 4);
+            args.ensure_vals<value_string, value_string, value_int, value_int>(true, true, false, false);
+            const std::string str = args.get_pos(0)->as_string().str();
+            const std::string sub = args.get_pos(1)->as_string().str();
+            const int64_t  n   = (int64_t) str.size();
+            int64_t start = args.count() > 2 ? args.get_pos(2)->as_int() : 0;
+            int64_t end   = args.count() > 3 ? args.get_pos(3)->as_int() : n;
+            if (start < 0) { start += n; if (start < 0) start = 0; }
+            if (end   < 0) { end   += n; if (end   < 0) end   = 0; }
+            if (end > n) end = n;
+            if (start > end) return mk_val<value_int>(-1);
+            if (sub.empty()) return mk_val<value_int>(end);
+            const std::string hay = str.substr((size_t) start, (size_t) (end - start));
+            const size_t pos = hay.rfind(sub);
+            if (pos == std::string::npos) return mk_val<value_int>(-1);
+            if (start + (int64_t) pos + (int64_t) sub.size() > end) return mk_val<value_int>(-1);
+            return mk_val<value_int>(start + (int64_t) pos);
+        }},
         {"int", [](const func_args & args) -> value {
             value val_input   = args.get_pos(0);
             value val_default = args.get_kwarg_or_pos("default", 1);

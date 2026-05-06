@@ -1314,6 +1314,90 @@ static void test_string_methods(testing & t) {
         "a,b-c"
     );
 
+    test_template(t, "string.find() hit",
+        "{{ s.find('lo') }}",
+        {{"s", "hello world"}},
+        "3"
+    );
+
+    test_template(t, "string.find() miss",
+        "{{ s.find('xyz') }}",
+        {{"s", "hello world"}},
+        "-1"
+    );
+
+    test_template(t, "string.find() with start",
+        "{{ s.find('o', 5) }}",
+        {{"s", "hello world"}},
+        "7"
+    );
+
+    test_template(t, "string.find() with start and end (exclusive)",
+        "{{ s.find('o', 0, 5) }}",
+        {{"s", "hello world"}},
+        "4"
+    );
+
+    test_template(t, "string.find() empty needle returns start",
+        "{{ s.find('', 3) }}",
+        {{"s", "hello"}},
+        "3"
+    );
+
+    test_template(t, "string.find() negative start (counts from end)",
+        "{{ s.find('o', -4) }}",
+        {{"s", "hello world"}},
+        "7"
+    );
+
+    test_template(t, "string.find() respects end exclusivity",
+        "{{ s.find('lo', 0, 4) }}",
+        {{"s", "hello world"}},
+        "-1"
+    );
+
+    test_template(t, "string.rfind() hit",
+        "{{ s.rfind('o') }}",
+        {{"s", "hello world"}},
+        "7"
+    );
+
+    test_template(t, "string.rfind() miss",
+        "{{ s.rfind('xyz') }}",
+        {{"s", "hello world"}},
+        "-1"
+    );
+
+    test_template(t, "string.rfind() with end caps search",
+        "{{ s.rfind('o', 0, 5) }}",
+        {{"s", "hello world"}},
+        "4"
+    );
+
+    test_template(t, "string.rfind() empty needle returns end",
+        "{{ s.rfind('', 0, 4) }}",
+        {{"s", "hello"}},
+        "4"
+    );
+
+    test_template(t, "string.rfind() negative end",
+        "{{ s.rfind('o', 0, -1) }}",
+        {{"s", "hello world"}},
+        "7"
+    );
+
+    test_template(t, "string.rfind() unclosed-think-before-tool detector",
+        // Mirrors fix #6 in froggeric/Qwen-Fixed-Chat-Templates: detect that the
+        // most recent <think> is unclosed when followed by a <tool_call>.
+        "{%- set last_think = c.rfind('<think>') %}"
+        "{%- set last_close = c.rfind('</think>') %}"
+        "{%- set tool_pos = c.find('<tool_call>') %}"
+        "{%- if last_close < last_think or last_close == -1 %}unclosed{%- else %}closed{%- endif %}"
+        " {{ tool_pos }}",
+        {{"c", "hi <think>plan<tool_call>x</tool_call>"}},
+        "unclosed 14"
+    );
+
     test_template(t, "string.replace() basic",
         "{{ s.replace('world', 'jinja') }}",
         {{"s", "hello world"}},
