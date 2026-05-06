@@ -237,6 +237,20 @@ if (GGML_CUDA)
     llama_build_and_test(mtp-ubatch-hook/test-hook-no-secondary-decode.cpp)
     llama_build_and_test(mtp-ubatch-hook/test-hook-cross-ubatch-pairing.cpp)
     llama_build_and_test(mtp-ubatch-hook/test-hook-idempotent-chop.cpp)
+
+    # mtp_verify_accept.allium — RED-first scaffolding for the verify-step
+    # accept-decision contract that sits between the per-ubatch hook and
+    # the post-accept KV chop. Host-side; no GPU needed for the algorithm
+    # itself, gated alongside sister bundles for symmetry.
+    llama_build_and_test(mtp-verify-accept/test-accept-symbols.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-logits-shape.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-longest-prefix.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-bonus-correctness.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-bonus-position.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-determinism.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-progress.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-probabilistic-rejected.cpp)
+    llama_build_and_test(mtp-verify-accept/test-accept-committed-shape.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
