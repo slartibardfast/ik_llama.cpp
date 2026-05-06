@@ -216,6 +216,27 @@ if (GGML_CUDA)
     llama_build_and_test(test-cuda-graph-update-state-mutation.cpp)
     llama_build_and_test(test-cuda-graph-comparator-op-params.cpp)
     llama_build_and_test(test-cuda-pool-graceful-oom.cpp)
+
+    # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
+    # to compile or link until its referenced API symbols land.
+    llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-step-count-bound.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-single-compute.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-argmax-correctness.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-determinism.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-kv-coverage.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-kv-chop-rewrite.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-prob-populated.cpp)
+
+    # mtp_ubatch_hook.allium — RED-first scaffolding for the per-ubatch
+    # MTP-KV hook. The .sh integration tests live alongside but are
+    # not registered in ctest; they're run manually like
+    # tests/mtp-rollout-investigation/.
+    llama_build_and_test(mtp-ubatch-hook/test-hook-tag-tensor.cpp)
+    llama_build_and_test(mtp-ubatch-hook/test-hook-fires-once.cpp)
+    llama_build_and_test(mtp-ubatch-hook/test-hook-no-secondary-decode.cpp)
+    llama_build_and_test(mtp-ubatch-hook/test-hook-cross-ubatch-pairing.cpp)
+    llama_build_and_test(mtp-ubatch-hook/test-hook-idempotent-chop.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
