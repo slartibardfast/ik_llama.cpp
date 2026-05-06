@@ -455,7 +455,8 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * delta_input, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
-            uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb) const {
+            uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb,
+            bool force_reduce_cast) const {
 
     const int64_t n_tok = delta_input->ne[1];
     const int64_t n_seqs = 1;
@@ -558,7 +559,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
                 gated_output = ggml_add(ctx0, gated_output, input);
                 input_added = true;
             }
-            if (gated_output->ne[1] > 32 && lctx.cparams.reduce_type != GGML_TYPE_F32) {
+            if (force_reduce_cast && lctx.cparams.reduce_type != GGML_TYPE_F32) {
                 gated_output = ggml_cast(ctx0, gated_output, lctx.cparams.reduce_type);
             }
             ggml_build_forward_expand(gf, gated_output);
@@ -645,9 +646,15 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     GGML_ASSERT(model.layers[il].wqkv != nullptr || model.layers[il].ssm_in != nullptr);
     GGML_ASSERT(model.layers[il].wqkv_gate != nullptr || model.layers[il].ssm_in != nullptr);
 
+    // Lift the cross-device-reduce cast threshold to batch granularity. Per-block
+    // dispatch below would otherwise evaluate gated_output->ne[1] > 32 independently
+    // for each block, returning F32 for tiny blocks and F16 for large ones — the
+    // ggml_concat at the end of this function then aborts on dtype mismatch.
+    const bool force_reduce_cast = (cur->ne[1] > 32);
+
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
     }
 
     // Phase D: split the batch into contiguous-by-seq blocks and dispatch
@@ -684,9 +691,19 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
         const bool reset_state_blk = batch.pos != nullptr && batch.pos[blk.start] == 0;
         const uint32_t state_seq_id_blk = (uint32_t) blk.seq_id;
-        ggml_tensor * out_blk = build_layer_attn_linear_core(ctx0, gf, cur_blk, inp_s_seq_qnext_blk, inp_out_ids, state_seq_id_blk, reset_state_blk, il, cb);
+        // Pass nullptr for inp_out_ids on the per-block path: those indices
+        // address positions in the FULL batch, but cur_blk is only blk.len
+        // rows long. ggml_get_rows with whole-batch indices on a sliced
+        // view reads OOB. Defer the gather to after the concat below — that
+        // keeps gather indices coherent against the joined whole-batch
+        // tensor (InpOutIdsPerBlockSliceOrDeferred, Option B).
+        ggml_tensor * out_blk = build_layer_attn_linear_core(ctx0, gf, cur_blk, inp_s_seq_qnext_blk, /*inp_out_ids=*/nullptr, state_seq_id_blk, reset_state_blk, il, cb, force_reduce_cast);
 
         out = out == nullptr ? out_blk : ggml_concat(ctx0, out, out_blk, 1);
+    }
+
+    if (inp_out_ids) {
+        out = ggml_get_rows(ctx0, out, inp_out_ids);
     }
 
     return out;

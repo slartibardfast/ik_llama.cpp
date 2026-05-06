@@ -45,9 +45,9 @@ namespace {
 // ---------------------------------------------------------------------
 
 struct cuda_runner {
-    ggml_backend_t backend = nullptr;
-    ggml_context * ctx     = nullptr;
-    std::vector<uint8_t> buf;
+    ggml_backend_t        backend = nullptr;
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
 
     cuda_runner() {
         backend = ggml_backend_cuda_init(0, nullptr);
@@ -65,22 +65,28 @@ struct cuda_runner {
     }
 
     ~cuda_runner() {
+        if (buf)     ggml_backend_buffer_free(buf);
         if (ctx)     ggml_free(ctx);
         if (backend) ggml_backend_free(backend);
     }
 
-    // Allocate every tensor in `ctx` to `backend`, build the supplied
-    // cgraph, and run it. Returns true on completion, false on failure.
-    bool run(ggml_cgraph * gf) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    // Bind every tensor currently in `ctx` to `backend`. Must be
+    // called after the graph is constructed and before any
+    // ggml_backend_tensor_set fill — those require a backing buffer.
+    bool alloc() {
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         if (!buf) {
             fprintf(stderr, "ggml_backend_alloc_ctx_tensors failed\n");
             return false;
         }
+        return true;
+    }
+
+    // Run the supplied cgraph. Caller is responsible for having
+    // called alloc() and filled inputs. Returns true on completion.
+    bool run(ggml_cgraph * gf) {
         const auto status = ggml_backend_graph_compute(backend, gf);
-        const bool ok = (status == GGML_STATUS_SUCCESS);
-        ggml_backend_buffer_free(buf);
-        return ok;
+        return status == GGML_STATUS_SUCCESS;
     }
 };
 
@@ -118,6 +124,8 @@ bool test_concat_uniform_f32() {
 
     ggml_cgraph * gf = ggml_new_graph(r.ctx);
     ggml_build_forward_expand(gf, out);
+
+    if (!r.alloc()) return false;
 
     fill_ramp_f32(r.backend, a, 0.0f);
     fill_ramp_f32(r.backend, b, 1000.0f);
@@ -185,6 +193,8 @@ bool test_concat_mismatched_dtypes_aborts() {
     ggml_cgraph * gf = ggml_new_graph(r.ctx);
     ggml_build_forward_expand(gf, out);
 
+    if (!r.alloc()) return false;
+
     fill_ramp_f32(r.backend, a, 0.0f);
     // b is F16, fill via host side then upload as raw bytes.
     {
@@ -249,26 +259,97 @@ bool test_dtype_uniform_across_blocks_layer() {
 }
 
 // ---------------------------------------------------------------------
-// Test 4 — InpOutIdsPerBlockSliceOrDeferred (system invariant) — SKELETON
+// Test 4 — InpOutIdsPerBlockSliceOrDeferred (system invariant)
 //
 // Spec construct: invariant InpOutIdsPerBlockSliceOrDeferred
 // Obligation:     invariant-property.InpOutIdsPerBlockSliceOrDeferred
 //
-// Source-level static check stand-in: assert that the per-block call
-// site at src/llama-delta-net.cpp:687 either
-//   - slices inp_out_ids before passing, OR
-//   - passes nullptr (gather deferred past the join).
+// Validates the structural assertion of Option B (defer gather past
+// the join): build a graph with three F32 blocks of differing rows,
+// concat them along dim 1, then ggml_get_rows with indices that span
+// across all three blocks. The gather-of-concat must equal the same
+// rows pulled from a single equivalent flat tensor.
 //
-// As written today the call passes inp_out_ids verbatim — the
-// divergence the weed report flagged. A grep-based check is brittle
-// but it captures the contract until a runtime-observable equivalent
-// is wired in via Test 3's bridge.
-//
-// Currently: SKIPPED. The static check belongs to a future tooling
-// pass; the runtime evidence is captured by Test 3 once that lands.
+// This is the regression that the original synthetic test suite
+// missed. test-qnext-heterogeneous-batch.sh did not set inp_out_ids,
+// so the per-block dispatch's verbatim-pass of inp_out_ids was never
+// stressed by the kernel-level tests.
 // ---------------------------------------------------------------------
-bool test_inp_out_ids_per_block() {
-    printf("test_inp_out_ids_per_block: SKIPPED — needs Test 3's bridge or a static analyzer\n");
+bool test_concat_then_gather_across_blocks() {
+    cuda_runner r;
+
+    const int64_t n_embd = 16;
+    const int64_t blk_a  = 5;
+    const int64_t blk_b  = 7;
+    const int64_t blk_c  = 4;
+    const int64_t total  = blk_a + blk_b + blk_c;
+
+    ggml_tensor * a = ggml_new_tensor_2d(r.ctx, GGML_TYPE_F32, n_embd, blk_a);
+    ggml_tensor * b = ggml_new_tensor_2d(r.ctx, GGML_TYPE_F32, n_embd, blk_b);
+    ggml_tensor * c = ggml_new_tensor_2d(r.ctx, GGML_TYPE_F32, n_embd, blk_c);
+    ggml_set_name(a, "blk_a"); ggml_set_name(b, "blk_b"); ggml_set_name(c, "blk_c");
+
+    // Indices that span across all three blocks. The OOB-on-first-block
+    // failure mode would manifest if a per-block dispatch passed these
+    // verbatim — index 11 is past blk_a.len=5 and past blk_b.start+len=12.
+    const int32_t idx_data[] = { 0, 4, 5, 11, 12, 15 };
+    const int n_idx = sizeof(idx_data)/sizeof(idx_data[0]);
+    ggml_tensor * idx = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, n_idx);
+    ggml_set_name(idx, "idx");
+
+    // Concat then gather (Option B's structural shape).
+    ggml_tensor * ab  = ggml_concat(r.ctx, a, b, /*dim*/ 1);
+    ggml_tensor * abc = ggml_concat(r.ctx, ab, c, /*dim*/ 1);
+    ggml_tensor * out = ggml_get_rows(r.ctx, abc, idx);
+    ggml_set_name(out, "out");
+
+    ggml_cgraph * gf = ggml_new_graph(r.ctx);
+    ggml_build_forward_expand(gf, out);
+
+    if (!r.alloc()) return false;
+
+    fill_ramp_f32(r.backend, a, 0.0f);
+    fill_ramp_f32(r.backend, b, 1000.0f);
+    fill_ramp_f32(r.backend, c, 2000.0f);
+    ggml_backend_tensor_set(idx, idx_data, 0, sizeof(idx_data));
+
+    if (!r.run(gf)) {
+        fprintf(stderr, "test_concat_then_gather_across_blocks: graph_compute failed\n");
+        return false;
+    }
+
+    // Reference: build the equivalent flat tensor on host and gather
+    // the same indices from it. fill_ramp writes value (base + i) at
+    // element i in row-major order, so cell [row, col] = base + col*n_embd + row.
+    auto cell = [&](float base, int64_t col) -> std::vector<float> {
+        std::vector<float> v(n_embd);
+        for (int r = 0; r < n_embd; ++r) v[r] = base + (float)(col*n_embd + r);
+        return v;
+    };
+    std::vector<float> flat;
+    for (int64_t col = 0; col < blk_a; ++col) { auto v = cell(0.0f,    col); flat.insert(flat.end(), v.begin(), v.end()); }
+    for (int64_t col = 0; col < blk_b; ++col) { auto v = cell(1000.0f, col); flat.insert(flat.end(), v.begin(), v.end()); }
+    for (int64_t col = 0; col < blk_c; ++col) { auto v = cell(2000.0f, col); flat.insert(flat.end(), v.begin(), v.end()); }
+
+    std::vector<float> got((size_t) n_embd * n_idx);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+
+    for (int i = 0; i < n_idx; ++i) {
+        int32_t src_col = idx_data[i];
+        if (src_col < 0 || src_col >= total) {
+            fprintf(stderr, "test bug: idx %d out of range [0,%lld)\n", src_col, (long long) total);
+            return false;
+        }
+        for (int e = 0; e < n_embd; ++e) {
+            float want = flat[(size_t) src_col * n_embd + e];
+            float have = got[(size_t) i * n_embd + e];
+            if (want != have) {
+                fprintf(stderr, "mismatch at idx=%d (src_col=%d) e=%d: want=%f have=%f\n",
+                        i, src_col, e, want, have);
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -320,7 +401,7 @@ int main() {
     run("test_concat_uniform_f32",                     test_concat_uniform_f32);
     run("test_concat_mismatched_dtypes_aborts",        test_concat_mismatched_dtypes_aborts);
     run("test_dtype_uniform_across_blocks_layer",      test_dtype_uniform_across_blocks_layer);
-    run("test_inp_out_ids_per_block",                  test_inp_out_ids_per_block);
+    run("test_concat_then_gather_across_blocks",       test_concat_then_gather_across_blocks);
     run("test_no_abort_on_contracted_patterns",        test_no_abort_on_contracted_patterns);
 
     printf("=== summary: %d passed, %d failed ===\n", passed, failed);
