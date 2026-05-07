@@ -5641,7 +5641,20 @@ static int llama_decode_internal(
         // graph nodes. Synchronous tensor_get because the host buffers
         // are read-after-write in the same scope; the async variant
         // can race with the read on backends that don't auto-flush.
-        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
+        //
+        // Phase 38 E: gate the entire extraction block behind
+        // mtp_fused_skip_extraction. When true, the server has
+        // dispatched a speculative async fused that should overlap
+        // with verify on a separate stream. The post-compute
+        // extraction (sched_synchronize + tensor_get + persist
+        // capture) is deferred to llama_mtp_fused_extract_results
+        // called by the server AFTER both dispatches complete.
+        // The cgraph is stashed for extract_results to iterate.
+        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED && lctx.mtp_fused_skip_extraction) {
+            lctx.mtp_fused_pending_gf = gf;
+            lctx.mtp_fused_pending_n_steps = cparams.mtp_fused_n_steps;
+            // Skip extraction; will run in extract_results.
+        } else if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
             const int n_steps = cparams.mtp_fused_n_steps;
             lctx.mtp_fused_results_n = n_steps;
             // Sync once to make all output tensors readable.
@@ -9761,6 +9774,164 @@ int32_t llama_mtp_fused_draft_invoke(
 
 int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx) {
     return ctx ? ctx->mtp_fused_last_compute_count : 0;
+}
+
+// Phase 38 E: accessors for speculative.cpp coordination.
+int32_t llama_mtp_get_persist_n(struct llama_context * ctx) {
+    return ctx ? ctx->mtp_persist_n : 0;
+}
+bool llama_mtp_has_pending_async(struct llama_context * ctx) {
+    return ctx && ctx->mtp_fused_pending_gf != nullptr;
+}
+int32_t llama_mtp_get_async_guess(struct llama_context * ctx) {
+    return ctx ? ctx->mtp_fused_async_guess : -1;
+}
+void llama_mtp_set_async_guess(struct llama_context * ctx, int32_t guess) {
+    if (ctx) ctx->mtp_fused_async_guess = guess;
+}
+int32_t llama_mtp_get_pending_chain_residual_step(struct llama_context * ctx) {
+    return ctx ? ctx->pending_chain_residual_step : -1;
+}
+
+// Phase 38 E: async fused-draft dispatch.
+int32_t llama_mtp_fused_dispatch_async(
+        struct llama_context * ctx,
+        llama_token            seed_token,
+        const float          * seed_hidden,
+        int32_t                n_steps,
+        int32_t                chain_residual_step) {
+    if (ctx == nullptr || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
+        return -1;
+    }
+    if (ctx->mtp_fused_pending_gf != nullptr) {
+        // A prior async dispatch is still pending — caller must
+        // extract first.
+        return -2;
+    }
+
+    if (chain_residual_step >= 0) {
+        llama_set_draft_input_chain_residual(ctx, chain_residual_step);
+    } else if (seed_hidden != nullptr) {
+        llama_set_draft_input_hidden_state(ctx, seed_hidden);
+    }
+
+    // Flag for llama_decode_internal to skip post-compute extraction.
+    ctx->mtp_fused_skip_extraction = true;
+
+    llama_mtp_fused_result fr{};
+    const int32_t rc = llama_mtp_fused_draft_invoke(
+            ctx, seed_token, /*seed_hidden=*/nullptr, n_steps, &fr);
+    // The invoke ran llama_decode which honored skip_extraction;
+    // mtp_fused_pending_gf is now set if the dispatch succeeded
+    // (post-compute block stashed gf instead of extracting).
+    if (rc != 0) {
+        ctx->mtp_fused_skip_extraction = false;
+        ctx->mtp_fused_pending_gf = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
+// Phase 38 E: complete a prior async fused dispatch.
+int32_t llama_mtp_fused_extract_results(
+        struct llama_context     * ctx,
+        struct llama_mtp_fused_result * out) {
+    if (ctx == nullptr || out == nullptr) {
+        return -1;
+    }
+    if (ctx->mtp_fused_pending_gf == nullptr) {
+        return -1;  // No async dispatch pending.
+    }
+
+    ggml_cgraph * gf = ctx->mtp_fused_pending_gf;
+    const int n_steps = ctx->mtp_fused_pending_n_steps;
+    const int n_extend = ctx->cparams.mtp_fused_n_extend;
+    const int n_chain = n_steps + n_extend;
+
+    // Sync ctx_mtp's stream — wait for the async kernels to complete.
+    ggml_backend_sched_synchronize(ctx->sched);
+
+    ctx->mtp_fused_results_n = n_steps;
+    for (int k = 0; k < n_steps; ++k) {
+        char nm_a[32], nm_p[32];
+        snprintf(nm_a, sizeof(nm_a), "mtp_argmax_%d", k);
+        snprintf(nm_p, sizeof(nm_p), "mtp_prob_%d", k);
+        ggml_tensor * t_a = nullptr, * t_p = nullptr;
+        for (int i = gf->n_nodes - 1; i >= 0; --i) {
+            if (!t_a && strcmp(gf->nodes[i]->name, nm_a) == 0) t_a = gf->nodes[i];
+            if (!t_p && strcmp(gf->nodes[i]->name, nm_p) == 0) t_p = gf->nodes[i];
+            if (t_a && t_p) break;
+        }
+        if (t_a) {
+            int32_t v = 0;
+            ggml_backend_tensor_get(t_a, &v, 0, sizeof(v));
+            const int32_t n_vocab = (int32_t) ctx->model.hparams.n_vocab;
+            ctx->mtp_fused_results_tokens[k] =
+                (v < 0 || v >= n_vocab) ? -1 : (llama_token) v;
+        } else {
+            ctx->mtp_fused_results_tokens[k] = -1;
+        }
+        if (t_p) {
+            float v = 0.0f;
+            ggml_backend_tensor_get(t_p, &v, 0, sizeof(v));
+            ctx->mtp_fused_results_probs[k] = v;
+        } else {
+            ctx->mtp_fused_results_probs[k] = 1.0f;
+        }
+    }
+
+    // Capture persist (Phase 38 B). Lazy-init if needed.
+    {
+        bool need_init = (ctx->mtp_persist_ctx == nullptr);
+        if (need_init) {
+            ggml_init_params init_params = {
+                /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ctx->mtp_persist_ctx = ggml_init(init_params);
+            const int64_t n_embd_persist = ctx->model.hparams.n_embd;
+            for (int _k = 0; _k < 8; ++_k) {
+                ctx->mtp_persist[_k] = ggml_new_tensor_2d(
+                    ctx->mtp_persist_ctx, GGML_TYPE_F32,
+                    n_embd_persist, 1);
+                char nm[40];
+                snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
+                ggml_set_name(ctx->mtp_persist[_k], nm);
+            }
+            ggml_backend_t bk0 = ctx->mtp_fused_chain_residuals[0]
+                ? ggml_backend_sched_get_tensor_backend(ctx->sched, ctx->mtp_fused_chain_residuals[0])
+                : nullptr;
+            ggml_backend_buffer_type_t buft = bk0
+                ? ggml_backend_get_default_buffer_type(bk0)
+                : llama_default_buffer_type_cpu(true);
+            ctx->mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                ctx->mtp_persist_ctx, buft);
+        }
+        int captured = 0;
+        for (int k = 0; k < n_chain && k < 8; ++k) {
+            ggml_tensor * src_t = ctx->mtp_fused_chain_residuals[k];
+            ggml_tensor * dst_t = ctx->mtp_persist[k];
+            if (src_t == nullptr || dst_t == nullptr) break;
+            if (ggml_nbytes(src_t) != ggml_nbytes(dst_t)) break;
+            ggml_backend_tensor_copy(src_t, dst_t);
+            ++captured;
+        }
+        ctx->mtp_persist_n = captured;
+    }
+
+    // Fill out struct.
+    out->n_steps = ctx->mtp_fused_results_n;
+    for (int k = 0; k < out->n_steps && k < LLAMA_MTP_FUSED_MAX; ++k) {
+        out->tokens[k] = ctx->mtp_fused_results_tokens[k];
+        out->probs[k]  = ctx->mtp_fused_results_probs[k];
+    }
+
+    // Reset pending state.
+    ctx->mtp_fused_skip_extraction = false;
+    ctx->mtp_fused_pending_gf = nullptr;
+    ctx->mtp_fused_pending_n_steps = 0;
+    return 0;
 }
 
 void llama_synchronize(struct llama_context * ctx) {

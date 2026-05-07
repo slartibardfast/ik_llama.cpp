@@ -389,6 +389,33 @@ struct llama_context {
     // below for the persistent variant.
     struct ggml_tensor * mtp_fused_chain_residuals[8] = {};
 
+    // Phase 38 E: when true, llama_decode_internal SKIPS the
+    // post-compute extraction block (sched_synchronize +
+    // tensor_get for argmax/prob + persist capture) for fused
+    // decodes. The deferred work is run by
+    // llama_mtp_fused_extract_results, called by the server after
+    // the parallel verify dispatch completes. Cleared by
+    // extract_results.
+    bool mtp_fused_skip_extraction = false;
+
+    // Phase 38 E: cached cgraph for the most recent async fused
+    // dispatch. Held so extract_results can iterate the graph
+    // nodes for argmax/prob/persist values. Set by
+    // llama_decode_internal at the end of the fused dispatch when
+    // skip_extraction is true. Reset by extract_results on
+    // completion.
+    struct ggml_cgraph * mtp_fused_pending_gf = nullptr;
+    int mtp_fused_pending_n_steps = 0;
+
+    // Phase 38 E (server-internal): the chain_residual_step that
+    // was used as seed for the most recent async dispatch. After
+    // verify completes and actual n_accepted is known, the
+    // speculative path compares this guess to actual: match → use
+    // async result; miss → discard + sequential redo. Set by
+    // mtp_speculative_gen_draft when it dispatches async; read +
+    // reset by the same function on the next cycle.
+    int mtp_fused_async_guess = -1;
+
     // Phase 38 B: persistent chain-residual buffer. Outlives every
     // sched_reset (verify, UPDATE_ACCEPTED, fused-rebuild) so the
     // chain-residual seed plumbing in prepare_mtp_graph_inputs can

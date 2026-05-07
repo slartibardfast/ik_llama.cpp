@@ -1619,6 +1619,43 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // -1 on use, so callers must re-arm per decode.
     LLAMA_API void llama_set_draft_input_chain_residual(struct llama_context * ctx, int chain_step);
 
+    // Phase 38 E: async fused-draft dispatch. Same logical operation
+    // as llama_mtp_fused_draft_invoke, but skips the post-compute
+    // extraction (sched_synchronize + tensor_get + persist capture)
+    // so the call returns after kernels are launched on the device's
+    // stream. Caller MUST follow up with llama_mtp_fused_extract_results
+    // before issuing another decode on the same context (otherwise
+    // the next decode's sched_alloc would invalidate the pending
+    // graph's tensor data). Used by the server's speculative
+    // dispatch path to overlap fused(k+1) with verify(k).
+    //
+    // Returns 0 on success, negative on failure.
+    LLAMA_API int32_t llama_mtp_fused_dispatch_async(
+        struct llama_context * ctx,
+        llama_token            seed_token,
+        const float          * seed_hidden,
+        int32_t                n_steps,
+        int32_t                chain_residual_step);
+
+    // Phase 38 E: complete a prior llama_mtp_fused_dispatch_async.
+    // Calls sched_synchronize, runs the deferred argmax/prob
+    // extraction from the pending cgraph, captures persist[]
+    // tensors, and fills *out. Returns 0 on success, -1 if no
+    // async dispatch is pending.
+    LLAMA_API int32_t llama_mtp_fused_extract_results(
+        struct llama_context     * ctx,
+        struct llama_mtp_fused_result * out);
+
+    // Phase 38 E: query/set internal speculative-dispatch state.
+    // common/speculative.cpp uses these to coordinate async fused
+    // dispatch + match/miss recovery without touching llama_context's
+    // private layout.
+    LLAMA_API int32_t llama_mtp_get_persist_n(struct llama_context * ctx);
+    LLAMA_API bool    llama_mtp_has_pending_async(struct llama_context * ctx);
+    LLAMA_API int32_t llama_mtp_get_async_guess(struct llama_context * ctx);
+    LLAMA_API void    llama_mtp_set_async_guess(struct llama_context * ctx, int32_t guess);
+    LLAMA_API int32_t llama_mtp_get_pending_chain_residual_step(struct llama_context * ctx);
+
     // Phase 36 Step 3 (per-ubatch MTP KV hook): expose the pre-final-norm
     // residual stream tensor from the most recent main forward graph
     // built on this context. Returns nullptr when:

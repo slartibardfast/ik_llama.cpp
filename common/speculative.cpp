@@ -1386,6 +1386,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     // exit. Env-gated by LLAMA_MTP_FUSED until full sampler-trivial
     // detection lands in common_sampler.
     static const bool _fused_enabled = (getenv("LLAMA_MTP_FUSED") != nullptr);
+    static const bool _full_2_enabled = (getenv("LLAMA_MTP_FULL_2") != nullptr);
     if (_fused_enabled && n_draft > 1 && n_draft <= LLAMA_MTP_FUSED_MAX) {
         // Phase 36 chain-seed fix #2: the runner has ALREADY called
         // llama_set_draft_input_hidden_state(ctx_mtp, slot.mtp_hidden_state)
@@ -1396,8 +1397,40 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         // We pass nullptr to indicate the seed is already set; the
         // fused invoke will use ctx->draft_input_hidden_state directly.
         llama_mtp_fused_result fr{};
-        const int32_t rc = llama_mtp_fused_draft_invoke(
-                ctx, id_last, /*seed_hidden=*/nullptr, n_draft, &fr);
+        int32_t rc = -1;
+
+        // Phase 38 E: try to extract a pending async fused dispatch
+        // from a prior call. If guess matched actual n_accepted_drafts
+        // (= the int passed via llama_set_draft_input_chain_residual
+        // which the server set in Phase B based on actual accept), we
+        // already have valid drafts on-device. Sync ctx_mtp's stream
+        // and read them.
+        if (_full_2_enabled) {
+            const int async_guess = llama_mtp_get_async_guess(ctx);
+            const int actual_step = llama_mtp_get_pending_chain_residual_step(ctx);
+            if (async_guess >= 0 && llama_mtp_has_pending_async(ctx)) {
+                if (async_guess == actual_step) {
+                    // Match — extract async result.
+                    rc = llama_mtp_fused_extract_results(ctx, &fr);
+                    // Successfully used async; clear the seed-arm so
+                    // the dispatch_async below picks up correctly.
+                    llama_set_draft_input_chain_residual(ctx, -1);
+                } else {
+                    // Miss — extract anyway to flush, then discard.
+                    llama_mtp_fused_result _flush_fr{};
+                    llama_mtp_fused_extract_results(ctx, &_flush_fr);
+                    rc = -1;  // Force sync fallback below.
+                }
+                llama_mtp_set_async_guess(ctx, -1);
+            }
+        }
+
+        if (rc != 0) {
+            // No async result available (or miss): regular sync dispatch.
+            rc = llama_mtp_fused_draft_invoke(
+                    ctx, id_last, /*seed_hidden=*/nullptr, n_draft, &fr);
+        }
+
         if (rc == 0 && fr.n_steps > 0) {
             // Phase 37 #4: adaptive chain depth. Truncate the draft at the
             // first step whose argmax probability falls below the env
@@ -1427,6 +1460,44 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             for (int k = 0; k < n_use; ++k) {
                 drafts.push_back(fr.tokens[k]);
             }
+
+            // Phase 38 E: dispatch ASYNC fused for the NEXT cycle.
+            // Predict guess = persist_n - 1 (highest available chain
+            // index, == n_steps when EXTEND=1, the all-accept case).
+            // Hits ~51% with per-draft p=0.8 at n=3 due to geometric
+            // distribution favoring all-accept.
+            //
+            // The async dispatch runs on ctx_mtp's stream concurrently
+            // with the upcoming verify on ctx_tgt's stream. Same
+            // cgraph topology as the just-completed sync dispatch
+            // (graph reuse via Phase 37 #5 hits).
+            //
+            // On match next cycle: extract returns drafts.
+            // On miss: discard via the rc=-1 path above; pay one sync
+            // fused redo. Net: lift on match, neutral on miss + GPU
+            // contention overhead.
+            const int persist_n_now = llama_mtp_get_persist_n(ctx);
+            if (_full_2_enabled && persist_n_now > 0
+                    && !llama_mtp_has_pending_async(ctx)) {
+                // Use the highest persist index as the all-accept guess.
+                // With LLAMA_MTP_FUSED_EXTEND=1, persist_n = n_steps + 1
+                // and persist[n_steps] is exactly the all-accept seed.
+                const int guess = persist_n_now - 1;
+                // The seed_token for fused(k+1) is fr.tokens[guess] —
+                // i.e., the predicted next token after `guess` accepts.
+                // For all-accept, that's fr.tokens[n_steps - 1] (the
+                // last drafted token, which would be the bonus position
+                // that fused chains from).
+                const llama_token next_seed_token = (guess > 0 && guess - 1 < fr.n_steps)
+                    ? fr.tokens[guess - 1] : id_last;
+                const int async_rc = llama_mtp_fused_dispatch_async(
+                        ctx, next_seed_token, /*seed_hidden=*/nullptr,
+                        n_draft, /*chain_residual_step=*/guess);
+                if (async_rc == 0) {
+                    llama_mtp_set_async_guess(ctx, guess);
+                }
+            }
+
             return drafts;
         }
         // Fall through to per-step path on failure.
