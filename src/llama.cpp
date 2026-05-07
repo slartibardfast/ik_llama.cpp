@@ -4887,6 +4887,24 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     }
 
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
+
+    static const bool input_chk =
+        (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
+    if (input_chk) {
+        const char * op_label = "?";
+        switch (lctx.cparams.mtp_op_type) {
+            case MTP_OP_NONE:             op_label = "NONE";             break;
+            case MTP_OP_DRAFT_GEN:        op_label = "DRAFT_GEN";        break;
+            case MTP_OP_DRAFT_GEN_FUSED:  op_label = "DRAFT_GEN_FUSED";  break;
+            case MTP_OP_UPDATE_ACCEPTED:  op_label = "UPDATE_ACCEPTED";  break;
+            case MTP_OP_WARMUP:           op_label = "WARMUP";           break;
+        }
+        fprintf(stderr,
+            "[mtp-input-chk] op=%s nbytes=%zu first8=[%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f]\n",
+            op_label, (size_t) ggml_nbytes(dst),
+            src[0], src[1], src[2], src[3],
+            src[4], src[5], src[6], src[7]);
+    }
     return true;
 }
 
@@ -4911,6 +4929,23 @@ static int llama_decode_internal(
     // memory. Clear it here so callers can detect "no fresh main graph
     // built this decode" via a null pointer.
     lctx.t_h_pre_norm = nullptr;
+    // Phase 36 diagnostic: bump cycle counter at each verify decode so
+    // fused / per-step stats prints can be cycle-aligned. The server
+    // routes verify and MTP draft through DIFFERENT llama_context
+    // instances (verify on main, draft on mtp_target / hs_ctx), so a
+    // per-lctx member never bridges them. Use a process-global counter
+    // instead — single-slot diagnostic only, fine for this scope.
+    static int64_t _global_mtp_cycle = 0;  // diagnostic only; single-slot use
+    if (lctx.cparams.mtp_op_type == MTP_OP_NONE) {
+        ++_global_mtp_cycle;
+    }
+    lctx.mtp_cycle_counter = _global_mtp_cycle;
+    if (getenv("LLAMA_MTP_CYCLE_DBG")) {
+        fprintf(stderr, "[mtp-cycle-dbg] op_type=%d mtp=%d cycle=%lld\n",
+                (int) lctx.cparams.mtp_op_type,
+                (int) lctx.cparams.mtp,
+                (long long) lctx.mtp_cycle_counter);
+    }
     // Same stale-pointer guard for the per-step offset tensors used by
     // the fused chain's per-device argmax + reduction. Set only when
     // a fresh fused graph is built; cleared otherwise.
@@ -5385,6 +5420,23 @@ static int llama_decode_internal(
                         lctx.draft_argmax_valid = true;
                         lctx.draft_argmax_n     = rows_to_pull;
 
+                        {
+                            static const bool perstep_stats =
+                                (getenv("LLAMA_MTP_FUSED_STATS") != nullptr);
+                            if (perstep_stats && draftgen_fast) {
+                                const int32_t pos0 = u_batch.pos ? (int32_t) u_batch.pos[0] : -1;
+                                for (int i = 0; i < rows_to_pull; ++i) {
+                                    fprintf(stderr,
+                                            "[mtp-perstep-stats] cycle=%lld pos=%d row=%d tok=%d prob=%.4f\n",
+                                            (long long) lctx.mtp_cycle_counter,
+                                            pos0,
+                                            i,
+                                            lctx.draft_argmax_ids[i],
+                                            lctx.draft_argmax_probs[i]);
+                                }
+                            }
+                        }
+
                         goto logits_extract_done;
                     }
                 }
@@ -5519,6 +5571,18 @@ static int llama_decode_internal(
                     lctx.mtp_fused_results_probs[k] = v;
                 } else {
                     lctx.mtp_fused_results_probs[k] = 1.0f;
+                }
+                static const bool mtp_fused_stats =
+                    (getenv("LLAMA_MTP_FUSED_STATS") != nullptr);
+                if (mtp_fused_stats) {
+                    const int32_t pos_k = u_batch.pos ? (int32_t) u_batch.pos[k] : -1;
+                    fprintf(stderr,
+                            "[mtp-fused-stats] cycle=%lld pos=%d step=%d tok=%d prob=%.4f\n",
+                            (long long) lctx.mtp_cycle_counter,
+                            pos_k,
+                            k,
+                            (int) lctx.mtp_fused_results_tokens[k],
+                            (float) lctx.mtp_fused_results_probs[k]);
                 }
             }
         }
@@ -9423,7 +9487,14 @@ int32_t llama_mtp_fused_draft_invoke(
         const float *                    seed_hidden,
         int32_t                          n_steps,
         struct llama_mtp_fused_result *  out) {
-    if (!ctx || !seed_hidden || !out || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
+    // seed_hidden may be nullptr — in that case, the caller has already
+    // populated ctx->draft_input_hidden_state via
+    // llama_set_draft_input_hidden_state and we should not overwrite it.
+    if (!ctx || !out || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
+        return -1;
+    }
+    if (seed_hidden == nullptr && ctx->draft_input_hidden_state == nullptr) {
+        // Neither path provided a seed.
         return -1;
     }
     out->n_steps = 0;
@@ -9441,8 +9512,11 @@ int32_t llama_mtp_fused_draft_invoke(
 
     // Push the seed hidden state through the existing host→device
     // bounce slot. set_inputs copies it into the inp_mtp_states tensor
-    // built by build_qwen35_mtp_fused.
-    llama_set_draft_input_hidden_state(ctx, seed_hidden);
+    // built by build_qwen35_mtp_fused. If seed_hidden is null, the
+    // caller already set ctx->draft_input_hidden_state — leave it.
+    if (seed_hidden != nullptr) {
+        llama_set_draft_input_hidden_state(ctx, seed_hidden);
+    }
 
     // Build an n_steps-token batch. inp_tokens[0] = seed_token (step 0
     // input); inp_tokens[k>0] are dummy zeros that the fused graph
@@ -10819,7 +10893,15 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 }
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
-    ctx->draft_input_hidden_state = hidden_state;
+    if (hidden_state == nullptr) {
+        ctx->draft_input_hidden_state = nullptr;
+        return;
+    }
+    // Copy into context-owned buffer so the value survives the next
+    // llama_decode's llama_output_reserve (which repoints lctx.embd).
+    const size_t n_embd = (size_t) ctx->model.hparams.n_embd;
+    ctx->draft_input_hidden_state_buf.assign(hidden_state, hidden_state + n_embd);
+    ctx->draft_input_hidden_state = ctx->draft_input_hidden_state_buf.data();
 }
 
 bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob) {

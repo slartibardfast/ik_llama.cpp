@@ -272,7 +272,21 @@ struct llama_context {
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
 
-    const float * draft_input_hidden_state = nullptr;
+    // Phase 36 chain-seed fix: copy-on-set, not pointer-on-set.
+    // The previous `const float *` design held a pointer into lctx.embd
+    // captured before the next llama_decode. llama_decode's
+    // llama_output_reserve repoints lctx.embd based on the new
+    // n_outputs_max, leaving the captured pointer aimed at stale or
+    // zeroed memory. Copying into a context-owned buffer at set time
+    // immunises the fused/per-step chain seed against re-pointing.
+    std::vector<float> draft_input_hidden_state_buf;
+    const float *      draft_input_hidden_state = nullptr;
+
+    // Phase 36 diagnostic: cycle counter increments on each verify
+    // decode (MTP_OP_NONE && cparams.mtp). Threaded into fused/per-step
+    // stats prints so cycle-aligned comparisons across paths are
+    // possible without ad-hoc line counting.
+    int64_t mtp_cycle_counter = 0;
 
     // MTP DRAFT_GEN device-side residual cache: populated by the embedding-extract
     // path on a CUDA backend (D2D copy from the cgraph's `embd` tensor) so the

@@ -1387,21 +1387,25 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     // detection lands in common_sampler.
     static const bool _fused_enabled = (getenv("LLAMA_MTP_FUSED") != nullptr);
     if (_fused_enabled && n_draft > 1 && n_draft <= LLAMA_MTP_FUSED_MAX) {
-        // Pull current hidden state for step 0 seed.
-        const float * seed_hidden = llama_get_embeddings_ith(ctx, 0);
-        if (seed_hidden) {
-            llama_mtp_fused_result fr{};
-            const int32_t rc = llama_mtp_fused_draft_invoke(
-                    ctx, id_last, seed_hidden, n_draft, &fr);
-            if (rc == 0 && fr.n_steps > 0) {
-                drafts.reserve(fr.n_steps);
-                for (int k = 0; k < fr.n_steps; ++k) {
-                    drafts.push_back(fr.tokens[k]);
-                }
-                return drafts;
+        // Phase 36 chain-seed fix #2: the runner has ALREADY called
+        // llama_set_draft_input_hidden_state(ctx_mtp, slot.mtp_hidden_state)
+        // before invoking the speculative draft (server-context.cpp:3185).
+        // Reading from llama_get_embeddings_ith(ctx_mtp, 0) here would
+        // pull from ctx_mtp->embd, a SEPARATE context whose embd is
+        // never populated by the verify decode (verify runs on ctx_tgt).
+        // We pass nullptr to indicate the seed is already set; the
+        // fused invoke will use ctx->draft_input_hidden_state directly.
+        llama_mtp_fused_result fr{};
+        const int32_t rc = llama_mtp_fused_draft_invoke(
+                ctx, id_last, /*seed_hidden=*/nullptr, n_draft, &fr);
+        if (rc == 0 && fr.n_steps > 0) {
+            drafts.reserve(fr.n_steps);
+            for (int k = 0; k < fr.n_steps; ++k) {
+                drafts.push_back(fr.tokens[k]);
             }
-            // Fall through to per-step path on failure.
+            return drafts;
         }
+        // Fall through to per-step path on failure.
     }
 
     llama_batch mtp_batch = llama_batch_init(1, 0, 1);

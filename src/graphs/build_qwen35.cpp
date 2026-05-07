@@ -294,6 +294,85 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     return cur;
 }
 
+// Phase 36 #3: shared MTP chain-residual primitive. See header comment.
+// Returns the post-shared_head_norm tensor; the caller invokes lm_head
+// + argmax separately. Both per-step (build_qwen35_mtp) and fused
+// (build_qwen35_mtp_fused chain step) call this so the graph optimizer
+// sees identical op sequences and picks identical kernels.
+struct ggml_tensor * llm_build_context::build_qwen35_mtp_chain_residual(
+    const llama_layer & mtp_layer,
+    struct ggml_tensor * prev_embeddings,
+    struct ggml_tensor * tokens_input,
+    int64_t n_embd_head,
+    struct ggml_cgraph * gf,
+    struct ggml_tensor * inp_pos,
+    struct ggml_tensor * KQ_mask,
+    int kv_head_offset) {
+
+    const int il = hparams.n_layer - 1;
+
+    GGML_ASSERT(il < (int)kv_self.k_l.size() && il < (int)kv_self.v_l.size());
+    if (!kv_self.k_l[il] || !kv_self.v_l[il]) {
+        LLAMA_LOG_ERROR("%s: KV cache not allocated for MTP layer %d (k=%p, v=%p)\n",
+                __func__, il, (void*)kv_self.k_l[il], (void*)kv_self.v_l[il]);
+        GGML_ABORT("KV cache not allocated for MTP layer");
+    }
+    if (!model.layers[il].wq || !model.layers[il].wk ||
+        !model.layers[il].wv || !model.layers[il].wo) {
+        LLAMA_LOG_ERROR("%s: Missing attention weights for MTP layer %d\n",
+                __func__, il);
+        GGML_ABORT("Missing attention weights for MTP layer");
+    }
+
+    ggml_tensor * token_emb = ggml_get_rows(ctx0, model.tok_embd, tokens_input);
+    ggml_tensor * token_emb_norm = llm_build_norm(
+            ctx0, token_emb, hparams, mtp_layer.nextn.enorm,
+            NULL, LLM_NORM_RMS, cb, il);
+    ggml_tensor * hidden_state_norm = llm_build_norm(
+            ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm,
+            NULL, LLM_NORM_RMS, cb, il);
+
+    ggml_tensor * cur;
+    if (mtp_layer.nextn.eh_proj != nullptr) {
+        ggml_tensor * combined = ggml_concat(ctx0, token_emb_norm, hidden_state_norm, 0);
+        cb(combined, "mtp_concat", il);
+        cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+    } else {
+        cur = ggml_add(ctx0, token_emb_norm, hidden_state_norm);
+    }
+    cb(cur, "mtp_fused", il);
+
+    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+
+    cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
+            inp_pos, nullptr, nullptr,
+            KQ_mask, nullptr, nullptr,
+            kq_scale, 0.0f, 0, il,
+            /*do_rope=*/true, /*add_graph_split=*/false,
+            /*add_input=*/true, /*is_norm=*/false,
+            /*is_multi=*/true, /*post_norm=*/nullptr,
+            kv_head_offset, /*fa_prec_f32=*/true);
+
+    if (mtp_layer.ffn_gate != nullptr) {
+        cur = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
+                mtp_layer.ffn_up,   NULL, NULL,
+                mtp_layer.ffn_gate, NULL, NULL,
+                mtp_layer.ffn_down, NULL, NULL,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+    }
+
+    cur = lctx.cvec.apply_to(ctx0, cur, il);
+    cb(cur, "ffn_out", il);
+
+    cur = llm_build_norm(ctx0, cur, hparams,
+            mtp_layer.nextn.shared_head_norm,
+            NULL, LLM_NORM_RMS, cb, il);
+    cb(cur, "result_norm", -1);
+
+    return cur;
+}
+
 // Phase 36 Step 3: MTP layer compute that stops after attention. Used by
 // the per-ubatch hook when integrating MTP KV writes into verify forward.
 // Skips FFN, final norm, and lm_head — KV write is the only side effect
@@ -305,7 +384,8 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp_kv_only(
     int64_t n_embd_head,
     struct ggml_cgraph * gf,
     struct ggml_tensor * inp_pos,
-    struct ggml_tensor * KQ_mask) {
+    struct ggml_tensor * KQ_mask,
+    int kv_head_offset) {
 
     const int il = hparams.n_layer - 1;
 
@@ -330,7 +410,8 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp_kv_only(
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
             inp_pos, nullptr, nullptr,
             KQ_mask, nullptr, nullptr,
-            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr);
+            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr,
+            kv_head_offset);
 
     cb(cur, "mtp_kv_attn_out", il);
     return cur;
@@ -426,46 +507,26 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
             lctx.inp_KQ_mask->nb[1],
             (size_t) k * GGML_KQ_MASK_PAD * lctx.inp_KQ_mask->nb[1]);
 
-        ggml_tensor * cur = build_qwen35_mtp_kv_only(
+        // Phase 36 #3: route through the shared chain-residual primitive
+        // (the SAME primitive build_qwen35_mtp uses).
+        ggml_tensor * normed = build_qwen35_mtp_chain_residual(
             mtp_layer, prev_residual, tok_id_k,
-            n_embd_head, gf, pos_k, mask_k);
+            n_embd_head, gf, pos_k, mask_k,
+            /*kv_head_offset=*/k);
+        (void) is_moe;
 
-        // Optional FFN
-        if (is_moe) {
-            cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
-                    mtp_layer.ffn_gate_inp, nullptr,
-                    mtp_layer.ffn_up_exps, nullptr,
-                    mtp_layer.ffn_gate_exps, nullptr,
-                    mtp_layer.ffn_down_exps, nullptr,
-                    nullptr,
-                    mtp_layer.ffn_up_shexp, nullptr,
-                    mtp_layer.ffn_gate_shexp, nullptr,
-                    mtp_layer.ffn_down_shexp, nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, true, false, 0.0f,
-                    LLM_EXPERT_GATING_FUNC_SOFTMAX,
-                    LLM_FFN_SILU, cb, il_mtp, gf, true,
-                    mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
-        } else if (mtp_layer.ffn_gate != nullptr) {
-            cur = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
-                    mtp_layer.ffn_up,   NULL, NULL,
-                    mtp_layer.ffn_gate, NULL, NULL,
-                    mtp_layer.ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+        // Phase 37 fix: force materialization of the chain residual at
+        // each step boundary. ggml_dup is identity in F32; its purpose
+        // is to break ggml's graph optimizer's ability to fuse step
+        // k+1's compute into kernels of step k. Per-step has this
+        // materialization implicitly via the D2H boundary between
+        // separate decodes; fused needs it explicitly. Closes the
+        // cumulative drift identified by the d=2 probe (d=2 ratio 0.93
+        // vs d=3 ratio 0.67 — drift compounds at chain step ≥ 2).
+        if (k + 1 < n_draft) {
+            normed = ggml_dup(ctx0, normed);
+            cb(normed, "mtp_chain_residual", il_mtp);
         }
-
-        cur = lctx.cvec.apply_to(ctx0, cur, il_mtp);
-        cb(cur, "ffn_out", il_mtp);
-
-        // Apply the shared-head norm BEFORE branching into chain-input
-        // and lm_head. The per-step path captures result_norm (post-norm)
-        // as the next step's prev_embeddings via llama_get_embeddings_ith
-        // — fused must do the same to match acceptance.
-        ggml_tensor * normed = llm_build_norm(ctx0, cur, hparams,
-            mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
-        cb(normed, "result_norm", -1);
-
         prev_residual = normed;
 
         // Head: per-device lm_head matmul, per-device argmax + max-val,

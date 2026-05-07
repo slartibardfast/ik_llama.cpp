@@ -440,7 +440,7 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
-            bool is_multi = false, ggml_tensor * post_norm = nullptr);
+            bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_head_offset = 0, bool fa_prec_f32 = false);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
@@ -482,7 +482,31 @@ llm_expert_gating_func_type   gating_op,
         int64_t n_embd_head,
         struct ggml_cgraph * gf,
         struct ggml_tensor * inp_pos,
-        struct ggml_tensor * KQ_mask
+        struct ggml_tensor * KQ_mask,
+        int kv_head_offset = 0
+    );
+
+    // Phase 36 #3: shared primitive for the MTP chain residual.
+    // Both per-step (build_qwen35_mtp) and fused (build_qwen35_mtp_fused
+    // chain step) route through this. Returns the post-shared_head_norm
+    // tensor — the tensor whose value is the next chain step's input.
+    // Caller separately invokes lm_head + argmax on the returned tensor.
+    //
+    // Identical-compute guarantee: by routing both paths through the
+    // same op sequence with the same cb tags and the same input shape,
+    // ggml's graph optimizer makes identical kernel-selection and
+    // fusion decisions. This closes the per-step vs fused argmax-prob
+    // divergence observed at d=3 (post seed-source fix the gap was
+    // ~6 pp on X02 256K, ~25 pp on small synthetic).
+    struct ggml_tensor * build_qwen35_mtp_chain_residual(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_tensor * tokens_input,
+        int64_t n_embd_head,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * KQ_mask,
+        int kv_head_offset = 0
     );
 
     // Phase 36 Step 1: fused multi-draft cgraph (n_draft chained MTP
