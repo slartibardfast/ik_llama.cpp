@@ -571,15 +571,14 @@ struct llama_context::Prev {
 void llama_context::reset_scheduler() {
     ggml_backend_sched_reset(sched);
     prev.reset();
-    // Phase 37 #2.1: sched_reset frees the prior graph's tensor
-    // backing buffers. The chain_residual tensor headers stored here
-    // become dangling pointers — null them so prepare_mtp_graph_inputs'
-    // chain-residual seed path falls back cleanly. Also flip the
-    // validity flag (data is gone too).
+    // Phase 37 #2.1 / Phase 38 B: sched_reset frees the prior graph's
+    // tensor backing buffers. The sched-owned chain_residual tensor
+    // headers become dangling — null them. The persist[] tensors are
+    // independent (context-owned backend buffer) and survive
+    // sched_reset, so they are NOT touched here.
     for (int _i = 0; _i < 8; ++_i) {
         mtp_fused_chain_residuals[_i] = nullptr;
     }
-    mtp_fused_chain_residuals_valid = false;
 }
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
@@ -708,6 +707,16 @@ llama_context::~llama_context() {
     }
 
     ggml_backend_buffer_free(buf_output);
+
+    // Phase 38 B3: cleanup persistent chain-residual buffer.
+    if (mtp_persist_buf != nullptr) {
+        ggml_backend_buffer_free(mtp_persist_buf);
+        mtp_persist_buf = nullptr;
+    }
+    if (mtp_persist_ctx != nullptr) {
+        ggml_free(mtp_persist_ctx);
+        mtp_persist_ctx = nullptr;
+    }
 }
 
 //
@@ -4898,43 +4907,39 @@ static void llama_graph_compute(
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_tensor * dst = lctx.inp_mtp_states;
 
-    // Phase 37 #2.2: chain-residual seed (D2D, no host bounce). When the
-    // caller has armed pending_chain_residual_step AND the prior fused
-    // decode's chain residuals are still valid (graph reuse hit, or
-    // tensors built but compute pending — the flag distinguishes), pull
-    // the seed from the prior fused decode's chain_residuals[step]
-    // tensor — its backing buffer holds h_pre_norm at position
-    // seed_pos + step + 1, exactly the seed for THIS fused decode.
-    // Saves a verify->host copy + host->fused-device copy per cycle
-    // (~150-300 us measured).
+    // Phase 38 B: chain-residual seed (D2D, no host bounce). When the
+    // caller has armed pending_chain_residual_step AND the persistent
+    // chain-residual buffer holds valid data from a prior fused decode
+    // (persist_n > step), pull the seed from persist[step] — its
+    // backing buffer holds h_pre_norm at position seed_pos + step + 1,
+    // exactly the seed for THIS fused decode.
     //
-    // Same-stream FIFO ordering: this D2D copy and this graph's
-    // compute kernels run on the same stream. The copy completes
-    // before compute starts overwriting the chain_residual buffers,
-    // so reading from a buffer that the same graph will later write
-    // to is race-free.
+    // Persist tensors live in a context-owned backend buffer that
+    // outlives sched_reset (verify, UPDATE_ACCEPTED, fused-rebuild
+    // all reset sched but persist remains intact). The post-fused-
+    // compute extraction (see llama_decode_internal) D2D-copies
+    // sched-owned chain_residuals[k] into persist[k], capturing the
+    // values BEFORE the next decode's sched_reset frees them.
     //
     // Auto-clears the arm bit so a later decode without re-arm falls
     // through to the host-bounce path (existing semantics preserved).
     {
         const int step = lctx.pending_chain_residual_step;
         lctx.pending_chain_residual_step = -1;
-        if (step >= 0 && step < 8 && lctx.mtp_fused_chain_residuals_valid) {
-            ggml_tensor * src_t = lctx.mtp_fused_chain_residuals[step];
+        if (step >= 0 && step < lctx.mtp_persist_n) {
+            ggml_tensor * src_t = lctx.mtp_persist[step];
             if (src_t != nullptr && ggml_nbytes(src_t) >= ggml_nbytes(dst)) {
                 ggml_backend_tensor_copy(src_t, dst);
                 static const bool input_chk =
                     (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
                 if (input_chk) {
                     fprintf(stderr,
-                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=chain_residual[%d] nbytes=%zu (D2D)\n",
+                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] nbytes=%zu (D2D)\n",
                         step, (size_t) ggml_nbytes(dst));
                 }
                 return true;
             }
-            // Mismatched/missing chain residual: fall through to host
-            // path. Don't error — caller may have armed for a fused
-            // decode that hasn't run yet (e.g. first cycle).
+            // Mismatched/missing persist: fall through to host path.
         }
     }
 
@@ -5027,33 +5032,21 @@ static int llama_decode_internal(
     // sched). So clear ONLY when this decode is NOT a fused decode —
     // a fused decode either rebuilds (re-populates) or reuses (keeps
     // prior valid pointers).
+    // Phase 38 B: stale-pointer guards for sched-owned tensors. Persist
+    // tensors are NOT touched here — they live in a context-owned
+    // backend buffer with persist_n as its validity counter, both
+    // updated only at end-of-fused-compute extraction.
     if (lctx.cparams.mtp_op_type != MTP_OP_DRAFT_GEN_FUSED) {
         for (int _i = 0; _i < 8; ++_i) {
             lctx.mtp_fused_offset_t[_i] = nullptr;
             lctx.mtp_fused_offset_n_dev[_i] = 0;
             lctx.mtp_fused_chain_residuals[_i] = nullptr;
         }
-        lctx.mtp_fused_chain_residuals_valid = false;
     } else {
         for (int _i = 0; _i < 8; ++_i) {
             lctx.mtp_fused_offset_t[_i] = nullptr;
             lctx.mtp_fused_offset_n_dev[_i] = 0;
         }
-        // chain_residuals tensor headers: on rebuild, build_qwen35_mtp_fused
-        // re-populates them. On reuse, the cached graph's pointers stay
-        // valid. The validity flag is owned by the post-compute extraction
-        // (set true after a successful fused decode), so do NOT touch it
-        // here — it remains true across a reuse cycle, which is exactly
-        // the case where the seed plumbing wants to read the prior data
-        // before this decode's compute overwrites it.
-        //
-        // For the rebuild path: the flag's semantic is "the tensors
-        // referenced here hold valid POST-compute data". After rebuild,
-        // the pointers are repopulated but compute hasn't run, so the
-        // flag MUST flip to false until end-of-compute resets it. The
-        // rebuild path goes through reset_scheduler() which sets
-        // mtp_fused_chain_residuals_valid = false; that's where the flip
-        // happens. So we don't need a flip here.
     }
     const uint32_t n_tokens_all = batch_all.n_tokens;
 
@@ -5699,12 +5692,68 @@ static int llama_decode_internal(
                 }
             }
 
-            // Phase 37 #2.1: chain-residual outputs are now stable
-            // (post-compute, post-sched_synchronize). The next fused
-            // decode (within this same sched lifetime — i.e. graph
-            // reuse path) can pull seed bytes directly from these
-            // tensors via prepare_mtp_graph_inputs's D2D path.
-            lctx.mtp_fused_chain_residuals_valid = true;
+            // Phase 38 B: capture chain-residual outputs to the
+            // persistent context-owned buffer. The sched-owned
+            // chain_residual tensors get freed on the next sched_reset
+            // (verify, UPDATE_ACCEPTED, fused-rebuild — all common);
+            // the persist[] copies survive. Lazy-init the persist
+            // buffer on first use.
+            //
+            // Allocation lives on the same backend the chain_residuals
+            // landed on (sched-assigned); for split-mode, this is
+            // typically device 0. Cross-device tensor_copy works if
+            // the assignment differs; we accept the slower path as
+            // edge-case.
+            {
+                bool need_init = (lctx.mtp_persist_ctx == nullptr);
+                if (need_init) {
+                    // Allocate ggml_context with overhead for 8
+                    // tensor headers (no_alloc).
+                    ggml_init_params init_params = {
+                        /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
+                        /*.mem_buffer =*/ NULL,
+                        /*.no_alloc   =*/ true,
+                    };
+                    lctx.mtp_persist_ctx = ggml_init(init_params);
+                    GGML_ASSERT(lctx.mtp_persist_ctx != nullptr);
+                    const int64_t n_embd_persist = lctx.model.hparams.n_embd;
+                    for (int _k = 0; _k < 8; ++_k) {
+                        lctx.mtp_persist[_k] = ggml_new_tensor_2d(
+                            lctx.mtp_persist_ctx, GGML_TYPE_F32,
+                            n_embd_persist, 1);
+                        char nm[40];
+                        snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
+                        ggml_set_name(lctx.mtp_persist[_k], nm);
+                    }
+                    // Pick the buft from chain_residuals[0]'s assigned
+                    // backend so the persist buffer lives on the same
+                    // device (avoids cross-device D2D on the hot path).
+                    ggml_backend_t bk0 = lctx.mtp_fused_chain_residuals[0]
+                        ? ggml_backend_sched_get_tensor_backend(
+                              lctx.sched, lctx.mtp_fused_chain_residuals[0])
+                        : nullptr;
+                    ggml_backend_buffer_type_t buft = bk0
+                        ? ggml_backend_get_default_buffer_type(bk0)
+                        : llama_default_buffer_type_cpu(true);
+                    lctx.mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                        lctx.mtp_persist_ctx, buft);
+                    GGML_ASSERT(lctx.mtp_persist_buf != nullptr);
+                }
+
+                // D2D copy each chain_residual to its persist slot.
+                // Synchronous via ggml_backend_tensor_copy; the data
+                // is byte-stable here (post-compute + post-sync).
+                int captured = 0;
+                for (int k = 0; k < n_steps && k < 8; ++k) {
+                    ggml_tensor * src_t = lctx.mtp_fused_chain_residuals[k];
+                    ggml_tensor * dst_t = lctx.mtp_persist[k];
+                    if (src_t == nullptr || dst_t == nullptr) break;
+                    if (ggml_nbytes(src_t) != ggml_nbytes(dst_t)) break;
+                    ggml_backend_tensor_copy(src_t, dst_t);
+                    ++captured;
+                }
+                lctx.mtp_persist_n = captured;
+            }
         }
 
         n_outputs_prev += lctx.n_outputs;

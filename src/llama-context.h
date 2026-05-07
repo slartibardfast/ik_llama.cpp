@@ -381,24 +381,27 @@ struct llama_context {
     struct ggml_tensor * mtp_fused_offset_t[8] = {};
     int32_t mtp_fused_offset_n_dev[8] = {};
 
-    // Phase 37 #2.1: per-chain-step residual outputs (set_output) of
-    // the fused MTP cgraph. Each tensor [n_embd, 1] holds h_pre_norm
-    // at position seed_pos + k + 1 (where seed_pos is fused's seed's
-    // position). Used by the chain-residual seed plumbing
-    // (#2.2) to pull next-cycle's fused seed directly from the prior
-    // fused decode's output without a host-bounce. Reset to nullptr
-    // by reset_scheduler when the cgraph is rebuilt.
+    // Phase 37 #2.1 / Phase 38 B: per-chain-step residual outputs
+    // (set_output) of the fused MTP cgraph. Each tensor [n_embd, 1]
+    // holds h_pre_norm at position seed_pos + k + 1 (where seed_pos
+    // is fused's seed's position). The sched-owned tensors are
+    // short-lived (freed on next sched_reset); see mtp_persist_*
+    // below for the persistent variant.
     struct ggml_tensor * mtp_fused_chain_residuals[8] = {};
 
-    // Phase 37 #2.2: validity flag for the chain-residual outputs.
-    // Set true at the end of a successful fused decode's post-compute
-    // extraction; cleared at the top of each llama_decode_internal.
-    // The pointer-only check is insufficient because graph rebuild
-    // re-populates the tensor headers BEFORE compute, so non-null
-    // pointers can refer to uninitialized memory between build and
-    // compute. This flag distinguishes "tensors built but data
-    // stale/uninitialized" from "tensors built and data valid".
-    bool mtp_fused_chain_residuals_valid = false;
+    // Phase 38 B: persistent chain-residual buffer. Outlives every
+    // sched_reset (verify, UPDATE_ACCEPTED, fused-rebuild) so the
+    // chain-residual seed plumbing in prepare_mtp_graph_inputs can
+    // pull the prior fused decode's residuals D2D without going
+    // through the host. Lazy-init on first fused compute (alloc
+    // backend buffer + 8 tensors via ggml_backend_alloc_ctx_tensors_from_buft).
+    // Populated by D2D copy from the sched-owned chain_residuals at
+    // the end of post-compute extraction. persist_n is the count of
+    // valid persist tensors (== n_steps of the most recent fused).
+    struct ggml_context     * mtp_persist_ctx = nullptr;
+    ggml_backend_buffer_t     mtp_persist_buf = nullptr;
+    struct ggml_tensor      * mtp_persist[8]  = {};
+    int                       mtp_persist_n   = 0;
 
     // Phase 37 #2.2: when set to a value in [0, n_steps-1], the next
     // MTP_OP_DRAFT_GEN_FUSED decode populates inp_mtp_states via D2D
