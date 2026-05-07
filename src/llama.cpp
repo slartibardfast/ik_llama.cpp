@@ -9224,7 +9224,30 @@ int32_t llama_decode(
     // that arrived after the interrupted call returned would bleed into the next decode and cause
     // an immediate ret=-3, which servers interpret as a fatal decode failure.
     stop_internal_decode = false;
+
+    // Per-call wall timing tagged by mtp_op_type. Env-gated by
+    // LLAMA_PROFILE_DECODE; zero cost when off. Format ($1=label,
+    // $2=microseconds) matches scripts/profile-mtp-draft-cycle.sh
+    // grep patterns; bucket by op= field for verify/draft/update_accepted.
+    static const bool _prof_decode = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+    const int64_t _decode_t0 = _prof_decode ? ggml_time_us() : 0;
+
     const int ret = llama_decode_internal(*ctx, batch);
+
+    if (_prof_decode) {
+        const int64_t _dt_us = ggml_time_us() - _decode_t0;
+        const char * op = "main";
+        switch (ctx->cparams.mtp_op_type) {
+            case MTP_OP_WARMUP:          op = "warmup";          break;
+            case MTP_OP_UPDATE_ACCEPTED: op = "update_accepted"; break;
+            case MTP_OP_DRAFT_GEN:       op = "draft_gen";       break;
+            case MTP_OP_NONE:
+            default:                     op = "main";            break;
+        }
+        fprintf(stderr, "decode_op  %lld  op=%s  n_tokens=%d\n",
+                (long long)_dt_us, op, (int)batch.n_tokens);
+    }
+
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
