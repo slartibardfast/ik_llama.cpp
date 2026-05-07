@@ -4935,18 +4935,9 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
                 static const bool input_chk =
                     (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
                 if (input_chk) {
-                    // Read first 4 floats of persist[step] for inspection.
-                    float persist_head[4] = {0,0,0,0};
-                    ggml_backend_tensor_get(src_t, persist_head, 0, sizeof(persist_head));
-                    // Compare against host-buffer seed's first 4 floats.
-                    const float * src_h = lctx.draft_input_hidden_state;
                     fprintf(stderr,
-                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] (D2D) "
-                        "persist_first4=[%.3f %.3f %.3f %.3f] host_first4=[%.3f %.3f %.3f %.3f] persist_n=%d\n",
-                        step,
-                        persist_head[0], persist_head[1], persist_head[2], persist_head[3],
-                        src_h ? src_h[0] : 0, src_h ? src_h[1] : 0, src_h ? src_h[2] : 0, src_h ? src_h[3] : 0,
-                        lctx.mtp_persist_n);
+                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] nbytes=%zu (D2D)\n",
+                        step, (size_t) ggml_nbytes(dst));
                 }
                 return true;
             }
@@ -9811,6 +9802,59 @@ void llama_mtp_set_async_guess(struct llama_context * ctx, int32_t guess) {
 }
 int32_t llama_mtp_get_pending_chain_residual_step(struct llama_context * ctx) {
     return ctx ? ctx->pending_chain_residual_step : -1;
+}
+
+int32_t llama_mtp_set_persist_from_host(
+        struct llama_context * ctx,
+        const float          * src,
+        int32_t                n_positions) {
+    if (ctx == nullptr || src == nullptr || n_positions <= 0) return -1;
+
+    const int64_t n_embd = ctx->model.hparams.n_embd;
+    const int32_t cap_n  = (n_positions > 8) ? 8 : n_positions;
+
+    // Lazy-init persist buffer (reuse the pattern from
+    // llama_decode_internal post-compute extraction).
+    if (ctx->mtp_persist_ctx == nullptr) {
+        ggml_init_params init_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx->mtp_persist_ctx = ggml_init(init_params);
+        if (ctx->mtp_persist_ctx == nullptr) return -1;
+        for (int _k = 0; _k < 8; ++_k) {
+            ctx->mtp_persist[_k] = ggml_new_tensor_2d(
+                ctx->mtp_persist_ctx, GGML_TYPE_F32, n_embd, 1);
+            char nm[40];
+            snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
+            ggml_set_name(ctx->mtp_persist[_k], nm);
+        }
+        // Pick buft from inp_mtp_states's backend (same device path
+        // the seed will eventually flow to).
+        ggml_backend_t bk0 = ctx->inp_mtp_states
+            ? ggml_backend_sched_get_tensor_backend(ctx->sched, ctx->inp_mtp_states)
+            : nullptr;
+        ggml_backend_buffer_type_t buft = bk0
+            ? ggml_backend_get_default_buffer_type(bk0)
+            : llama_default_buffer_type_cpu(true);
+        ctx->mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx->mtp_persist_ctx, buft);
+        if (ctx->mtp_persist_buf == nullptr) return -1;
+    }
+
+    // H2D each row.
+    int captured = 0;
+    for (int k = 0; k < cap_n; ++k) {
+        ggml_tensor * dst_t = ctx->mtp_persist[k];
+        if (dst_t == nullptr) break;
+        const size_t nbytes_row = (size_t) n_embd * sizeof(float);
+        if (ggml_nbytes(dst_t) < nbytes_row) break;
+        ggml_backend_tensor_set(dst_t, src + (size_t) k * n_embd, 0, nbytes_row);
+        ++captured;
+    }
+    ctx->mtp_persist_n = captured;
+    return 0;
 }
 
 // Phase 38 E: async fused-draft dispatch.

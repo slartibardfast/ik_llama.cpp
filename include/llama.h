@@ -1656,6 +1656,19 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void    llama_mtp_set_async_guess(struct llama_context * ctx, int32_t guess);
     LLAMA_API int32_t llama_mtp_get_pending_chain_residual_step(struct llama_context * ctx);
 
+    // Phase 38.5 (revised): fill ctx's persist[k] for k in [0, n_positions)
+    // from a host buffer of layout [n_positions × n_embd] floats. Each
+    // position's n_embd values become persist[k]. This replaces the
+    // chain-residual capture (which had wrong numeric distribution) with
+    // verify-derived embeddings (right distribution; same as what the
+    // existing host-bounce path uses). Caller is responsible for the
+    // host buffer being verify's embd at the right positions (typically
+    // server's slot.mtp_hidden_state). Returns 0 on success.
+    LLAMA_API int32_t llama_mtp_set_persist_from_host(
+        struct llama_context * ctx,
+        const float          * src,
+        int32_t                n_positions);
+
     // Phase 36 Step 3 (per-ubatch MTP KV hook): expose the pre-final-norm
     // residual stream tensor from the most recent main forward graph
     // built on this context. Returns nullptr when:

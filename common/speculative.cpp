@@ -1411,10 +1411,6 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         if (_full_2_enabled) {
             const int async_guess = llama_mtp_get_async_guess(ctx);
             const int actual_step = llama_mtp_get_pending_chain_residual_step(ctx);
-            if (_full2_diag && (async_guess >= 0 || actual_step >= 0)) {
-                fprintf(stderr, "[full2-cmp] guess=%d actual_step=%d has_pending=%d\n",
-                    async_guess, actual_step, llama_mtp_has_pending_async(ctx) ? 1 : 0);
-            }
             if (async_guess >= 0 && llama_mtp_has_pending_async(ctx)) {
                 if (async_guess == actual_step) {
                     // Match — extract async result.
@@ -1478,19 +1474,6 @@ std::vector<llama_token> mtp_speculative_gen_draft(
                     }
                 }
             }
-            if (_full2_diag) {
-                fprintf(stderr, "[full2-fr] n_steps=%d probs=[%.3f %.3f %.3f %.3f] tokens=[%d %d %d %d] n_use=%d\n",
-                    fr.n_steps,
-                    fr.n_steps > 0 ? fr.probs[0] : -1.0f,
-                    fr.n_steps > 1 ? fr.probs[1] : -1.0f,
-                    fr.n_steps > 2 ? fr.probs[2] : -1.0f,
-                    fr.probs[3],
-                    fr.n_steps > 0 ? fr.tokens[0] : -1,
-                    fr.n_steps > 1 ? fr.tokens[1] : -1,
-                    fr.n_steps > 2 ? fr.tokens[2] : -1,
-                    fr.tokens[3],
-                    (int) n_use);
-            }
             drafts.reserve(n_use);
             for (int k = 0; k < n_use; ++k) {
                 drafts.push_back(fr.tokens[k]);
@@ -1532,13 +1515,6 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             // Don't dispatch async when EXTEND is 0 (no fr.tokens[n_use]
             // available) or when n_use is 0 (chain produced nothing).
             const bool extend_available = (persist_n_now > n_emitted);
-            if (_full2_diag) {
-                fprintf(stderr,
-                    "[full2-disp-gate] full2=%d persist_n=%d n_emitted=%d extend_avail=%d has_pending=%d\n",
-                    _full_2_enabled ? 1 : 0, persist_n_now, n_emitted,
-                    extend_available ? 1 : 0,
-                    llama_mtp_has_pending_async(ctx) ? 1 : 0);
-            }
             if (_full_2_enabled && persist_n_now > 0 && n_emitted > 0
                     && extend_available
                     && !llama_mtp_has_pending_async(ctx)) {

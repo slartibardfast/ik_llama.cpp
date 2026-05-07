@@ -3207,28 +3207,17 @@ void server_context::add_sampled_tokens() {
                 // captures real GPU overlap. See PHASE37.md "#2 —
                 // pipelining design" + the measurement that drove
                 // path-3 recalibration as the chosen close.
-                // Phase 38 diagnosis (2026-05-07): the chain-residual
-                // seed plumbing is FUNDAMENTALLY UNSOUND for this
-                // model. persist[k] holds fused's post-shared_head_norm
-                // chain residual, which is NOT in the same numeric
-                // distribution as verify's h_pre_norm. Empirically
-                // measured: persist[0] first4 ≈ [1.5, 1.0, -1.5, 0.3]
-                // (positive small values, low variance) vs host first4
-                // ≈ [-3, 2, -2, ...] (high-magnitude varied). When
-                // fused chain step 0 gets persist[step] as seed, it
-                // reads from off-distribution input → chain compute
-                // degrades → probs collapse to ~0.03 → MIN_PROB=0.5
-                // truncation kills all drafts. Phase 38 E's +18%
-                // projection requires this seed pathway to be sound;
-                // it isn't. Fix path (Phase 38.5/39): capture verify's
-                // t_h_pre_norm at all batch positions (the right
-                // numeric space), index by n_accepted_drafts, pull
-                // from there. Until then: arming kept gated on
-                // LLAMA_MTP_CHAIN_RESIDUAL_SEED only (legacy gate
-                // env, default OFF). FULL_2 path is dormant.
+                // Phase 38.5 (revised): persist now holds verify's embd
+                // (right numeric space, populated via
+                // llama_mtp_set_persist_from_host from
+                // slot.mtp_hidden_state in Phase B). Arm the
+                // chain-residual seed for the next fused so prepare
+                // reads persist[step] D2D instead of host-bouncing.
                 static const bool _chain_residual_enabled =
                     (getenv("LLAMA_MTP_CHAIN_RESIDUAL_SEED") != nullptr);
-                if (_chain_residual_enabled
+                static const bool _full_2_enabled =
+                    (getenv("LLAMA_MTP_FULL_2") != nullptr);
+                if ((_chain_residual_enabled || _full_2_enabled)
                         && slot.mtp_next_chain_residual_step >= 0) {
                     llama_set_draft_input_chain_residual(hs_ctx, slot.mtp_next_chain_residual_step);
                 }
@@ -4007,6 +3996,14 @@ void server_context::speculative_decoding_accept() {
 
                     slot.mtp_hidden_state = std::move(mtp_hidden_state_pre);
                     llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
+                    // Phase 38.5 wiring removed — see PHASE38.md for
+                    // diagnosis (chain_residual ≠ h_pre_norm
+                    // distribution) and PHASE39.md for the replacement
+                    // architecture (upstream's collapsed-context MTP).
+                    // The llama_mtp_set_persist_from_host API is kept
+                    // as a primitive (in llama.h / llama.cpp); not
+                    // called from server until/unless future work
+                    // re-needs it.
                     mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
                 }
             // Phase 37 #2.2: arm chain-residual seed for the next
