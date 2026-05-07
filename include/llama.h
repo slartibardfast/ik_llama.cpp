@@ -1581,6 +1581,18 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
+    // Phase 36 Step 3 (per-ubatch MTP KV hook): expose the pre-final-norm
+    // residual stream tensor from the most recent main forward graph
+    // built on this context. Returns nullptr when:
+    //   - the model is not Qwen 3.5/3.6 family with MTP enabled, or
+    //   - the most recent decode used a reused graph (no fresh build),
+    //     a non-main mtp_op_type (DRAFT_GEN/UPDATE_ACCEPTED/WARMUP), or
+    //     cparams.mtp was off when the graph was built.
+    // The returned tensor is named "h_pre_norm" and has shape
+    // (n_embd, n_tokens) of type GGML_TYPE_F32. Backed by the cgraph;
+    // the pointer is invalidated by the next sched_reset / build.
+    LLAMA_API struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

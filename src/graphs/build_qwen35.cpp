@@ -74,9 +74,17 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         }
 
         if (lctx.cparams.mtp) {
+            // Tag pre-final-norm residual ("h_pre_norm") so the per-ubatch
+            // MTP KV hook (Phase 36 Step 3) can read it without a name
+            // search. Same tensor still feeds the embd-extraction path
+            // below — the rename matches what the residual actually is
+            // (input to the final norm + lm_head, NOT the MTP layer's
+            // output). Stash on the context so callers that already had
+            // ctx (rather than the cgraph) can find it.
             struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
-            cb(embd_copy, "result_mtp_embd", -1);
+            cb(embd_copy, "h_pre_norm", -1);
             ggml_set_output(embd_copy);
+            lctx.t_h_pre_norm = embd_copy;
         }
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
@@ -154,9 +162,12 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         }
 
         if (lctx.cparams.mtp) {
+            // See build_qwen35moe() above for the rationale on the
+            // "h_pre_norm" tag + lctx.t_h_pre_norm stash.
             struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
-            cb(embd_copy, "result_mtp_embd", -1);
+            cb(embd_copy, "h_pre_norm", -1);
             ggml_set_output(embd_copy);
+            lctx.t_h_pre_norm = embd_copy;
         }
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);

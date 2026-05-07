@@ -335,6 +335,14 @@ struct llama_context {
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
 
+    // Pre-final-norm residual stream from the main forward graph.
+    // Tagged "h_pre_norm" by the qwen35 / qwen35moe builders when
+    // cparams.mtp is set. Reset to nullptr at the start of each
+    // llama_decode_internal so the per-ubatch hook can detect a
+    // fresh build vs a stale pointer. Read via
+    // llama_main_graph_h_pre_norm() (Phase 36 Step 3 hook plumbing).
+    struct ggml_tensor * t_h_pre_norm = nullptr;
+
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;

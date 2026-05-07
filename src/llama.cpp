@@ -4818,6 +4818,13 @@ static int llama_decode_internal(
            llama_batch   batch_all) { // TODO: rename back to batch
 
     lctx.is_encoding = false;
+    // Stale-pointer guard: t_h_pre_norm is set by the qwen35 / qwen35moe
+    // graph builders only on the main forward path. If the next decode
+    // hits a different code path (DRAFT_GEN, UPDATE_ACCEPTED, or graph
+    // reuse), the pointer would still reference the prior graph's tensor
+    // memory. Clear it here so callers can detect "no fresh main graph
+    // built this decode" via a null pointer.
+    lctx.t_h_pre_norm = nullptr;
     const uint32_t n_tokens_all = batch_all.n_tokens;
 
     if (n_tokens_all == 0) {
@@ -5152,7 +5159,7 @@ static int llama_decode_internal(
             const bool use_qwen_mtp_embd = has_mtp && (lctx.model.arch == LLM_ARCH_QWEN35 || lctx.model.arch == LLM_ARCH_QWEN35MOE);
             if (cparams.embeddings || has_mtp) {
                 for (int i = gf->n_nodes - 1; i >= 0; --i) {
-                    if (use_qwen_mtp_embd && strcmp(gf->nodes[i]->name, "result_mtp_embd") == 0) {
+                    if (use_qwen_mtp_embd && strcmp(gf->nodes[i]->name, "h_pre_norm") == 0) {
                         // Qwen 3.5 uses raw hidden state before the final shared-head normalization.
                         embd = gf->nodes[i];
                         break;
@@ -9257,6 +9264,10 @@ int32_t llama_decode(
 
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
     ctx->set_mtp_op_type(mtp_op_type);
+}
+
+struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx) {
+    return ctx ? ctx->t_h_pre_norm : nullptr;
 }
 
 void llama_synchronize(struct llama_context * ctx) {
