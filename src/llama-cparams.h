@@ -57,6 +57,13 @@ struct llama_cparams {
     // Set by llama_mtp_fused_draft_invoke before each fused decode;
     // read by build_qwen35_mtp_fused / set_inputs.
     int  mtp_fused_n_steps;
+    // Phase 38 C: extended-chain count. When > 0, fused runs
+    // n_steps + n_extend internal chain steps but emits only
+    // n_steps drafts. Populates persist[n_steps..n_steps+n_extend-1]
+    // with the extended residuals (used as seed for the all-accept
+    // case in Phase 38 E speculative dispatch). 0 = no extension
+    // (default; matches pre-Phase-38 behavior).
+    int  mtp_fused_n_extend;
     int  worst_graph_tokens;
 
     enum ggml_type reduce_type;

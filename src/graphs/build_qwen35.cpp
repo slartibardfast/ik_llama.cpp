@@ -6,7 +6,7 @@
 ggml_cgraph * llm_build_context::build_qwen35moe() {
 
     if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
-        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, /*is_moe=*/true);
+        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, cparams.mtp_fused_n_extend, /*is_moe=*/true);
     }
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
@@ -119,7 +119,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 ggml_cgraph * llm_build_context::build_qwen35() {
 
     if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
-        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, /*is_moe=*/false);
+        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, cparams.mtp_fused_n_extend, /*is_moe=*/false);
     }
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
@@ -428,12 +428,22 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp_kv_only(
 // batch.n_tokens == n_draft so that n_tokens (the const member of
 // llm_build_context) matches the chain length and the slot allocator
 // reserves n_draft consecutive KV cells.
-ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe) {
+ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_extend, bool is_moe) {
     GGML_ASSERT(n_draft >= 1 && n_draft <= LLAMA_MTP_FUSED_MAX);
-    GGML_ASSERT(n_draft == n_tokens);
+    // Phase 38 C: extended-chain — run n_draft + n_extend internal
+    // chain steps but emit only n_draft drafts. n_extend > 0 populates
+    // chain_residuals at indices [n_draft, n_draft+n_extend) — used as
+    // seed for the all-accept case in Phase 38 E speculative dispatch.
+    // The batch passed to llama_decode must have n_tokens = n_chain so
+    // the slot allocator reserves n_chain consecutive KV cells (each
+    // chain step writes its own cell).
+    GGML_ASSERT(n_extend >= 0);
+    GGML_ASSERT(n_draft + n_extend <= LLAMA_MTP_FUSED_MAX);
+    const int n_chain = n_draft + n_extend;
+    GGML_ASSERT(n_chain == n_tokens);
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(
-        ctx0, model.max_nodes(n_tokens) * (n_draft + 2), false);
+        ctx0, model.max_nodes(n_tokens) * (n_chain + 2), false);
 
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
@@ -478,7 +488,7 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
     ggml_tensor * argmaxes[LLAMA_MTP_FUSED_MAX] = {};
     ggml_tensor * probs[LLAMA_MTP_FUSED_MAX] = {};
 
-    for (int k = 0; k < n_draft; ++k) {
+    for (int k = 0; k < n_chain; ++k) {
         // Token id for this step. Step 0 reads inp_tokens[0] via a
         // 1-element view; step k>0 uses argmax_{k-1} (already shape [1]).
         // The view path keeps each step's compute single-token even
@@ -537,7 +547,7 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         lctx.mtp_fused_chain_residuals[k] = normed;
         cb(normed, "mtp_chain_residual", il_mtp);
 
-        if (k + 1 < n_draft) {
+        if (k + 1 < n_chain) {
             // Phase 37 #3b: dependency anchor on step k's KV cpy(s).
             // cache_copies's MTP-layer slot is overwritten by step k+1's
             // build_std_attention call (il_mtp is fixed across the chain),
@@ -708,9 +718,21 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         probs[k] = prob;
     }
 
+    // Drafts are only emitted for the first n_draft steps. The
+    // remaining n_extend steps are extended-chain residuals captured
+    // to persist for the all-accept seed case (Phase 38 C/E); their
+    // argmax/prob tensors are computed in-graph but unused.
     for (int k = 0; k < n_draft; ++k) {
         ggml_build_forward_expand(gf, argmaxes[k]);
         ggml_build_forward_expand(gf, probs[k]);
+    }
+    // Phase 38 C: ensure all chain residuals (including extended ones)
+    // are wired into the graph so post-compute extraction can capture
+    // them. The chain_residual tensors for k in [0, n_chain) are
+    // already set_output and referenced via prev_residual chain;
+    // ggml_build_forward_expand on the LAST one ensures no DCE.
+    if (lctx.mtp_fused_chain_residuals[n_chain - 1] != nullptr) {
+        ggml_build_forward_expand(gf, lctx.mtp_fused_chain_residuals[n_chain - 1]);
     }
 
     return gf;

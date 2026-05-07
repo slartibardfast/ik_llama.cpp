@@ -513,5 +513,5 @@ llm_expert_gating_func_type   gating_op,
     // steps in a single graph). Outputs n_draft argmax + n_draft prob
     // tensors (each shape [1] / [1] respectively) tagged
     // mtp_argmax_<k> / mtp_prob_<k>.
-    struct ggml_cgraph * build_qwen35_mtp_fused(int n_draft, bool is_moe);
+    struct ggml_cgraph * build_qwen35_mtp_fused(int n_draft, int n_extend, bool is_moe);
 };

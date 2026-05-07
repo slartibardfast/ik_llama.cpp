@@ -562,9 +562,10 @@ struct llama_context::Prev {
     int all_seq_id;
     int n_outputs;
     int n_kv;
-    int n_tokens;          // Phase 37 #5: for MTP fused graph reuse
+    int n_tokens;            // Phase 37 #5: for MTP fused graph reuse
     llama_mtp_op_type mtp_op_type;
-    int mtp_fused_n_steps; // Phase 37 #5: for MTP fused graph reuse
+    int mtp_fused_n_steps;   // Phase 37 #5: for MTP fused graph reuse
+    int mtp_fused_n_extend;  // Phase 38 C: extended-chain count
     ggml_cgraph * graph;
 };
 
@@ -594,7 +595,8 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
             cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED;
         const bool _fused_reusable = _fused_now &&
             prev->mtp_op_type == MTP_OP_DRAFT_GEN_FUSED &&
-            cparams.mtp_fused_n_steps == prev->mtp_fused_n_steps &&
+            cparams.mtp_fused_n_steps  == prev->mtp_fused_n_steps  &&
+            cparams.mtp_fused_n_extend == prev->mtp_fused_n_extend &&
             u_batch.n_tokens == prev->n_tokens;
         if (u_batch.n_tokens > 1 && !_fused_reusable) {
             g_can_reuse_last_miss_reason = 2;
@@ -5367,7 +5369,9 @@ static int llama_decode_internal(
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
                         (int)u_batch.n_tokens,
                         cparams.mtp_op_type,
-                        cparams.mtp_fused_n_steps, gf});
+                        cparams.mtp_fused_n_steps,
+                        cparams.mtp_fused_n_extend,
+                        gf});
             }
         } else {
             //printf("Reusing graph\n");
@@ -5743,8 +5747,14 @@ static int llama_decode_internal(
                 // D2D copy each chain_residual to its persist slot.
                 // Synchronous via ggml_backend_tensor_copy; the data
                 // is byte-stable here (post-compute + post-sync).
+                //
+                // Phase 38 C: capture all chain residuals including
+                // extended (n_chain = n_steps + n_extend). Extended
+                // residuals at indices [n_steps, n_chain) provide the
+                // all-accept seed for Phase 38 E speculative dispatch.
+                const int n_chain_capture = n_steps + cparams.mtp_fused_n_extend;
                 int captured = 0;
-                for (int k = 0; k < n_steps && k < 8; ++k) {
+                for (int k = 0; k < n_chain_capture && k < 8; ++k) {
                     ggml_tensor * src_t = lctx.mtp_fused_chain_residuals[k];
                     ggml_tensor * dst_t = lctx.mtp_persist[k];
                     if (src_t == nullptr || dst_t == nullptr) break;
@@ -7012,6 +7022,7 @@ struct llama_context * llama_init_from_model(
     // be wired up once the inline-hook bake-out lands.
     cparams.mtp_inline_kv_hook = (getenv("LLAMA_MTP_INLINE_KV") != nullptr);
     cparams.mtp_fused_n_steps = 0;
+    cparams.mtp_fused_n_extend = 0;
     cparams.worst_graph_tokens = params.worst_case_tokens;
 
     cparams.reduce_type      = params.type_reduce;
@@ -9672,12 +9683,32 @@ int32_t llama_mtp_fused_draft_invoke(
     const llama_pos pos_base = (llama_pos) ctx->kv_self.head;
     const llama_seq_id seq_id_0 = 0;
 
+    // Phase 38 C: read LLAMA_MTP_FUSED_EXTEND env knob. When set to a
+    // positive integer N, fused runs n_steps + N internal chain steps
+    // but emits only n_steps drafts. The extra residuals populate
+    // persist[n_steps..n_steps+N-1] for the all-accept seed case used
+    // by Phase 38 E speculative dispatch. Default 0 = no extension
+    // (matches pre-Phase-38 behavior).
+    static const int _n_extend_env = []() {
+        const char * env = getenv("LLAMA_MTP_FUSED_EXTEND");
+        if (!env) return 0;
+        int v = atoi(env);
+        if (v < 0) v = 0;
+        if (v > LLAMA_MTP_FUSED_MAX) v = LLAMA_MTP_FUSED_MAX;
+        return v;
+    }();
+    const int n_extend = (n_steps + _n_extend_env <= LLAMA_MTP_FUSED_MAX)
+                       ? _n_extend_env : 0;
+    const int n_chain  = n_steps + n_extend;
+
     // Stash + override cparams for this fused decode. Restore on exit.
     const llama_mtp_op_type saved_op_type  = ctx->cparams.mtp_op_type;
     const int               saved_n_steps  = ctx->cparams.mtp_fused_n_steps;
+    const int               saved_n_extend = ctx->cparams.mtp_fused_n_extend;
 
     ctx->cparams.mtp_op_type       = MTP_OP_DRAFT_GEN_FUSED;
     ctx->cparams.mtp_fused_n_steps = n_steps;
+    ctx->cparams.mtp_fused_n_extend = n_extend;
 
     // Push the seed hidden state through the existing host→device
     // bounce slot. set_inputs copies it into the inp_mtp_states tensor
@@ -9687,14 +9718,16 @@ int32_t llama_mtp_fused_draft_invoke(
         llama_set_draft_input_hidden_state(ctx, seed_hidden);
     }
 
-    // Build an n_steps-token batch. inp_tokens[0] = seed_token (step 0
+    // Build an n_chain-token batch. inp_tokens[0] = seed_token (step 0
     // input); inp_tokens[k>0] are dummy zeros that the fused graph
     // ignores (step k>0 reads argmax_{k-1} in-graph). Positions cover
-    // n_steps consecutive cells starting at pos_base so the slot
-    // allocator reserves n_steps KV slots in one find_slot call.
-    llama_batch batch = llama_batch_init(n_steps, 0, 1);
-    batch.n_tokens = n_steps;
-    for (int k = 0; k < n_steps; ++k) {
+    // n_chain consecutive cells starting at pos_base so the slot
+    // allocator reserves n_chain KV slots in one find_slot call —
+    // necessary because fused's chain writes its own KV at every step
+    // (drafts and extended steps alike).
+    llama_batch batch = llama_batch_init(n_chain, 0, 1);
+    batch.n_tokens = n_chain;
+    for (int k = 0; k < n_chain; ++k) {
         batch.token[k]    = (k == 0) ? seed_token : 0;
         batch.pos[k]      = pos_base + k;
         batch.n_seq_id[k] = 1;
@@ -9710,8 +9743,9 @@ int32_t llama_mtp_fused_draft_invoke(
     ctx->mtp_fused_last_compute_count = (rc == 0) ? 1 : 0;
 
     llama_batch_free(batch);
-    ctx->cparams.mtp_op_type       = saved_op_type;
-    ctx->cparams.mtp_fused_n_steps = saved_n_steps;
+    ctx->cparams.mtp_op_type        = saved_op_type;
+    ctx->cparams.mtp_fused_n_steps  = saved_n_steps;
+    ctx->cparams.mtp_fused_n_extend = saved_n_extend;
 
     if (rc != 0) {
         return rc < 0 ? rc : -2;
