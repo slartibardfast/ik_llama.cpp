@@ -526,6 +526,30 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         if (k + 1 < n_draft) {
             normed = ggml_dup(ctx0, normed);
             cb(normed, "mtp_chain_residual", il_mtp);
+
+            // Phase 37 #3b: dependency anchor on step k's KV cpy(s).
+            // cache_copies's MTP-layer slot is overwritten by step k+1's
+            // build_std_attention call (il_mtp is fixed across the chain),
+            // so capture the cpy tensor handle here while it's still
+            // step k's. Anchoring via ggml_dup adds a leaf node that
+            // depends on the cpy, forcing any scheduler — single-stream
+            // FIFO, multi-stream with reorder, or graph optimizer — to
+            // sequence step k's cpy before step k+1's compute.
+            const size_t splits_eff =
+                model.splits.empty() ? 1 : model.splits.size();
+            const size_t kv_idx_base = 2 * splits_eff * (size_t) il_mtp;
+            const size_t n_slots = 2 * splits_eff;
+            for (size_t s = 0; s < n_slots; ++s) {
+                if (kv_idx_base + s >= lctx.cache_copies.size()) break;
+                ggml_tensor * cpy = lctx.cache_copies[kv_idx_base + s].cpy;
+                if (cpy == nullptr) continue;
+                ggml_tensor * dep_anchor = ggml_dup(ctx0, cpy);
+                cb(dep_anchor,
+                   (s % 2 == 0) ? "mtp_kv_dep_anchor_k"
+                                : "mtp_kv_dep_anchor_v",
+                   il_mtp);
+                ggml_build_forward_expand(gf, dep_anchor);
+            }
         }
         prev_residual = normed;
 
