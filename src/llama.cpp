@@ -562,7 +562,9 @@ struct llama_context::Prev {
     int all_seq_id;
     int n_outputs;
     int n_kv;
+    int n_tokens;          // Phase 37 #5: for MTP fused graph reuse
     llama_mtp_op_type mtp_op_type;
+    int mtp_fused_n_steps; // Phase 37 #5: for MTP fused graph reuse
     ggml_cgraph * graph;
 };
 
@@ -573,7 +575,24 @@ void llama_context::reset_scheduler() {
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!prev || !prev->graph)                    { g_can_reuse_last_miss_reason = 1;  return false; }
-    if (u_batch.n_tokens > 1)                     { g_can_reuse_last_miss_reason = 2;  return false; }
+    // Phase 37 #5: allow MTP fused decodes (which always have
+    // n_tokens == n_steps > 1) to reuse the cached graph IF the
+    // previous decode was also MTP fused with the same step count
+    // and same n_tokens. The cgraph's input shapes are determined by
+    // n_steps, so successive fused calls with the same n_steps share
+    // a graph topology and just need set_input rebinds.
+    {
+        const bool _fused_now =
+            cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED;
+        const bool _fused_reusable = _fused_now &&
+            prev->mtp_op_type == MTP_OP_DRAFT_GEN_FUSED &&
+            cparams.mtp_fused_n_steps == prev->mtp_fused_n_steps &&
+            u_batch.n_tokens == prev->n_tokens;
+        if (u_batch.n_tokens > 1 && !_fused_reusable) {
+            g_can_reuse_last_miss_reason = 2;
+            return false;
+        }
+    }
     if (u_batch.embd)                             { g_can_reuse_last_miss_reason = 3;  return false; }
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
@@ -5258,10 +5277,21 @@ static int llama_decode_internal(
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
 #endif
-            if (u_batch.n_tokens == 1 && u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
+            // Phase 37 #5: cache prev for non-fused single-token decodes
+            // (existing behaviour) AND for MTP fused decodes (extended).
+            // The fused path has n_tokens == n_steps > 1; that's allowed
+            // as long as cparams.mtp_op_type marks it as fused so the
+            // can_reuse_graph fused-bypass fires symmetrically.
+            const bool _cache_prev_eligible =
+                u_batch.embd == nullptr && lctx.cparams.graph_reuse &&
+                (u_batch.n_tokens == 1 ||
+                 cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED);
+            if (_cache_prev_eligible) {
                 lctx.prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
-                        cparams.mtp_op_type, gf});
+                        (int)u_batch.n_tokens,
+                        cparams.mtp_op_type,
+                        cparams.mtp_fused_n_steps, gf});
             }
         } else {
             //printf("Reusing graph\n");
