@@ -1405,30 +1405,52 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         // which the server set in Phase B based on actual accept), we
         // already have valid drafts on-device. Sync ctx_mtp's stream
         // and read them.
+        static int64_t _full2_hits = 0, _full2_misses = 0, _full2_no_pending = 0;
+        static int64_t _full2_extract_us_total = 0, _full2_sync_us_total = 0, _full2_dispatch_us_total = 0;
+        static const bool _full2_diag = (getenv("LLAMA_MTP_FULL_2_DIAG") != nullptr);
         if (_full_2_enabled) {
             const int async_guess = llama_mtp_get_async_guess(ctx);
             const int actual_step = llama_mtp_get_pending_chain_residual_step(ctx);
+            if (_full2_diag && (async_guess >= 0 || actual_step >= 0)) {
+                fprintf(stderr, "[full2-cmp] guess=%d actual_step=%d has_pending=%d\n",
+                    async_guess, actual_step, llama_mtp_has_pending_async(ctx) ? 1 : 0);
+            }
             if (async_guess >= 0 && llama_mtp_has_pending_async(ctx)) {
                 if (async_guess == actual_step) {
                     // Match — extract async result.
+                    auto t_extract_0 = std::chrono::high_resolution_clock::now();
                     rc = llama_mtp_fused_extract_results(ctx, &fr);
+                    auto t_extract_1 = std::chrono::high_resolution_clock::now();
+                    _full2_extract_us_total += std::chrono::duration_cast<std::chrono::microseconds>(t_extract_1 - t_extract_0).count();
+                    ++_full2_hits;
                     // Successfully used async; clear the seed-arm so
                     // the dispatch_async below picks up correctly.
                     llama_set_draft_input_chain_residual(ctx, -1);
                 } else {
                     // Miss — extract anyway to flush, then discard.
+                    auto t_extract_0 = std::chrono::high_resolution_clock::now();
                     llama_mtp_fused_result _flush_fr{};
                     llama_mtp_fused_extract_results(ctx, &_flush_fr);
+                    auto t_extract_1 = std::chrono::high_resolution_clock::now();
+                    _full2_extract_us_total += std::chrono::duration_cast<std::chrono::microseconds>(t_extract_1 - t_extract_0).count();
+                    ++_full2_misses;
                     rc = -1;  // Force sync fallback below.
                 }
                 llama_mtp_set_async_guess(ctx, -1);
+            } else {
+                ++_full2_no_pending;
             }
         }
 
         if (rc != 0) {
             // No async result available (or miss): regular sync dispatch.
+            auto t_sync_0 = std::chrono::high_resolution_clock::now();
             rc = llama_mtp_fused_draft_invoke(
                     ctx, id_last, /*seed_hidden=*/nullptr, n_draft, &fr);
+            auto t_sync_1 = std::chrono::high_resolution_clock::now();
+            if (_full_2_enabled) {
+                _full2_sync_us_total += std::chrono::duration_cast<std::chrono::microseconds>(t_sync_1 - t_sync_0).count();
+            }
         }
 
         if (rc == 0 && fr.n_steps > 0) {
@@ -1456,6 +1478,19 @@ std::vector<llama_token> mtp_speculative_gen_draft(
                     }
                 }
             }
+            if (_full2_diag) {
+                fprintf(stderr, "[full2-fr] n_steps=%d probs=[%.3f %.3f %.3f %.3f] tokens=[%d %d %d %d] n_use=%d\n",
+                    fr.n_steps,
+                    fr.n_steps > 0 ? fr.probs[0] : -1.0f,
+                    fr.n_steps > 1 ? fr.probs[1] : -1.0f,
+                    fr.n_steps > 2 ? fr.probs[2] : -1.0f,
+                    fr.probs[3],
+                    fr.n_steps > 0 ? fr.tokens[0] : -1,
+                    fr.n_steps > 1 ? fr.tokens[1] : -1,
+                    fr.n_steps > 2 ? fr.tokens[2] : -1,
+                    fr.tokens[3],
+                    (int) n_use);
+            }
             drafts.reserve(n_use);
             for (int k = 0; k < n_use; ++k) {
                 drafts.push_back(fr.tokens[k]);
@@ -1477,24 +1512,64 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             // fused redo. Net: lift on match, neutral on miss + GPU
             // contention overhead.
             const int persist_n_now = llama_mtp_get_persist_n(ctx);
-            if (_full_2_enabled && persist_n_now > 0
+            const int n_emitted = (int) drafts.size();
+            // [n_use already declared above for the truncation loop;
+            // shadow with local var name n_emitted here.]
+            // Phase 38 E (corrected): only the all-accept case
+            // (n_accepted == n_use) admits a correct speculative seed.
+            // For j < n_use, verify's bonus at position j+1 is its
+            // correction-on-rejection, which fused's chain CANNOT
+            // predict (different from fr.tokens[j] which IS what got
+            // rejected). For j == n_use, seed_token = predicted
+            // bonus = fr.tokens[n_use] (chain step n_use's argmax,
+            // requires EXTEND >= 1 for the +1 chain step to exist).
+            //
+            // Match condition: actual n_accepted == n_use AND
+            // verify's bonus == fr.tokens[n_use]. The latter holds
+            // with probability p (per-draft accept rate, ~0.86).
+            // Combined match: p^(n_use+1).
+            //
+            // Don't dispatch async when EXTEND is 0 (no fr.tokens[n_use]
+            // available) or when n_use is 0 (chain produced nothing).
+            const bool extend_available = (persist_n_now > n_emitted);
+            if (_full2_diag) {
+                fprintf(stderr,
+                    "[full2-disp-gate] full2=%d persist_n=%d n_emitted=%d extend_avail=%d has_pending=%d\n",
+                    _full_2_enabled ? 1 : 0, persist_n_now, n_emitted,
+                    extend_available ? 1 : 0,
+                    llama_mtp_has_pending_async(ctx) ? 1 : 0);
+            }
+            if (_full_2_enabled && persist_n_now > 0 && n_emitted > 0
+                    && extend_available
                     && !llama_mtp_has_pending_async(ctx)) {
-                // Use the highest persist index as the all-accept guess.
-                // With LLAMA_MTP_FUSED_EXTEND=1, persist_n = n_steps + 1
-                // and persist[n_steps] is exactly the all-accept seed.
-                const int guess = persist_n_now - 1;
-                // The seed_token for fused(k+1) is fr.tokens[guess] —
-                // i.e., the predicted next token after `guess` accepts.
-                // For all-accept, that's fr.tokens[n_steps - 1] (the
-                // last drafted token, which would be the bonus position
-                // that fused chains from).
-                const llama_token next_seed_token = (guess > 0 && guess - 1 < fr.n_steps)
-                    ? fr.tokens[guess - 1] : id_last;
+                const int guess = n_emitted;
+                // seed_token = predicted bonus at position last_committed_K + n_use + 1
+                //            = chain step n_use's argmax
+                //            = fr.tokens[n_use]
+                // (extract_results fills tokens[] for all chain steps including EXTEND)
+                const llama_token next_seed_token = fr.tokens[guess];
+                auto t_disp_0 = std::chrono::high_resolution_clock::now();
                 const int async_rc = llama_mtp_fused_dispatch_async(
                         ctx, next_seed_token, /*seed_hidden=*/nullptr,
                         n_draft, /*chain_residual_step=*/guess);
+                auto t_disp_1 = std::chrono::high_resolution_clock::now();
+                _full2_dispatch_us_total += std::chrono::duration_cast<std::chrono::microseconds>(t_disp_1 - t_disp_0).count();
                 if (async_rc == 0) {
                     llama_mtp_set_async_guess(ctx, guess);
+                }
+            }
+            // Periodic diagnostic dump.
+            if (_full_2_enabled && _full2_diag) {
+                const int64_t total = _full2_hits + _full2_misses;
+                if (total > 0 && total % 20 == 0) {
+                    fprintf(stderr,
+                        "[full2-diag] cycles=%lld hits=%lld(%.0f%%) misses=%lld no_pending=%lld extract_total_ms=%.1f sync_total_ms=%.1f dispatch_total_ms=%.1f\n",
+                        (long long) total, (long long) _full2_hits,
+                        100.0 * (double) _full2_hits / (double) total,
+                        (long long) _full2_misses, (long long) _full2_no_pending,
+                        _full2_extract_us_total / 1000.0,
+                        _full2_sync_us_total / 1000.0,
+                        _full2_dispatch_us_total / 1000.0);
                 }
             }
 

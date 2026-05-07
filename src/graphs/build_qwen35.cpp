@@ -718,11 +718,14 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
         probs[k] = prob;
     }
 
-    // Drafts are only emitted for the first n_draft steps. The
-    // remaining n_extend steps are extended-chain residuals captured
-    // to persist for the all-accept seed case (Phase 38 C/E); their
-    // argmax/prob tensors are computed in-graph but unused.
-    for (int k = 0; k < n_draft; ++k) {
+    // Phase 38 E: expand argmax/prob for ALL chain steps including
+    // EXTEND. Speculative dispatch needs fr.tokens[n_emitted] (the
+    // extend step's argmax) as the predicted bonus token for the
+    // all-accept seed. Without expansion, the tensors are set_output
+    // but ggml's graph optimizer can DCE the upstream compute since
+    // no graph node references them — leading to zero values being
+    // read at extract time.
+    for (int k = 0; k < n_chain; ++k) {
         ggml_build_forward_expand(gf, argmaxes[k]);
         ggml_build_forward_expand(gf, probs[k]);
     }

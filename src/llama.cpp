@@ -4935,9 +4935,18 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
                 static const bool input_chk =
                     (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
                 if (input_chk) {
+                    // Read first 4 floats of persist[step] for inspection.
+                    float persist_head[4] = {0,0,0,0};
+                    ggml_backend_tensor_get(src_t, persist_head, 0, sizeof(persist_head));
+                    // Compare against host-buffer seed's first 4 floats.
+                    const float * src_h = lctx.draft_input_hidden_state;
                     fprintf(stderr,
-                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] nbytes=%zu (D2D)\n",
-                        step, (size_t) ggml_nbytes(dst));
+                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] (D2D) "
+                        "persist_first4=[%.3f %.3f %.3f %.3f] host_first4=[%.3f %.3f %.3f %.3f] persist_n=%d\n",
+                        step,
+                        persist_head[0], persist_head[1], persist_head[2], persist_head[3],
+                        src_h ? src_h[0] : 0, src_h ? src_h[1] : 0, src_h ? src_h[2] : 0, src_h ? src_h[3] : 0,
+                        lctx.mtp_persist_n);
                 }
                 return true;
             }
@@ -5655,8 +5664,19 @@ static int llama_decode_internal(
             lctx.mtp_fused_pending_n_steps = cparams.mtp_fused_n_steps;
             // Skip extraction; will run in extract_results.
         } else if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
-            const int n_steps = cparams.mtp_fused_n_steps;
-            lctx.mtp_fused_results_n = n_steps;
+            // Phase 38 E: extract argmax/prob for ALL chain steps,
+            // including the EXTEND steps (chain step k for k in
+            // [n_steps, n_steps + n_extend)). The extra results are
+            // used by the speculative dispatch as seed_token for
+            // all-accept prediction (chain step n_use's argmax = the
+            // predicted bonus token at the new last_committed
+            // position). Without this, fr.tokens[n_use] is stale
+            // garbage and async dispatch with guess=n_use produces
+            // invalid drafts (server crash with "Invalid token"
+            // observed).
+            const int n_steps_emit = cparams.mtp_fused_n_steps;
+            const int n_steps = std::min(n_steps_emit + cparams.mtp_fused_n_extend, 8);
+            lctx.mtp_fused_results_n = n_steps_emit;  // emitted draft count
             // Sync once to make all output tensors readable.
             ggml_backend_sched_synchronize(lctx.sched);
             for (int k = 0; k < n_steps; ++k) {
@@ -9844,14 +9864,17 @@ int32_t llama_mtp_fused_extract_results(
     }
 
     ggml_cgraph * gf = ctx->mtp_fused_pending_gf;
-    const int n_steps = ctx->mtp_fused_pending_n_steps;
+    const int n_steps_emit = ctx->mtp_fused_pending_n_steps;
     const int n_extend = ctx->cparams.mtp_fused_n_extend;
-    const int n_chain = n_steps + n_extend;
+    const int n_steps = std::min(n_steps_emit + n_extend, 8);
+    const int n_chain = n_steps_emit + n_extend;
 
     // Sync ctx_mtp's stream — wait for the async kernels to complete.
     ggml_backend_sched_synchronize(ctx->sched);
 
-    ctx->mtp_fused_results_n = n_steps;
+    ctx->mtp_fused_results_n = n_steps_emit;  // Phase 38 E: extract all
+    // chain steps' argmax (including EXTEND steps); n_steps_emit is
+    // the consumer-visible count.
     for (int k = 0; k < n_steps; ++k) {
         char nm_a[32], nm_p[32];
         snprintf(nm_a, sizeof(nm_a), "mtp_argmax_%d", k);
@@ -9920,9 +9943,15 @@ int32_t llama_mtp_fused_extract_results(
         ctx->mtp_persist_n = captured;
     }
 
-    // Fill out struct.
+    // Fill out struct. n_steps is the EMITTED draft count
+    // (consumer-visible), but tokens[]/probs[] are filled for ALL
+    // chain steps including EXTEND steps (so callers using Phase 38 E
+    // speculative dispatch can read tokens[n_use] for the all-accept
+    // bonus prediction).
     out->n_steps = ctx->mtp_fused_results_n;
-    for (int k = 0; k < out->n_steps && k < LLAMA_MTP_FUSED_MAX; ++k) {
+    int fill_n = n_steps;
+    if (fill_n > LLAMA_MTP_FUSED_MAX) fill_n = LLAMA_MTP_FUSED_MAX;
+    for (int k = 0; k < fill_n; ++k) {
         out->tokens[k] = ctx->mtp_fused_results_tokens[k];
         out->probs[k]  = ctx->mtp_fused_results_probs[k];
     }
