@@ -1399,8 +1399,32 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         const int32_t rc = llama_mtp_fused_draft_invoke(
                 ctx, id_last, /*seed_hidden=*/nullptr, n_draft, &fr);
         if (rc == 0 && fr.n_steps > 0) {
-            drafts.reserve(fr.n_steps);
-            for (int k = 0; k < fr.n_steps; ++k) {
+            // Phase 37 #4: adaptive chain depth. Truncate the draft at the
+            // first step whose argmax probability falls below the env
+            // threshold. Default 0.0 (no truncation, behaviour
+            // unchanged). Tuning lever for "stop chain when the model is
+            // unsure": each truncation saves the corresponding verify
+            // forward at the cost of one fewer drafted token. fr.probs[k]
+            // is the softmax probability of the argmax token at chain
+            // step k (already host-side from
+            // ggml_backend_cuda_mtp_argmax_with_prob_to_host). All steps
+            // are computed by the fused graph regardless of truncation;
+            // the saving is on the verify side, not the draft side.
+            static const float _min_prob = []() {
+                const char * env = getenv("LLAMA_MTP_CHAIN_MIN_PROB");
+                return env ? (float) atof(env) : 0.0f;
+            }();
+            int32_t n_use = fr.n_steps;
+            if (_min_prob > 0.0f) {
+                for (int k = 0; k < fr.n_steps; ++k) {
+                    if (fr.probs[k] < _min_prob) {
+                        n_use = k;
+                        break;
+                    }
+                }
+            }
+            drafts.reserve(n_use);
+            for (int k = 0; k < n_use; ++k) {
                 drafts.push_back(fr.tokens[k]);
             }
             return drafts;
