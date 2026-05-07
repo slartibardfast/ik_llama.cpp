@@ -1868,6 +1868,10 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
 
 std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const {
+    // n_tokens here is the per-call value derived from the input tensor —
+    // not the build-context-wide member. Lets the same primitive serve
+    // verify (n=N+1), fused-chain (n=1 per step), and kv-only (n=N+1).
+    const int64_t n_tokens = cur->ne[1];
     auto Qaux = llm_build_lora_mm(lctx, ctx0, wq, cur);
     cb(Qaux, "Qaux", il);
     auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur);
@@ -1907,6 +1911,8 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
             ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split) const {
+    // Per-call n_tokens — see llm_build_mul_mat_qkv_gated for rationale.
+    const int64_t n_tokens = cur->ne[1];
     int n_head    = hparams.n_head(il);
     int n_head_kv = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
@@ -2489,6 +2495,13 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
         ggml_tensor * post_norm) {
+
+    // Phase 36 synthesis: drive n_tokens from the input tensor's second
+    // dim, not from the build-context member. One primitive then serves
+    // verify (n=N+1), fused-chain (n=1 per step), and kv-only (n=N+1).
+    // The local shadow keeps every ne-sizing line below correct without
+    // a wider sweep through every call site.
+    const int64_t n_tokens = input->ne[1];
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;

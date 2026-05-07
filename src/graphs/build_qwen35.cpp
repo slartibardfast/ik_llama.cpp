@@ -373,19 +373,23 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
     cb(lctx.inp_tokens, "inp_tokens", -1);
     ggml_set_input(lctx.inp_tokens);
 
-    // Position tensor: n_tokens elements [pos_base, pos_base+n_draft-1].
-    lctx.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    // Position tensor: matches build_inp_pos() — for MROPE/IMROPE,
+    // 4 entries per token; otherwise 1 per token. Step k slices its
+    // n_pos_per_embd-element segment via ggml_view_1d below.
+    const int n_pos_per_embd = (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
+                                hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+    lctx.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens * n_pos_per_embd);
     cb(lctx.inp_pos, "inp_pos", -1);
     ggml_set_input(lctx.inp_pos);
 
-    // KQ_mask: (n_kv, n_tokens). Each column k = step k's mask. Per-step
-    // visibility filled by llama_set_inputs in the standard way based on
-    // batch positions vs kv_self positions; the chain causality is
-    // enforced naturally because each step writes its KV before the next
-    // step's attention reads it.
+    // KQ_mask: (n_kv, n_tokens * GGML_KQ_MASK_PAD). Each step k uses a
+    // (n_kv, GGML_KQ_MASK_PAD) view at row offset k*GGML_KQ_MASK_PAD —
+    // satisfies the flash-attention requirement that mask->ne[1] >=
+    // GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) for single-token queries.
+    // Per-step visibility filled by llama_set_inputs.
     lctx.inp_KQ_mask = ggml_new_tensor_2d(
         ctx0, flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
-        n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        n_kv, (int64_t)n_tokens * GGML_KQ_MASK_PAD);
     cb(lctx.inp_KQ_mask, "KQ_mask", -1);
     ggml_set_input(lctx.inp_KQ_mask);
 
@@ -394,24 +398,33 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
     ggml_tensor * probs[LLAMA_MTP_FUSED_MAX] = {};
 
     for (int k = 0; k < n_draft; ++k) {
-        // Token id for this step (single-element I32 tensor).
+        // Token id for this step. Step 0 reads inp_tokens[0] via a
+        // 1-element view; step k>0 uses argmax_{k-1} (already shape [1]).
+        // The view path keeps each step's compute single-token even
+        // though the outer build context has n_tokens = n_draft.
         ggml_tensor * tok_id_k;
         if (k == 0) {
-            tok_id_k = lctx.inp_tokens;
+            tok_id_k = ggml_view_1d(ctx0, lctx.inp_tokens, 1, 0);
         } else {
-            // argmax_{k-1} is the previous step's argmax (shape [1] I32).
             tok_id_k = argmaxes[k-1];
         }
 
-        // Per-step inp_pos view (1 element at offset k).
-        ggml_tensor * pos_k = ggml_view_1d(ctx0, lctx.inp_pos, 1, k * lctx.inp_pos->nb[0]);
+        // Per-step inp_pos view: n_pos_per_embd elements at offset
+        // k * n_pos_per_embd. For MROPE/IMROPE this is 4 elements per
+        // step; otherwise 1.
+        ggml_tensor * pos_k = ggml_view_1d(ctx0, lctx.inp_pos,
+            n_pos_per_embd,
+            (size_t) k * n_pos_per_embd * lctx.inp_pos->nb[0]);
 
-        // Per-step KQ_mask view: column k of the (n_kv, n_draft) mask.
-        // Shape (n_kv, 1).
+        // Per-step KQ_mask view: (n_kv, GGML_KQ_MASK_PAD) at row offset
+        // k * GGML_KQ_MASK_PAD. The mask's first row is the actual
+        // visibility for step k's query; the remaining KQ_MASK_PAD-1
+        // rows are padding (FA reads them but they don't affect output
+        // for n_queries=1).
         ggml_tensor * mask_k = ggml_view_2d(ctx0, lctx.inp_KQ_mask,
-            lctx.inp_KQ_mask->ne[0], 1,
+            lctx.inp_KQ_mask->ne[0], GGML_KQ_MASK_PAD,
             lctx.inp_KQ_mask->nb[1],
-            k * lctx.inp_KQ_mask->nb[1]);
+            (size_t) k * GGML_KQ_MASK_PAD * lctx.inp_KQ_mask->nb[1]);
 
         ggml_tensor * cur = build_qwen35_mtp_kv_only(
             mtp_layer, prev_residual, tok_id_k,
@@ -445,13 +458,17 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         cur = lctx.cvec.apply_to(ctx0, cur, il_mtp);
         cb(cur, "ffn_out", il_mtp);
 
-        prev_residual = cur;
-
-        // Head: norm + lm_head + argmax + softmax → prob
+        // Apply the shared-head norm BEFORE branching into chain-input
+        // and lm_head. The per-step path captures result_norm (post-norm)
+        // as the next step's prev_embeddings via llama_get_embeddings_ith
+        // — fused must do the same to match acceptance.
         ggml_tensor * normed = llm_build_norm(ctx0, cur, hparams,
             mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
         cb(normed, "result_norm", -1);
 
+        prev_residual = normed;
+
+        // Head: lm_head + argmax + softmax → prob
         ggml_tensor * logits = build_output(lctx, ctx0, normed, model.output, nullptr, cb);
         cb(logits, "result_output", -1);
 
@@ -462,14 +479,13 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         ggml_set_output(argmax);
         argmaxes[k] = argmax;
 
-        // softmax → prob[argmax]. logits is (n_vocab, 1); transpose to
-        // (1, n_vocab) so get_rows can index dim 1 with the argmax token
-        // id, returning (1, 1) = scalar. ggml_transpose is a view, no
-        // compute. The prob value is populated for the test contract;
-        // fused mode does NOT use prob for early-exit (graph is static)
-        // so the value is informational only.
+        // softmax → prob[argmax]. ggml_transpose is a view (non-contig
+        // in dim 0), and CUDA get_rows requires src0->nb[0] ==
+        // ggml_type_size(src0->type). Materialize the transpose with
+        // ggml_cont before indexing. The prob is populated for the
+        // test contract; fused mode does not gate on prob<p_min.
         ggml_tensor * sm = ggml_soft_max(ctx0, logits);
-        ggml_tensor * sm_t = ggml_transpose(ctx0, sm);
+        ggml_tensor * sm_t = ggml_cont(ctx0, ggml_transpose(ctx0, sm));
         ggml_tensor * prob = ggml_get_rows(ctx0, sm_t, argmax);
         snprintf(nm, sizeof(nm), "mtp_prob_%d", k);
         ggml_set_name(prob, nm);

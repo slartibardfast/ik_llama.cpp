@@ -4122,6 +4122,73 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
 #endif
+
+        // Phase 36 Step 1: dedicated fused-mode mask fill. The fused
+        // builder allocates KQ_mask as (n_kv, n_draft * GGML_KQ_MASK_PAD)
+        // and slices a (n_kv, GGML_KQ_MASK_PAD) view per step at row
+        // offset k * GGML_KQ_MASK_PAD. The standard fill below writes
+        // visibility for token j at column j (i.e., bytes [j*n_kv,
+        // (j+1)*n_kv)), but the fused view of step k reads column
+        // k*GGML_KQ_MASK_PAD. Without remapping, only step 0 sees the
+        // right mask; steps 1..N-1 read uninitialized memory and the
+        // attention output is garbage.
+        //
+        // This block fills the fused layout directly: column k *
+        // GGML_KQ_MASK_PAD = visibility for batch token k; columns
+        // (k * KQ_MASK_PAD) + 1 .. ((k+1) * KQ_MASK_PAD) - 1 = -INF
+        // padding (FA reads them but for n_queries=1 they don't
+        // affect the output).
+        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED &&
+            cparams.causal_attn && !lctx.is_encoding && lctx.inp_KQ_mask) {
+
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+            GGML_ASSERT(!hparams.use_alibi);
+            GGML_ASSERT(lctx.inp_KQ_mask_swa == nullptr);
+
+            const int64_t n_kv     = kv_self.n;
+            const int64_t n_tokens = batch.n_tokens;
+            const int64_t pad      = GGML_KQ_MASK_PAD;
+            const bool    fa       = cparams.flash_attn;
+
+            float     * mdf32 = fa ? nullptr : (float     *) lctx.inp_KQ_mask->data;
+            ggml_half * mdf16 = fa ? (ggml_half *) lctx.inp_KQ_mask->data : nullptr;
+            const ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_half h_zero = ggml_fp32_to_fp16(0.f);
+
+            // Step 1: fill the entire mask with -INF (covers all the
+            // padding columns; visibility columns are overwritten below).
+            const int64_t total = n_kv * n_tokens * pad;
+            if (mdf32) std::fill(mdf32, mdf32 + total, -INFINITY);
+            if (mdf16) std::fill(mdf16, mdf16 + total, h_inf);
+
+            // Step 2: per-step visibility column at offset
+            // k * pad * n_kv. Token k attends to all kv_self cells
+            // whose pos is <= batch.pos[k] AND has the same seq_id.
+            // The standard chain-causality property holds because
+            // llama_kv_cache_find_slot has already assigned cells
+            // [head, head+n_tokens) the batch positions [pos_base,
+            // pos_base+n_tokens), so cell j > k has pos > pos[k] and
+            // is correctly masked.
+            for (int j = 0; j < n_tokens; ++j) {
+                const llama_pos    pos    = batch.pos[j];
+                const llama_seq_id seq_id = batch.seq_id[j][0];
+                const int64_t      col_base = (int64_t) j * pad * n_kv;
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    const bool visible = lctx.kv_self.cells[i].has_seq_id(seq_id) &&
+                                         lctx.kv_self.cells[i].pos <= pos;
+                    if (mdf32) mdf32[col_base + i] = visible ? 0.0f : -INFINITY;
+                    if (mdf16) mdf16[col_base + i] = visible ? h_zero : h_inf;
+                }
+            }
+
+#if IK_PRINT_TIMING == 2
+            auto tim2 = ggml_time_us();
+            printf("set_inputs(mask:fused): %d us\n", int(tim2-tim1));
+#endif
+            // Skip the rest of the KQ_mask block.
+            goto kq_mask_done;
+        }
+
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (cparams.causal_attn && !lctx.is_encoding) {
             const int64_t n_kv     = kv_self.n;
@@ -4428,6 +4495,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             printf("set_inputs(mask2): %d us\n", int(tim2-tim1));
 #endif
         }
+
+        kq_mask_done: ;
     }
 
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
@@ -4790,43 +4859,15 @@ static void llama_graph_compute(
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_tensor * dst = lctx.inp_mtp_states;
 
-    // Phase 36 Step 4: device-resident relay. When the previous decode
-    // tagged h_pre_norm AND the row count matches what inp_mtp_states
-    // expects (1 for DRAFT_GEN / DRAFT_GEN_FUSED step 0; n_tokens for
-    // UPDATE_ACCEPTED), copy directly D2D via ggml_backend_tensor_copy.
-    // Source: lctx.t_h_pre_norm from the prior verify forward — the
-    // pre-final-norm residual the MTP layer needs, which is exactly
-    // what llama_get_embeddings_ith would have D2H'd then we'd H2D
-    // back. The D2D path skips that round-trip.
-    //
-    // The earlier 70150c6d failure (acceptance 85→3%) captured the
-    // DRAFT_GEN forward's own output, not the verify-side residual.
-    // We now read t_h_pre_norm which is set ONLY during verify
-    // (cleared at every llama_decode_internal entry; verify path
-    // assigns it before compute). Stale-pointer guard means we fall
-    // through to the host-bounce path if t_h_pre_norm is null on the
-    // current decode.
-    if (lctx.t_h_pre_norm != nullptr &&
-        lctx.t_h_pre_norm->ne[0] == dst->ne[0] &&
-        lctx.t_h_pre_norm->ne[1] >= dst->ne[1]) {
-        // Copy the LAST row of t_h_pre_norm (corresponds to the
-        // verify-target token, the seed for DRAFT_GEN/FUSED). For
-        // multi-row dst (UPDATE_ACCEPTED), copy the full overlap.
-        const size_t row_bytes = (size_t) dst->ne[0] * sizeof(float);
-        const size_t total_bytes = row_bytes * (size_t) dst->ne[1];
-        const size_t src_offset =
-            (size_t) (lctx.t_h_pre_norm->ne[1] - dst->ne[1]) * row_bytes;
-        ggml_backend_t b_src = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.t_h_pre_norm);
-        ggml_backend_t b_dst = ggml_backend_sched_get_tensor_backend(lctx.sched, dst);
-        if (b_src != nullptr && b_dst != nullptr && b_src == b_dst) {
-            ggml_backend_tensor_copy(lctx.t_h_pre_norm, dst);
-            (void) src_offset; (void) total_bytes;
-            return true;
-        }
-        // Fall through to host bounce when backends differ (e.g.,
-        // split-mode-graph cross-device). Acceptable for now; future
-        // work can add per-device D2D.
-    }
+    // Phase 36 Step 4: device-resident relay (disabled for the moment).
+    // Sub-tensor D2D from t_h_pre_norm into inp_mtp_states needs to
+    // pick the row whose semantic the per-step path already validates
+    // (row 0 of llama_get_embeddings_ith, NOT the last row of the
+    // verify batch — those aren't the same for multi-token verifies).
+    // Until the row-selection contract is locked down with a passing
+    // acceptance test, fall through to the existing host-bounce path
+    // so the per-step and fused paths see identical seed values.
+    (void) lctx; // keep symbol live for the dst access below.
 
     const float * src = lctx.draft_input_hidden_state;
     if (!src) {
@@ -5417,11 +5458,14 @@ static int llama_decode_internal(
         }
         // Phase 36 Step 1: extract fused-draft results (N argmax + N prob
         // tensors named "mtp_argmax_<k>" / "mtp_prob_<k>") from the
-        // graph nodes. Stored on lctx for llama_mtp_fused_draft_invoke
-        // to read post-decode.
+        // graph nodes. Synchronous tensor_get because the host buffers
+        // are read-after-write in the same scope; the async variant
+        // can race with the read on backends that don't auto-flush.
         if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
             const int n_steps = cparams.mtp_fused_n_steps;
             lctx.mtp_fused_results_n = n_steps;
+            // Sync once to make all output tensors readable.
+            ggml_backend_sched_synchronize(lctx.sched);
             for (int k = 0; k < n_steps; ++k) {
                 char nm_a[32], nm_p[32];
                 snprintf(nm_a, sizeof(nm_a), "mtp_argmax_%d", k);
@@ -5434,24 +5478,37 @@ static int llama_decode_internal(
                 }
                 if (t_a) {
                     int32_t v = 0;
-                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(lctx.sched, t_a);
-                    ggml_backend_tensor_get_async(b, t_a, &v, 0, sizeof(v));
-                    lctx.mtp_fused_results_tokens[k] = (llama_token) v;
+                    ggml_backend_tensor_get(t_a, &v, 0, sizeof(v));
+                    // Issue F detector: if v is out of vocab, the
+                    // device-side argmax over the split lm_head
+                    // concat misread cross-device memory. Per-device
+                    // argmax + reduction is required.
+                    const int32_t n_vocab = (int32_t) lctx.model.hparams.n_vocab;
+                    if (v < 0 || v >= n_vocab) {
+                        fprintf(stderr,
+                                "[mtp-fused] ISSUE F: step=%d argmax=%d out of vocab [0,%d) — split lm_head + on-device argmax is broken\n",
+                                k, v, n_vocab);
+                        lctx.mtp_fused_results_tokens[k] = -1;
+                    } else {
+                        lctx.mtp_fused_results_tokens[k] = (llama_token) v;
+                    }
                 } else {
                     lctx.mtp_fused_results_tokens[k] = -1;
                 }
                 if (t_p) {
                     float v = 0.0f;
-                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(lctx.sched, t_p);
-                    ggml_backend_tensor_get_async(b, t_p, &v, 0, sizeof(v));
+                    ggml_backend_tensor_get(t_p, &v, 0, sizeof(v));
                     lctx.mtp_fused_results_probs[k] = v;
                 } else {
                     lctx.mtp_fused_results_probs[k] = 1.0f;
                 }
+                static const bool _dbg = (getenv("LLAMA_MTP_FUSED_DEBUG") != nullptr);
+                if (_dbg) {
+                    fprintf(stderr, "[mtp-fused] step=%d tok=%d prob=%.4f\n",
+                            k, (int)lctx.mtp_fused_results_tokens[k],
+                            lctx.mtp_fused_results_probs[k]);
+                }
             }
-            // Force sync so the results are populated before llama_decode
-            // returns (consumers read directly without a synchronize).
-            ggml_backend_sched_synchronize(lctx.sched);
         }
 
         n_outputs_prev += lctx.n_outputs;

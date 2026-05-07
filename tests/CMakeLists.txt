@@ -227,6 +227,8 @@ if (GGML_CUDA)
     llama_build_and_test(mtp-fused/test-mtp-fused-kv-coverage.cpp)
     llama_build_and_test(mtp-fused/test-mtp-fused-kv-chop-rewrite.cpp)
     llama_build_and_test(mtp-fused/test-mtp-fused-prob-populated.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-split-argmax.cpp)
+    llama_build_and_test(mtp-fused/test-mtp-fused-chain-residual.cpp)
 
     # mtp_ubatch_hook.allium — RED-first scaffolding for the per-ubatch
     # MTP-KV hook. The .sh integration tests live alongside but are
@@ -237,6 +239,7 @@ if (GGML_CUDA)
     llama_build_and_test(mtp-ubatch-hook/test-hook-no-secondary-decode.cpp)
     llama_build_and_test(mtp-ubatch-hook/test-hook-cross-ubatch-pairing.cpp)
     llama_build_and_test(mtp-ubatch-hook/test-hook-idempotent-chop.cpp)
+    llama_build_and_test(mtp-ubatch-hook/test-hook-acceptance-vs-update-accepted.cpp)
 
     # mtp_verify_accept.allium — RED-first scaffolding for the verify-step
     # accept-decision contract that sits between the per-ubatch hook and
