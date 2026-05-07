@@ -571,6 +571,15 @@ struct llama_context::Prev {
 void llama_context::reset_scheduler() {
     ggml_backend_sched_reset(sched);
     prev.reset();
+    // Phase 37 #2.1: sched_reset frees the prior graph's tensor
+    // backing buffers. The chain_residual tensor headers stored here
+    // become dangling pointers — null them so prepare_mtp_graph_inputs'
+    // chain-residual seed path falls back cleanly. Also flip the
+    // validity flag (data is gone too).
+    for (int _i = 0; _i < 8; ++_i) {
+        mtp_fused_chain_residuals[_i] = nullptr;
+    }
+    mtp_fused_chain_residuals_valid = false;
 }
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
@@ -4889,15 +4898,45 @@ static void llama_graph_compute(
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_tensor * dst = lctx.inp_mtp_states;
 
-    // Phase 36 Step 4: device-resident relay (disabled for the moment).
-    // Sub-tensor D2D from t_h_pre_norm into inp_mtp_states needs to
-    // pick the row whose semantic the per-step path already validates
-    // (row 0 of llama_get_embeddings_ith, NOT the last row of the
-    // verify batch — those aren't the same for multi-token verifies).
-    // Until the row-selection contract is locked down with a passing
-    // acceptance test, fall through to the existing host-bounce path
-    // so the per-step and fused paths see identical seed values.
-    (void) lctx; // keep symbol live for the dst access below.
+    // Phase 37 #2.2: chain-residual seed (D2D, no host bounce). When the
+    // caller has armed pending_chain_residual_step AND the prior fused
+    // decode's chain residuals are still valid (graph reuse hit, or
+    // tensors built but compute pending — the flag distinguishes), pull
+    // the seed from the prior fused decode's chain_residuals[step]
+    // tensor — its backing buffer holds h_pre_norm at position
+    // seed_pos + step + 1, exactly the seed for THIS fused decode.
+    // Saves a verify->host copy + host->fused-device copy per cycle
+    // (~150-300 us measured).
+    //
+    // Same-stream FIFO ordering: this D2D copy and this graph's
+    // compute kernels run on the same stream. The copy completes
+    // before compute starts overwriting the chain_residual buffers,
+    // so reading from a buffer that the same graph will later write
+    // to is race-free.
+    //
+    // Auto-clears the arm bit so a later decode without re-arm falls
+    // through to the host-bounce path (existing semantics preserved).
+    {
+        const int step = lctx.pending_chain_residual_step;
+        lctx.pending_chain_residual_step = -1;
+        if (step >= 0 && step < 8 && lctx.mtp_fused_chain_residuals_valid) {
+            ggml_tensor * src_t = lctx.mtp_fused_chain_residuals[step];
+            if (src_t != nullptr && ggml_nbytes(src_t) >= ggml_nbytes(dst)) {
+                ggml_backend_tensor_copy(src_t, dst);
+                static const bool input_chk =
+                    (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
+                if (input_chk) {
+                    fprintf(stderr,
+                        "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=chain_residual[%d] nbytes=%zu (D2D)\n",
+                        step, (size_t) ggml_nbytes(dst));
+                }
+                return true;
+            }
+            // Mismatched/missing chain residual: fall through to host
+            // path. Don't error — caller may have armed for a fused
+            // decode that hasn't run yet (e.g. first cycle).
+        }
+    }
 
     const float * src = lctx.draft_input_hidden_state;
     if (!src) {
@@ -4968,9 +5007,53 @@ static int llama_decode_internal(
     // Same stale-pointer guard for the per-step offset tensors used by
     // the fused chain's per-device argmax + reduction. Set only when
     // a fresh fused graph is built; cleared otherwise.
-    for (int _i = 0; _i < 8; ++_i) {
-        lctx.mtp_fused_offset_t[_i] = nullptr;
-        lctx.mtp_fused_offset_n_dev[_i] = 0;
+    //
+    // Phase 37 #2.1: chain-residual outputs follow the same lifetime —
+    // valid only across a fresh fused graph build. When the next decode
+    // is a verify (MTP_OP_NONE) or a per-step DRAFT_GEN, the prior
+    // fused graph's tensor headers go stale; null them so the
+    // chain-residual seed plumbing in prepare_mtp_graph_inputs falls
+    // back to the host path.
+    //
+    // Exception: when graph reuse is in play (Phase 37 #5), the fused
+    // graph and its tensors persist across decodes — re-population of
+    // these pointers happens in build_qwen35_mtp_fused at *fresh*
+    // build time only. Reuse path keeps the prior pointers alive
+    // because it skips build entirely. Distinguishing reuse-vs-rebuild
+    // here would require state we don't have until later in
+    // llama_decode_internal; instead, the rebuild-side code repopulates
+    // these slots, and a reuse path sees the prior valid values from
+    // the cached graph (whose tensor memory stays allocated by the
+    // sched). So clear ONLY when this decode is NOT a fused decode —
+    // a fused decode either rebuilds (re-populates) or reuses (keeps
+    // prior valid pointers).
+    if (lctx.cparams.mtp_op_type != MTP_OP_DRAFT_GEN_FUSED) {
+        for (int _i = 0; _i < 8; ++_i) {
+            lctx.mtp_fused_offset_t[_i] = nullptr;
+            lctx.mtp_fused_offset_n_dev[_i] = 0;
+            lctx.mtp_fused_chain_residuals[_i] = nullptr;
+        }
+        lctx.mtp_fused_chain_residuals_valid = false;
+    } else {
+        for (int _i = 0; _i < 8; ++_i) {
+            lctx.mtp_fused_offset_t[_i] = nullptr;
+            lctx.mtp_fused_offset_n_dev[_i] = 0;
+        }
+        // chain_residuals tensor headers: on rebuild, build_qwen35_mtp_fused
+        // re-populates them. On reuse, the cached graph's pointers stay
+        // valid. The validity flag is owned by the post-compute extraction
+        // (set true after a successful fused decode), so do NOT touch it
+        // here — it remains true across a reuse cycle, which is exactly
+        // the case where the seed plumbing wants to read the prior data
+        // before this decode's compute overwrites it.
+        //
+        // For the rebuild path: the flag's semantic is "the tensors
+        // referenced here hold valid POST-compute data". After rebuild,
+        // the pointers are repopulated but compute hasn't run, so the
+        // flag MUST flip to false until end-of-compute resets it. The
+        // rebuild path goes through reset_scheduler() which sets
+        // mtp_fused_chain_residuals_valid = false; that's where the flip
+        // happens. So we don't need a flip here.
     }
     const uint32_t n_tokens_all = batch_all.n_tokens;
 
@@ -5615,6 +5698,13 @@ static int llama_decode_internal(
                             (float) lctx.mtp_fused_results_probs[k]);
                 }
             }
+
+            // Phase 37 #2.1: chain-residual outputs are now stable
+            // (post-compute, post-sched_synchronize). The next fused
+            // decode (within this same sched lifetime — i.e. graph
+            // reuse path) can pull seed bytes directly from these
+            // tensors via prepare_mtp_graph_inputs's D2D path.
+            lctx.mtp_fused_chain_residuals_valid = true;
         }
 
         n_outputs_prev += lctx.n_outputs;
@@ -10932,6 +11022,11 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
     const size_t n_embd = (size_t) ctx->model.hparams.n_embd;
     ctx->draft_input_hidden_state_buf.assign(hidden_state, hidden_state + n_embd);
     ctx->draft_input_hidden_state = ctx->draft_input_hidden_state_buf.data();
+}
+
+void llama_set_draft_input_chain_residual(struct llama_context * ctx, int chain_step) {
+    if (ctx == nullptr) return;
+    ctx->pending_chain_residual_step = chain_step < 0 ? -1 : chain_step;
 }
 
 bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob) {

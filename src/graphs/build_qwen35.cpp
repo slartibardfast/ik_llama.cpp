@@ -523,10 +523,21 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
         // separate decodes; fused needs it explicitly. Closes the
         // cumulative drift identified by the d=2 probe (d=2 ratio 0.93
         // vs d=3 ratio 0.67 — drift compounds at chain step ≥ 2).
-        if (k + 1 < n_draft) {
-            normed = ggml_dup(ctx0, normed);
-            cb(normed, "mtp_chain_residual", il_mtp);
+        //
+        // Phase 37 #2 extension: also expose normed at EVERY step (not
+        // just k+1<n_draft) as set_output. The exposed tensor is the
+        // hidden state at position S_k+(k+1) — exactly what the next
+        // cycle's fused decode needs as its seed when verify accepts
+        // k drafts. Indexed via lctx.mtp_fused_chain_residuals[k].
+        normed = ggml_dup(ctx0, normed);
+        char nm_residual[40];
+        snprintf(nm_residual, sizeof(nm_residual), "mtp_chain_residual_%d", k);
+        ggml_set_name(normed, nm_residual);
+        ggml_set_output(normed);
+        lctx.mtp_fused_chain_residuals[k] = normed;
+        cb(normed, "mtp_chain_residual", il_mtp);
 
+        if (k + 1 < n_draft) {
             // Phase 37 #3b: dependency anchor on step k's KV cpy(s).
             // cache_copies's MTP-layer slot is overwritten by step k+1's
             // build_std_attention call (il_mtp is fixed across the chain),

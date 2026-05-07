@@ -170,6 +170,16 @@ struct server_slot {
     bool has_mtp = false;
     std::vector<float> mtp_hidden_state;
 
+    // Phase 37 #2.2: chain-residual seed for the NEXT MTP fused decode.
+    // Set in Phase B of speculative_decoding_accept after sampling
+    // yields the actual n_accepted_drafts (= ids.size() - 1, with -1
+    // for the bonus token). Range [0, n_steps-1] selects fused(k)'s
+    // chain residual at that index as fused(k+1)'s seed (D2D, no host
+    // bounce). -1 = unavailable (cold start, or this slot just exited
+    // a path that didn't run a fused decode), fall back to
+    // mtp_hidden_state host-bounce.
+    int32_t mtp_next_chain_residual_step = -1;
+
     // saves recurrent state before a speculative batch so it can be restored on rejection
     server_speculative_checkpoint spec_ckpt;
 

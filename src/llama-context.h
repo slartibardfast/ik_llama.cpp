@@ -381,6 +381,36 @@ struct llama_context {
     struct ggml_tensor * mtp_fused_offset_t[8] = {};
     int32_t mtp_fused_offset_n_dev[8] = {};
 
+    // Phase 37 #2.1: per-chain-step residual outputs (set_output) of
+    // the fused MTP cgraph. Each tensor [n_embd, 1] holds h_pre_norm
+    // at position seed_pos + k + 1 (where seed_pos is fused's seed's
+    // position). Used by the chain-residual seed plumbing
+    // (#2.2) to pull next-cycle's fused seed directly from the prior
+    // fused decode's output without a host-bounce. Reset to nullptr
+    // by reset_scheduler when the cgraph is rebuilt.
+    struct ggml_tensor * mtp_fused_chain_residuals[8] = {};
+
+    // Phase 37 #2.2: validity flag for the chain-residual outputs.
+    // Set true at the end of a successful fused decode's post-compute
+    // extraction; cleared at the top of each llama_decode_internal.
+    // The pointer-only check is insufficient because graph rebuild
+    // re-populates the tensor headers BEFORE compute, so non-null
+    // pointers can refer to uninitialized memory between build and
+    // compute. This flag distinguishes "tensors built but data
+    // stale/uninitialized" from "tensors built and data valid".
+    bool mtp_fused_chain_residuals_valid = false;
+
+    // Phase 37 #2.2: when set to a value in [0, n_steps-1], the next
+    // MTP_OP_DRAFT_GEN_FUSED decode populates inp_mtp_states via D2D
+    // copy from mtp_fused_chain_residuals[pending_chain_residual_step]
+    // (the prior fused decode's residual at that chain step) instead
+    // of the host-bounce path. Set to -1 by default to keep the host
+    // path live as a fallback (e.g. when the prior decode wasn't
+    // fused, or when n_accepted == n_steps and no chain residual at
+    // that index exists). Read+cleared by prepare_mtp_graph_inputs;
+    // resets to -1 every call so callers must re-arm per decode.
+    int32_t pending_chain_residual_step = -1;
+
     // Phase 36 Step 3 (per-ubatch MTP KV hook): observability counters
     // for tests/mtp-ubatch-hook/. mtp_hook_fire_count = number of verify
     // ubatches that ran the kv-only hook; mtp_inline_decode_count =

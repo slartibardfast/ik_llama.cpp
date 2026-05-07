@@ -1603,6 +1603,22 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
+    // Phase 37 #2.2: chain-residual seed plumbing. Selects the prior
+    // fused decode's chain residual at index `chain_step` (in
+    // [0, n_steps-1]) as the seed for the NEXT MTP_OP_DRAFT_GEN_FUSED
+    // decode. The chain residual is the post-shared_head_norm tensor
+    // at chain step `chain_step`, equivalent to the verify-side
+    // h_pre_norm at position seed_pos + chain_step + 1. Using the
+    // chain residual avoids the verify->host->fused-device bounce
+    // (~150-300 us/cycle) and ties fused(k+1)'s seed to fused(k)'s
+    // exact internal state instead of verify's recomputed embedding.
+    //
+    // chain_step == -1 (or any negative value) reverts to the
+    // host-bounce path (caller must have set draft_input_hidden_state
+    // separately). prepare_mtp_graph_inputs auto-clears this back to
+    // -1 on use, so callers must re-arm per decode.
+    LLAMA_API void llama_set_draft_input_chain_residual(struct llama_context * ctx, int chain_step);
+
     // Phase 36 Step 3 (per-ubatch MTP KV hook): expose the pre-final-norm
     // residual stream tensor from the most recent main forward graph
     // built on this context. Returns nullptr when:

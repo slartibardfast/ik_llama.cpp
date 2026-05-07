@@ -3193,6 +3193,25 @@ void server_context::add_sampled_tokens() {
                         llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data());
                     }
                 }
+                // Phase 37 #2.2: arm chain-residual seed (D2D, no host
+                // bounce). The full path is gated OFF by default — the
+                // measured emb_d2h+hidden_h2d cost is only ~4 us/chain
+                // step (vs the projected 50-100 us), making Mini #2's
+                // realistic lift <0.05%. The plumbing remains wired
+                // (gated by LLAMA_MTP_CHAIN_RESIDUAL_SEED) as the
+                // foundation for a future Full #2 implementation that
+                // pairs chain residuals with a context-owned persistent
+                // device buffer (so chain residuals survive the
+                // intervening verify+UPDATE_ACCEPTED sched_resets) and
+                // a dual-stream/speculative dispatch architecture that
+                // captures real GPU overlap. See PHASE37.md "#2 —
+                // pipelining design" + the measurement that drove
+                // path-3 recalibration as the chosen close.
+                static const bool _chain_residual_enabled =
+                    (getenv("LLAMA_MTP_CHAIN_RESIDUAL_SEED") != nullptr);
+                if (_chain_residual_enabled && slot.mtp_next_chain_residual_step >= 0) {
+                    llama_set_draft_input_chain_residual(hs_ctx, slot.mtp_next_chain_residual_step);
+                }
             }
 
             llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
@@ -3956,6 +3975,11 @@ void server_context::speculative_decoding_accept() {
         const bool any_rejected = (ids.size() - 1) < n_draft;
         if (any_rejected && slot.spec_ckpt.valid) {
             restore_speculative_checkpoint(slot, ctx, model, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
+            // Phase 37 #2.2: rejection restore breaks the fused chain
+            // (mtp_accept_tokens runs an MTP_OP_UPDATE_ACCEPTED decode
+            // which invalidates chain_residuals_valid). Force the host
+            // path on the next cycle.
+            slot.mtp_next_chain_residual_step = -1;
         } else {
             if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
                     llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
@@ -3965,6 +3989,22 @@ void server_context::speculative_decoding_accept() {
                     llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
                     mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
                 }
+            // Phase 37 #2.2: arm chain-residual seed for the next
+            // fused decode. n_accepted_drafts = ids.size() - 1 is the
+            // index of the chain residual that holds h_pre_norm at
+            // the new last_accepted_position. When n_accepted_drafts
+            // == n_steps_fused (all-accept), the index points one past
+            // the chain (no chain residual exists at that position) —
+            // prepare_mtp_graph_inputs's bound check returns null,
+            // and the host-bounce path supplies the seed instead.
+            // Also: mtp_accept_tokens just above ran an
+            // UPDATE_ACCEPTED decode which invalidates the prior fused
+            // chain_residuals (sched_reset). So this arm only takes
+            // effect once the FOLLOWING fused decode populates
+            // chain_residuals afresh — the very next add_sampled_tokens
+            // call will see _valid == false and fall through to host.
+            // Subsequent cycles see the freshly-populated residuals.
+            slot.mtp_next_chain_residual_step = (int32_t) ids.size() - 1;
             llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
             discard_speculative_checkpoint(slot, ctx);
         }
