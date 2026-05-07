@@ -5,6 +5,10 @@
 
 ggml_cgraph * llm_build_context::build_qwen35moe() {
 
+    if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
+        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, /*is_moe=*/true);
+    }
+
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
     const int64_t n_embd_head = hparams.n_embd_head_v(0);
@@ -89,6 +93,22 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
+
+        // Phase 36 Step 3.2: per-ubatch kv-only MTP hook. Fold MTP KV
+        // writes into the verify forward so the separate
+        // MTP_OP_UPDATE_ACCEPTED decode can be eliminated. Gated by
+        // cparams.mtp_inline_kv_hook to allow A/B comparison.
+        if (lctx.cparams.mtp && lctx.cparams.mtp_inline_kv_hook) {
+            const int il_mtp = hparams.n_layer - 1;
+            const auto & mtp_layer = model.layers[il_mtp];
+            ggml_tensor * mtp_kv = build_qwen35_mtp_kv_only(
+                    mtp_layer, inpL, lctx.inp_tokens,
+                    n_embd_head, gf, inp_pos, KQ_mask);
+            cb(mtp_kv, "mtp_kv_inline_moe", il_mtp);
+            ggml_build_forward_expand(gf, mtp_kv);
+            ++lctx.mtp_hook_fire_count;
+            ++lctx.mtp_inline_decode_count;
+        }
     }
 
     ggml_build_forward_expand(gf, cur);
@@ -97,6 +117,10 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 }
 
 ggml_cgraph * llm_build_context::build_qwen35() {
+
+    if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
+        return build_qwen35_mtp_fused(cparams.mtp_fused_n_steps, /*is_moe=*/false);
+    }
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
@@ -172,6 +196,20 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
+
+        // Phase 36 Step 3.2: per-ubatch kv-only MTP hook. See
+        // build_qwen35moe() for the rationale.
+        if (lctx.cparams.mtp && lctx.cparams.mtp_inline_kv_hook) {
+            const int il_mtp = hparams.n_layer - 1;
+            const auto & mtp_layer = model.layers[il_mtp];
+            ggml_tensor * mtp_kv = build_qwen35_mtp_kv_only(
+                    mtp_layer, inpL, lctx.inp_tokens,
+                    n_embd_head, gf, inp_pos, KQ_mask);
+            cb(mtp_kv, "mtp_kv_inline", il_mtp);
+            ggml_build_forward_expand(gf, mtp_kv);
+            ++lctx.mtp_hook_fire_count;
+            ++lctx.mtp_inline_decode_count;
+        }
     }
 
     ggml_build_forward_expand(gf, cur);
@@ -254,4 +292,195 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     cb(cur, "result_output", -1);
 
     return cur;
+}
+
+// Phase 36 Step 3: MTP layer compute that stops after attention. Used by
+// the per-ubatch hook when integrating MTP KV writes into verify forward.
+// Skips FFN, final norm, and lm_head — KV write is the only side effect
+// we want.
+struct ggml_tensor * llm_build_context::build_qwen35_mtp_kv_only(
+    const llama_layer & mtp_layer,
+    struct ggml_tensor * prev_embeddings,
+    struct ggml_tensor * tokens_input,
+    int64_t n_embd_head,
+    struct ggml_cgraph * gf,
+    struct ggml_tensor * inp_pos,
+    struct ggml_tensor * KQ_mask) {
+
+    const int il = hparams.n_layer - 1;
+
+    ggml_tensor * token_emb = ggml_get_rows(ctx0, model.tok_embd, tokens_input);
+    ggml_tensor * token_emb_norm = llm_build_norm(ctx0, token_emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
+    ggml_tensor * hidden_state_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
+
+    ggml_tensor * cur;
+    if (mtp_layer.nextn.eh_proj != nullptr) {
+        ggml_tensor * combined = ggml_concat(ctx0, token_emb_norm, hidden_state_norm, 0);
+        cb(combined, "mtp_kv_concat", il);
+        cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+    } else {
+        cur = ggml_add(ctx0, token_emb_norm, hidden_state_norm);
+    }
+    cb(cur, "mtp_kv_fused", il);
+
+    GGML_ASSERT(il < (int)kv_self.k_l.size() && il < (int)kv_self.v_l.size());
+
+    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+
+    cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
+            inp_pos, nullptr, nullptr,
+            KQ_mask, nullptr, nullptr,
+            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr);
+
+    cb(cur, "mtp_kv_attn_out", il);
+    return cur;
+}
+
+// Phase 36 Step 1: fused multi-draft cgraph. Chains N MTP draft steps in
+// a single graph. Each step: token_emb→enorm/hnorm→concat→eh_proj→attn
+// (writes KV at pos_base+k)→[ffn]→norm→lm_head→argmax→softmax→prob.
+// Step 0 token = inp_tokens[0] (seed); step k>0 token = argmax_{k-1}.
+// Outputs: N argmax tensors named "mtp_argmax_<k>" and N prob tensors
+// named "mtp_prob_<k>", all set_output.
+//
+// Caller contract: the batch passed into llama_decode must have
+// batch.n_tokens == n_draft so that n_tokens (the const member of
+// llm_build_context) matches the chain length and the slot allocator
+// reserves n_draft consecutive KV cells.
+ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe) {
+    GGML_ASSERT(n_draft >= 1 && n_draft <= LLAMA_MTP_FUSED_MAX);
+    GGML_ASSERT(n_draft == n_tokens);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(
+        ctx0, model.max_nodes(n_tokens) * (n_draft + 2), false);
+
+    const int64_t n_embd_head = hparams.n_embd_head_v(0);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(0));
+
+    const int il_mtp = hparams.n_layer - 1;
+    const auto & mtp_layer = model.layers[il_mtp];
+
+    // Initial hidden state input (h_pre_norm from verify, 1 row).
+    // Filled by prepare_mtp_graph_inputs from lctx.draft_input_hidden_state.
+    ggml_tensor * inp_states = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, 1);
+    ggml_set_name(inp_states, "inp_mtp_states");
+    ggml_set_input(inp_states);
+    lctx.inp_mtp_states = inp_states;
+
+    // Token tensor sized for the batch (n_tokens = n_draft). Step 0
+    // reads index 0 (seed_token); steps k>0 use argmax_{k-1} in-graph.
+    lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    cb(lctx.inp_tokens, "inp_tokens", -1);
+    ggml_set_input(lctx.inp_tokens);
+
+    // Position tensor: n_tokens elements [pos_base, pos_base+n_draft-1].
+    lctx.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    cb(lctx.inp_pos, "inp_pos", -1);
+    ggml_set_input(lctx.inp_pos);
+
+    // KQ_mask: (n_kv, n_tokens). Each column k = step k's mask. Per-step
+    // visibility filled by llama_set_inputs in the standard way based on
+    // batch positions vs kv_self positions; the chain causality is
+    // enforced naturally because each step writes its KV before the next
+    // step's attention reads it.
+    lctx.inp_KQ_mask = ggml_new_tensor_2d(
+        ctx0, flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
+        n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+    cb(lctx.inp_KQ_mask, "KQ_mask", -1);
+    ggml_set_input(lctx.inp_KQ_mask);
+
+    ggml_tensor * prev_residual = inp_states;
+    ggml_tensor * argmaxes[LLAMA_MTP_FUSED_MAX] = {};
+    ggml_tensor * probs[LLAMA_MTP_FUSED_MAX] = {};
+
+    for (int k = 0; k < n_draft; ++k) {
+        // Token id for this step (single-element I32 tensor).
+        ggml_tensor * tok_id_k;
+        if (k == 0) {
+            tok_id_k = lctx.inp_tokens;
+        } else {
+            // argmax_{k-1} is the previous step's argmax (shape [1] I32).
+            tok_id_k = argmaxes[k-1];
+        }
+
+        // Per-step inp_pos view (1 element at offset k).
+        ggml_tensor * pos_k = ggml_view_1d(ctx0, lctx.inp_pos, 1, k * lctx.inp_pos->nb[0]);
+
+        // Per-step KQ_mask view: column k of the (n_kv, n_draft) mask.
+        // Shape (n_kv, 1).
+        ggml_tensor * mask_k = ggml_view_2d(ctx0, lctx.inp_KQ_mask,
+            lctx.inp_KQ_mask->ne[0], 1,
+            lctx.inp_KQ_mask->nb[1],
+            k * lctx.inp_KQ_mask->nb[1]);
+
+        ggml_tensor * cur = build_qwen35_mtp_kv_only(
+            mtp_layer, prev_residual, tok_id_k,
+            n_embd_head, gf, pos_k, mask_k);
+
+        // Optional FFN
+        if (is_moe) {
+            cur = llm_build_std_moe_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
+                    mtp_layer.ffn_gate_inp, nullptr,
+                    mtp_layer.ffn_up_exps, nullptr,
+                    mtp_layer.ffn_gate_exps, nullptr,
+                    mtp_layer.ffn_down_exps, nullptr,
+                    nullptr,
+                    mtp_layer.ffn_up_shexp, nullptr,
+                    mtp_layer.ffn_gate_shexp, nullptr,
+                    mtp_layer.ffn_down_shexp, nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, true, false, 0.0f,
+                    LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                    LLM_FFN_SILU, cb, il_mtp, gf, true,
+                    mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
+        } else if (mtp_layer.ffn_gate != nullptr) {
+            cur = llm_build_ffn(ctx0, lctx, mtp_layer.ffn_norm, cur,
+                    mtp_layer.ffn_up,   NULL, NULL,
+                    mtp_layer.ffn_gate, NULL, NULL,
+                    mtp_layer.ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il_mtp, gf, true, false);
+        }
+
+        cur = lctx.cvec.apply_to(ctx0, cur, il_mtp);
+        cb(cur, "ffn_out", il_mtp);
+
+        prev_residual = cur;
+
+        // Head: norm + lm_head + argmax + softmax → prob
+        ggml_tensor * normed = llm_build_norm(ctx0, cur, hparams,
+            mtp_layer.nextn.shared_head_norm, NULL, LLM_NORM_RMS, cb, il_mtp);
+        cb(normed, "result_norm", -1);
+
+        ggml_tensor * logits = build_output(lctx, ctx0, normed, model.output, nullptr, cb);
+        cb(logits, "result_output", -1);
+
+        // argmax over vocab axis → I32 [1]
+        ggml_tensor * argmax = ggml_argmax(ctx0, logits);
+        char nm[32]; snprintf(nm, sizeof(nm), "mtp_argmax_%d", k);
+        ggml_set_name(argmax, nm);
+        ggml_set_output(argmax);
+        argmaxes[k] = argmax;
+
+        // softmax → prob[argmax]. logits is (n_vocab, 1); transpose to
+        // (1, n_vocab) so get_rows can index dim 1 with the argmax token
+        // id, returning (1, 1) = scalar. ggml_transpose is a view, no
+        // compute. The prob value is populated for the test contract;
+        // fused mode does NOT use prob for early-exit (graph is static)
+        // so the value is informational only.
+        ggml_tensor * sm = ggml_soft_max(ctx0, logits);
+        ggml_tensor * sm_t = ggml_transpose(ctx0, sm);
+        ggml_tensor * prob = ggml_get_rows(ctx0, sm_t, argmax);
+        snprintf(nm, sizeof(nm), "mtp_prob_%d", k);
+        ggml_set_name(prob, nm);
+        ggml_set_output(prob);
+        probs[k] = prob;
+    }
+
+    for (int k = 0; k < n_draft; ++k) {
+        ggml_build_forward_expand(gf, argmaxes[k]);
+        ggml_build_forward_expand(gf, probs[k]);
+    }
+
+    return gf;
 }

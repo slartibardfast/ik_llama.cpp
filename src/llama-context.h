@@ -343,6 +343,27 @@ struct llama_context {
     // llama_main_graph_h_pre_norm() (Phase 36 Step 3 hook plumbing).
     struct ggml_tensor * t_h_pre_norm = nullptr;
 
+    // Phase 36 Step 1 (fused multi-draft cgraph): graph_compute call
+    // count from the most recent llama_mtp_fused_draft_invoke. The
+    // fused path expects this to be 1; per-step fallback expects
+    // n_steps. Read via llama_mtp_fused_last_compute_count().
+    int32_t mtp_fused_last_compute_count = 0;
+
+    // Phase 36 Step 1: per-step results extracted from the fused graph
+    // by llama_decode_internal post-compute. Read by
+    // llama_mtp_fused_draft_invoke into the user's result struct.
+    int32_t mtp_fused_results_n = 0;
+    llama_token mtp_fused_results_tokens[8] = {};
+    float       mtp_fused_results_probs[8]  = {};
+
+    // Phase 36 Step 3 (per-ubatch MTP KV hook): observability counters
+    // for tests/mtp-ubatch-hook/. mtp_hook_fire_count = number of verify
+    // ubatches that ran the kv-only hook; mtp_inline_decode_count =
+    // number of MTP-block decodes triggered by the hook (today equals
+    // hook fire count since each fire is one inline kv compute).
+    uint64_t mtp_hook_fire_count = 0;
+    uint64_t mtp_inline_decode_count = 0;
+
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;

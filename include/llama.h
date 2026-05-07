@@ -288,6 +288,28 @@ extern "C" {
         MTP_OP_WARMUP           = 1,
         MTP_OP_UPDATE_ACCEPTED  = 2,
         MTP_OP_DRAFT_GEN        = 3,
+        MTP_OP_DRAFT_GEN_FUSED  = 4,
+
+        // Aliases with the LLAMA_-prefixed naming used by Phase 36
+        // public API tests (tests/mtp-fused/*). Same numeric values,
+        // both names compile.
+        LLAMA_MTP_OP_NONE             = MTP_OP_NONE,
+        LLAMA_MTP_OP_WARMUP           = MTP_OP_WARMUP,
+        LLAMA_MTP_OP_UPDATE_ACCEPTED  = MTP_OP_UPDATE_ACCEPTED,
+        LLAMA_MTP_OP_DRAFT_GEN        = MTP_OP_DRAFT_GEN,
+        LLAMA_MTP_OP_DRAFT_GEN_FUSED  = MTP_OP_DRAFT_GEN_FUSED,
+    };
+
+    // Phase 36 Step 1: fused multi-draft cgraph result. n_steps is the
+    // number of populated entries in tokens/probs (≤ LLAMA_MTP_FUSED_MAX
+    // and ≤ the n_steps argument passed to llama_mtp_fused_draft_invoke).
+    // The fused path may return a smaller n_steps than requested if a
+    // step-level early-exit fires (e.g., probability below threshold).
+    enum { LLAMA_MTP_FUSED_MAX = 8 };
+    struct llama_mtp_fused_result {
+        int32_t      n_steps;
+        llama_token  tokens[LLAMA_MTP_FUSED_MAX];
+        float        probs[LLAMA_MTP_FUSED_MAX];
     };
 
     typedef struct llama_token_data {
@@ -1592,6 +1614,29 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // (n_embd, n_tokens) of type GGML_TYPE_F32. Backed by the cgraph;
     // the pointer is invalidated by the next sched_reset / build.
     LLAMA_API struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx);
+
+    // Phase 36 Step 1: fused multi-draft cgraph entry point. Builds and
+    // computes a single ggml_cgraph that chains n_steps MTP draft steps,
+    // seeded by `seed_token` (the last verify-accepted token) and
+    // `seed_hidden` (the hidden state from verify, n_embd floats).
+    // Result is filled in *out: n_steps populated entries, each with
+    // an argmax-selected draft token id and its softmax probability.
+    // Returns 0 on success, negative on failure. Implementation only
+    // applies to greedy (trivial) sampling; non-trivial samplers must
+    // use the per-step path in mtp_speculative_gen_draft.
+    LLAMA_API int32_t llama_mtp_fused_draft_invoke(
+            struct llama_context *           ctx,
+            llama_token                      seed_token,
+            const float *                    seed_hidden,
+            int32_t                          n_steps,
+            struct llama_mtp_fused_result *  out);
+
+    // Returns the number of ggml_backend_sched_graph_compute calls made
+    // during the most recent llama_mtp_fused_draft_invoke. The fused
+    // path expects this to be 1; per-step fallback returns n_steps.
+    // Used by tests/mtp-fused/test-mtp-fused-single-compute.cpp to
+    // assert SingleGraphCompute.
+    LLAMA_API int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

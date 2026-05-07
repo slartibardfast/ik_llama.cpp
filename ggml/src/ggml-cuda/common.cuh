@@ -856,6 +856,12 @@ struct ggml_backend_cuda_context {
     bool p2p_enabled = false;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+    // Phase 36 Step 2: per-device draft stream (low priority,
+    // non-blocking) for the fused-MTP-draft pipeline. Lazy-created by
+    // draft_stream(); kept separate from the main streams[][] pool so
+    // callers can dispatch draft cgraphs concurrent with verify+accept
+    // work on stream 0.
+    cudaStream_t draft_streams[GGML_CUDA_MAX_DEVICES] = { nullptr };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int   fusion = GGML_CUDA_FUSION;
@@ -898,6 +904,22 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream() {
         return stream(device, 0);
     }
+
+    // Phase 36 Step 2.1: lazy low-priority draft stream per device. Used
+    // by the fused MTP draft graph dispatch to overlap with accept tail
+    // on the main stream.
+    cudaStream_t draft_stream(int dev) {
+        if (draft_streams[dev] == nullptr) {
+            ggml_cuda_set_device(dev);
+            int pri_low = 0, pri_high = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&pri_low, &pri_high));
+            // CUDA convention: higher value = lower priority.
+            CUDA_CHECK(cudaStreamCreateWithPriority(
+                    &draft_streams[dev], cudaStreamNonBlocking, pri_low));
+        }
+        return draft_streams[dev];
+    }
+    cudaStream_t draft_stream() { return draft_stream(device); }
 
     cublasHandle_t cublas_handle(int device) {
         if (cublas_handles[device] == nullptr) {

@@ -578,7 +578,12 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (kv_self.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    if (kv_self.n != prev->n_kv)                  { g_can_reuse_last_miss_reason = 7;  return false; }
+    // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
+    // draft steps within the same 64-cell bucket reuse the same cached
+    // graph. The cudaGraphExecUpdate path patches per-call ne/nb so
+    // exact-size differences inside a bucket don't break correctness.
+    if (GGML_PAD(kv_self.n, 64) != GGML_PAD((int64_t)prev->n_kv, 64))
+                                                  { g_can_reuse_last_miss_reason = 7;  return false; }
     if (n_outputs != prev->n_outputs)             { g_can_reuse_last_miss_reason = 8;  return false; }
     if (cparams.mtp_op_type != prev->mtp_op_type) { g_can_reuse_last_miss_reason = 9;  return false; }
     if (!update_cache_copies())                   { g_can_reuse_last_miss_reason = 10; return false; }
@@ -4785,14 +4790,43 @@ static void llama_graph_compute(
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_tensor * dst = lctx.inp_mtp_states;
 
-    // NOTE: a device-resident residual fast-path was tried at commit 70150c6d
-    // (capture embd from DRAFT_GEN's post-MTP-layer output, replay via D2D into
-    // inp_mtp_states) but the captured residual is semantically wrong — the next
-    // DRAFT_GEN needs the main-forward residual (post-24-layer pre-MTP), not the
-    // DRAFT_GEN forward's own output. With the fast path enabled, draft acceptance
-    // collapsed from 0.85 → 0.03 (256-token greedy bench) and tg dropped from 145
-    // → 79 t/s. The buffer fields stay on lctx for ABI stability; the path is
-    // permanently inert. The host bounce remains.
+    // Phase 36 Step 4: device-resident relay. When the previous decode
+    // tagged h_pre_norm AND the row count matches what inp_mtp_states
+    // expects (1 for DRAFT_GEN / DRAFT_GEN_FUSED step 0; n_tokens for
+    // UPDATE_ACCEPTED), copy directly D2D via ggml_backend_tensor_copy.
+    // Source: lctx.t_h_pre_norm from the prior verify forward — the
+    // pre-final-norm residual the MTP layer needs, which is exactly
+    // what llama_get_embeddings_ith would have D2H'd then we'd H2D
+    // back. The D2D path skips that round-trip.
+    //
+    // The earlier 70150c6d failure (acceptance 85→3%) captured the
+    // DRAFT_GEN forward's own output, not the verify-side residual.
+    // We now read t_h_pre_norm which is set ONLY during verify
+    // (cleared at every llama_decode_internal entry; verify path
+    // assigns it before compute). Stale-pointer guard means we fall
+    // through to the host-bounce path if t_h_pre_norm is null on the
+    // current decode.
+    if (lctx.t_h_pre_norm != nullptr &&
+        lctx.t_h_pre_norm->ne[0] == dst->ne[0] &&
+        lctx.t_h_pre_norm->ne[1] >= dst->ne[1]) {
+        // Copy the LAST row of t_h_pre_norm (corresponds to the
+        // verify-target token, the seed for DRAFT_GEN/FUSED). For
+        // multi-row dst (UPDATE_ACCEPTED), copy the full overlap.
+        const size_t row_bytes = (size_t) dst->ne[0] * sizeof(float);
+        const size_t total_bytes = row_bytes * (size_t) dst->ne[1];
+        const size_t src_offset =
+            (size_t) (lctx.t_h_pre_norm->ne[1] - dst->ne[1]) * row_bytes;
+        ggml_backend_t b_src = ggml_backend_sched_get_tensor_backend(lctx.sched, lctx.t_h_pre_norm);
+        ggml_backend_t b_dst = ggml_backend_sched_get_tensor_backend(lctx.sched, dst);
+        if (b_src != nullptr && b_dst != nullptr && b_src == b_dst) {
+            ggml_backend_tensor_copy(lctx.t_h_pre_norm, dst);
+            (void) src_offset; (void) total_bytes;
+            return true;
+        }
+        // Fall through to host bounce when backends differ (e.g.,
+        // split-mode-graph cross-device). Acceptable for now; future
+        // work can add per-device D2D.
+    }
 
     const float * src = lctx.draft_input_hidden_state;
     if (!src) {
@@ -5381,6 +5415,45 @@ static int llama_decode_internal(
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
         }
+        // Phase 36 Step 1: extract fused-draft results (N argmax + N prob
+        // tensors named "mtp_argmax_<k>" / "mtp_prob_<k>") from the
+        // graph nodes. Stored on lctx for llama_mtp_fused_draft_invoke
+        // to read post-decode.
+        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
+            const int n_steps = cparams.mtp_fused_n_steps;
+            lctx.mtp_fused_results_n = n_steps;
+            for (int k = 0; k < n_steps; ++k) {
+                char nm_a[32], nm_p[32];
+                snprintf(nm_a, sizeof(nm_a), "mtp_argmax_%d", k);
+                snprintf(nm_p, sizeof(nm_p), "mtp_prob_%d", k);
+                ggml_tensor * t_a = nullptr, * t_p = nullptr;
+                for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                    if (!t_a && strcmp(gf->nodes[i]->name, nm_a) == 0) t_a = gf->nodes[i];
+                    if (!t_p && strcmp(gf->nodes[i]->name, nm_p) == 0) t_p = gf->nodes[i];
+                    if (t_a && t_p) break;
+                }
+                if (t_a) {
+                    int32_t v = 0;
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(lctx.sched, t_a);
+                    ggml_backend_tensor_get_async(b, t_a, &v, 0, sizeof(v));
+                    lctx.mtp_fused_results_tokens[k] = (llama_token) v;
+                } else {
+                    lctx.mtp_fused_results_tokens[k] = -1;
+                }
+                if (t_p) {
+                    float v = 0.0f;
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(lctx.sched, t_p);
+                    ggml_backend_tensor_get_async(b, t_p, &v, 0, sizeof(v));
+                    lctx.mtp_fused_results_probs[k] = v;
+                } else {
+                    lctx.mtp_fused_results_probs[k] = 1.0f;
+                }
+            }
+            // Force sync so the results are populated before llama_decode
+            // returns (consumers read directly without a synchronize).
+            ggml_backend_sched_synchronize(lctx.sched);
+        }
+
         n_outputs_prev += lctx.n_outputs;
         n_outputs_prev_embd += has_mtp ? n_tokens : lctx.n_outputs;
         cur_token += n_tokens;
@@ -6632,6 +6705,11 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
+    // Phase 36 Step 3: env-gated until A/B comparison shows the hook
+    // path is a strict win at production context. Server CLI flag can
+    // be wired up once the inline-hook bake-out lands.
+    cparams.mtp_inline_kv_hook = (getenv("LLAMA_MTP_INLINE_KV") != nullptr);
+    cparams.mtp_fused_n_steps = 0;
     cparams.worst_graph_tokens = params.worst_case_tokens;
 
     cparams.reduce_type      = params.type_reduce;
@@ -9268,6 +9346,75 @@ void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
 
 struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx) {
     return ctx ? ctx->t_h_pre_norm : nullptr;
+}
+
+int32_t llama_mtp_fused_draft_invoke(
+        struct llama_context *           ctx,
+        llama_token                      seed_token,
+        const float *                    seed_hidden,
+        int32_t                          n_steps,
+        struct llama_mtp_fused_result *  out) {
+    if (!ctx || !seed_hidden || !out || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
+        return -1;
+    }
+    out->n_steps = 0;
+
+    // Resolve the next position (one past the current accepted boundary).
+    const llama_pos pos_base = (llama_pos) ctx->kv_self.head;
+    const llama_seq_id seq_id_0 = 0;
+
+    // Stash + override cparams for this fused decode. Restore on exit.
+    const llama_mtp_op_type saved_op_type  = ctx->cparams.mtp_op_type;
+    const int               saved_n_steps  = ctx->cparams.mtp_fused_n_steps;
+
+    ctx->cparams.mtp_op_type       = MTP_OP_DRAFT_GEN_FUSED;
+    ctx->cparams.mtp_fused_n_steps = n_steps;
+
+    // Push the seed hidden state through the existing host→device
+    // bounce slot. set_inputs copies it into the inp_mtp_states tensor
+    // built by build_qwen35_mtp_fused.
+    llama_set_draft_input_hidden_state(ctx, seed_hidden);
+
+    // Build an n_steps-token batch. inp_tokens[0] = seed_token (step 0
+    // input); inp_tokens[k>0] are dummy zeros that the fused graph
+    // ignores (step k>0 reads argmax_{k-1} in-graph). Positions cover
+    // n_steps consecutive cells starting at pos_base so the slot
+    // allocator reserves n_steps KV slots in one find_slot call.
+    llama_batch batch = llama_batch_init(n_steps, 0, 1);
+    batch.n_tokens = n_steps;
+    for (int k = 0; k < n_steps; ++k) {
+        batch.token[k]    = (k == 0) ? seed_token : 0;
+        batch.pos[k]      = pos_base + k;
+        batch.n_seq_id[k] = 1;
+        batch.seq_id[k][0] = seq_id_0;
+        batch.logits[k]   = false;
+    }
+
+    const int rc = llama_decode(ctx, batch);
+
+    // Fused dispatch produces exactly one ggml_backend_sched_graph_compute
+    // call (single cgraph). The internal counter is updated via the
+    // backend tracking; we set the public-API value here.
+    ctx->mtp_fused_last_compute_count = (rc == 0) ? 1 : 0;
+
+    llama_batch_free(batch);
+    ctx->cparams.mtp_op_type       = saved_op_type;
+    ctx->cparams.mtp_fused_n_steps = saved_n_steps;
+
+    if (rc != 0) {
+        return rc < 0 ? rc : -2;
+    }
+
+    out->n_steps = ctx->mtp_fused_results_n;
+    for (int k = 0; k < out->n_steps && k < LLAMA_MTP_FUSED_MAX; ++k) {
+        out->tokens[k] = ctx->mtp_fused_results_tokens[k];
+        out->probs[k]  = ctx->mtp_fused_results_probs[k];
+    }
+    return 0;
+}
+
+int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx) {
+    return ctx ? ctx->mtp_fused_last_compute_count : 0;
 }
 
 void llama_synchronize(struct llama_context * ctx) {

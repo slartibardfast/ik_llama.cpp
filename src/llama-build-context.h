@@ -470,4 +470,24 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_cgraph * gf,
         struct ggml_tensor * inp_pos
     );
+
+    // Phase 36 Step 3: kv-only MTP layer for verify-time hook. Same as
+    // build_qwen35_mtp through the attention output (which writes KV);
+    // skips FFN, final norm, and lm_head. Returns the post-attention
+    // residual purely so the caller can ggml_build_forward_expand it.
+    struct ggml_tensor * build_qwen35_mtp_kv_only(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_tensor * tokens_input,
+        int64_t n_embd_head,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * KQ_mask
+    );
+
+    // Phase 36 Step 1: fused multi-draft cgraph (n_draft chained MTP
+    // steps in a single graph). Outputs n_draft argmax + n_draft prob
+    // tensors (each shape [1] / [1] respectively) tagged
+    // mtp_argmax_<k> / mtp_prob_<k>.
+    struct ggml_cgraph * build_qwen35_mtp_fused(int n_draft, bool is_moe);
 };

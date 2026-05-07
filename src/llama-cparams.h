@@ -47,6 +47,16 @@ struct llama_cparams {
     int  min_experts;
     float thresh_experts;
     bool mtp;
+    // Phase 36 Step 3 (per-ubatch MTP KV hook): when true, the qwen35
+    // verify graph appends a kv-only MTP layer compute that writes MTP
+    // KV entries for ALL batch positions in one shot. Speculative.cpp
+    // skips the separate MTP_OP_UPDATE_ACCEPTED dispatch and uses
+    // llama_kv_cache_seq_rm to trim rejected positions.
+    bool mtp_inline_kv_hook;
+    // Phase 36 Step 1: number of fused draft steps (0 = not fused).
+    // Set by llama_mtp_fused_draft_invoke before each fused decode;
+    // read by build_qwen35_mtp_fused / set_inputs.
+    int  mtp_fused_n_steps;
     int  worst_graph_tokens;
 
     enum ggml_type reduce_type;

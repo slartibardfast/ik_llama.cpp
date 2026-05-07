@@ -705,6 +705,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
         }
+        // Phase 36 Step 2.1: destroy lazy draft stream if one was created.
+        if (draft_streams[i] != nullptr) {
+            CUDA_CHECK(cudaStreamDestroy(draft_streams[i]));
+        }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }

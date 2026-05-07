@@ -1381,6 +1381,29 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         }
     }
 
+    // Phase 36 Step 1.4: fused path. Greedy/argmax sampler only — fused
+    // graph runs N steps unconditionally with no per-step prob<p_min
+    // exit. Env-gated by LLAMA_MTP_FUSED until full sampler-trivial
+    // detection lands in common_sampler.
+    static const bool _fused_enabled = (getenv("LLAMA_MTP_FUSED") != nullptr);
+    if (_fused_enabled && n_draft > 1 && n_draft <= LLAMA_MTP_FUSED_MAX) {
+        // Pull current hidden state for step 0 seed.
+        const float * seed_hidden = llama_get_embeddings_ith(ctx, 0);
+        if (seed_hidden) {
+            llama_mtp_fused_result fr{};
+            const int32_t rc = llama_mtp_fused_draft_invoke(
+                    ctx, id_last, seed_hidden, n_draft, &fr);
+            if (rc == 0 && fr.n_steps > 0) {
+                drafts.reserve(fr.n_steps);
+                for (int k = 0; k < fr.n_steps; ++k) {
+                    drafts.push_back(fr.tokens[k]);
+                }
+                return drafts;
+            }
+            // Fall through to per-step path on failure.
+        }
+    }
+
     llama_batch mtp_batch = llama_batch_init(1, 0, 1);
     llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
 
@@ -1523,6 +1546,21 @@ void mtp_accept_tokens(
     llama_seq_id seq_id
 ) {
     if (ids.empty()) {
+        return;
+    }
+
+    // Phase 36 Step 3.3: when the per-ubatch MTP KV hook is on, the
+    // verify forward already wrote MTP KV for all batch positions
+    // (including the ones now being accepted). The seq_rm at the
+    // server's accept tail (server-context.cpp:3968 etc.) trims
+    // rejected positions on both main + MTP layers. The separate
+    // MTP_OP_UPDATE_ACCEPTED dispatch is therefore redundant — skip it.
+    static const bool _hook_on = (getenv("LLAMA_MTP_INLINE_KV") != nullptr);
+    if (_hook_on) {
+        // Note: caller is expected to issue llama_kv_cache_seq_rm on
+        // its own (ctx, seq_id, slot.n_past, -1). We don't do it here
+        // because mtp_accept_tokens has no knowledge of which positions
+        // were rejected — only the caller does, via slot.n_past.
         return;
     }
 
