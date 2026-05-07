@@ -468,25 +468,144 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, bool is_moe
 
         prev_residual = normed;
 
-        // Head: lm_head + argmax + softmax → prob
-        ggml_tensor * logits = build_output(lctx, ctx0, normed, model.output, nullptr, cb);
-        cb(logits, "result_output", -1);
+        // Head: per-device lm_head matmul, per-device argmax + max-val,
+        // then in-graph reduction across devices to pick the global
+        // winner. This avoids the Issue F bug where ggml_argmax on the
+        // ggml_concat of split-mode lm_head outputs reads past one
+        // device's slice. Per-device argmax stays on its own device;
+        // the small (n_dev,) reduction tensors sched-route to one
+        // device for the final argmax.
+        //
+        // Single-device case (output->extra == nullptr) falls through
+        // to a one-shot lm_head + argmax — identical to the previous
+        // code path, just routed via the same helper.
+        ggml_tensor * argmax = nullptr;
+        ggml_tensor * prob   = nullptr;
+        if (model.output->extra != nullptr) {
+            // Multi-device split path: per-device argmax + reduction.
+            auto split_output = (ggml_split_tensor_t *)model.output->extra;
+            const int n_dev = split_output->n_device;
 
-        // argmax over vocab axis → I32 [1]
-        ggml_tensor * argmax = ggml_argmax(ctx0, logits);
+            std::vector<ggml_tensor *> dev_amaxes;
+            std::vector<ggml_tensor *> dev_max_vals;
+            int64_t device_offset_const[16 /*MAX_DEVICES*/] = {0};
+            int64_t cum_offset = 0;
+            for (int d = 0; d < n_dev; ++d) {
+                auto split = split_output->splits[d];
+                if (!split) continue;
+                ggml_tensor * dev_logits = llm_build_lora_mm(lctx, ctx0, split, normed); // (n_vocab/n_dev, 1)
+                cb(dev_logits, "mtp_dev_logits", il_mtp);
+
+                // Local argmax (in [0, n_vocab/n_dev)).
+                ggml_tensor * local_amax = ggml_argmax(ctx0, dev_logits);
+                cb(local_amax, "mtp_dev_argmax_local", il_mtp);
+
+                // Max value at local_amax: get_rows on contiguous
+                // transpose so dim-0 contiguity is satisfied for CUDA.
+                ggml_tensor * dev_logits_t = ggml_cont(ctx0, ggml_transpose(ctx0, dev_logits));
+                ggml_tensor * local_max_val = ggml_get_rows(ctx0, dev_logits_t, local_amax);
+                cb(local_max_val, "mtp_dev_max_val", il_mtp);
+
+                device_offset_const[d] = cum_offset;
+                cum_offset += dev_logits->ne[0];
+
+                dev_amaxes.push_back(local_amax);
+                dev_max_vals.push_back(local_max_val);
+            }
+
+            // In-graph reduction: stack max_vals (n_dev,) and argmax to
+            // pick the winning device. Stack global_amaxes (with offset
+            // pre-added in graph via ggml_add of a per-device offset
+            // input) and get_rows by winning device idx.
+            //
+            // Allocate one (n_dev,) input tensor for offsets, filled by
+            // set_inputs from device_offset_const[].
+            char nm_off[40]; snprintf(nm_off, sizeof(nm_off), "mtp_dev_offsets_%d", k);
+            ggml_tensor * offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int)dev_amaxes.size());
+            ggml_set_name(offsets, nm_off);
+            ggml_set_input(offsets);
+            // Stash the tensor pointer + values; set_inputs fills.
+            lctx.mtp_fused_offset_t[k] = offsets;
+            lctx.mtp_fused_offset_n_dev[k] = (int32_t) dev_amaxes.size();
+            for (int d = 0; d < (int)dev_amaxes.size(); ++d) {
+                lctx.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/ + d] = (int32_t) device_offset_const[d];
+            }
+
+            // Concat per-device argmaxes (each shape [1]) into shape (n_dev,).
+            ggml_tensor * stacked_amax = dev_amaxes[0];
+            for (int d = 1; d < (int)dev_amaxes.size(); ++d) {
+                stacked_amax = ggml_concat(ctx0, stacked_amax, dev_amaxes[d], 0);
+            }
+            // Add per-device offsets → global indices (n_dev,) I32.
+            ggml_tensor * global_amaxes = ggml_add(ctx0, stacked_amax, offsets);
+            cb(global_amaxes, "mtp_global_amaxes", il_mtp);
+
+            // Concat per-device max_vals (each shape [1, 1]) → (n_dev,) F32 view.
+            ggml_tensor * stacked_max_val = dev_max_vals[0];
+            for (int d = 1; d < (int)dev_max_vals.size(); ++d) {
+                stacked_max_val = ggml_concat(ctx0, stacked_max_val, dev_max_vals[d], 0);
+            }
+            // argmax over the (n_dev, 1) shape → (1) I32 = winning device idx.
+            ggml_tensor * winner_dev = ggml_argmax(ctx0, stacked_max_val);
+            cb(winner_dev, "mtp_winner_dev", il_mtp);
+
+            // get_rows(global_amaxes, winner_dev): we need dim-0
+            // contiguity for CUDA. global_amaxes is shape (n_dev,);
+            // make it (n_dev, 1) and transpose to (1, n_dev) cont, then
+            // index by winner_dev to get scalar.
+            ggml_tensor * global_amaxes_2d = ggml_reshape_2d(ctx0, global_amaxes, (int64_t)dev_amaxes.size(), 1);
+            ggml_tensor * global_amaxes_t  = ggml_cont(ctx0, ggml_transpose(ctx0, global_amaxes_2d));
+            argmax = ggml_get_rows(ctx0, global_amaxes_t, winner_dev);
+            // For prob: take the winning device's max value.
+            ggml_tensor * stacked_max_val_2d = ggml_reshape_2d(ctx0, stacked_max_val, (int64_t)dev_max_vals.size(), 1);
+            ggml_tensor * stacked_max_val_t  = ggml_cont(ctx0, ggml_transpose(ctx0, stacked_max_val_2d));
+            prob = ggml_get_rows(ctx0, stacked_max_val_t, winner_dev);
+        } else {
+            // Single-device fast path.
+            ggml_tensor * logits = llm_build_lora_mm(lctx, ctx0, model.output, normed);
+            cb(logits, "result_output", -1);
+
+            // Phase 36 Issue G fix: lm_head is (n_embd, hparams.n_vocab)
+            // where hparams.n_vocab is the matmul-aligned padded width
+            // (Qwen 3.6 27B: 248320). The real tokenizer vocab is
+            // model.vocab.n_tokens() (152064). The padded tail is junk
+            // — argmax over the full output picks fake tokens (e.g.
+            // 248045) and the server rejects with "Invalid token".
+            // Per-step works because host-side sampling reads only
+            // [0, n_vocab_real). Slice the same way for fused.
+            // Issue G note: model.vocab.n_tokens() equals
+            // hparams.n_vocab for this AutoRound GGUF (248320 both),
+            // so this slice is currently a no-op for Qwen 3.6 27B.
+            // The padded vocab range [152064, 248320) still wins
+            // argmax on some cycles (giving fused 13-18% accept vs
+            // per-step's 58%). Per-step survives because its sampler
+            // chain (top_k, top_p) filters; fused on-device argmax
+            // does not. Future fix: track the real tokenizer
+            // boundary separately or push the per-step sampler ops
+            // into the graph.
+            const int64_t n_vocab_real = (int64_t) lctx.model.vocab.n_tokens();
+            const int64_t n_vocab_pad  = logits->ne[0];
+            if (n_vocab_real > 0 && n_vocab_real < n_vocab_pad) {
+                ggml_tensor * logits_real = ggml_view_2d(
+                        ctx0, logits, n_vocab_real, logits->ne[1],
+                        logits->nb[1], 0);
+                argmax = ggml_argmax(ctx0, logits_real);
+                ggml_tensor * sm = ggml_soft_max(ctx0, logits_real);
+                ggml_tensor * sm_t = ggml_cont(ctx0, ggml_transpose(ctx0, sm));
+                prob = ggml_get_rows(ctx0, sm_t, argmax);
+            } else {
+                argmax = ggml_argmax(ctx0, logits);
+                ggml_tensor * sm = ggml_soft_max(ctx0, logits);
+                ggml_tensor * sm_t = ggml_cont(ctx0, ggml_transpose(ctx0, sm));
+                prob = ggml_get_rows(ctx0, sm_t, argmax);
+            }
+        }
+
         char nm[32]; snprintf(nm, sizeof(nm), "mtp_argmax_%d", k);
         ggml_set_name(argmax, nm);
         ggml_set_output(argmax);
         argmaxes[k] = argmax;
 
-        // softmax → prob[argmax]. ggml_transpose is a view (non-contig
-        // in dim 0), and CUDA get_rows requires src0->nb[0] ==
-        // ggml_type_size(src0->type). Materialize the transpose with
-        // ggml_cont before indexing. The prob is populated for the
-        // test contract; fused mode does not gate on prob<p_min.
-        ggml_tensor * sm = ggml_soft_max(ctx0, logits);
-        ggml_tensor * sm_t = ggml_cont(ctx0, ggml_transpose(ctx0, sm));
-        ggml_tensor * prob = ggml_get_rows(ctx0, sm_t, argmax);
         snprintf(nm, sizeof(nm), "mtp_prob_%d", k);
         ggml_set_name(prob, nm);
         ggml_set_output(prob);

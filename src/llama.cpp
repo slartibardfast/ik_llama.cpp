@@ -4185,6 +4185,17 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             auto tim2 = ggml_time_us();
             printf("set_inputs(mask:fused): %d us\n", int(tim2-tim1));
 #endif
+            // Per-step offset tensors for per-device argmax reduction.
+            // Filled from lctx.mtp_fused_offset_buf (set at graph
+            // build time per step from the split-tensor metadata).
+            for (int k = 0; k < cparams.mtp_fused_n_steps; ++k) {
+                ggml_tensor * t_off = lctx.mtp_fused_offset_t[k];
+                if (t_off == nullptr) continue;
+                const int n_dev = lctx.mtp_fused_offset_n_dev[k];
+                ggml_backend_tensor_set(t_off,
+                        &lctx.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/],
+                        0, n_dev * sizeof(int32_t));
+            }
             // Skip the rest of the KQ_mask block.
             goto kq_mask_done;
         }
@@ -4900,6 +4911,13 @@ static int llama_decode_internal(
     // memory. Clear it here so callers can detect "no fresh main graph
     // built this decode" via a null pointer.
     lctx.t_h_pre_norm = nullptr;
+    // Same stale-pointer guard for the per-step offset tensors used by
+    // the fused chain's per-device argmax + reduction. Set only when
+    // a fresh fused graph is built; cleared otherwise.
+    for (int _i = 0; _i < 8; ++_i) {
+        lctx.mtp_fused_offset_t[_i] = nullptr;
+        lctx.mtp_fused_offset_n_dev[_i] = 0;
+    }
     const uint32_t n_tokens_all = batch_all.n_tokens;
 
     if (n_tokens_all == 0) {
@@ -5501,12 +5519,6 @@ static int llama_decode_internal(
                     lctx.mtp_fused_results_probs[k] = v;
                 } else {
                     lctx.mtp_fused_results_probs[k] = 1.0f;
-                }
-                static const bool _dbg = (getenv("LLAMA_MTP_FUSED_DEBUG") != nullptr);
-                if (_dbg) {
-                    fprintf(stderr, "[mtp-fused] step=%d tok=%d prob=%.4f\n",
-                            k, (int)lctx.mtp_fused_results_tokens[k],
-                            lctx.mtp_fused_results_probs[k]);
                 }
             }
         }

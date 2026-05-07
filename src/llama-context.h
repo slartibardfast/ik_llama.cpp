@@ -356,6 +356,17 @@ struct llama_context {
     llama_token mtp_fused_results_tokens[8] = {};
     float       mtp_fused_results_probs[8]  = {};
 
+    // Phase 36 Step 1: per-device offset constants for the per-device
+    // argmax + reduction path. One i32 per step per device, filled at
+    // graph build time and copied via set_inputs into the offsets
+    // input tensor for that step.
+    int32_t mtp_fused_offset_buf[8 * 16 /*MAX_DEVICES*/] = {};
+    // Pointers to the per-step offset input tensors built by
+    // build_qwen35_mtp_fused. set_inputs fills them from
+    // mtp_fused_offset_buf. Sized [LLAMA_MTP_FUSED_MAX].
+    struct ggml_tensor * mtp_fused_offset_t[8] = {};
+    int32_t mtp_fused_offset_n_dev[8] = {};
+
     // Phase 36 Step 3 (per-ubatch MTP KV hook): observability counters
     // for tests/mtp-ubatch-hook/. mtp_hook_fire_count = number of verify
     // ubatches that ran the kv-only hook; mtp_inline_decode_count =
