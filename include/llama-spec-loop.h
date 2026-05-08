@@ -57,6 +57,29 @@ extern "C" {
 
     LLAMA_API void llama_spec_loop_free(struct llama_spec_loop * loop);
 
+    // Granular API (D8.2): mirrors server's existing draft + accept flow.
+    // The caller drives the verify decode + accept-prefix computation
+    // between these two calls.
+    //
+    // Generate up to `n_draft_max` MTP tokens off the loop's draft
+    // decoder. Caller is responsible for the verify forward and the
+    // accept-prefix logic that follows. Returns drafts in `drafts_out`.
+    // Returns count, or negative on setup error.
+    LLAMA_API int32_t llama_spec_loop_gen_drafts(
+            struct llama_spec_loop * loop,
+            llama_token              id_last,
+            float                    p_min,
+            int32_t                  n_draft_max,
+            llama_seq_id             seq_id,
+            llama_pos                n_past,
+            llama_token            * drafts_out);
+
+    // Inform the loop that `n_accepted` of the last drafted tokens were
+    // accepted by the verifier. Updates internal stats.
+    LLAMA_API void llama_spec_loop_accept_n(
+            struct llama_spec_loop * loop,
+            int32_t                  n_accepted);
+
     // Step the loop with a prompt batch (for first call) or an empty
     // batch (subsequent calls). Returns number of accepted tokens, or
     // negative on error.

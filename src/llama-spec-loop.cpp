@@ -9,6 +9,7 @@
 
 #include "llama-spec-loop.h"
 #include "llama-decoder.h"
+#include "llama-spec.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -57,6 +58,46 @@ struct llama_spec_loop * llama_spec_loop_create(
 
 void llama_spec_loop_free(struct llama_spec_loop * loop) {
     delete loop;
+}
+
+int32_t llama_spec_loop_gen_drafts(
+        struct llama_spec_loop * loop,
+        llama_token              id_last,
+        float                    p_min,
+        int32_t                  n_draft_max,
+        llama_seq_id             seq_id,
+        llama_pos                n_past,
+        llama_token            * drafts_out) {
+    if (loop == nullptr || loop->verify == nullptr) return -1;
+    if (loop->drafts.empty())                       return -1;
+    if (drafts_out == nullptr || n_draft_max <= 0)  return -1;
+
+    const int32_t n = llama_spec_mtp_draft(
+            loop->verify,
+            loop->drafts[0],
+            id_last,
+            p_min,
+            n_draft_max,
+            seq_id,
+            n_past,
+            drafts_out);
+
+    if (n > 0) {
+        loop->n_drafted += n;
+        loop->last_accepted.assign(drafts_out, drafts_out + n);
+    } else {
+        loop->last_accepted.clear();
+    }
+    return n;
+}
+
+void llama_spec_loop_accept_n(struct llama_spec_loop * loop, int32_t n_accepted) {
+    if (loop == nullptr || n_accepted <= 0) return;
+    loop->n_accepted     += n_accepted;
+    loop->n_verify_steps += 1;
+    if ((size_t) n_accepted < loop->last_accepted.size()) {
+        loop->last_accepted.resize(n_accepted);
+    }
 }
 
 int32_t llama_spec_loop_step(struct llama_spec_loop * /*loop*/, struct llama_batch /*batch*/) {
