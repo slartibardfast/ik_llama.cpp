@@ -1,45 +1,161 @@
 //
 // PHASE 45 D8 extraction: libllama-level MTP draft primitive.
 //
-// D8.1a: signature + landing-zone stub. Aborts loudly if called so the
-// extraction's downstream consumer (spec_loop_step at D8.2) fails fast
-// rather than silently producing empty drafts. Body lands at D8.1b
-// (port of `mtp_speculative_gen_draft`'s core path with sampler
-// interaction adapted from `common_sampler` → `llama_sampler`).
+// D8.1b: per-step body extracted from common/speculative.cpp's
+// `mtp_speculative_gen_draft`. Draft sampling is greedy (argmax) — that's
+// the only mode `mtp_speculative_gen_draft` actually uses through
+// `common_sampler_sample_speculative`, which short-circuits the
+// caller's sampler chain in favor of device-side argmax + host-fallback
+// argmax. The "sampler" passed at the libcommon layer is irrelevant
+// to the draft path; it matters only on the verify side.
 //
-// Out-of-scope for D8.1b (deferred to D8.1c+):
-//   - Async fused dispatch (LLAMA_MTP_FULL_2 path)
-//   - Autotune feedback (lives in libcommon)
-//   - Top-2 probe instrumentation (LLAMA_PROBE_TOP2)
-//
-// In-scope for D8.1b:
+// Out-of-scope (D8.1c+):
 //   - Sync fused dispatch via `llama_mtp_fused_draft_invoke`
-//   - Per-step argmax sampling via `llama_sampler_sample`
-//   - p_min truncation
-//   - Hidden-state seeding via `llama_set_draft_input_hidden_state`
+//   - Async fused dispatch (LLAMA_MTP_FULL_2 path)
+//   - Top-2 probe instrumentation (LLAMA_PROBE_TOP2)
+//   - Per-step decode profiling (LLAMA_PROFILE_DECODE)
+//   - Autotune (lives in libcommon — application policy)
 //
 
 #include "llama-spec.h"
+#include "llama-session.h"
+#include "llama-decoder.h"
 
-#include <cstdio>
-#include <cstdlib>
+#include <cmath>
+
+extern "C" {
+// Internal accessor exposed by llama-session.cpp; not in public header.
+struct llama_context * llama_session_internal_context(struct llama_session * session);
+}
+
+// Argmax + softmax-prob over the last logits row. Matches
+// `common_sampler_sample_speculative` semantics: argmax token id and
+// the softmax probability of that token. Used when the device-side
+// argmax fast path is unavailable.
+static llama_token spec_argmax_with_prob(const float * logits, int n_vocab, float * out_prob) {
+    if (logits == nullptr || n_vocab <= 0) {
+        if (out_prob) *out_prob = 0.0f;
+        return -1;
+    }
+    int   best_id = 0;
+    float max_l   = logits[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_l) { max_l = logits[i]; best_id = i; }
+    }
+    if (out_prob) {
+        double sum = 0.0;
+        for (int i = 0; i < n_vocab; ++i) {
+            sum += std::exp((double) (logits[i] - max_l));
+        }
+        *out_prob = (sum > 0.0) ? (float) (1.0 / sum) : 0.0f;
+    }
+    return (llama_token) best_id;
+}
 
 extern "C" {
 
 int32_t llama_spec_mtp_draft(
-        struct llama_decoder * /*verify_decoder*/,
-        struct llama_decoder * /*draft_decoder*/,
-        struct llama_sampler * /*sampler*/,
-        llama_token            /*id_last*/,
-        float                  /*p_min*/,
-        int32_t                /*n_draft_max*/,
-        llama_seq_id           /*seq_id*/,
-        llama_pos              /*n_past*/,
-        llama_token          * /*drafts_out*/) {
-    std::fprintf(stderr,
-        "PHASE 45 D8.1a: llama_spec_mtp_draft is the extraction landing zone. "
-        "Body fill is D8.1b work. Aborting to surface unintended use.\n");
-    std::abort();
+        struct llama_decoder * verify_decoder,
+        struct llama_decoder * draft_decoder,
+        llama_token            id_last,
+        float                  p_min,
+        int32_t                n_draft_max,
+        llama_seq_id           seq_id,
+        llama_pos              n_past,
+        llama_token          * drafts_out) {
+
+    if (verify_decoder == nullptr || draft_decoder == nullptr || drafts_out == nullptr) return -1;
+    if (n_draft_max <= 0) return 0;
+
+    // PHASE45 invariant: VERIFY and DRAFT decoders share the same session.
+    // Both write to the same transformer K/V; the draft writes layer N-1
+    // exclusively (see PHASE45_PHASE39_INTEGRATION.md §4).
+    struct llama_session * session = llama_decoder_session(draft_decoder);
+    if (session == nullptr || session != llama_decoder_session(verify_decoder)) return -1;
+
+    struct llama_context * ctx = llama_session_internal_context(session);
+    if (ctx == nullptr) return -1;
+
+    const struct llama_model * model = llama_decoder_model(draft_decoder);
+    if (model == nullptr) return -1;
+    const int n_vocab = llama_n_vocab(model);
+    if (n_vocab <= 0) return -1;
+
+    // Single-token batch reused across the chain.
+    llama_batch batch = llama_batch_init(/*n_tokens=*/1, /*embd=*/0, /*n_seq_max=*/1);
+
+    // Flip op_type to DRAFT_GEN. Restored to NONE on exit. PHASE45.md
+    // will eventually map this off decoder.role rather than via this
+    // side channel.
+    llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
+
+    llama_token current_id  = id_last;
+    llama_pos   current_pos = n_past;
+    int32_t     n_drafts    = 0;
+
+    for (int32_t i = 0; i < n_draft_max; ++i) {
+        // Build single-token batch: token, pos, seq_id, logits=true.
+        batch.n_tokens         = 1;
+        batch.token   [0]      = current_id;
+        batch.pos     [0]      = current_pos;
+        batch.n_seq_id[0]      = 1;
+        batch.seq_id  [0][0]   = seq_id;
+        batch.logits  [0]      = 1;
+
+        // Forward through the draft decoder. The decoder API enforces
+        // its own params (n_threads, causal_attn, embeddings) before
+        // forwarding to llama_decode.
+        if (llama_decoder_decode(draft_decoder, batch) != 0) break;
+
+        // Greedy: try the device-cached argmax first (populated during
+        // the DRAFT_GEN forward, avoids the per-draft ~2 MB logits
+        // D2H), fall back to host-side argmax when the cache is cold.
+        llama_token id_next = -1;
+        float       prob    = 0.0f;
+        {
+            int32_t cached_id  = -1;
+            float   cached_prob = 0.0f;
+            if (llama_get_draft_argmax(ctx, /*i=*/0, &cached_id, &cached_prob)) {
+                id_next = (llama_token) cached_id;
+                prob    = cached_prob;
+            } else {
+                const float * logits = llama_get_logits_ith(ctx, /*i=*/0);
+                id_next = spec_argmax_with_prob(logits, n_vocab, &prob);
+            }
+        }
+        if (id_next < 0 || id_next >= n_vocab) break;
+
+        drafts_out[n_drafts++] = id_next;
+
+        // Pull the hidden state and feed it back as next step's input —
+        // this is the MTP head's recurrent seed for chain step i+1.
+        const float * emb = llama_get_embeddings_ith(ctx, /*i=*/0);
+        if (emb != nullptr) {
+            llama_set_draft_input_hidden_state(ctx, emb);
+        }
+
+        current_id   = id_next;
+        current_pos += 1;
+
+        // p_min truncation: stop when the model's argmax probability
+        // falls below the threshold. Each truncation saves one
+        // verify-side forward at the cost of one fewer drafted token.
+        // p_min == 0 disables truncation.
+        if (p_min > 0.0f && prob < p_min) break;
+    }
+
+    llama_batch_free(batch);
+    llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+
+    // Purge KV-cell metadata for the drafted positions. The verify
+    // decoder's forward will re-populate these positions for the
+    // accepted prefix; without the purge, we'd hold two cells
+    // mapping to the same logical position.
+    if (n_drafts > 0) {
+        llama_kv_cache_seq_rm(ctx, seq_id, n_past, current_pos);
+    }
+
+    return n_drafts;
 }
 
 } // extern "C"

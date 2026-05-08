@@ -29,7 +29,11 @@ extern "C" {
     struct llama_decoder;
 
     // Generate up to n_draft_max speculative tokens from the MTP head
-    // attached to the draft decoder, using the given sampler chain.
+    // attached to the draft decoder. Draft sampling is greedy (argmax)
+    // with the device-side argmax fast path used when available — this
+    // matches the semantics of `common_sampler_sample_speculative` and
+    // is the only mode `mtp_speculative_gen_draft` exercises in
+    // production (PHASE36/37/38).
     //
     // Inputs:
     //   verify_decoder  — VERIFY-role decoder; its session is also where
@@ -37,12 +41,11 @@ extern "C" {
     //                     Hidden state for the MTP seed comes from the
     //                     verify decoder's last forward.
     //   draft_decoder   — DRAFT_MTP-role decoder.
-    //   sampler         — llama_sampler chain to apply at each draft step
-    //                     (typically a greedy/argmax chain for MTP).
     //   id_last         — last token from the verify path (the seed token
     //                     for the MTP head's first step).
     //   p_min           — minimum chain probability; truncate the draft
     //                     when the per-step argmax probability drops below.
+    //                     Use 0.0 to disable truncation (full chain).
     //   n_draft_max     — maximum number of draft tokens to emit.
     //   seq_id          — sequence id (slot) the draft is for.
     //   n_past          — current position before the draft starts.
@@ -54,7 +57,6 @@ extern "C" {
     LLAMA_API int32_t llama_spec_mtp_draft(
             struct llama_decoder * verify_decoder,
             struct llama_decoder * draft_decoder,
-            struct llama_sampler * sampler,
             llama_token            id_last,
             float                  p_min,
             int32_t                n_draft_max,
