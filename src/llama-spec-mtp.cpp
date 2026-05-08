@@ -1,20 +1,31 @@
 //
 // PHASE 45 D8 extraction: libllama-level MTP draft primitive.
 //
-// D8.1b: per-step body extracted from common/speculative.cpp's
-// `mtp_speculative_gen_draft`. Draft sampling is greedy (argmax) — that's
-// the only mode `mtp_speculative_gen_draft` actually uses through
-// `common_sampler_sample_speculative`, which short-circuits the
-// caller's sampler chain in favor of device-side argmax + host-fallback
-// argmax. The "sampler" passed at the libcommon layer is irrelevant
-// to the draft path; it matters only on the verify side.
+// D8.1b/c: sync fused fast path + per-step fallback, both extracted from
+// common/speculative.cpp's `mtp_speculative_gen_draft`. Draft sampling
+// is greedy (argmax) — `common_sampler_sample_speculative` short-circuits
+// the caller's sampler chain in favor of device-side argmax (fused
+// path) or host-fallback argmax (per-step path). The "sampler" passed
+// at the libcommon layer is irrelevant to draft selection; it matters
+// only on the verify side.
 //
-// Out-of-scope (D8.1c+):
-//   - Sync fused dispatch via `llama_mtp_fused_draft_invoke`
-//   - Async fused dispatch (LLAMA_MTP_FULL_2 path)
-//   - Top-2 probe instrumentation (LLAMA_PROBE_TOP2)
-//   - Per-step decode profiling (LLAMA_PROFILE_DECODE)
-//   - Autotune (lives in libcommon — application policy)
+// Decision: env-gate `LLAMA_MTP_FUSED` matches today's runtime knob —
+// changing it would silently affect production behaviour. The bench
+// configs in `scripts/bench-multiturn-pre-port.sh` (e.g.,
+// "D_mtp_d3_ikv_fused_minprob") set this var; the +19% target the D8.4
+// gate enforces depends on the fused path.
+//
+// Genuinely out of libllama scope:
+//   - Async fused dispatch (LLAMA_MTP_FULL_2) — PHASE38 E was abandoned,
+//     PHASE45 supersedes.
+//   - Top-2 probe (LLAMA_PROBE_TOP2) — calls libcommon's
+//     `probe_top2_push`; cannot live in libllama without breaking the
+//     dependency direction. Re-add at the D8.3 libcommon shim layer.
+//   - Autotune (spec-tuner) — application policy, libcommon home.
+//
+// Deferred but in libllama scope:
+//   - Per-step decode profiling (LLAMA_PROFILE_DECODE) — diagnostic;
+//     no architectural blocker. Add later if profiling tooling needs it.
 //
 
 #include "llama-spec.h"
@@ -22,6 +33,7 @@
 #include "llama-decoder.h"
 
 #include <cmath>
+#include <cstdlib>
 
 extern "C" {
 // Internal accessor exposed by llama-session.cpp; not in public header.
@@ -81,7 +93,45 @@ int32_t llama_spec_mtp_draft(
     const int n_vocab = llama_n_vocab(model);
     if (n_vocab <= 0) return -1;
 
-    // Single-token batch reused across the chain.
+    // ---- Fast path: sync fused chain --------------------------------------
+    //
+    // PHASE36 Step 1.4: when the chain is greedy + within LLAMA_MTP_FUSED_MAX,
+    // a single fused cgraph emits all draft tokens at once instead of N
+    // sequential per-step decodes. Env-gated so behaviour matches today's
+    // production server. On any failure (env not set, n outside fused range,
+    // dispatch rc != 0, n_steps == 0), fall through to per-step.
+    {
+        static const bool fused_enabled = (std::getenv("LLAMA_MTP_FUSED") != nullptr);
+        if (fused_enabled && n_draft_max > 1 && n_draft_max <= LLAMA_MTP_FUSED_MAX) {
+            llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN_FUSED);
+            llama_mtp_fused_result fr{};
+            const int32_t rc = llama_mtp_fused_draft_invoke(
+                    ctx, id_last, /*seed_hidden=*/nullptr, n_draft_max, &fr);
+            llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+
+            if (rc == 0 && fr.n_steps > 0) {
+                // p_min truncation on the per-step argmax probabilities
+                // (host-side from ggml_backend_cuda_mtp_argmax_with_prob_to_host).
+                int32_t n_use = fr.n_steps;
+                if (p_min > 0.0f) {
+                    for (int k = 0; k < fr.n_steps; ++k) {
+                        if (fr.probs[k] < p_min) { n_use = k; break; }
+                    }
+                }
+                for (int32_t k = 0; k < n_use; ++k) {
+                    drafts_out[k] = fr.tokens[k];
+                }
+                // Fused path does not pollute KV-cell metadata (writes go
+                // through the persist[] tensors, not the live cells), so
+                // no kv_seq_rm purge is needed here.
+                return n_use;
+            }
+            // Fall through to per-step on dispatch failure.
+        }
+    }
+
+    // ---- Slow path: per-step chain ----------------------------------------
+
     llama_batch batch = llama_batch_init(/*n_tokens=*/1, /*embd=*/0, /*n_seq_max=*/1);
 
     // Flip op_type to DRAFT_GEN. Restored to NONE on exit. PHASE45.md
