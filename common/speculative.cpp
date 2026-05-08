@@ -3,6 +3,9 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-session.h"
+#include "llama-decoder.h"
+#include "llama-spec-loop.h"
 #include "log.h"
 
 extern "C" void probe_top2_push(int32_t t1, int32_t t2);
@@ -154,7 +157,19 @@ struct common_speculative_state {
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_mtp = nullptr;
-    common_sampler * smpl;
+
+    // PHASE45 D8.3: forward to libllama spec_loop. session adopts ctx_mtp
+    // (non-owning); decoders + spec_loop are owned here and freed before
+    // llama_free(ctx_mtp). The verify decoder is required by the
+    // spec_loop_create API contract; in single-draft MTP it is the same
+    // context as the draft, and only the draft decoder's forward fires
+    // inside gen_drafts. Sampler is dropped — spec_mtp_draft is greedy
+    // by construction (matches the GGML_UNUSED in
+    // common_sampler_sample_speculative).
+    llama_session   * session_mtp = nullptr;
+    llama_decoder   * verify_dec  = nullptr;
+    llama_decoder   * draft_dec   = nullptr;
+    llama_spec_loop * loop        = nullptr;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
@@ -163,26 +178,31 @@ struct common_speculative_state_mtp : public common_speculative_state {
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
     {
-        struct common_params_sampling params;
-        params.samplers_sequence = {
-            llama_sampler_type::DIST,
-        };
-        smpl = common_sampler_init(llama_get_model(ctx_tgt), params);
-
         const llama_model * model = llama_get_model(ctx_tgt);
         ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), mtp_cparams);
         if (ctx_mtp) {
             LOG_INF("%s: created MTP context (n_ctx=%d)\n", __func__, llama_n_ctx(ctx_mtp));
+
+            session_mtp = llama_session_adopt(ctx_mtp);
+
+            llama_decoder_params verify_p = llama_decoder_default_params(LLAMA_DECODER_VERIFY);
+            llama_decoder_params draft_p  = llama_decoder_default_params(LLAMA_DECODER_DRAFT_MTP);
+            verify_dec = llama_decoder_create(session_mtp, verify_p);
+            draft_dec  = llama_decoder_create(session_mtp, draft_p);
+
+            llama_spec_loop_params lp = llama_spec_loop_default_params();
+            loop = llama_spec_loop_create(verify_dec, &draft_dec, 1, lp);
         } else {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
         }
     }
 
     ~common_speculative_state_mtp() override {
-        common_sampler_free(smpl);
-        if (ctx_mtp) {
-            llama_free(ctx_mtp);
-        }
+        if (loop)        llama_spec_loop_free(loop);
+        if (draft_dec)   llama_decoder_free(draft_dec);
+        if (verify_dec)  llama_decoder_free(verify_dec);
+        if (session_mtp) llama_session_free(session_mtp);  // non-owning; doesn't touch ctx_mtp
+        if (ctx_mtp)     llama_free(ctx_mtp);
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -195,25 +215,33 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_token id_last,
             llama_tokens & result) override {
 
-        int32_t n_past = (int32_t)prompt_tgt.size();
-        llama_seq_id seq_id = 0;
+        const int32_t      n_past = (int32_t)prompt_tgt.size();
+        const llama_seq_id seq_id = 0;
 
-        llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
+        // Pre-clean any leftover draft cells from prior cycles.
+        const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
         if (mtp_pos_max >= n_past) {
             llama_kv_cache_seq_rm(ctx_mtp, seq_id, n_past, -1);
         }
 
-        llama_context * ctx = ctx_mtp;
+        if (!loop) { result.clear(); return; }
 
-        result = mtp_speculative_gen_draft(
-            smpl,
-            ctx,
-            params.n_max,
-            params.p_min,
-            id_last,
-            n_past,
-            seq_id
-        );
+        std::vector<llama_token> buf((size_t) std::max(0, params.n_max));
+        const int32_t n = llama_spec_loop_gen_drafts(
+                loop,
+                id_last,
+                params.p_min,
+                params.n_max,
+                seq_id,
+                n_past,
+                buf.data());
+
+        if (n > 0) {
+            buf.resize((size_t) n);
+            result = std::move(buf);
+        } else {
+            result.clear();
+        }
     }
 
     void accept(uint16_t n_accepted) override {
