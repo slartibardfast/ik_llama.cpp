@@ -16,6 +16,7 @@
 //
 
 #include "llama-session.h"
+#include "llama-session-internal.h"
 #include "llama.h"
 
 #include <cstring>
@@ -27,10 +28,6 @@ struct llama_session {
 };
 
 extern "C" {
-
-// Internal accessor: exposes the wrapped llama_context to llama-decoder.cpp.
-// Not in the public header; deletes at D10.
-struct llama_context * llama_session_internal_context(struct llama_session * session);
 
 struct llama_session_params llama_session_default_params(void) {
     llama_session_params p{};
@@ -187,8 +184,9 @@ int32_t llama_session_control_vector_apply(
     return session ? llama_control_vector_apply(session->ctx, data, len, n_embd, il_start, il_end) : -1;
 }
 
-// Internal-API: expose the underlying ctx pointer to the decoder. Not in
-// the public header. D10 will delete this entirely.
+// Internal-API: expose the underlying ctx pointer to other libllama
+// .cpps that need direct ctx access (declared in llama-session-internal.h).
+// D10 will delete this entirely.
 struct llama_context * llama_session_internal_context(struct llama_session * session) {
     return session ? session->ctx : nullptr;
 }

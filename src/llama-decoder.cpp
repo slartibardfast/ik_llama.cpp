@@ -14,12 +14,8 @@
 
 #include "llama-decoder.h"
 #include "llama-session.h"
+#include "llama-session-internal.h"
 #include "llama.h"
-
-extern "C" {
-// Internal accessor exposed by llama-session.cpp; not in public headers.
-extern struct llama_context * llama_session_internal_context(struct llama_session * session);
-}
 
 struct llama_decoder {
     struct llama_session    * session = nullptr;

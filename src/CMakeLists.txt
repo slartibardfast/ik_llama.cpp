@@ -64,6 +64,7 @@ add_library(llama
             llama-delta-net.cpp
             # PHASE 45 D6 — decomposition skeletons
             llama-session.cpp
+            llama-session-internal.h
             llama-decoder.cpp
             llama-kv-txn.cpp
             llama-spec-loop.cpp

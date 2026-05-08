@@ -26,11 +26,12 @@ struct llama_spec_loop {
     std::vector<llama_token> last_accepted;
 };
 
-[[noreturn]] static void spec_loop_unimplemented(const char * fn) {
+static int32_t spec_loop_step_unimplemented(const char * fn) {
     std::fprintf(stderr,
-        "PHASE 45 D6: %s called, but spec_loop body is D8 work. "
-        "Aborting to surface unintended use.\n", fn);
-    std::abort();
+        "%s: vertical spec_loop API has no implementation. "
+        "Use llama_spec_loop_gen_drafts + llama_spec_loop_accept_n. "
+        "Returning -1.\n", fn);
+    return -1;
 }
 
 extern "C" {
@@ -101,7 +102,7 @@ void llama_spec_loop_accept_n(struct llama_spec_loop * loop, int32_t n_accepted)
 }
 
 int32_t llama_spec_loop_step(struct llama_spec_loop * /*loop*/, struct llama_batch /*batch*/) {
-    spec_loop_unimplemented(__func__);
+    return spec_loop_step_unimplemented(__func__);
 }
 
 const llama_token * llama_spec_loop_last_accepted(const struct llama_spec_loop * loop, int32_t * n_accepted) {

@@ -30,15 +30,11 @@
 
 #include "llama-spec.h"
 #include "llama-session.h"
+#include "llama-session-internal.h"
 #include "llama-decoder.h"
 
 #include <cmath>
 #include <cstdlib>
-
-extern "C" {
-// Internal accessor exposed by llama-session.cpp; not in public header.
-struct llama_context * llama_session_internal_context(struct llama_session * session);
-}
 
 // Argmax + softmax-prob over the last logits row. Matches
 // `common_sampler_sample_speculative` semantics: argmax token id and
