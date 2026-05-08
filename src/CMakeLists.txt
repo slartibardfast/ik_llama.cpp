@@ -43,6 +43,7 @@ add_library(llama
             ../include/llama-decoder.h
             ../include/llama-kv-txn.h
             ../include/llama-spec-loop.h
+            ../include/llama-spec.h
             llama.cpp
             llama-vocab.cpp
             llama-grammar.cpp
@@ -66,6 +67,7 @@ add_library(llama
             llama-decoder.cpp
             llama-kv-txn.cpp
             llama-spec-loop.cpp
+            llama-spec-mtp.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
