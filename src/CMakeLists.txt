@@ -39,6 +39,10 @@ endif()
 
 add_library(llama
             ../include/llama.h
+            ../include/llama-session.h
+            ../include/llama-decoder.h
+            ../include/llama-kv-txn.h
+            ../include/llama-spec-loop.h
             llama.cpp
             llama-vocab.cpp
             llama-grammar.cpp
@@ -57,6 +61,11 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            # PHASE 45 D6 — decomposition skeletons
+            llama-session.cpp
+            llama-decoder.cpp
+            llama-kv-txn.cpp
+            llama-spec-loop.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp

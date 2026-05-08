@@ -109,9 +109,9 @@ extern "C" {
     LLAMA_API float * llama_decoder_get_embeddings_seq(struct llama_decoder * decoder, llama_seq_id seq_id);
 
     // Performance counters (per-decoder; verify and draft are tracked separately)
-    LLAMA_API struct llama_perf_data llama_decoder_perf      (const struct llama_decoder * decoder);
-    LLAMA_API void                   llama_decoder_perf_reset(      struct llama_decoder * decoder);
-    LLAMA_API void                   llama_decoder_perf_print(const struct llama_decoder * decoder);
+    LLAMA_API struct llama_timings llama_decoder_timings    (const struct llama_decoder * decoder);
+    LLAMA_API void                 llama_decoder_perf_reset(      struct llama_decoder * decoder);
+    LLAMA_API void                 llama_decoder_perf_print(const struct llama_decoder * decoder);
 
 #ifdef __cplusplus
 }
