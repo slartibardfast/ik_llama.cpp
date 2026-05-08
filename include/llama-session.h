@@ -68,6 +68,13 @@ extern "C" {
             struct llama_model           * model,
             struct llama_session_params    params);
 
+    // PHASE45 D6/D7 helper: wrap an externally-created llama_context as
+    // a non-owning session. session_free will NOT free the wrapped ctx;
+    // the caller retains ownership. Used while common's
+    // llama_init_from_gpt_params remains the canonical context factory.
+    // Removed at D10 once common is ported.
+    LLAMA_API struct llama_session * llama_session_adopt(struct llama_context * ctx);
+
     LLAMA_API void llama_session_free(struct llama_session * session);
 
     // Accessors

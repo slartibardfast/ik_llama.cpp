@@ -1,32 +1,37 @@
 //
-// PHASE 45 D6 stub: llama_decoder implementation skeleton.
+// PHASE 45 D6: llama_decoder implementation (Option A wrapper).
 //
-// Each decoder borrows a session pointer (no ownership) and parameterizes
-// its execution by `role`. PRIMARY decoders cover today's standalone
-// forward; VERIFY/DRAFT_MTP/TREE_BRANCH activate in D7-D9.
+// A `llama_decoder` borrows a session pointer and parameterizes execution
+// by `role`. For D6 PRIMARY-role single-decoder usage, decode/get_logits/
+// timings forward unchanged into the session's internal llama_context;
+// behavior is byte-identical to old API by construction.
 //
-// D6 verifier (greedy decode through main.cpp via the new API) needs
-// PRIMARY-role decode/get_logits to forward into the session's internal
-// llama_context. That delegation lands in the next iteration.
+// Per-decoder state that today lives on llama_context (n_threads, causal,
+// embeddings, mtp_op_type) is applied at decoder_create / decoder_decode
+// time via existing setters. D7+ will add per-decoder-private storage so
+// VERIFY and DRAFT_MTP can coexist on a single shared session.
 //
 
 #include "llama-decoder.h"
 #include "llama-session.h"
+#include "llama.h"
 
-#include <cstdlib>
-#include <cstdio>
+extern "C" {
+// Internal accessor exposed by llama-session.cpp; not in public headers.
+extern struct llama_context * llama_session_internal_context(struct llama_session * session);
+}
 
 struct llama_decoder {
     struct llama_session    * session = nullptr;
-    struct llama_decoder_params params;
+    struct llama_decoder_params params{};
     enum   llama_decoder_role role    = LLAMA_DECODER_PRIMARY;
 };
 
-[[noreturn]] static void decoder_unimplemented(const char * fn) {
-    std::fprintf(stderr,
-        "PHASE 45 D6 skeleton: %s body is the next iteration's work. "
-        "Aborting to surface unintended use.\n", fn);
-    std::abort();
+static void apply_decoder_params_to_ctx(struct llama_context * ctx, const struct llama_decoder_params & p) {
+    if (ctx == nullptr) return;
+    llama_set_n_threads (ctx, p.n_threads, p.n_threads_batch);
+    llama_set_causal_attn(ctx, p.causal_attn);
+    llama_set_embeddings (ctx, p.embeddings);
 }
 
 extern "C" {
@@ -63,6 +68,8 @@ struct llama_decoder * llama_decoder_create(struct llama_session * session, stru
     d->session = session;
     d->params  = params;
     d->role    = params.role;
+
+    apply_decoder_params_to_ctx(llama_session_internal_context(session), params);
     return d;
 }
 
@@ -87,30 +94,70 @@ void llama_decoder_set_n_threads(struct llama_decoder * decoder, uint32_t n_thre
     if (!decoder) return;
     decoder->params.n_threads       = n_threads;
     decoder->params.n_threads_batch = n_threads_batch;
+    llama_set_n_threads(llama_session_internal_context(decoder->session), n_threads, n_threads_batch);
 }
-void llama_decoder_set_causal    (struct llama_decoder * decoder, bool causal_attn) { if (decoder) decoder->params.causal_attn = causal_attn; }
-void llama_decoder_set_embeddings(struct llama_decoder * decoder, bool embeddings)  { if (decoder) decoder->params.embeddings  = embeddings;  }
-void llama_decoder_set_warmup    (struct llama_decoder * /*decoder*/, bool /*warmup*/) {
-    // Warmup flag is consumed by the underlying llama_context at create-time
-    // in the existing implementation; D6 forwarding lives in the next iteration.
+void llama_decoder_set_causal(struct llama_decoder * decoder, bool causal_attn) {
+    if (!decoder) return;
+    decoder->params.causal_attn = causal_attn;
+    llama_set_causal_attn(llama_session_internal_context(decoder->session), causal_attn);
+}
+void llama_decoder_set_embeddings(struct llama_decoder * decoder, bool embeddings) {
+    if (!decoder) return;
+    decoder->params.embeddings = embeddings;
+    llama_set_embeddings(llama_session_internal_context(decoder->session), embeddings);
+}
+void llama_decoder_set_warmup(struct llama_decoder * /*decoder*/, bool /*warmup*/) {
+    // Warmup is consumed at ctx-create time by the existing factory; no
+    // post-create runtime knob today. D7+ will expose if needed.
 }
 
-int32_t llama_decoder_decode(struct llama_decoder * /*decoder*/, struct llama_batch /*batch*/) { decoder_unimplemented(__func__); }
-int32_t llama_decoder_encode(struct llama_decoder * /*decoder*/, struct llama_batch /*batch*/) { decoder_unimplemented(__func__); }
-
-void llama_decoder_synchronize(struct llama_decoder * /*decoder*/) { decoder_unimplemented(__func__); }
-
-float * llama_decoder_get_logits        (struct llama_decoder * /*decoder*/) { decoder_unimplemented(__func__); }
-float * llama_decoder_get_logits_ith    (struct llama_decoder * /*decoder*/, int32_t /*i*/) { decoder_unimplemented(__func__); }
-float * llama_decoder_get_embeddings    (struct llama_decoder * /*decoder*/) { decoder_unimplemented(__func__); }
-float * llama_decoder_get_embeddings_ith(struct llama_decoder * /*decoder*/, int32_t /*i*/) { decoder_unimplemented(__func__); }
-float * llama_decoder_get_embeddings_seq(struct llama_decoder * /*decoder*/, llama_seq_id /*seq_id*/) { decoder_unimplemented(__func__); }
-
-struct llama_timings llama_decoder_timings(const struct llama_decoder * /*decoder*/) {
-    llama_timings data{};
-    return data;
+int32_t llama_decoder_decode(struct llama_decoder * decoder, struct llama_batch batch) {
+    if (!decoder || !decoder->session) return -1;
+    apply_decoder_params_to_ctx(llama_session_internal_context(decoder->session), decoder->params);
+    return llama_decode(llama_session_internal_context(decoder->session), batch);
 }
-void llama_decoder_perf_reset(struct llama_decoder * /*decoder*/) { /* no-op until D6 wires perf forwarding */ }
-void llama_decoder_perf_print(const struct llama_decoder * /*decoder*/) { /* no-op until D6 wires perf forwarding */ }
+
+int32_t llama_decoder_encode(struct llama_decoder * decoder, struct llama_batch batch) {
+    if (!decoder || !decoder->session) return -1;
+    apply_decoder_params_to_ctx(llama_session_internal_context(decoder->session), decoder->params);
+    return llama_encode(llama_session_internal_context(decoder->session), batch);
+}
+
+void llama_decoder_synchronize(struct llama_decoder * decoder) {
+    if (!decoder || !decoder->session) return;
+    llama_synchronize(llama_session_internal_context(decoder->session));
+}
+
+float * llama_decoder_get_logits(struct llama_decoder * decoder) {
+    return decoder && decoder->session ? llama_get_logits(llama_session_internal_context(decoder->session)) : nullptr;
+}
+float * llama_decoder_get_logits_ith(struct llama_decoder * decoder, int32_t i) {
+    return decoder && decoder->session ? llama_get_logits_ith(llama_session_internal_context(decoder->session), i) : nullptr;
+}
+float * llama_decoder_get_embeddings(struct llama_decoder * decoder) {
+    return decoder && decoder->session ? llama_get_embeddings(llama_session_internal_context(decoder->session)) : nullptr;
+}
+float * llama_decoder_get_embeddings_ith(struct llama_decoder * decoder, int32_t i) {
+    return decoder && decoder->session ? llama_get_embeddings_ith(llama_session_internal_context(decoder->session), i) : nullptr;
+}
+float * llama_decoder_get_embeddings_seq(struct llama_decoder * decoder, llama_seq_id seq_id) {
+    return decoder && decoder->session ? llama_get_embeddings_seq(llama_session_internal_context(decoder->session), seq_id) : nullptr;
+}
+
+struct llama_timings llama_decoder_timings(const struct llama_decoder * decoder) {
+    if (!decoder || !decoder->session) {
+        llama_timings z{};
+        return z;
+    }
+    return llama_get_timings(llama_session_internal_context(decoder->session));
+}
+void llama_decoder_perf_reset(struct llama_decoder * decoder) {
+    if (!decoder || !decoder->session) return;
+    llama_reset_timings(llama_session_internal_context(decoder->session));
+}
+void llama_decoder_perf_print(const struct llama_decoder * decoder) {
+    if (!decoder || !decoder->session) return;
+    llama_print_timings(llama_session_internal_context(decoder->session));
+}
 
 } // extern "C"

@@ -2,6 +2,8 @@
 #include "chat.h"
 #include "console.h"
 #include "llama.h"
+#include "llama-session.h"  // PHASE45 D6: forward through decomposed API
+#include "llama-decoder.h"
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -214,6 +216,18 @@ int main(int argc, char ** argv) {
         ctx_guidance = llama_init_from_model(model, lparams);
     }
 
+    // PHASE45 D6: wrap the existing context as a non-owning session +
+    // PRIMARY decoder. Forward path goes through the new types; cleanup
+    // is reverse: decoder/session free before llama_free(ctx).
+    llama_session * session = llama_session_adopt(ctx);
+    llama_decoder_params dparams = llama_decoder_default_params(LLAMA_DECODER_PRIMARY);
+    dparams.n_threads       = params.n_threads;
+    // gpt_params uses 0 to mean "default to n_threads" — normalize before
+    // the decoder forwards to llama_set_n_threads, which expects > 0.
+    dparams.n_threads_batch = params.n_threads_batch > 0 ? params.n_threads_batch : params.n_threads;
+    dparams.embeddings      = params.embedding;
+    llama_decoder * decoder = llama_decoder_create(session, dparams);
+
     if (model == NULL) {
         LOG_TEE("%s: error: unable to load model\n", __func__);
         return 1;
@@ -221,7 +235,7 @@ int main(int argc, char ** argv) {
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
 
     const int n_ctx_train = llama_n_ctx_train(model);
-    const int n_ctx = llama_n_ctx(ctx);
+    const int n_ctx = llama_session_n_ctx(session);
     LOG("n_ctx: %d\n", n_ctx);
 
     if (n_ctx > n_ctx_train) {
@@ -365,7 +379,7 @@ int main(int argc, char ** argv) {
         }
 
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
+        llama_session_kv_seq_rm(session, -1, n_matching_session_tokens, -1);
     }
 
     LOGLN(
@@ -607,8 +621,8 @@ int main(int argc, char ** argv) {
                     LOG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                             n_past, n_left, n_ctx, params.n_keep, n_discard);
 
-                    llama_kv_cache_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                    llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
+                    llama_session_kv_seq_rm (session, 0, params.n_keep            , params.n_keep + n_discard);
+                    llama_session_kv_seq_add(session, 0, params.n_keep + n_discard, n_past, -n_discard);
 
                     n_past -= n_discard;
 
@@ -635,9 +649,9 @@ int main(int argc, char ** argv) {
                     LOG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib*bd, ga_i + ib*bd + ga_w, ga_n, (ga_i + ib*bd)/ga_n, (ga_i + ib*bd + ga_w)/ga_n);
                     LOG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib*bd + ga_w, n_past + ib*bd, dd, ga_i + ib*bd + ga_w + dd, n_past + ib*bd + dd);
 
-                    llama_kv_cache_seq_add(ctx, 0, ga_i,                n_past,              ib*bd);
-                    llama_kv_cache_seq_div(ctx, 0, ga_i + ib*bd,        ga_i + ib*bd + ga_w, ga_n);
-                    llama_kv_cache_seq_add(ctx, 0, ga_i + ib*bd + ga_w, n_past + ib*bd,      dd);
+                    llama_session_kv_seq_add(session, 0, ga_i,                n_past,              ib*bd);
+                    llama_session_kv_seq_div(session, 0, ga_i + ib*bd,        ga_i + ib*bd + ga_w, ga_n);
+                    llama_session_kv_seq_add(session, 0, ga_i + ib*bd + ga_w, n_past + ib*bd,      dd);
 
                     n_past -= bd;
 
@@ -717,7 +731,7 @@ int main(int argc, char ** argv) {
 
                 LOG("eval: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
+                if (llama_decoder_decode(decoder, llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
                     LOG_TEE("%s : failed to eval\n", __func__);
                     return 1;
                 }
@@ -998,9 +1012,11 @@ int main(int argc, char ** argv) {
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
 
-    llama_print_timings(ctx);
+    llama_decoder_perf_print(decoder);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
 
+    llama_decoder_free(decoder);
+    llama_session_free(session);  // non-owning (adopted); does not touch ctx
     if (ctx_guidance) { llama_free(ctx_guidance); }
     llama_free(ctx);
     llama_free_model(model);
