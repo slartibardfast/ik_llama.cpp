@@ -136,6 +136,16 @@ void llama_session_kv_seq_div(struct llama_session * session, llama_seq_id seq, 
 llama_pos llama_session_kv_seq_pos_max(struct llama_session * session, llama_seq_id seq) {
     return session ? llama_kv_cache_seq_pos_max(session->ctx, seq) : -1;
 }
+llama_pos llama_session_kv_seq_pos_min(struct llama_session * session, llama_seq_id seq) {
+    return session ? llama_kv_cache_seq_pos_min(session->ctx, seq) : -1;
+}
+
+int32_t llama_session_kv_token_count(const struct llama_session * session) {
+    return session ? llama_get_kv_cache_token_count(session->ctx) : 0;
+}
+int32_t llama_session_kv_used_cells(const struct llama_session * session) {
+    return session ? llama_get_kv_cache_used_cells(session->ctx) : 0;
+}
 
 void llama_session_kv_update(struct llama_session * session) {
     if (session) llama_kv_cache_update(session->ctx);

@@ -68,6 +68,8 @@ static bool save_speculative_checkpoint(server_slot & slot, llama_model * model,
 }
 
 server_context::~server_context() {
+    if (decoder) { llama_decoder_free(decoder); decoder = nullptr; }
+    if (session) { llama_session_free(session); session = nullptr; }  // non-owning; doesn't touch ctx
     if (ctx) {
         llama_free(ctx);
         ctx = nullptr;
@@ -119,7 +121,20 @@ bool server_context::load_model(const gpt_params& params_) {
         return false;
     }
 
-    n_ctx = llama_n_ctx(ctx);
+    // PHASE45 D9.2: wrap ctx as a non-owning session + PRIMARY decoder.
+    // Used for the simple callsites (KV ops, accessors, embeddings, perf).
+    // ctx_mtp lifecycle stays in common_speculative_state_mtp (D8.3); spec
+    // uses its own session/decoder stack via the libcommon shim.
+    session = llama_session_adopt(ctx);
+    {
+        llama_decoder_params dp = llama_decoder_default_params(LLAMA_DECODER_PRIMARY);
+        dp.n_threads       = params_base.n_threads;
+        dp.n_threads_batch = params_base.n_threads_batch > 0 ? params_base.n_threads_batch : params_base.n_threads;
+        dp.embeddings      = params_base.embedding;
+        decoder = llama_decoder_create(session, dp);
+    }
+
+    n_ctx = llama_session_n_ctx(session);
 
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
@@ -275,7 +290,7 @@ void server_context::init() {
                 SLT_DBG(slot, "batch_spec contains %d tokens\n", slot.batch_spec.n_tokens);
 
                 SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
-                llama_set_embeddings(ctx, true);
+                llama_decoder_set_embeddings(decoder, true);
             }
             else {
                 SRV_WRN("%s\n", "MTP enabled via flag, but model has 0 NextN layers. Disabling speculative.");
@@ -321,7 +336,7 @@ void server_context::init() {
     // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
     // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
     {
-        const int32_t n_batch = llama_n_batch(ctx);
+        const int32_t n_batch = llama_session_n_batch(session);
 
         // only a single seq_id per token is needed
         batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
@@ -1080,11 +1095,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
     if (slot.sparams.penalty_last_n == -1) {
         // note: should be the slot's context and not the full context, but it's ok
-        slot.sparams.penalty_last_n = llama_n_ctx(ctx);
+        slot.sparams.penalty_last_n = llama_session_n_ctx(session);
     }
 
     if (slot.sparams.dry_penalty_last_n == -1) {
-        slot.sparams.dry_penalty_last_n = llama_n_ctx(ctx);
+        slot.sparams.dry_penalty_last_n = llama_session_n_ctx(session);
 
     }
     if (slot.sparams.dry_base < 1.0f)
@@ -1690,7 +1705,7 @@ void server_context::kv_cache_clear() {
     LOG_VERBOSE("clearing KV cache", {});
 
     // clear the entire KV cache
-    llama_kv_cache_clear(ctx);
+    llama_session_kv_clear(session);
     clean_kv_cache = false;
 }
 
@@ -1705,7 +1720,7 @@ void server_context::system_prompt_update() {
     if (!system_prompt.empty()) {
         system_tokens = ::common_tokenize(ctx, system_prompt, true);
 
-        const int32_t n_batch = llama_n_batch(ctx);
+        const int32_t n_batch = llama_session_n_batch(session);
         const int32_t n_tokens_prompt = system_tokens.size();
 
         for (int32_t i = 0; i < n_tokens_prompt; i += n_batch) {
@@ -1725,7 +1740,7 @@ void server_context::system_prompt_update() {
 
         // assign the system KV cache to all parallel sequences
         for (int32_t i = 1; i <= params_base.n_parallel; ++i) {
-            llama_kv_cache_seq_cp(ctx, 0, i, -1, -1);
+            llama_session_kv_seq_cp(session, 0, i, -1, -1);
         }
     }
 
@@ -2185,10 +2200,10 @@ void server_context::send_embedding(const server_slot& slot, const llama_batch& 
 
         const float* embd = nullptr;
         if (llama_pooling_type(slot.ctx) == LLAMA_POOLING_TYPE_NONE) {
-            embd = llama_get_embeddings_ith(ctx, i);
+            embd = llama_decoder_get_embeddings_ith(decoder, i);
         }
         else {
-            embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
+            embd = llama_decoder_get_embeddings_seq(decoder, batch.seq_id[i][0]);
         }
 
         if (embd == nullptr) {
@@ -2578,8 +2593,8 @@ void server_context::process_single_task(server_task&& task) {
             { "n_tokens_predicted",              metrics.n_tokens_predicted},
             { "t_tokens_generation",             metrics.t_tokens_generation},
 
-            { "kv_cache_tokens_count",           llama_get_kv_cache_token_count(ctx)},
-            { "kv_cache_used_cells",             llama_get_kv_cache_used_cells(ctx)},
+            { "kv_cache_tokens_count",           llama_session_kv_token_count(session)},
+            { "kv_cache_used_cells",             llama_session_kv_used_cells(session)},
 
             { "slots",                           slots_data },
         };
@@ -2696,7 +2711,7 @@ void server_context::process_single_task(server_task&& task) {
         }
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
-        llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+        llama_session_kv_seq_rm(session, slot->id, -1, -1);
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
         slot->server_cached_prompt.checkpoints.clear();
@@ -2954,10 +2969,10 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
     auto kv_keep = slot.cache_tokens.pos_next(n_keep);
     auto kv_discard = slot.cache_tokens.pos_next(n_keep + n_discard) - kv_keep;
     auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
-    int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
-    const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
-    llama_kv_cache_seq_rm(ctx, slot.id, kv_keep, kv_keep + kv_discard);
-    llama_kv_cache_seq_add(ctx, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
+    int32_t pos_min = llama_session_kv_seq_pos_min(session, slot.id);
+    const auto pos_max = llama_session_kv_seq_pos_max(session, slot.id);
+    llama_session_kv_seq_rm(session, slot.id, kv_keep, kv_keep + kv_discard);
+    llama_session_kv_seq_add(session, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
     if (slot.has_mtp && slot.spec) {
         common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
     }
@@ -3185,7 +3200,7 @@ void server_context::add_sampled_tokens() {
                     llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
                 } else {
                     LOG_ERROR("MTP hidden state is empty during speculation", {});
-                    const float* emb_neg1 = llama_get_embeddings_ith(ctx, -1);
+                    const float* emb_neg1 = llama_decoder_get_embeddings_ith(decoder, -1);
                     if (emb_neg1) {
                         const int n_embd = llama_model_n_embd(llama_get_model(ctx));
                         slot.mtp_hidden_state.resize(n_embd);
@@ -3279,7 +3294,7 @@ void server_context::add_sampled_tokens() {
 
 void  server_context::create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base) {
     if (params_base.do_checkpoint && params_base.ctx_checkpoints_interval > 0) {
-        auto pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+        auto pos = llama_session_kv_seq_pos_max(session, slot.id);
         if (slot.checkpoint_pos + params_base.ctx_checkpoints_interval <= 1 + pos) {
             bool created = create_checkpoint(slot);
             if (created) {
@@ -3296,7 +3311,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
     // snapshot, not a per-token window. Use pos_max against n_past to match whole-prefix checkpoints.
     const auto pos_min_thold = std::max(0, pos_next - 1);
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
-        int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
+        int32_t pos_min = llama_session_kv_seq_pos_min(session, slot.id);
 
         if (has_recurrent || pos_min > pos_min_thold) {
             SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
@@ -3376,8 +3391,8 @@ void server_context::apply_checkpoint(server_slot & slot) {
 
 bool server_context::create_checkpoint(server_slot & slot) {
     bool do_checkpoint = !slot.image_just_processed;
-    int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
-    const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+    int32_t pos_min = llama_session_kv_seq_pos_min(session, slot.id);
+    const auto pos_max = llama_session_kv_seq_pos_max(session, slot.id);
 
     // no need for empty or small checkpoints
     do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 16);
@@ -3628,14 +3643,14 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 slot.cache_tokens.keep_first(slot.n_past);
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                if (!llama_kv_cache_seq_rm(ctx, slot.id, p0, -1)) {
+                if (!llama_session_kv_seq_rm(session, slot.id, p0, -1)) {
                     // could not partially delete (likely using a non-Transformer model)
-                    llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                    llama_session_kv_seq_rm(session, slot.id, -1, -1);
 
                     p0 = (int)system_tokens.size();
                     if (p0 != 0) {
                         // copy over the system prompt when there is one
-                        llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+                        llama_session_kv_seq_cp(session, 0, slot.id, -1, -1);
                     }
 
                     // there is no common part left (except for the system prompt)
@@ -3778,9 +3793,9 @@ void server_context::extend_context(const int32_t n_tokens) {
                 LOG_TEE("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
                 LOG_TEE("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
 
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
-                llama_kv_cache_seq_div(ctx, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
+                llama_session_kv_seq_add(session, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
+                llama_session_kv_seq_div(session, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
+                llama_session_kv_seq_add(session, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
 
                 slot.n_past_se -= bd;
 
@@ -3842,7 +3857,7 @@ static void restore_speculative_checkpoint(
                 for (int j = 0; j < re_batch.n_tokens; j++) {
                     re_batch.logits[j] = true;
                 }
-                llama_set_embeddings(ctx, true);
+                llama_set_embeddings(ctx, true);  // free fn; no decoder in scope (D9.x port)
             }
 
             const int ret = llama_decode(ctx, re_batch);
@@ -3855,7 +3870,7 @@ static void restore_speculative_checkpoint(
                 const int n_accepted = (int)ids.size();
                 slot.mtp_hidden_state.resize(n_accepted * n_embd);
                 for (int j = 0; j < n_accepted; j++) {
-                    const float * emb_j = llama_get_embeddings_ith(ctx, j);
+                    const float * emb_j = llama_get_embeddings_ith(ctx, j);  // free fn; no decoder in scope (D9.x port)
                     if (emb_j) {
                         memcpy(slot.mtp_hidden_state.data() + j * n_embd, emb_j, n_embd * sizeof(float));
                     }
@@ -3933,13 +3948,13 @@ void server_context::speculative_decoding_accept() {
             if (!a.ids.empty()) {
                 a.mtp_hidden_state_pre.resize(a.ids.size() * n_embd);
                 for (size_t i = 0; i < a.ids.size(); i++) {
-                    const float* emb_i = llama_get_embeddings_ith(ctx, slot.i_batch_dft[i]);
+                    const float* emb_i = llama_decoder_get_embeddings_ith(decoder, slot.i_batch_dft[i]);
                     if (emb_i) {
                         memcpy(a.mtp_hidden_state_pre.data() + i * n_embd, emb_i, n_embd * sizeof(float));
                     }
                 }
             } else {
-                const float* emb0 = llama_get_embeddings_ith(ctx, 0);
+                const float* emb0 = llama_decoder_get_embeddings_ith(decoder, 0);
                 if (emb0) {
                     a.mtp_hidden_state_pre.resize(n_embd);
                     memcpy(a.mtp_hidden_state_pre.data(), emb0, n_embd * sizeof(float));
@@ -4022,7 +4037,7 @@ void server_context::speculative_decoding_accept() {
             // call will see _valid == false and fall through to host.
             // Subsequent cycles see the freshly-populated residuals.
             slot.mtp_next_chain_residual_step = (int32_t) ids.size() - 1;
-            llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+            llama_session_kv_seq_rm(session, slot.id, slot.n_past, -1);
             discard_speculative_checkpoint(slot, ctx);
         }
 
@@ -4242,7 +4257,7 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.n_past = slot.cache_tokens.n_tokens();
     
     // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.n_past, -1);
+    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.n_past, -1);  // free fn; no session in scope (D9.x port)
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -4458,7 +4473,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 const int n_toks = batch_view.n_tokens;
                 batch_mtp_hidden_state.resize(n_toks * n_embd);
                 for (int t = 0; t < n_toks; t++) {
-                    const float* emb_t = llama_get_embeddings_ith(ctx, t);
+                    const float* emb_t = llama_decoder_get_embeddings_ith(decoder, t);
                     if (emb_t) {
                         memcpy(batch_mtp_hidden_state.data() + t * n_embd, emb_t, n_embd * sizeof(float));
                     }
@@ -4510,7 +4525,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             const int tok_idx = slot.i_batch - i;
 
             if (params_base.has_mtp && slot.n_decoded == 0) {
-                const float* emb_i = llama_get_embeddings_ith(ctx, tok_idx);
+                const float* emb_i = llama_decoder_get_embeddings_ith(decoder, tok_idx);
                 if (emb_i) {
                     const int n_embd = llama_model_n_embd(llama_get_model(ctx));
                     slot.mtp_hidden_state.resize(n_embd);
@@ -4617,7 +4632,7 @@ void server_context::update_slots() {
     add_sampled_tokens(); // Prepare batch for inference
 
     // process in chunks of params.n_batch
-    int32_t n_batch = llama_n_batch(ctx);
+    int32_t n_batch = llama_session_n_batch(session);
     int32_t n_ubatch = llama_n_ubatch(ctx);
 
     // track if this is an embedding or non-embedding batch
@@ -4638,7 +4653,7 @@ void server_context::update_slots() {
         });
 
     // make sure we're in the right embedding mode
-    llama_set_embeddings(ctx, batch_type == 1);
+    llama_decoder_set_embeddings(decoder, batch_type == 1);
 
     if (llama_model_has_recurrent(model)) {
         const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
@@ -4673,7 +4688,7 @@ void server_context::update_slots() {
             any_target = true;
             if (!slot_sampler_is_trivial(slot)) { all_trivial = false; break; }
         }
-        llama_set_fast_argmax_for_verify(ctx, any_target && all_trivial);
+        llama_decoder_set_fast_argmax(decoder, any_target && all_trivial);
     }
 
     // process the created batch of tokens

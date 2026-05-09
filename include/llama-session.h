@@ -92,6 +92,10 @@ extern "C" {
     LLAMA_API void llama_session_kv_seq_add (struct llama_session * session, llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta);
     LLAMA_API void llama_session_kv_seq_div (struct llama_session * session, llama_seq_id seq, llama_pos p0, llama_pos p1, int d);
     LLAMA_API llama_pos llama_session_kv_seq_pos_max(struct llama_session * session, llama_seq_id seq);
+    LLAMA_API llama_pos llama_session_kv_seq_pos_min(struct llama_session * session, llama_seq_id seq);
+
+    LLAMA_API int32_t llama_session_kv_token_count(const struct llama_session * session);
+    LLAMA_API int32_t llama_session_kv_used_cells(const struct llama_session * session);
 
     LLAMA_API void llama_session_kv_update(struct llama_session * session);
     LLAMA_API void llama_session_kv_defrag(struct llama_session * session);

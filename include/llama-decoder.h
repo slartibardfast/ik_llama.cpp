@@ -93,6 +93,7 @@ extern "C" {
     LLAMA_API void llama_decoder_set_causal    (struct llama_decoder * decoder, bool causal_attn);
     LLAMA_API void llama_decoder_set_embeddings(struct llama_decoder * decoder, bool embeddings);
     LLAMA_API void llama_decoder_set_warmup    (struct llama_decoder * decoder, bool warmup);
+    LLAMA_API void llama_decoder_set_fast_argmax(struct llama_decoder * decoder, bool enabled);
 
     // Forward pass
     LLAMA_API int32_t llama_decoder_decode(struct llama_decoder * decoder, struct llama_batch batch);

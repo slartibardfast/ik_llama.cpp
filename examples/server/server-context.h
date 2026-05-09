@@ -1,6 +1,8 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "speculative.h"
+#include "llama-session.h"
+#include "llama-decoder.h"
 #include "json-schema-to-grammar.h"
 #include <nlohmann/json_fwd.hpp>
 
@@ -256,6 +258,13 @@ struct server_metrics {
 struct server_context {
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
+    // PHASE45 D9.2: non-owning session + PRIMARY decoder over `ctx`. Used
+    // by simple callsites (KV ops, n_ctx queries, get_logits, embeddings,
+    // perf, set_fast_argmax). The architectural slot.ctx → seq_id-on-shared
+    // session migration is D9.5; until then `ctx`, `session`, and
+    // `slot.ctx` are all aliases of the same underlying object.
+    llama_session  * session = nullptr;
+    llama_decoder  * decoder = nullptr;
     std::vector<llama_lora_adapter_container> lora_adapters;
     std::vector<control_vector_container> control_vectors;
 

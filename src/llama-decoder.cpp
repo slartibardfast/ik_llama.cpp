@@ -107,6 +107,11 @@ void llama_decoder_set_warmup(struct llama_decoder * /*decoder*/, bool /*warmup*
     // post-create runtime knob today. D7+ will expose if needed.
 }
 
+void llama_decoder_set_fast_argmax(struct llama_decoder * decoder, bool enabled) {
+    if (!decoder || !decoder->session) return;
+    llama_set_fast_argmax_for_verify(llama_session_internal_context(decoder->session), enabled);
+}
+
 int32_t llama_decoder_decode(struct llama_decoder * decoder, struct llama_batch batch) {
     if (!decoder || !decoder->session) return -1;
     apply_decoder_params_to_ctx(llama_session_internal_context(decoder->session), decoder->params);
