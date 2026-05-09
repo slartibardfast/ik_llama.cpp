@@ -1305,6 +1305,146 @@ llama_tokens common_speculative_draft(
     return result;
 }
 
+// PHASE45 D10.b: batched-draft entry point.
+//
+// All slots share the post-D9.5 collapsed-context invariant: each
+// per-slot common_speculative_state_mtp wraps the same shared ctx_tgt
+// (and therefore the same spec_loop verify+draft decoder pair). When
+// every input is MTP-typed and the shared-decoder invariant holds,
+// run a single batched forward per draft step. Otherwise fall back to
+// the per-slot serial path so that mixed deployments keep working.
+std::vector<llama_tokens> common_speculative_draft_batched(
+        const std::vector<common_speculative_batched_in> & inputs,
+        const common_params_speculative & params) {
+    std::vector<llama_tokens> out(inputs.size());
+    if (inputs.empty()) return out;
+
+    // First, drive each spec's per-slot begin() bookkeeping (matches
+    // common_speculative_draft's per-spec impl->begin/draft semantics).
+    // We also collect the MTP states + their loops, and bail to fallback
+    // if any spec is non-MTP.
+    std::vector<common_speculative_state_mtp *> mtp_states(inputs.size(), nullptr);
+    std::vector<llama_spec_loop *>              loops     (inputs.size(), nullptr);
+    bool all_mtp = true;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        common_speculative * spec = inputs[i].spec;
+        if (spec == nullptr || spec->impls.empty()) { all_mtp = false; break; }
+        // Reset curr_impl (matches common_speculative_draft semantics).
+        spec->t_step_start_us = ggml_time_us();
+        if (spec->tuner && spec->tuner->enabled) {
+            // Per-slot autotune proposal. We pass the same params object;
+            // for batched mode the proposal is a per-slot mutation.
+            // (Behaves identically to per-slot draft.)
+            common_params_speculative tmp = params;
+            spec->tuner->propose(tmp);
+        }
+        spec->curr_impl = nullptr;
+
+        // Find the MTP impl (single-impl assumption matches the existing
+        // per-slot draft path which breaks on the first non-empty impl).
+        common_speculative_state_mtp * mtp = nullptr;
+        for (auto & impl : spec->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+                mtp = dynamic_cast<common_speculative_state_mtp *>(impl.get());
+                break;
+            }
+        }
+        if (mtp == nullptr || mtp->loop == nullptr) { all_mtp = false; break; }
+        mtp_states[i] = mtp;
+        loops[i]      = mtp->loop;
+    }
+
+    // All slots must share the underlying llama_context (post-D9.5
+    // collapsed-context invariant: every common_speculative_state_mtp
+    // captures ctx_tgt; each per-slot session_adopt creates its own
+    // session/decoders that wrap the SAME ctx). The batched primitive
+    // forwards through the chosen decoder pair into that one ctx.
+    if (all_mtp && mtp_states.size() > 1) {
+        llama_context * ctx0 = mtp_states[0]->ctx_tgt;
+        for (size_t i = 1; i < mtp_states.size() && all_mtp; ++i) {
+            if (mtp_states[i]->ctx_tgt != ctx0) all_mtp = false;
+        }
+    }
+
+    if (!all_mtp) {
+        // Fallback: per-slot serial via existing common_speculative_draft.
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            // common_speculative_draft takes params by reference; we use
+            // a local copy so the autotune proposal applied above doesn't
+            // leak into other slots.
+            common_params_speculative tmp = params;
+            out[i] = common_speculative_draft(inputs[i].spec, tmp,
+                    inputs[i].prompt_tgt, inputs[i].id_last);
+        }
+        return out;
+    }
+
+    // All-MTP batched path. Pre-clean per-slot draft cells (matches
+    // common_speculative_state_mtp::draft).
+    llama_context * ctx_tgt = mtp_states[0]->ctx_tgt;
+    std::vector<llama_spec_mtp_slot_in> slots_in(inputs.size());
+    int32_t stride = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const llama_seq_id seq_id = mtp_states[i]->seq_id;
+        const int32_t      n_past = (int32_t) inputs[i].prompt_tgt.size();
+
+        const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_tgt, seq_id);
+        if (mtp_pos_max >= n_past) {
+            llama_kv_cache_seq_rm(ctx_tgt, seq_id, n_past, -1);
+        }
+
+        slots_in[i].seq_id      = seq_id;
+        slots_in[i].id_last     = inputs[i].id_last;
+        slots_in[i].n_past      = n_past;
+        slots_in[i].n_draft_max = std::max(0, params.n_max);
+        if (slots_in[i].n_draft_max > stride) stride = slots_in[i].n_draft_max;
+    }
+    if (stride == 0) return out;
+
+    std::vector<llama_token>             buf(inputs.size() * (size_t) stride);
+    std::vector<llama_spec_mtp_slot_out> outs(inputs.size());
+
+    const int32_t total = llama_spec_loop_gen_drafts_batched(
+            loops.data(), (int32_t) loops.size(),
+            slots_in.data(),
+            params.p_min,
+            buf.data(), stride,
+            outs.data());
+
+    if (total <= 0) {
+        return out;
+    }
+
+    // Pack per-slot vectors and update curr_impl + stats so that the
+    // accept/print paths remain correct (matches per-slot draft path).
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const int32_t k = outs[i].n_drafted;
+        if (k <= 0) {
+            out[i].clear();
+            continue;
+        }
+        out[i].assign(buf.begin() + (ptrdiff_t) (i * (size_t) stride),
+                      buf.begin() + (ptrdiff_t) (i * (size_t) stride + (size_t) k));
+
+        common_speculative * spec = inputs[i].spec;
+        // Locate the MTP impl in spec->impls and stamp it as curr_impl
+        // so common_speculative_accept / print_stats find the right one.
+        for (auto & impl : spec->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+                spec->curr_impl = impl.get();
+                impl->n_call_draft++;
+                impl->n_gen_drafts++;
+                impl->n_gen_tokens += (size_t) k;
+                break;
+            }
+        }
+        if (spec->tuner && spec->tuner->enabled) {
+            spec->last_n_drafted = k;
+        }
+    }
+    return out;
+}
+
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
     if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
         int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;

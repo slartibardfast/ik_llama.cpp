@@ -22,6 +22,7 @@
 #define LLAMA_SPEC_LOOP_H
 
 #include "llama.h"
+#include "llama-spec.h"  // PHASE45 D10.b: llama_spec_mtp_slot_in/out
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +80,25 @@ extern "C" {
     LLAMA_API void llama_spec_loop_accept_n(
             struct llama_spec_loop * loop,
             int32_t                  n_accepted);
+
+    // PHASE45 D10.b: batched-draft wrapper. Each `loops[i]` contributes
+    // one slot to the batch; all loops MUST share the same verify_decoder
+    // and draft_decoder pair (post-D9.5 collapsed-context invariant: each
+    // per-slot common_speculative_state_mtp wraps the same shared ctx_tgt).
+    //
+    // `slots[i]` carries the slot's seq_id / id_last / n_past / n_draft_max.
+    // `drafts_out` is slot-major with stride `drafts_out_stride` (in
+    // tokens). `outs[i]` returns the per-slot count + truncation flag.
+    //
+    // Returns total drafts emitted, or negative on setup error.
+    LLAMA_API int32_t llama_spec_loop_gen_drafts_batched(
+            struct llama_spec_loop      ** loops,
+            int32_t                        n_loops,
+            const llama_spec_mtp_slot_in * slots,
+            float                          p_min,
+            llama_token                  * drafts_out,
+            int32_t                        drafts_out_stride,
+            llama_spec_mtp_slot_out      * outs);
 
     // Step the loop with a prompt batch (for first call) or an empty
     // batch (subsequent calls). Returns number of accepted tokens, or

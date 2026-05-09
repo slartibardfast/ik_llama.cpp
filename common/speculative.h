@@ -36,6 +36,20 @@ llama_tokens common_speculative_draft(
                      const llama_tokens & prompt,
                             llama_token   id_last);
 
+// PHASE45 D10.b: batched-draft variant. Inputs describe per-slot work
+// (each slot's spec/prompt_tgt/id_last); the batched path drives one
+// forward per draft step that processes all slots at once. Falls back
+// to per-slot serial drafting if any input fails the MTP cast (only
+// MTP supports batched drafting today).
+struct common_speculative_batched_in {
+    common_speculative * spec;
+    llama_tokens         prompt_tgt;
+    llama_token          id_last;
+};
+std::vector<llama_tokens> common_speculative_draft_batched(
+        const std::vector<common_speculative_batched_in> & inputs,
+        const common_params_speculative & params);
+
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 

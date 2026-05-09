@@ -64,6 +64,53 @@ extern "C" {
             llama_pos              n_past,
             llama_token          * drafts_out);
 
+    // PHASE45 D10.b: batched MTP draft. Generates drafts for `n_slots`
+    // active slots that share the verify_decoder + draft_decoder pair.
+    // Each step issues ONE forward of n_slots tokens (one per alive slot)
+    // through the draft decoder, replacing N sequential per-slot decodes.
+    //
+    // Input layout: `slots[0..n_slots-1]` describes one slot each
+    // (seq_id + id_last + n_past + n_draft_max). All slots' draft
+    // chains share the same `p_min` truncation threshold.
+    //
+    // Output layout: `drafts_out` is slot-major with stride
+    // `drafts_out_stride` (in tokens) — slot i's drafts live at
+    // drafts_out[i*stride + 0 .. i*stride + outs[i].n_drafted-1]. The
+    // caller sets stride to max(slots[].n_draft_max).
+    //
+    // Per-slot output: `outs[i].n_drafted` is the number of valid tokens
+    // produced for slot i (0 if no progress was possible, e.g. all slots
+    // started dead). `outs[i].truncated` is true if p_min cut the chain
+    // before reaching n_draft_max.
+    //
+    // LLAMA_MTP_FUSED is NOT consulted by this path — fused single-shot
+    // batches a one-slot chain, not multi-slot. Callers wanting fused
+    // for n_slots==1 must use the single-slot llama_spec_mtp_draft.
+    //
+    // Returns total drafts emitted across all slots, or negative on
+    // setup error.
+    typedef struct {
+        llama_seq_id seq_id;
+        llama_token  id_last;
+        llama_pos    n_past;
+        int32_t      n_draft_max;
+    } llama_spec_mtp_slot_in;
+
+    typedef struct {
+        int32_t n_drafted;     // 0..n_draft_max
+        bool    truncated;     // p_min cut chain short
+    } llama_spec_mtp_slot_out;
+
+    LLAMA_API int32_t llama_spec_mtp_draft_batched(
+            struct llama_decoder              * verify_decoder,
+            struct llama_decoder              * draft_decoder,
+            const llama_spec_mtp_slot_in      * slots,
+            int32_t                             n_slots,
+            float                               p_min,
+            llama_token                       * drafts_out,
+            int32_t                             drafts_out_stride,
+            llama_spec_mtp_slot_out           * outs);
+
 #ifdef __cplusplus
 }
 #endif

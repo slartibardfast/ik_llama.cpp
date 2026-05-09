@@ -205,4 +205,193 @@ int32_t llama_spec_mtp_draft(
     return n_drafts;
 }
 
+// PHASE45 D10.b: batched per-step MTP draft.
+//
+// One forward per draft step processes ALL alive slots at once. The verify
+// forward already runs all slots' tokens in a single batch (server collected
+// in add_sampled_tokens), and this drives the same alignment for the draft.
+//
+// Algorithm:
+//   1. alive_mask = true for each slot (skipping any slot with n_draft_max <= 0)
+//   2. For step = 0..max(n_draft_max)-1:
+//      a. Build a one-token-per-alive-slot batch with its current (id, pos, seq_id)
+//      b. llama_decoder_decode(draft_decoder, batch) -- one forward
+//      c. For each batch row i (corresponding to alive slot s):
+//           argmax id from llama_get_draft_argmax(ctx, i, ...)
+//           write drafts_out[s*stride + step] = id
+//           extract emb_i = llama_get_embeddings_ith(ctx, i)  (for next step's seed)
+//           current_id[s] = id; current_pos[s] += 1
+//           if prob < p_min: alive[s] = false; outs[s].truncated = true
+//      d. If any slot still alive AND step+1 < n_draft_max: pack new hidden
+//         states for the next step in slot order (only alive slots) and call
+//         llama_set_draft_input_hidden_state_multi
+//      e. If no alive slots remain, break.
+//   3. Per-slot kv_cache_seq_rm to purge drafted positions.
+int32_t llama_spec_mtp_draft_batched(
+        struct llama_decoder              * verify_decoder,
+        struct llama_decoder              * draft_decoder,
+        const llama_spec_mtp_slot_in      * slots,
+        int32_t                             n_slots,
+        float                               p_min,
+        llama_token                       * drafts_out,
+        int32_t                             drafts_out_stride,
+        llama_spec_mtp_slot_out           * outs) {
+
+    if (verify_decoder == nullptr || draft_decoder == nullptr) return -1;
+    if (slots == nullptr || drafts_out == nullptr || outs == nullptr) return -1;
+    if (n_slots <= 0 || drafts_out_stride <= 0) return -1;
+
+    // Shared session invariant.
+    struct llama_session * session = llama_decoder_session(draft_decoder);
+    if (session == nullptr || session != llama_decoder_session(verify_decoder)) return -1;
+
+    struct llama_context * ctx = llama_session_internal_context(session);
+    if (ctx == nullptr) return -1;
+
+    const struct llama_model * model = llama_decoder_model(draft_decoder);
+    if (model == nullptr) return -1;
+    const int n_vocab = llama_n_vocab(model);
+    const int n_embd  = llama_model_n_embd(model);
+    if (n_vocab <= 0 || n_embd <= 0) return -1;
+
+    // Per-slot state.
+    std::vector<llama_token> current_id (n_slots);
+    std::vector<llama_pos>   current_pos(n_slots);
+    std::vector<bool>        alive      (n_slots);
+
+    int32_t n_max_total   = 0;
+    int32_t n_alive_init  = 0;
+    for (int32_t s = 0; s < n_slots; ++s) {
+        outs[s].n_drafted = 0;
+        outs[s].truncated = false;
+        const bool ok = (slots[s].n_draft_max > 0);
+        alive[s] = ok;
+        current_id [s] = slots[s].id_last;
+        current_pos[s] = slots[s].n_past;
+        if (ok) {
+            n_alive_init++;
+            if (slots[s].n_draft_max > n_max_total) n_max_total = slots[s].n_draft_max;
+        }
+    }
+    if (n_alive_init == 0) return 0;
+
+    // Per-step batch; capacity = n_slots tokens.
+    llama_batch batch = llama_batch_init(/*n_tokens=*/n_slots, /*embd=*/0, /*n_seq_max=*/1);
+
+    llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
+
+    // Scratch buffer for next-step hidden seeds (slot-major, n_alive rows).
+    std::vector<float> next_hidden_buf;
+    next_hidden_buf.reserve((size_t) n_slots * (size_t) n_embd);
+
+    int32_t total_drafted = 0;
+
+    // Track which slots are alive in the *current* batch row order so we
+    // can map row index -> slot index.
+    std::vector<int32_t> row_to_slot;
+    row_to_slot.reserve(n_slots);
+
+    for (int32_t step = 0; step < n_max_total; ++step) {
+        // Build the per-step batch from currently-alive slots that still
+        // want more drafts (step < their n_draft_max).
+        batch.n_tokens = 0;
+        row_to_slot.clear();
+        for (int32_t s = 0; s < n_slots; ++s) {
+            if (!alive[s]) continue;
+            if (step >= slots[s].n_draft_max) {
+                // Slot reached its own cap; close cleanly.
+                alive[s] = false;
+                continue;
+            }
+            const int32_t i = batch.n_tokens;
+            batch.token   [i]    = current_id [s];
+            batch.pos     [i]    = current_pos[s];
+            batch.n_seq_id[i]    = 1;
+            batch.seq_id  [i][0] = slots[s].seq_id;
+            batch.logits  [i]    = 1;
+            batch.n_tokens++;
+            row_to_slot.push_back(s);
+        }
+        if (batch.n_tokens == 0) break;
+
+        if (llama_decoder_decode(draft_decoder, batch) != 0) break;
+
+        // Read argmax / prob per row, update per-slot state, and pack
+        // the per-slot embeddings for the next step's seed (in
+        // alive-row order, matching what the next forward expects).
+        next_hidden_buf.clear();
+        // Build a row mask of which slots survive into step+1 (for hidden state ordering).
+        std::vector<int32_t> alive_after;
+        alive_after.reserve(batch.n_tokens);
+
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const int32_t s = row_to_slot[i];
+
+            llama_token id_next = -1;
+            float       prob    = 0.0f;
+            int32_t     cached_id = -1;
+            float       cached_prob = 0.0f;
+            if (llama_get_draft_argmax(ctx, /*i=*/i, &cached_id, &cached_prob)) {
+                id_next = (llama_token) cached_id;
+                prob    = cached_prob;
+            } else {
+                const float * logits = llama_get_logits_ith(ctx, /*i=*/i);
+                id_next = spec_argmax_with_prob(logits, n_vocab, &prob);
+            }
+            if (id_next < 0 || id_next >= n_vocab) {
+                alive[s] = false;
+                continue;
+            }
+
+            drafts_out[(size_t) s * (size_t) drafts_out_stride + (size_t) step] = id_next;
+            outs[s].n_drafted++;
+            total_drafted++;
+
+            current_id [s] = id_next;
+            current_pos[s] += 1;
+
+            // p_min: stop this slot AFTER recording the token, matching the
+            // single-slot semantics in llama_spec_mtp_draft above.
+            if (p_min > 0.0f && prob < p_min) {
+                outs[s].truncated = true;
+                alive[s] = false;
+                continue;
+            }
+            // This slot is alive and wants step+1.
+            if (step + 1 < slots[s].n_draft_max) {
+                alive_after.push_back(s);
+                const float * emb = llama_get_embeddings_ith(ctx, /*i=*/i);
+                if (emb == nullptr) {
+                    // No emb: cannot seed next step for this slot — close cleanly.
+                    alive[s] = false;
+                    alive_after.pop_back();
+                    continue;
+                }
+                next_hidden_buf.insert(next_hidden_buf.end(), emb, emb + n_embd);
+            } else {
+                alive[s] = false;
+            }
+        }
+
+        if (alive_after.empty()) break;
+
+        // Arm the per-slot hidden states for the next step's forward.
+        llama_set_draft_input_hidden_state_multi(ctx, (int32_t) alive_after.size(), next_hidden_buf.data());
+    }
+
+    llama_batch_free(batch);
+    llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+
+    // Per-slot KV-cell purge for the drafted positions.
+    for (int32_t s = 0; s < n_slots; ++s) {
+        if (outs[s].n_drafted > 0) {
+            const llama_pos start = slots[s].n_past;
+            const llama_pos end   = start + outs[s].n_drafted;
+            llama_kv_cache_seq_rm(ctx, slots[s].seq_id, start, end);
+        }
+    }
+
+    return total_drafted;
+}
+
 } // extern "C"

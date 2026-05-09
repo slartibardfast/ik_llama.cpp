@@ -1603,6 +1603,16 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
+    // PHASE45 D10.b: multi-slot variant. Pack `n_slots` hidden states of
+    // length n_embd back-to-back: bytes [slot0_emb, slot1_emb, ...,
+    // slotN-1_emb]. The storage matches inp_mtp_states' 2D
+    // (n_embd, n_tokens) row-major layout. The next decode's
+    // prepare_mtp_graph_inputs copies ggml_nbytes(dst) bytes from this
+    // buffer; caller must ensure the buffer is large enough for the
+    // forward's n_tokens rows. Sets draft_input_hidden_state to point at
+    // the internal buffer (single-shot, like the 1-row variant).
+    LLAMA_API void llama_set_draft_input_hidden_state_multi(struct llama_context * ctx, int32_t n_slots, const float * hidden_states);
+
     // Phase 37 #2.2: chain-residual seed plumbing. Selects the prior
     // fused decode's chain residual at index `chain_step` (in
     // [0, n_steps-1]) as the seed for the NEXT MTP_OP_DRAFT_GEN_FUSED

@@ -3179,6 +3179,22 @@ void server_context::context_shift() {
 }
 
 void server_context::add_sampled_tokens() {
+    // PHASE45 D10.b: collect MTP-eligible slots so we can issue ONE batched
+    // draft forward per step instead of N sequential per-slot forwards. M=1
+    // takes the existing single-slot path (LLAMA_MTP_FUSED still applies);
+    // M >= 2 takes the batched path.
+    struct mtp_draft_collected {
+        server_slot * slot = nullptr;
+        common_speculative_batched_in input{};
+    };
+    std::vector<mtp_draft_collected> mtp_collected;
+    mtp_collected.reserve(slots.size());
+
+    // Used to assemble the single packed hidden-state buffer for the
+    // batched call (slot-major: [slot0_emb, slot1_emb, ...]). Only sized
+    // when M >= 2.
+    std::vector<float> packed_hidden;
+
     for (auto& slot : slots) {
         slot.released = false;
         if (slot.state == SLOT_STATE_IDLE) {
@@ -3200,50 +3216,28 @@ void server_context::add_sampled_tokens() {
             auto & params_spec = slot.params.speculative;
 
             if (slot.has_mtp) {
-                llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
-                llama_context * hs_ctx = mtp_ctx ? mtp_ctx : ctx;
-                if (!slot.mtp_hidden_state.empty()) {
-                    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
-                    const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
-                    llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
-                } else {
+                // Per-slot pre-amble: ensure mtp_hidden_state is populated.
+                // For batched mode (deferred dispatch), we record per-slot
+                // last hidden state into packed_hidden during collection.
+                if (slot.mtp_hidden_state.empty()) {
                     LOG_ERROR("MTP hidden state is empty during speculation", {});
                     const float* emb_neg1 = llama_decoder_get_embeddings_ith(decoder, -1);
                     if (emb_neg1) {
                         const int n_embd = llama_model_n_embd(llama_get_model(ctx));
                         slot.mtp_hidden_state.resize(n_embd);
                         memcpy(slot.mtp_hidden_state.data(), emb_neg1, n_embd * sizeof(float));
-                        llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data());
                     }
                 }
-                // Phase 37 #2.2: arm chain-residual seed (D2D, no host
-                // bounce). The full path is gated OFF by default — the
-                // measured emb_d2h+hidden_h2d cost is only ~4 us/chain
-                // step (vs the projected 50-100 us), making Mini #2's
-                // realistic lift <0.05%. The plumbing remains wired
-                // (gated by LLAMA_MTP_CHAIN_RESIDUAL_SEED) as the
-                // foundation for a future Full #2 implementation that
-                // pairs chain residuals with a context-owned persistent
-                // device buffer (so chain residuals survive the
-                // intervening verify+UPDATE_ACCEPTED sched_resets) and
-                // a dual-stream/speculative dispatch architecture that
-                // captures real GPU overlap. See PHASE37.md "#2 —
-                // pipelining design" + the measurement that drove
-                // path-3 recalibration as the chosen close.
-                // Phase 38.5 (revised): persist now holds verify's embd
-                // (right numeric space, populated via
-                // llama_mtp_set_persist_from_host from
-                // slot.mtp_hidden_state in Phase B). Arm the
-                // chain-residual seed for the next fused so prepare
-                // reads persist[step] D2D instead of host-bouncing.
-                static const bool _chain_residual_enabled =
-                    env_truthy("LLAMA_MTP_CHAIN_RESIDUAL_SEED");
-                static const bool _full_2_enabled =
-                    (getenv("LLAMA_MTP_FULL_2") != nullptr);
-                if ((_chain_residual_enabled || _full_2_enabled)
-                        && slot.mtp_next_chain_residual_step >= 0) {
-                    llama_set_draft_input_chain_residual(hs_ctx, slot.mtp_next_chain_residual_step);
-                }
+
+                // Defer the actual draft call until we have all slots; this
+                // collects the slot for the batched path.
+                mtp_draft_collected c;
+                c.slot               = &slot;
+                c.input.spec         = slot.spec;
+                c.input.prompt_tgt   = cached_text_tokens;
+                c.input.id_last      = slot.sampled;
+                mtp_collected.push_back(std::move(c));
+                continue;  // post-amble runs after the batched dispatch below
             }
 
             llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
@@ -3297,6 +3291,140 @@ void server_context::add_sampled_tokens() {
                 (int)slot.n_ctx, (int)slot.cache_tokens.size(), (int)slot.truncated);
         }
         slot.n_past = slot.cache_tokens.n_tokens();
+    }
+
+    // PHASE45 D10.b: dispatch MTP slots — single-slot fast path (M==1)
+    // preserves existing fused behavior; M>=2 takes the batched path.
+    if (!mtp_collected.empty()) {
+        const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+        // All slots share ctx_tgt under the post-D9.5 collapsed-context
+        // model. Use the first slot's mtp_ctx (or the main ctx if nullptr).
+        llama_context * mtp_ctx_first = common_speculative_get_mtp_ctx(mtp_collected[0].slot->spec);
+        llama_context * hs_ctx = mtp_ctx_first ? mtp_ctx_first : ctx;
+
+        if (mtp_collected.size() == 1) {
+            // Single-slot fast path: same as the pre-D10.b code.
+            auto & c = mtp_collected[0];
+            auto & slot = *c.slot;
+            auto & params_spec = slot.params.speculative;
+
+            if (!slot.mtp_hidden_state.empty()) {
+                const int n_hidden = slot.mtp_hidden_state.size() / n_embd;
+                llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd);
+            } else {
+                llama_set_draft_input_hidden_state(hs_ctx, slot.mtp_hidden_state.data());
+            }
+            // Phase 37 #2.2 chain-residual seed (preserved single-slot only).
+            static const bool _chain_residual_enabled =
+                env_truthy("LLAMA_MTP_CHAIN_RESIDUAL_SEED");
+            static const bool _full_2_enabled =
+                (getenv("LLAMA_MTP_FULL_2") != nullptr);
+            if ((_chain_residual_enabled || _full_2_enabled)
+                    && slot.mtp_next_chain_residual_step >= 0) {
+                llama_set_draft_input_chain_residual(hs_ctx, slot.mtp_next_chain_residual_step);
+            }
+
+            llama_tokens draft = common_speculative_draft(slot.spec, params_spec, c.input.prompt_tgt, c.input.id_last);
+
+            const int n_draft_max = slot.get_n_draft_max();
+            if (draft.size() > (size_t)n_draft_max) {
+                if (slot.params.speculative.autotune) {
+                    SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                } else {
+                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                }
+                draft.resize(n_draft_max);
+            }
+
+            slot.i_batch_dft.push_back(batch.n_tokens);
+            common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+            slot.cache_tokens.push_back(slot.sampled);
+
+            if (slot.params.speculative.n_min > (int)draft.size()) {
+                SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), slot.params.speculative.n_min);
+                slot.i_batch = slot.i_batch_dft[0];
+                slot.drafted.clear();
+                slot.i_batch_dft.clear();
+            } else {
+                slot.n_draft_total += draft.size();
+                for (size_t i = 0; i < draft.size(); i++) {
+                    slot.i_batch_dft.push_back(batch.n_tokens);
+                    common_batch_add(batch, draft[i], slot.cache_tokens.pos_next(), { slot.id }, true);
+                    slot.cache_tokens.push_back(draft[i]);
+                }
+                slot.drafted = std::move(draft);
+            }
+            slot.n_past = slot.cache_tokens.n_tokens();
+        } else {
+            // Multi-slot batched path: pack per-slot last hidden states,
+            // arm them in one shot, then issue a batched draft.
+            packed_hidden.clear();
+            packed_hidden.reserve(mtp_collected.size() * (size_t) n_embd);
+            for (auto & c : mtp_collected) {
+                auto & slot = *c.slot;
+                if (slot.mtp_hidden_state.empty()) {
+                    // Should have been backfilled above; emit zeros as last resort.
+                    packed_hidden.insert(packed_hidden.end(), (size_t) n_embd, 0.0f);
+                } else {
+                    const int n_hidden = (int) slot.mtp_hidden_state.size() / n_embd;
+                    const float * last = slot.mtp_hidden_state.data() + (n_hidden - 1) * n_embd;
+                    packed_hidden.insert(packed_hidden.end(), last, last + n_embd);
+                }
+            }
+            llama_set_draft_input_hidden_state_multi(hs_ctx, (int32_t) mtp_collected.size(), packed_hidden.data());
+            // Note: chain-residual seed is single-slot only (uses one
+            // device buffer + one chain). Skipping in batched mode is
+            // safe because the env-gated chain-residual path is OFF by
+            // default (see Phase 37 #2.2 comment above).
+
+            // Use the first slot's params as the shared draft params; n_max
+            // is per-slot but we forward the first slot's params (autotune /
+            // p_min / n_max all uniform across slots for now).
+            common_params_speculative shared_params = mtp_collected[0].slot->params.speculative;
+
+            std::vector<common_speculative_batched_in> inputs;
+            inputs.reserve(mtp_collected.size());
+            for (auto & c : mtp_collected) inputs.push_back(c.input);
+
+            std::vector<llama_tokens> drafts = common_speculative_draft_batched(inputs, shared_params);
+
+            // Per-slot post-amble (truncate, add sampled + drafts to batch).
+            for (size_t i = 0; i < mtp_collected.size(); ++i) {
+                auto & c = mtp_collected[i];
+                auto & slot = *c.slot;
+                llama_tokens draft = std::move(drafts[i]);
+
+                const int n_draft_max = slot.get_n_draft_max();
+                if (draft.size() > (size_t)n_draft_max) {
+                    if (slot.params.speculative.autotune) {
+                        SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                    } else {
+                        SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+                    }
+                    draft.resize(n_draft_max);
+                }
+
+                slot.i_batch_dft.push_back(batch.n_tokens);
+                common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+                slot.cache_tokens.push_back(slot.sampled);
+
+                if (slot.params.speculative.n_min > (int)draft.size()) {
+                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), slot.params.speculative.n_min);
+                    slot.i_batch = slot.i_batch_dft[0];
+                    slot.drafted.clear();
+                    slot.i_batch_dft.clear();
+                } else {
+                    slot.n_draft_total += draft.size();
+                    for (size_t k = 0; k < draft.size(); k++) {
+                        slot.i_batch_dft.push_back(batch.n_tokens);
+                        common_batch_add(batch, draft[k], slot.cache_tokens.pos_next(), { slot.id }, true);
+                        slot.cache_tokens.push_back(draft[k]);
+                    }
+                    slot.drafted = std::move(draft);
+                }
+                slot.n_past = slot.cache_tokens.n_tokens();
+            }
+        }
     }
 }
 

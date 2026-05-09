@@ -10,6 +10,8 @@
 #include "llama-spec-loop.h"
 #include "llama-decoder.h"
 #include "llama-spec.h"
+#include "llama-session.h"
+#include "llama-session-internal.h"  // PHASE45 D10.b: ctx-equality check via session
 
 #include <cstdlib>
 #include <cstdio>
@@ -99,6 +101,58 @@ void llama_spec_loop_accept_n(struct llama_spec_loop * loop, int32_t n_accepted)
     if ((size_t) n_accepted < loop->last_accepted.size()) {
         loop->last_accepted.resize(n_accepted);
     }
+}
+
+int32_t llama_spec_loop_gen_drafts_batched(
+        struct llama_spec_loop      ** loops,
+        int32_t                        n_loops,
+        const llama_spec_mtp_slot_in * slots,
+        float                          p_min,
+        llama_token                  * drafts_out,
+        int32_t                        drafts_out_stride,
+        llama_spec_mtp_slot_out      * outs) {
+    if (loops == nullptr || n_loops <= 0 || slots == nullptr) return -1;
+    if (drafts_out == nullptr || outs == nullptr || drafts_out_stride <= 0) return -1;
+
+    // All loops must share the underlying llama_context (post-D9.5
+    // invariant — each slot wraps the same shared ctx_tgt via its own
+    // session/decoder pair). The ctx check is what binds; the chosen
+    // decoder pair (loops[0]'s) forwards to that single ctx.
+    struct llama_decoder * verify = loops[0] ? loops[0]->verify : nullptr;
+    struct llama_decoder * draft  = (loops[0] && !loops[0]->drafts.empty()) ? loops[0]->drafts[0] : nullptr;
+    if (verify == nullptr || draft == nullptr) return -1;
+    struct llama_context * verify_ctx = llama_session_internal_context(llama_decoder_session(verify));
+    struct llama_context * draft_ctx  = llama_session_internal_context(llama_decoder_session(draft));
+    for (int32_t i = 1; i < n_loops; ++i) {
+        if (loops[i] == nullptr) return -1;
+        if (llama_session_internal_context(llama_decoder_session(loops[i]->verify)) != verify_ctx) return -1;
+        if (loops[i]->drafts.empty()) return -1;
+        if (llama_session_internal_context(llama_decoder_session(loops[i]->drafts[0])) != draft_ctx) return -1;
+    }
+
+    const int32_t n = llama_spec_mtp_draft_batched(
+            verify, draft,
+            slots, n_loops,
+            p_min,
+            drafts_out, drafts_out_stride,
+            outs);
+
+    if (n > 0) {
+        // Update per-loop stats; last_accepted is per-slot now (slot-major
+        // slice). Each slot's drafted count is outs[i].n_drafted.
+        for (int32_t i = 0; i < n_loops; ++i) {
+            const int32_t k = outs[i].n_drafted;
+            loops[i]->n_drafted += k;
+            loops[i]->last_accepted.assign(
+                drafts_out + (size_t) i * (size_t) drafts_out_stride,
+                drafts_out + (size_t) i * (size_t) drafts_out_stride + (size_t) k);
+        }
+    } else {
+        for (int32_t i = 0; i < n_loops; ++i) {
+            loops[i]->last_accepted.clear();
+        }
+    }
+    return n;
 }
 
 int32_t llama_spec_loop_step(struct llama_spec_loop * /*loop*/, struct llama_batch /*batch*/) {

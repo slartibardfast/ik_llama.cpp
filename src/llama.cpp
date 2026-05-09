@@ -11380,6 +11380,22 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
     ctx->default_decoder.draft_input_hidden_state = ctx->default_decoder.draft_input_hidden_state_buf.data();
 }
 
+// PHASE45 D10.b: multi-slot variant. Packs n_slots hidden states back-to-back
+// into the same context-owned buffer used by the 1-row setter. The decode-time
+// prepare_mtp_graph_inputs copies ggml_nbytes(dst) bytes; for an N-row forward
+// dst has shape (n_embd, N) and the layout is row-major (n_embd-fastest), so
+// callers pack [slot0_emb (n_embd floats), slot1_emb, ...].
+void llama_set_draft_input_hidden_state_multi(struct llama_context * ctx, int32_t n_slots, const float * hidden_states) {
+    if (ctx == nullptr || hidden_states == nullptr || n_slots <= 0) {
+        if (ctx) ctx->default_decoder.draft_input_hidden_state = nullptr;
+        return;
+    }
+    const size_t n_embd = (size_t) ctx->model.hparams.n_embd;
+    const size_t total  = n_embd * (size_t) n_slots;
+    ctx->default_decoder.draft_input_hidden_state_buf.assign(hidden_states, hidden_states + total);
+    ctx->default_decoder.draft_input_hidden_state = ctx->default_decoder.draft_input_hidden_state_buf.data();
+}
+
 void llama_set_draft_input_chain_residual(struct llama_context * ctx, int chain_step) {
     if (ctx == nullptr) return;
     ctx->default_decoder.pending_chain_residual_step = chain_step < 0 ? -1 : chain_step;

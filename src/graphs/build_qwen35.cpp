@@ -132,13 +132,15 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     ggml_tensor * inp_pos = build_inp_pos();
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
-        // MTP tail-only graph
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
+        // MTP tail-only graph.
+        // PHASE45 D10.b: inp_mtp_states is 2D (n_embd, n_tokens) for ALL
+        // MTP op types so DRAFT_GEN can carry one hidden state per batch
+        // row when N slots draft together. n_tokens=1 reduces to the
+        // original single-row case (a 2D shape with second dim 1 is
+        // mathematically identical to 1D for downstream concat + GEMM).
+        // Matches the MoE build (build_qwen35moe).
+        ggml_tensor * hidden_states_from_main_model =
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
         lctx.default_decoder.inp_mtp_states = hidden_states_from_main_model;
