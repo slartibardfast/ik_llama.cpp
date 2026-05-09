@@ -5498,7 +5498,16 @@ static int llama_decode_internal(
                 //     therefore committed to a trivial sampler.
                 const bool draftgen_fast = (cparams.mtp_op_type == MTP_OP_DRAFT_GEN);
                 const bool verify_fast   = (cparams.mtp_op_type == MTP_OP_NONE && cparams.mtp && fast_verify_armed);
-                if ((draftgen_fast || verify_fast) && n_outputs_new > 0 && res->ne[1] > 0) {
+                // C.1 diagnostic gate: env-disable the cuda mtp_argmax verify
+                // fast path so we can test whether this kernel is the source
+                // of the np>1 slot divergence. Read-once at first call;
+                // default-zero cost when env unset.
+                static const bool disable_mtp_verify_fast = []() {
+                    const char * v = getenv("LLAMA_DISABLE_MTP_VERIFY_FAST");
+                    return v && *v && *v != '0';
+                }();
+                const bool effective_verify_fast = verify_fast && !disable_mtp_verify_fast;
+                if ((draftgen_fast || effective_verify_fast) && n_outputs_new > 0 && res->ne[1] > 0) {
                     ggml_backend_buffer_t res_buf = res->buffer;
                     const char * res_buf_name = res_buf ? ggml_backend_buffer_name(res_buf) : nullptr;
                     if (res_buf_name && strstr(res_buf_name, "CUDA") != nullptr) {
