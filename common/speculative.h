@@ -53,15 +53,9 @@ void common_speculative_context_shift(
         llama_pos            kv_discard,
         llama_pos            kv_past);
 
-// Generates speculative draft tokens using the Multi-Token Prediction (MTP) architecture.
-std::vector<llama_token> mtp_speculative_gen_draft(
-    struct common_sampler * smpl,
-    struct llama_context * ctx,
-    int n_draft,
-    float p_min,
-    llama_token id_last,
-    int32_t n_past,
-    llama_seq_id seq_id);
+// PHASE45 D9.9: mtp_speculative_gen_draft removed (~300 LoC dead code).
+// Bypassed by D8.3's libcommon shim that forwards to spec_loop, which
+// in turn calls libllama-level llama_spec_mtp_draft.
 
 void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup);
 
