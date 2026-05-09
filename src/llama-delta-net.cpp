@@ -683,12 +683,21 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         const char * v = getenv("LLAMA_KERNEL_DIVERGENCE_TRACE");
         return v && *v && *v != '0';
     }();
+    // C.1 diagnostic gate: force blocks_loop unconditionally so np=1 and np=N
+    // both take the same code path, eliminating the all_same_seq fast-path-vs-
+    // blocks-loop divergence as a determinism source. Read-once at first call.
+    static const bool force_blocks_loop = []() {
+        const char * v = getenv("LLAMA_FORCE_BLOCKS_LOOP");
+        return v && *v && *v != '0';
+    }();
+    const bool effective_all_same_seq = all_same_seq && !force_blocks_loop;
     if (divergence_trace) {
-        fprintf(stderr, "[divergence] DeltaNet build_layer_attn_linear il=%d ne[1]=%d path=%s\n",
-                il, (int)cur->ne[1], all_same_seq ? "all_same_seq_fast" : "blocks_loop");
+        fprintf(stderr, "[divergence] DeltaNet build_layer_attn_linear il=%d ne[1]=%d path=%s%s\n",
+                il, (int)cur->ne[1], effective_all_same_seq ? "all_same_seq_fast" : "blocks_loop",
+                (force_blocks_loop && all_same_seq) ? " (forced)" : "");
     }
 
-    if (all_same_seq) {
+    if (effective_all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
     }
