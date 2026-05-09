@@ -1407,6 +1407,19 @@ void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, b
         return;
     }
 
+    // PHASE45 D10: when LLAMA_MTP_INLINE_KV is on, the per-ubatch hook in
+    // the verify forward already wrote the MTP KV layer for every batch
+    // position — the WARMUP / UPDATE_ACCEPTED dispatch is redundant. It is
+    // also unsafe under multi-slot: this function reads only
+    // batch.seq_id[0][0] for the seq_rm and runs a single llama_decode
+    // that crashes when the batch contains tokens from multiple seq_ids
+    // (multi-slot batched verify). Short-circuit when the hook is on,
+    // matching mtp_accept_tokens (line 1450).
+    static const bool _hook_on = env_truthy("LLAMA_MTP_INLINE_KV");
+    if (_hook_on) {
+        return;
+    }
+
     llama_seq_id seq_id    = batch.seq_id[0][0];
     llama_pos    start_pos = batch.pos[0];
 

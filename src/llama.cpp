@@ -8088,6 +8088,18 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
         requested = LLAMA_SPEC_CKPT_PER_STEP;
     }
 
+    // PHASE45 D10: PER_STEP save buffers (per_step_qkv / per_step_ssm) are
+    // sized for a single-slot draft chain (max_tokens = 1+n_draft) AND assume
+    // contiguous-per-slot tokens for restore. Under shared-session multi-slot,
+    // the verify forward batches all active slots into one ubatch, so
+    // n_tok_qkv > max_tokens (overflows the view) AND tokens are interleaved
+    // by seq_id (restore can't dis-interleave). Force GPU_FALLBACK whenever
+    // n_seq_max > 1; the full-state shadow path is correct under any batching
+    // pattern at the cost of saving the entire s_l once per save.
+    if (requested == LLAMA_SPEC_CKPT_PER_STEP && ctx->cparams.n_seq_max > 1) {
+        requested = LLAMA_SPEC_CKPT_GPU_FALLBACK;
+    }
+
     if (requested == LLAMA_SPEC_CKPT_PER_STEP) {
         if (spec_ckpt_try_per_step(kv, ctx->model, max_tokens)) {
             kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_PER_STEP;
