@@ -1,7 +1,7 @@
 #pragma once
 
 // Maps llama_seq_id -> fixed slot index in the qwen3next linear-attn
-// state buffer. The state buffer (lctx.kv_self.s_l[il]) is allocated
+// state buffer. The state buffer (lctx.default_decoder.s_l[il]) is allocated
 // with shape [state_dim, n_slots] at context init; this allocator
 // hands out per-seq slot indices into that fixed pool.
 //

@@ -4699,9 +4699,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // kv_cache_init sized it to llama_qwen3next_state_slots(cparams, kv_size).
         if (lctx.qnext_slot_alloc.n_slots == 0) {
             int32_t n_slots = 0;
-            for (size_t il = 0; il < lctx.kv_self.s_l.size(); ++il) {
-                if (lctx.kv_self.s_l[il] != nullptr) {
-                    n_slots = (int32_t) lctx.kv_self.s_l[il]->ne[1];
+            for (size_t il = 0; il < lctx.default_decoder.s_l.size(); ++il) {
+                if (lctx.default_decoder.s_l[il] != nullptr) {
+                    n_slots = (int32_t) lctx.default_decoder.s_l[il]->ne[1];
                     break;
                 }
             }
@@ -7366,6 +7366,13 @@ struct llama_context * llama_init_from_model(
             llama_free(ctx);
             return nullptr;
         }
+        // PHASE45 D9.6d: mirror recurrent-state pointers from kv_self
+        // onto default_decoder. Allocation lifetime stays in kv_cache's
+        // ggml_context; decoder holds borrowed pointers for the
+        // architecturally per-decoder s_l references in graph builders
+        // and spec_ckpt save/restore.
+        ctx->default_decoder.s_l       = ctx->kv_self.s_l;
+        ctx->default_decoder.split_s_l = ctx->kv_self.split_s_l;
 
         {
             size_t memory_size_k = 0;
@@ -8487,18 +8494,18 @@ struct llama_data_write {
 
         if (qnext_state != 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const bool has_s_cache = il < kv_self.s_l.size() && kv_self.s_l[il] != nullptr;
+                const bool has_s_cache = il < ctx->default_decoder.s_l.size() && ctx->default_decoder.s_l[il] != nullptr;
 
-                const int32_t s_type_i = has_s_cache ? (int32_t) kv_self.s_l[il]->type : -1;
+                const int32_t s_type_i = has_s_cache ? (int32_t) ctx->default_decoder.s_l[il]->type : -1;
                 write(&s_type_i, sizeof(s_type_i));
 
-                const uint64_t s_size_row = has_s_cache ? ggml_row_size(kv_self.s_l[il]->type, kv_self.s_l[il]->ne[0]) : 0;
+                const uint64_t s_size_row = has_s_cache ? ggml_row_size(ctx->default_decoder.s_l[il]->type, ctx->default_decoder.s_l[il]->ne[0]) : 0;
                 write(&s_size_row, sizeof(s_size_row));
 
                 uint32_t s_rows = 0;
                 size_t s_offset = 0;
                 if (has_s_cache) {
-                    const uint32_t n_slots = (uint32_t) kv_self.s_l[il]->ne[1];
+                    const uint32_t n_slots = (uint32_t) ctx->default_decoder.s_l[il]->ne[1];
                     if (seq_id == -1) {
                         s_rows = n_slots;
                     } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id) && (uint32_t) seq_id < kv_self.size) {
@@ -8513,7 +8520,7 @@ struct llama_data_write {
                 write(&s_rows, sizeof(s_rows));
 
                 if (has_s_cache && s_rows > 0) {
-                    write_tensor_data(kv_self.s_l[il], s_offset, s_rows * s_size_row, il);
+                    write_tensor_data(ctx->default_decoder.s_l[il], s_offset, s_rows * s_size_row, il);
                 }
             }
         }
@@ -8970,7 +8977,7 @@ struct llama_data_read {
 
         if (qnext_state_ref != 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const bool has_s_cache = il < kv_self.s_l.size() && kv_self.s_l[il] != nullptr;
+                const bool has_s_cache = il < ctx->default_decoder.s_l.size() && ctx->default_decoder.s_l[il] != nullptr;
 
                 int32_t s_type_i_ref;
                 read_to(&s_type_i_ref, sizeof(s_type_i_ref));
@@ -8980,7 +8987,7 @@ struct llama_data_read {
                         return false;
                     }
                 } else {
-                    const int32_t s_type_i = (int32_t) kv_self.s_l[il]->type;
+                    const int32_t s_type_i = (int32_t) ctx->default_decoder.s_l[il]->type;
                     if (s_type_i != s_type_i_ref) {
                         LLAMA_LOG_ERROR("%s: mismatched qwen3next state type (%d != %d, layer %d)\n", __func__, s_type_i, s_type_i_ref, il);
                         return false;
@@ -8990,7 +8997,7 @@ struct llama_data_read {
                 uint64_t s_size_row_ref;
                 read_to(&s_size_row_ref, sizeof(s_size_row_ref));
 
-                const uint64_t s_size_row = has_s_cache ? ggml_row_size(kv_self.s_l[il]->type, kv_self.s_l[il]->ne[0]) : 0;
+                const uint64_t s_size_row = has_s_cache ? ggml_row_size(ctx->default_decoder.s_l[il]->type, ctx->default_decoder.s_l[il]->ne[0]) : 0;
                 if (s_size_row != s_size_row_ref) {
                     LLAMA_LOG_ERROR("%s: mismatched qwen3next state row size (%zu != %zu, layer %d)\n",
                             __func__, (size_t) s_size_row, (size_t) s_size_row_ref, il);
@@ -9003,7 +9010,7 @@ struct llama_data_read {
                 uint32_t s_rows = 0;
                 uint32_t s_dst_row = 0;
                 if (has_s_cache) {
-                    const uint32_t n_slots = (uint32_t) kv_self.s_l[il]->ne[1];
+                    const uint32_t n_slots = (uint32_t) ctx->default_decoder.s_l[il]->ne[1];
                     if (seq_id == -1) {
                         s_rows = n_slots;
                     } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id)) {
@@ -9020,10 +9027,10 @@ struct llama_data_read {
                 if (s_rows > 0) {
                     const size_t s_data_size = s_rows * s_size_row;
                     const size_t s_dst_offset = (size_t) s_dst_row * s_size_row;
-                    if (kv_self.s_l[il]->extra) {
-                        read_kv_cache_data_split(ctx, kv_self.s_l[il], read(s_data_size), s_dst_row, s_size_row, s_rows, il);
+                    if (ctx->default_decoder.s_l[il]->extra) {
+                        read_kv_cache_data_split(ctx, ctx->default_decoder.s_l[il], read(s_data_size), s_dst_row, s_size_row, s_rows, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
+                        ggml_backend_tensor_set(ctx->default_decoder.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
                     }
                 }
             }

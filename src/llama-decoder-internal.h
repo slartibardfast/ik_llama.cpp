@@ -14,6 +14,7 @@
 
 #include "llama.h"
 #include "llama-decoder.h"
+#include "llama-impl.h"   // PHASE45 D9.6d: full llama_split_tensor definition
 #include "ggml-backend.h"
 
 #include <vector>
@@ -72,6 +73,18 @@ struct llama_decoder {
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+
+    // PHASE45 D9.6d: recurrent state per layer (Qwen3Next / DeltaNet).
+    // Architecturally per-decoder (verify and draft track independent
+    // recurrent trajectories on accept/reject). Today the storage is
+    // still allocated by llama_kv_cache_init alongside k_l/v_l so the
+    // ggml_context lifetimes stay co-located; default_decoder mirrors
+    // pointers from cache.s_l after init. Per-decoder allocation
+    // contexts land at D9.6g/D9.7 when split_cache also splits.
+    std::vector<struct ggml_tensor *> s_l;          // per layer
+    // For split layers: per-device tensor pointers, mirrored from
+    // kv_cache.split_s_l. Same lifetime caveat as s_l.
+    std::vector<struct llama_split_tensor> split_s_l;
 
     ~llama_decoder() {
         // PHASE45 D9.6c: decoder owns its output buffer; default_decoder
