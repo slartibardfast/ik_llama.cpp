@@ -436,6 +436,46 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
+// concurrent fork/join events
+
+ggml_backend_concurrent_event_t ggml_backend_concurrent_event_new(ggml_backend_t backend, int n_slots) {
+    GGML_ASSERT(n_slots >= 1);
+    if (backend->iface.concurrent_event_new == NULL) {
+        return NULL;
+    }
+    return backend->iface.concurrent_event_new(backend, n_slots);
+}
+
+void ggml_backend_concurrent_event_free(ggml_backend_concurrent_event_t event) {
+    if (event == NULL) {
+        return;
+    }
+    event->backend->iface.concurrent_event_free(event);
+}
+
+void ggml_backend_concurrent_event_fork(ggml_backend_concurrent_event_t event) {
+    if (event == NULL) {
+        return;
+    }
+    GGML_ASSERT(event->backend->iface.concurrent_event_fork != NULL);
+    event->backend->iface.concurrent_event_fork(event);
+}
+
+void ggml_backend_concurrent_event_join(ggml_backend_concurrent_event_t event) {
+    if (event == NULL) {
+        return;
+    }
+    GGML_ASSERT(event->backend->iface.concurrent_event_join != NULL);
+    event->backend->iface.concurrent_event_join(event);
+}
+
+int ggml_backend_concurrent_event_n_slots(ggml_backend_concurrent_event_t event) {
+    if (event == NULL) {
+        return 0;
+    }
+    return event->n_slots;
+}
+
 // backend registry
 
 #define GGML_REG_MAX_BACKENDS 64
@@ -942,6 +982,10 @@ static struct ggml_backend_i cpu_backend_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .event_synchronize       = */ NULL,
+    /* .concurrent_event_new    = */ NULL,
+    /* .concurrent_event_free   = */ NULL,
+    /* .concurrent_event_fork   = */ NULL,
+    /* .concurrent_event_join   = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {

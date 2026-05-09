@@ -127,6 +127,14 @@ extern "C" {
         void                 (*GGML_CALL event_wait)        (ggml_backend_t backend, ggml_backend_event_t event);
         // block until an event is recorded
         void                 (*GGML_CALL event_synchronize) (ggml_backend_event_t event);
+
+        // (optional) concurrent fork/join events for per-op deterministic |B|=1 dispatch.
+        // If unimplemented, ggml_backend_concurrent_event_new returns NULL and callers
+        // must dispatch serially on the main stream.
+        ggml_backend_concurrent_event_t (*GGML_CALL concurrent_event_new)  (ggml_backend_t backend, int n_slots);
+        void                            (*GGML_CALL concurrent_event_free) (ggml_backend_concurrent_event_t event);
+        void                            (*GGML_CALL concurrent_event_fork) (ggml_backend_concurrent_event_t event);
+        void                            (*GGML_CALL concurrent_event_join) (ggml_backend_concurrent_event_t event);
     };
 
     struct ggml_backend {
@@ -139,6 +147,12 @@ extern "C" {
     struct ggml_backend_event {
         ggml_backend_t backend;
         void * context;
+    };
+
+    struct ggml_backend_concurrent_event {
+        ggml_backend_t backend;
+        int            n_slots;
+        void *         context; // backend-specific (CUDA: per-slot streams + fan-out/fan-in cudaEvents)
     };
 
     //

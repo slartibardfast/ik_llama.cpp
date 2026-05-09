@@ -216,6 +216,10 @@ if (GGML_CUDA)
     llama_build_and_test(test-cuda-graph-update-state-mutation.cpp)
     llama_build_and_test(test-cuda-graph-comparator-op-params.cpp)
     llama_build_and_test(test-cuda-pool-graceful-oom.cpp)
+    llama_build_and_test(test-cuda-concurrent-event.cpp)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(test-cuda-concurrent-event PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(test-cuda-concurrent-event PRIVATE CUDA::cudart)
 
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.

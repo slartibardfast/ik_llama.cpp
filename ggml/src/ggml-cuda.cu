@@ -5431,6 +5431,93 @@ static void ggml_backend_cuda_event_synchronize(ggml_backend_event_t event) {
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// concurrent fork/join events
+//
+// Per-event context owns n_slots dedicated cudaStreams + (n_slots + 1) cudaEvents:
+// one fan-out event recorded on the main stream during fork(), and n_slots
+// fan-in events recorded on the per-slot streams during join(). The lifetime
+// model is one event per (decoder, op-site) — created once outside the hot
+// loop, reused across decode steps.
+
+struct ggml_backend_cuda_concurrent_event_context {
+    int                       device;
+    int                       n_slots;
+    std::vector<cudaStream_t> slot_streams;  // size n_slots
+    cudaEvent_t               fork_event;    // recorded on main stream during fork()
+    std::vector<cudaEvent_t>  join_events;   // size n_slots, recorded during join()
+};
+
+static ggml_backend_concurrent_event_t ggml_backend_cuda_concurrent_event_new(ggml_backend_t backend, int n_slots) {
+    GGML_ASSERT(n_slots >= 1);
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    auto * ctx = new ggml_backend_cuda_concurrent_event_context;
+    ctx->device  = cuda_ctx->device;
+    ctx->n_slots = n_slots;
+    ctx->slot_streams.resize(n_slots);
+    ctx->join_events.resize(n_slots);
+
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->fork_event, cudaEventDisableTiming));
+    for (int i = 0; i < n_slots; ++i) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->slot_streams[i], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx->join_events[i], cudaEventDisableTiming));
+    }
+
+    return new ggml_backend_concurrent_event {
+        /* .backend = */ backend,
+        /* .n_slots = */ n_slots,
+        /* .context = */ ctx,
+    };
+}
+
+static void ggml_backend_cuda_concurrent_event_free(ggml_backend_concurrent_event_t event) {
+    auto * ctx = (ggml_backend_cuda_concurrent_event_context *)event->context;
+    ggml_cuda_set_device(ctx->device);
+
+    for (int i = 0; i < ctx->n_slots; ++i) {
+        CUDA_CHECK(cudaStreamDestroy(ctx->slot_streams[i]));
+        CUDA_CHECK(cudaEventDestroy(ctx->join_events[i]));
+    }
+    CUDA_CHECK(cudaEventDestroy(ctx->fork_event));
+    delete ctx;
+    delete event;
+}
+
+static void ggml_backend_cuda_concurrent_event_fork(ggml_backend_concurrent_event_t event) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *)event->backend->context;
+    auto * ctx      = (ggml_backend_cuda_concurrent_event_context *)event->context;
+    ggml_cuda_set_device(ctx->device);
+
+    CUDA_CHECK(cudaEventRecord(ctx->fork_event, cuda_ctx->stream()));
+    for (int i = 0; i < ctx->n_slots; ++i) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx->slot_streams[i], ctx->fork_event, 0));
+    }
+}
+
+static void ggml_backend_cuda_concurrent_event_join(ggml_backend_concurrent_event_t event) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *)event->backend->context;
+    auto * ctx      = (ggml_backend_cuda_concurrent_event_context *)event->context;
+    ggml_cuda_set_device(ctx->device);
+
+    for (int i = 0; i < ctx->n_slots; ++i) {
+        CUDA_CHECK(cudaEventRecord(ctx->join_events[i], ctx->slot_streams[i]));
+    }
+    for (int i = 0; i < ctx->n_slots; ++i) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), ctx->join_events[i], 0));
+    }
+}
+
+// CUDA-specific accessor: returns the per-slot stream handle for direct kernel
+// dispatch. Only valid between fork() and join() on the owning event. Declared in
+// ggml/src/ggml-cuda/concurrent_event.cuh.
+extern "C" cudaStream_t ggml_backend_cuda_concurrent_event_stream(ggml_backend_concurrent_event_t event, int slot_idx) {
+    GGML_ASSERT(event != NULL);
+    auto * ctx = (ggml_backend_cuda_concurrent_event_context *)event->context;
+    GGML_ASSERT(slot_idx >= 0 && slot_idx < ctx->n_slots);
+    return ctx->slot_streams[slot_idx];
+}
+
 static ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -5452,6 +5539,10 @@ static ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .event_synchronize       = */ ggml_backend_cuda_event_synchronize,
+    /* .concurrent_event_new    = */ ggml_backend_cuda_concurrent_event_new,
+    /* .concurrent_event_free   = */ ggml_backend_cuda_concurrent_event_free,
+    /* .concurrent_event_fork   = */ ggml_backend_cuda_concurrent_event_fork,
+    /* .concurrent_event_join   = */ ggml_backend_cuda_concurrent_event_join,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

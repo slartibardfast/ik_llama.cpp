@@ -10,6 +10,7 @@ extern "C" {
     typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
     typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
     typedef struct ggml_backend_event * ggml_backend_event_t;
+    typedef struct ggml_backend_concurrent_event * ggml_backend_concurrent_event_t;
     typedef struct ggml_backend * ggml_backend_t;
     typedef void * ggml_backend_graph_plan_t;
 
@@ -93,6 +94,25 @@ extern "C" {
     GGML_API void                   ggml_backend_event_record     (ggml_backend_event_t event);
     GGML_API void                   ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                   ggml_backend_event_wait       (ggml_backend_t backend, ggml_backend_event_t event);
+
+    // concurrent fork/join events — per-op deterministic dispatch when |B|>1.
+    //
+    // The pattern:
+    //   1. main stream produces a batched tensor at |B|=N
+    //   2. fork(): main stream records a fan-out event; N per-slot streams wait on it
+    //   3. caller dispatches the bug-prone op on each per-slot stream with |B|=1
+    //   4. join(): each per-slot stream records a fan-in event; main stream waits on all N
+    //   5. main stream resumes with the tensor that the per-slot streams produced
+    //
+    // Access to per-slot stream handles is backend-specific; the CUDA backend
+    // exposes ggml_backend_cuda_concurrent_event_stream() via ggml-cuda.h. Backends
+    // without concurrent-dispatch support implement these as no-ops, leaving the
+    // caller to dispatch serially on the main stream (correct, just non-amortized).
+    GGML_API ggml_backend_concurrent_event_t ggml_backend_concurrent_event_new       (ggml_backend_t backend, int n_slots);
+    GGML_API void                            ggml_backend_concurrent_event_free      (ggml_backend_concurrent_event_t event);
+    GGML_API void                            ggml_backend_concurrent_event_fork      (ggml_backend_concurrent_event_t event);
+    GGML_API void                            ggml_backend_concurrent_event_join      (ggml_backend_concurrent_event_t event);
+    GGML_API int                             ggml_backend_concurrent_event_n_slots   (ggml_backend_concurrent_event_t event);
 
     //
     // CPU backend
