@@ -606,12 +606,12 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (u_batch.embd)                             { g_can_reuse_last_miss_reason = 3;  return false; }
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
-    if (kv_self.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
+    if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
     // graph. The cudaGraphExecUpdate path patches per-call ne/nb so
     // exact-size differences inside a bucket don't break correctness.
-    if (GGML_PAD(kv_self.n, 64) != GGML_PAD((int64_t)prev->n_kv, 64))
+    if (GGML_PAD(transformer_kv.n, 64) != GGML_PAD((int64_t)prev->n_kv, 64))
                                                   { g_can_reuse_last_miss_reason = 7;  return false; }
     if (decoder_ref->n_outputs != prev->n_outputs)             { g_can_reuse_last_miss_reason = 8;  return false; }
     if (cparams.mtp_op_type != prev->mtp_op_type) { g_can_reuse_last_miss_reason = 9;  return false; }
@@ -626,18 +626,18 @@ bool llama_context::update_cache_copies() {
     auto layer_has_attention_kv = [&](int il) {
         return !model.hparams.is_recurrent(il);
     };
-    if ((int)kv_self.k_l.size() != n_layer) return false;
-    if (!(kv_self.v_l.empty() || (int)kv_self.v_l.size() == n_layer)) return false;
+    if ((int)transformer_kv.k_l.size() != n_layer) return false;
+    if (!(transformer_kv.v_l.empty() || (int)transformer_kv.v_l.size() == n_layer)) return false;
     for (int il = 0; il < n_layer; ++il) {
-        if (!layer_has_attention_kv(il) || kv_self.k_l[il] == nullptr) {
+        if (!layer_has_attention_kv(il) || transformer_kv.k_l[il] == nullptr) {
             continue;
         }
-        auto kl = (ggml_split_tensor_t *)kv_self.k_l[il]->extra;
+        auto kl = (ggml_split_tensor_t *)transformer_kv.k_l[il]->extra;
         if (kl) {
             GGML_ASSERT(model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN);
             GGML_ASSERT(model.splits.size() > 1);
-            auto vl = !kv_self.v_l.empty() && kv_self.v_l[il] ? (ggml_split_tensor_t *)kv_self.v_l[il]->extra : nullptr;
-            GGML_ASSERT(kl && (!kv_self.v_l[il] || vl));
+            auto vl = !transformer_kv.v_l.empty() && transformer_kv.v_l[il] ? (ggml_split_tensor_t *)transformer_kv.v_l[il]->extra : nullptr;
+            GGML_ASSERT(kl && (!transformer_kv.v_l[il] || vl));
             if (vl) {
                 GGML_ASSERT(kl->n_device == vl->n_device);
             }
@@ -645,7 +645,7 @@ bool llama_context::update_cache_copies() {
                 if (!kl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 0];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) return false;
-                c.cpy->view_offs = kv_self.head*c.step;
+                c.cpy->view_offs = transformer_kv.head*c.step;
                 c.cpy->src[1]->data = (char *)kl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -654,30 +654,30 @@ bool llama_context::update_cache_copies() {
                 if (!vl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 1];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) return false;
-                c.cpy->view_offs = kv_self.head*c.step;
+                c.cpy->view_offs = transformer_kv.head*c.step;
                 c.cpy->src[1]->data = (char *)vl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
         } else {
             for (int il = 0; il < n_layer; ++il) {
-                if (!layer_has_attention_kv(il) || kv_self.k_l[il] == nullptr) {
+                if (!layer_has_attention_kv(il) || transformer_kv.k_l[il] == nullptr) {
                     continue;
                 }
                 auto& c = cache_copies[2*il+0];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.k_l[il]) return false;
-                c.cpy->view_offs = kv_self.head*c.step;
-                c.cpy->src[1]->data = (char *)kv_self.k_l[il]->data + c.cpy->view_offs;
+                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.k_l[il]) return false;
+                c.cpy->view_offs = transformer_kv.head*c.step;
+                c.cpy->src[1]->data = (char *)transformer_kv.k_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
-            if (kv_self.v_l.empty()) return true;
+            if (transformer_kv.v_l.empty()) return true;
             for (int il = 0; il < n_layer; ++il) {
-                if (!layer_has_attention_kv(il) || kv_self.v_l[il] == nullptr) {
+                if (!layer_has_attention_kv(il) || transformer_kv.v_l[il] == nullptr) {
                     continue;
                 }
                 auto& c = cache_copies[2*il+1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kv_self.v_l[il]) return false;
-                c.cpy->view_offs = kv_self.head*c.step;
-                c.cpy->src[1]->data = (char *)kv_self.v_l[il]->data + c.cpy->view_offs;
+                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.v_l[il]) return false;
+                c.cpy->view_offs = transformer_kv.head*c.step;
+                c.cpy->src[1]->data = (char *)transformer_kv.v_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
         }
@@ -3987,26 +3987,26 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 //
 
 static void llama_set_k_shift(llama_context & lctx) {
-    const int64_t kv_size = lctx.kv_self.size;
+    const int64_t kv_size = lctx.transformer_kv.size;
 
     assert(ggml_backend_buffer_is_host(lctx.default_decoder.inp_K_shift->buffer));
 
     int32_t * data = (int32_t *) lctx.default_decoder.inp_K_shift->data;
 
     for (int i = 0; i < kv_size; ++i) {
-        data[i] = lctx.kv_self.cells[i].delta;
+        data[i] = lctx.transformer_kv.cells[i].delta;
     }
 }
 
 static void llama_set_s_copy(llama_context & lctx) {
-    const int64_t kv_size = lctx.kv_self.size;
+    const int64_t kv_size = lctx.transformer_kv.size;
 
     assert(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_copy->buffer));
 
     int32_t * data = (int32_t *) lctx.default_decoder.inp_s_copy->data;
 
     for (int i = 0; i < kv_size; ++i) {
-        data[i] = lctx.kv_self.cells[i].src;
+        data[i] = lctx.transformer_kv.cells[i].src;
     }
 }
 
@@ -4041,7 +4041,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
-    const auto & kv_self = lctx.kv_self;
+    const auto & transformer_kv = lctx.transformer_kv;
 
     if (batch.token) {
 #if IK_PRINT_TIMING == 2
@@ -4185,7 +4185,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             GGML_ASSERT(!hparams.use_alibi);
             GGML_ASSERT(lctx.default_decoder.inp_KQ_mask_swa == nullptr);
 
-            const int64_t n_kv     = kv_self.n;
+            const int64_t n_kv     = transformer_kv.n;
             const int64_t n_tokens = batch.n_tokens;
             const int64_t pad      = GGML_KQ_MASK_PAD;
             const bool    fa       = cparams.flash_attn;
@@ -4202,7 +4202,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             if (mdf16) std::fill(mdf16, mdf16 + total, h_inf);
 
             // Step 2: per-step visibility column at offset
-            // k * pad * n_kv. Token k attends to all kv_self cells
+            // k * pad * n_kv. Token k attends to all transformer_kv cells
             // whose pos is <= batch.pos[k] AND has the same seq_id.
             // The standard chain-causality property holds because
             // llama_kv_cache_find_slot has already assigned cells
@@ -4214,8 +4214,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 const llama_seq_id seq_id = batch.seq_id[j][0];
                 const int64_t      col_base = (int64_t) j * pad * n_kv;
                 for (int64_t i = 0; i < n_kv; ++i) {
-                    const bool visible = lctx.kv_self.cells[i].has_seq_id(seq_id) &&
-                                         lctx.kv_self.cells[i].pos <= pos;
+                    const bool visible = lctx.transformer_kv.cells[i].has_seq_id(seq_id) &&
+                                         lctx.transformer_kv.cells[i].pos <= pos;
                     if (mdf32) mdf32[col_base + i] = visible ? 0.0f : -INFINITY;
                     if (mdf16) mdf16[col_base + i] = visible ? h_zero : h_inf;
                 }
@@ -4242,7 +4242,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (cparams.causal_attn && !lctx.is_encoding) {
-            const int64_t n_kv     = kv_self.n;
+            const int64_t n_kv     = transformer_kv.n;
             const int64_t n_tokens = batch.n_tokens;
 
 
@@ -4273,17 +4273,17 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
                 ggml_half h_zero = ggml_fp32_to_fp16(0.f);
                 for (int i = first; i < last; ++i) {
-                    ggml_half h = !lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos ? h_inf : h_zero;
+                    ggml_half h = !lctx.transformer_kv.cells[i].has_seq_id(seq_id) || lctx.transformer_kv.cells[i].pos > pos ? h_inf : h_zero;
                     if (data_f16) data_f16[j*n_kv + i] = h;
                     if (data_swa_f16) {
                         if (h != h_inf) {
                             if (hparams.n_attn_chunk) {
                                 llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (lctx.kv_self.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
                                     h = h_inf;
                                 }
                             } else {
-                                if (pos - lctx.kv_self.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                if (pos - lctx.transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
                                     h = h_inf;
                                 }
                             }
@@ -4311,11 +4311,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                         for (int i = first; i < last; ++i) {
                             float f;
-                            if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos) {
+                            if (!lctx.transformer_kv.cells[i].has_seq_id(seq_id) || lctx.transformer_kv.cells[i].pos > pos) {
                                 f = -INFINITY;
                             } else {
                                 if (hparams.use_alibi) {
-                                    f = -std::abs(lctx.kv_self.cells[i].pos - pos);
+                                    f = -std::abs(lctx.transformer_kv.cells[i].pos - pos);
                                 } else {
                                     f = 0.0f;
                                 }
@@ -4333,11 +4333,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                                 if (f > -INFINITY) {
                                     if (hparams.n_attn_chunk) {
                                         llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                        if (lctx.kv_self.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                        if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
                                             f = -INFINITY;
                                         }
                                     } else {
-                                        if (pos - lctx.kv_self.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                        if (pos - lctx.transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
                                             f = -INFINITY;
                                         }
                                     }
@@ -4392,11 +4392,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
                     for (int i = 0; i < n_kv; ++i) {
                         float f;
-                        if (!lctx.kv_self.cells[i].has_seq_id(seq_id) || lctx.kv_self.cells[i].pos > pos) {
+                        if (!lctx.transformer_kv.cells[i].has_seq_id(seq_id) || lctx.transformer_kv.cells[i].pos > pos) {
                             f = -INFINITY;
                         } else {
                             if (hparams.use_alibi) {
-                                f = -std::abs(lctx.kv_self.cells[i].pos - pos);
+                                f = -std::abs(lctx.transformer_kv.cells[i].pos - pos);
                             } else {
                                 f = 0.0f;
                             }
@@ -4413,11 +4413,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         if (data_swa || data_swa_f16) {
                             if (hparams.n_attn_chunk) {
                                 llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (lctx.kv_self.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
                                     f = -INFINITY;
                                 }
                             } else {
-                                if (pos - kv_self.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                if (pos - transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
                                     f = -INFINITY;
                                 }
                             }
@@ -4457,7 +4457,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         } else {
             // when using kv cache, the mask needs to match the kv cache size
             const int64_t n_tokens = batch.n_tokens;
-            const int64_t n_stride = hparams.causal_attn && !lctx.is_encoding ? kv_self.n : n_tokens;
+            const int64_t n_stride = hparams.causal_attn && !lctx.is_encoding ? transformer_kv.n : n_tokens;
 
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask->buffer));
 
@@ -4511,11 +4511,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         if (data_swa || data_swa_f16) {
                             if (hparams.n_attn_chunk) {
                                 llama_pos pos_chunk_start = (batch.pos[i] / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (lctx.kv_self.cells[i].pos < pos_chunk_start || batch.pos[i] < pos_chunk_start) {
+                                if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || batch.pos[i] < pos_chunk_start) {
                                     f = -INFINITY;
                                 }
                             } else {
-                                if (batch.pos[i] - kv_self.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                if (batch.pos[i] - transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
                                     f = -INFINITY;
                                 }
                             }
@@ -4634,8 +4634,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
-    if (kv_self.recurrent) {
-        const int64_t n_kv = kv_self.n;
+    if (transformer_kv.recurrent) {
+        const int64_t n_kv = transformer_kv.n;
 
         if (lctx.default_decoder.inp_s_mask) {
             GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_mask->buffer));
@@ -4643,8 +4643,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
             // states which are not affected by the current batch are left untouched
             for (int i = 0; i < n_kv; ++i) {
-                llama_seq_id    seq_id       = i + lctx.kv_self.head;
-                llama_kv_cell & kv_cell      = lctx.kv_self.cells[seq_id];
+                llama_seq_id    seq_id       = i + lctx.transformer_kv.head;
+                llama_kv_cell & kv_cell      = lctx.transformer_kv.cells[seq_id];
                 bool            has_self_seq = kv_cell.has_seq_id(seq_id);
 
                 data[i] = (float) has_self_seq;
@@ -4672,7 +4672,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 for (int i = 0; i < n_kv; ++i) {
                     if (i < n_seq) {
                         // for this type of model, the head is the minimum seq_id of the batch
-                        data[j*n_kv + i] = batch.seq_id[j][i] - kv_self.head;
+                        data[j*n_kv + i] = batch.seq_id[j][i] - transformer_kv.head;
                     } else {
                         data[j*n_kv + i] = -1;
                     }
@@ -4748,11 +4748,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         int32_t * data = (int32_t *) lctx.default_decoder.inp_pos_bucket->data;
 
         if (!lctx.is_encoding) {
-            const int64_t n_kv = kv_self.n;
+            const int64_t n_kv = transformer_kv.n;
             for (int h = 0; h < 1; ++h) {
                 for (int j = 0; j < n_tokens; ++j) {
                     for (int i = 0; i < n_kv; ++i) {
-                        data[h*(n_kv*n_tokens) + j*n_kv + i] = llama_relative_position_bucket(lctx.kv_self.cells[i].pos, batch.pos[j], hparams.n_rel_attn_bkts, lctx.is_encoding);
+                        data[h*(n_kv*n_tokens) + j*n_kv + i] = llama_relative_position_bucket(lctx.transformer_kv.cells[i].pos, batch.pos[j], hparams.n_rel_attn_bkts, lctx.is_encoding);
                     }
                 }
             }
@@ -5076,7 +5076,7 @@ static int llama_decode_internal(
     }
     lctx.decoder_ref->n_queued_tokens += n_tokens_all;
 
-    auto & kv_self = lctx.kv_self;
+    auto & transformer_kv = lctx.transformer_kv;
 
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
@@ -5258,21 +5258,21 @@ static int llama_decode_internal(
 
             // if we have enough unused cells before the current head ->
             //   better to start searching from the beginning of the cache, hoping to fill it
-            if (kv_self.head > kv_self.used + 2*n_tokens) {
-                kv_self.head = 0;
+            if (transformer_kv.head > transformer_kv.used + 2*n_tokens) {
+                transformer_kv.head = 0;
             }
 
-            if (!llama_kv_cache_find_slot(kv_self, u_batch)) {
+            if (!llama_kv_cache_find_slot(transformer_kv, u_batch)) {
                 return 1;
             }
 
-            if (!kv_self.recurrent) {
+            if (!transformer_kv.recurrent) {
                 // a heuristic, to avoid attending the full cache if it is not yet utilized
                 // after enough generations, the benefit from this heuristic disappears
                 // if we start defragmenting the cache, the benefit from this will be more important
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                auto max_cell = llama_kv_cache_cell_max(kv_self, pad);
-                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
+                auto max_cell = llama_kv_cache_cell_max(transformer_kv, pad);
+                transformer_kv.n = std::min(transformer_kv.size, std::max(pad, GGML_PAD(max_cell, pad)));
             }
         }
         if (stop_internal_decode) {
@@ -5289,9 +5289,9 @@ static int llama_decode_internal(
         //    printf("================= %s\n", __func__);
         //    printf("    all_pos_0 = %d, all_pos_1 = %d, all_seq_id = %d\n", batch_all.all_pos_0, batch_all.all_pos_1, batch_all.all_seq_id);
         //    printf("    embd = %p, logits = %p, token = %p\n", (const void *)batch_all.embd, (const void *)batch_all.logits, (const void *)batch_all.token);
-        //    printf("    n_outputs = %d, kv_self.n = %d\n", n_outputs, kv_self.n);
+        //    printf("    n_outputs = %d, transformer_kv.n = %d\n", n_outputs, transformer_kv.n);
         //}
-        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
+        //printf("transformer_kv.n = %5d, transformer_kv.used = %5d, transformer_kv.head = %5d\n", transformer_kv.n, transformer_kv.used, transformer_kv.head);
 
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
@@ -5367,7 +5367,7 @@ static int llama_decode_internal(
                  cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED);
             if (_cache_prev_eligible) {
                 lctx.prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
-                        (int)u_batch.all_seq_id, (int)lctx.decoder_ref->n_outputs, (int)lctx.kv_self.n,
+                        (int)u_batch.all_seq_id, (int)lctx.decoder_ref->n_outputs, (int)lctx.transformer_kv.n,
                         (int)u_batch.n_tokens,
                         cparams.mtp_op_type,
                         cparams.mtp_fused_n_steps,
@@ -5443,14 +5443,14 @@ static int llama_decode_internal(
         bool reset_previous = false;
         // update the kv ring buffer
         {
-            if (llama_model_has_recurrent(&lctx.model) && kv_self.head == 0) {
+            if (llama_model_has_recurrent(&lctx.model) && transformer_kv.head == 0) {
                 reset_previous = true;
             }
-            kv_self.head += n_tokens;
+            transformer_kv.head += n_tokens;
 
             // Ensure kv cache head points to a valid index.
-            if (kv_self.head >= kv_self.size) {
-                kv_self.head = 0;
+            if (transformer_kv.head >= transformer_kv.size) {
+                transformer_kv.head = 0;
             }
         }
 
@@ -5810,13 +5810,13 @@ static int llama_decode_internal(
 
     // decide if we need to defrag the kv cache
     if (cparams.causal_attn && cparams.defrag_thold >= 0.0f) {
-        const float fragmentation = kv_self.n >= 128 ? 1.0f - float(kv_self.used)/float(kv_self.n) : 0.0f;
+        const float fragmentation = transformer_kv.n >= 128 ? 1.0f - float(transformer_kv.used)/float(transformer_kv.n) : 0.0f;
 
         // queue defragmentation for next llama_kv_cache_update
         if (fragmentation > cparams.defrag_thold) {
             LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
 
-            llama_kv_cache_defrag(kv_self);
+            llama_kv_cache_defrag(transformer_kv);
         }
     }
 
@@ -6022,14 +6022,14 @@ static int llama_encode_internal(
 
 // find holes from the beginning of the KV cache and fill them by moving data from the end of the cache
 static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
-    auto & kv_self = lctx.kv_self;
+    auto & transformer_kv = lctx.transformer_kv;
 
     const auto & hparams = lctx.model.hparams;
 
     const uint32_t n_layer = hparams.n_layer;
 
-    const uint32_t n_kv   = llama_kv_cache_cell_max(kv_self);
-    const uint32_t n_used = kv_self.used;
+    const uint32_t n_kv   = llama_kv_cache_cell_max(transformer_kv);
+    const uint32_t n_used = transformer_kv.used;
 
     assert(n_used <= n_kv);
 
@@ -6054,7 +6054,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     std::vector<uint32_t> ids(n_kv, n_kv);
 
     for (uint32_t i0 = 0; i0 < n_used; ++i0) {
-        const auto & cell0 = kv_self.cells[i0];
+        const auto & cell0 = transformer_kv.cells[i0];
 
         if (!cell0.is_empty()) {
             ids[i0] = i0;
@@ -6067,7 +6067,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
         uint32_t nh = 1;
 
         // determine the size of the hole
-        while (i0 + nh < n_used && kv_self.cells[i0 + nh].is_empty()) {
+        while (i0 + nh < n_used && transformer_kv.cells[i0 + nh].is_empty()) {
             nh++;
         }
 
@@ -6076,7 +6076,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
         // starting from the end, find nh non-empty cells
         for (; is > i0; --is) {
-            const auto & cell1 = kv_self.cells[is];
+            const auto & cell1 = transformer_kv.cells[is];
 
             if (cell1.is_empty() || ids[is] != n_kv) {
                 continue;
@@ -6105,7 +6105,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
         // go back and move the nf cells to the hole
         for (; i1 < n_kv; ++i1) {
-            auto & cell1 = kv_self.cells[i1];
+            auto & cell1 = transformer_kv.cells[i1];
 
             if (cell1.is_empty() || ids[i1] != n_kv) {
                 if (n_moves == max_moves) {
@@ -6121,11 +6121,11 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
             ids[i1] = i0 + nf;
 
             // move the cell meta data
-            kv_self.cells[i0 + nf] = cell1;
+            transformer_kv.cells[i0 + nf] = cell1;
 
             // clear the old cell and move the head there
             cell1 = llama_kv_cell();
-            kv_self.head = n_used;
+            transformer_kv.head = n_used;
 
             if (!cont) {
                 n_moves++;
@@ -6169,23 +6169,23 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa();
     const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa();
 
-    const uint32_t kv_size = kv_self.size;
+    const uint32_t kv_size = transformer_kv.size;
 
     std::vector<uint8_t> buf_k;
     std::vector<uint8_t> buf_v;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
-        const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
-        const size_t k_size     = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_size);
+        const size_t k_size_row = ggml_row_size(transformer_kv.k_l[il]->type, n_embd_k_gqa);
+        const size_t k_size     = ggml_row_size(transformer_kv.k_l[il]->type, n_embd_k_gqa*kv_size);
 
-        const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
-        const size_t v_size    = ggml_row_size (kv_self.v_l[il]->type, n_embd_v_gqa*kv_size);
+        const size_t v_size_el = ggml_type_size(transformer_kv.v_l[il]->type);
+        const size_t v_size    = ggml_row_size (transformer_kv.v_l[il]->type, n_embd_v_gqa*kv_size);
 
         buf_k.resize(k_size);
         buf_v.resize(v_size);
 
-        ggml_backend_tensor_get(kv_self.k_l[il], buf_k.data(), 0, buf_k.size());
-        ggml_backend_tensor_get(kv_self.v_l[il], buf_v.data(), 0, buf_v.size());
+        ggml_backend_tensor_get(transformer_kv.k_l[il], buf_k.data(), 0, buf_k.size());
+        ggml_backend_tensor_get(transformer_kv.v_l[il], buf_v.data(), 0, buf_v.size());
 
         // batch move [i, i+nm) to [id, id+nm)
         // note: cells can move only to a lower index
@@ -6223,8 +6223,8 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
             i += nm - 1;
         }
 
-        ggml_backend_tensor_set(kv_self.k_l[il], buf_k.data(), 0, buf_k.size());
-        ggml_backend_tensor_set(kv_self.v_l[il], buf_v.data(), 0, buf_v.size());
+        ggml_backend_tensor_set(transformer_kv.k_l[il], buf_k.data(), 0, buf_k.size());
+        ggml_backend_tensor_set(transformer_kv.v_l[il], buf_v.data(), 0, buf_v.size());
     }
 #else
     // ggml_graph defrag
@@ -6251,7 +6251,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     bool need_reserve = false;
 
     // apply K-shift if needed
-    if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE && lctx.kv_self.has_shift) {
+    if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE && lctx.transformer_kv.has_shift) {
         if (!get_can_shift(lctx)) {
             return 1;
         }
@@ -6271,17 +6271,17 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         }
 
         {
-            auto & kv_self = lctx.kv_self;
+            auto & transformer_kv = lctx.transformer_kv;
 
-            kv_self.has_shift = false;
+            transformer_kv.has_shift = false;
 
-            for (uint32_t i = 0; i < kv_self.size; ++i) {
-                kv_self.cells[i].delta = 0;
+            for (uint32_t i = 0; i < transformer_kv.size; ++i) {
+                transformer_kv.cells[i].delta = 0;
             }
         }
     }
 
-    if ((lctx.kv_self.recurrent || llama_kv_has_qnext_state_storage(lctx.kv_self)) && lctx.kv_self.do_copy) {
+    if ((lctx.transformer_kv.recurrent || llama_kv_has_qnext_state_storage(lctx.transformer_kv)) && lctx.transformer_kv.do_copy) {
         {
             lctx.reset_scheduler();
 
@@ -6297,23 +6297,23 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         }
 
         {
-            auto & kv_self = lctx.kv_self;
+            auto & transformer_kv = lctx.transformer_kv;
 
-            kv_self.do_copy = false;
+            transformer_kv.do_copy = false;
 
-            for (uint32_t i = 0; i < kv_self.size; ++i) {
-                kv_self.cells[i].src = i;
+            for (uint32_t i = 0; i < transformer_kv.size; ++i) {
+                transformer_kv.cells[i].src = i;
             }
         }
     }
 
     // defragment the KV cache if needed
-    if (lctx.kv_self.do_defrag) {
+    if (lctx.transformer_kv.do_defrag) {
         llama_kv_cache_defrag_internal(lctx);
 
         need_reserve = true;
 
-        lctx.kv_self.do_defrag = false;
+        lctx.transformer_kv.do_defrag = false;
     }
 
     // reserve a worst case graph again
@@ -7057,7 +7057,7 @@ struct llama_context * llama_init_from_model(
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
-    // this is necessary due to kv_self.n being padded later during inference
+    // this is necessary due to transformer_kv.n being padded later during inference
     cparams.n_ctx            = GGML_PAD(cparams.n_ctx, llama_kv_cache_get_padding(cparams));
 
     // with causal attention, the batch size is limited by the context size
@@ -7352,32 +7352,32 @@ struct llama_context * llama_init_from_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
-        if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv,
+        if (!llama_kv_cache_init(ctx->transformer_kv, ctx, type_k, type_v, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
                     params.n_k_first, params.n_k_last, params.n_v_first, params.n_v_last)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
         }
-        // PHASE45 D9.6d: mirror recurrent-state pointers from kv_self
+        // PHASE45 D9.6d: mirror recurrent-state pointers from transformer_kv
         // onto default_decoder. Allocation lifetime stays in kv_cache's
         // ggml_context; decoder holds borrowed pointers for the
         // architecturally per-decoder s_l references in graph builders
         // and spec_ckpt save/restore.
-        ctx->default_decoder.s_l       = ctx->kv_self.s_l;
-        ctx->default_decoder.split_s_l = ctx->kv_self.split_s_l;
+        ctx->default_decoder.s_l       = ctx->transformer_kv.s_l;
+        ctx->default_decoder.split_s_l = ctx->transformer_kv.split_s_l;
 
         {
             size_t memory_size_k = 0;
             size_t memory_size_v = 0;
 
-            for (auto & k : ctx->kv_self.k_l) {
+            for (auto & k : ctx->transformer_kv.k_l) {
                 if (k) {
                     memory_size_k += ggml_nbytes(k);
                 }
             }
 
-            for (auto & v : ctx->kv_self.v_l) {
+            for (auto & v : ctx->transformer_kv.v_l) {
                 if (v) {
                     memory_size_v += ggml_nbytes(v);
                 }
@@ -7551,7 +7551,7 @@ uint32_t llama_n_ubatch(const struct llama_context * ctx) {
 }
 
 uint32_t llama_n_seq_max(const struct llama_context * ctx) {
-    return ctx->kv_self.size;
+    return ctx->transformer_kv.size;
 }
 
 enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab) {
@@ -7927,8 +7927,8 @@ void llama_kv_cache_view_free(struct llama_kv_cache_view * view) {
 }
 
 void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_kv_cache_view * view) {
-    if (uint32_t(view->n_cells) < ctx->kv_self.size || view->cells == nullptr) {
-        view->n_cells = int32_t(ctx->kv_self.size);
+    if (uint32_t(view->n_cells) < ctx->transformer_kv.size || view->cells == nullptr) {
+        view->n_cells = int32_t(ctx->transformer_kv.size);
         void * p = realloc(view->cells, sizeof(struct llama_kv_cache_view_cell) * view->n_cells);
         GGML_ASSERT(p != nullptr && "Failed to alloc kv_cache_view cells");
         view->cells = (struct llama_kv_cache_view_cell *)p;
@@ -7937,7 +7937,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
         view->cells_sequences = (llama_seq_id *)p;
     }
 
-    const std::vector<llama_kv_cell> & kv_cells = ctx->kv_self.cells;
+    const std::vector<llama_kv_cell> & kv_cells = ctx->transformer_kv.cells;
     llama_kv_cache_view_cell * c_curr = view->cells;
     llama_seq_id * cs_curr = view->cells_sequences;
     int32_t used_cells = 0;
@@ -7946,7 +7946,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
     uint32_t max_contig = 0;
     int32_t max_contig_idx = -1;
 
-    for (int32_t i = 0; i < int32_t(ctx->kv_self.size); i++, c_curr++, cs_curr += view->n_seq_max) {
+    for (int32_t i = 0; i < int32_t(ctx->transformer_kv.size); i++, c_curr++, cs_curr += view->n_seq_max) {
         const size_t curr_size = kv_cells[i].seq_id.size();
         token_count += curr_size;
         c_curr->pos = kv_cells[i].pos + kv_cells[i].delta;
@@ -7984,28 +7984,28 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
     view->max_contiguous_idx = max_contig_idx;
     view->token_count = token_count;
     view->used_cells = used_cells;
-    if (uint32_t(used_cells) != ctx->kv_self.used) {
+    if (uint32_t(used_cells) != ctx->transformer_kv.used) {
         LLAMA_LOG_ERROR("%s: used cells mismatch. kv_cache says %d but we calculated %d\n",
-            __func__, ctx->kv_self.used, used_cells);
+            __func__, ctx->transformer_kv.used, used_cells);
     }
 }
 
 int32_t llama_get_kv_cache_token_count(const struct llama_context * ctx) {
     int result = 0;
 
-    for (uint32_t i = 0; i < ctx->kv_self.size; i++) {
-        result += ctx->kv_self.cells[i].seq_id.size();
+    for (uint32_t i = 0; i < ctx->transformer_kv.size; i++) {
+        result += ctx->transformer_kv.cells[i].seq_id.size();
     }
 
     return result;
 }
 
 int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
-    return ctx->kv_self.used;
+    return ctx->transformer_kv.used;
 }
 
 void llama_kv_cache_clear(struct llama_context * ctx) {
-    llama_kv_cache_clear(ctx->kv_self);
+    llama_kv_cache_clear(ctx->transformer_kv);
 }
 
 // Unified speculative-checkpoint
@@ -8067,7 +8067,7 @@ static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & mode
 }
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
-    auto & kv = ctx->kv_self;
+    auto & kv = ctx->transformer_kv;
 
     kv.save_per_step_ssm     = false;
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
@@ -8104,7 +8104,7 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
 }
 
 bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
-    auto & kv = ctx->kv_self;
+    auto & kv = ctx->transformer_kv;
 
     switch (kv.ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP:
@@ -8130,7 +8130,7 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
 
 bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
                               llama_pos n_past, int accepted_step) {
-    auto & kv = ctx->kv_self;
+    auto & kv = ctx->transformer_kv;
 
     switch (kv.ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP: {
@@ -8165,7 +8165,7 @@ bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
 }
 
 void llama_spec_ckpt_discard(struct llama_context * ctx) {
-    auto & kv = ctx->kv_self;
+    auto & kv = ctx->transformer_kv;
 
     if (kv.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP) {
         kv.save_per_step_ssm = false;
@@ -8179,7 +8179,7 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    const bool ok = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    const bool ok = llama_kv_cache_seq_rm(ctx->transformer_kv, seq_id, p0, p1);
     // Phase 2: release the qnext-state slot when this seq has been fully cleared.
     // Bulk clears (p0<=0 && p1<0) imply the seq is done — return its slot to the
     // free-list. Partial removals (e.g. spec rollback) must NOT release; the seq
@@ -8195,7 +8195,7 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
     if (seq_id_src == seq_id_dst) {
         return;
     }
-    llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
+    llama_kv_cache_seq_cp(ctx->transformer_kv, seq_id_src, seq_id_dst, p0, p1);
     // Phase 2: ensure dst has an allocator slot. The cells[].src + do_copy
     // machinery (set above by llama_kv_cache_seq_cp on the cache) handles the
     // physical state-row copy via llama_set_s_copy at decode time; this keeps
@@ -8207,7 +8207,7 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
-    llama_kv_cache_seq_keep(ctx->kv_self, seq_id);
+    llama_kv_cache_seq_keep(ctx->transformer_kv, seq_id);
 }
 
 void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
@@ -8215,7 +8215,7 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
         return;
     }
 
-    llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
+    llama_kv_cache_seq_add(ctx->transformer_kv, seq_id, p0, p1, delta);
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -8223,22 +8223,22 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
         return;
     }
 
-    llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
+    llama_kv_cache_seq_div(ctx->transformer_kv, seq_id, p0, p1, d);
 }
 
 llama_pos llama_kv_cache_seq_pos_min(struct llama_context * ctx, llama_seq_id seq_id) {
-    if (ctx->kv_self.hybrid || ctx->kv_self.recurrent) {
-        return llama_kv_cache_seq_pos_max(ctx->kv_self, seq_id);
+    if (ctx->transformer_kv.hybrid || ctx->transformer_kv.recurrent) {
+        return llama_kv_cache_seq_pos_max(ctx->transformer_kv, seq_id);
     }
-    return llama_kv_cache_seq_pos_min(ctx->kv_self, seq_id);
+    return llama_kv_cache_seq_pos_min(ctx->transformer_kv, seq_id);
 }
 
 llama_pos llama_kv_cache_seq_pos_max(struct llama_context * ctx, llama_seq_id seq_id) {
-    return llama_kv_cache_seq_pos_max(ctx->kv_self, seq_id);
+    return llama_kv_cache_seq_pos_max(ctx->transformer_kv, seq_id);
 }
 
 void llama_kv_cache_defrag(struct llama_context * ctx) {
-    llama_kv_cache_defrag(ctx->kv_self);
+    llama_kv_cache_defrag(ctx->transformer_kv);
 }
 
 int32_t llama_kv_cache_update(struct llama_context * ctx) {
@@ -8355,11 +8355,11 @@ struct llama_data_write {
         }
     }
 
-    void write_kv_cache_meta(const llama_kv_cache & kv_self, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) {
+    void write_kv_cache_meta(const llama_kv_cache & transformer_kv, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) {
 
         for (const auto & range : cell_ranges) {
             for (uint32_t i = range.first; i < range.second; ++i) {
-                const auto & cell = kv_self.cells[i];
+                const auto & cell = transformer_kv.cells[i];
                 const llama_pos pos      = cell.pos;
                 const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
@@ -8377,14 +8377,14 @@ struct llama_data_write {
 
     void write_kv_cache_data(const struct llama_context * ctx, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1,
         llama_state_seq_flags flags = 0) {
-        const struct llama_kv_cache & kv_self = ctx->kv_self;
+        const struct llama_kv_cache & transformer_kv = ctx->transformer_kv;
         const struct llama_hparams & hparams = ctx->model.hparams;
         bool need_kv = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
         // v_state: 0 -> not transposed V cache
         //          1 -> transposed V cache
         //          2 -> no V cache (as it may be the case with MLA)
-        const uint32_t v_state = kv_self.v_l.empty() ? 2 : kv_self.v_trans ? 1 : 0;
-        const uint32_t n_layer = kv_self.k_l.size();
+        const uint32_t v_state = transformer_kv.v_l.empty() ? 2 : transformer_kv.v_trans ? 1 : 0;
+        const uint32_t n_layer = transformer_kv.k_l.size();
 
         write(&v_state, sizeof(v_state));
         write(&n_layer, sizeof(n_layer));
@@ -8395,17 +8395,17 @@ struct llama_data_write {
             const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
-            const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
+            const bool has_k_cache = transformer_kv.k_l[il] != nullptr && need_kv;
 
             // Write key type
-            const int32_t k_type_i = has_k_cache ? (int32_t) kv_self.k_l[il]->type : -1;
+            const int32_t k_type_i = has_k_cache ? (int32_t) transformer_kv.k_l[il]->type : -1;
             write(&k_type_i, sizeof(k_type_i));
 
             // Write row size of key
             const uint64_t k_size_row = has_k_cache
                 ? ((ctx->cparams.mla_attn == 0)
-                    ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa)
-                    : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope))
+                    ? ggml_row_size(transformer_kv.k_l[il]->type, n_embd_k_gqa)
+                    : ggml_row_size(transformer_kv.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope))
                 : 0;
             write(&k_size_row, sizeof(k_size_row));
 
@@ -8417,21 +8417,21 @@ struct llama_data_write {
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * k_size_row;
-                write_tensor_data(kv_self.k_l[il], range.first * k_size_row, buf_size, il);
+                write_tensor_data(transformer_kv.k_l[il], range.first * k_size_row, buf_size, il);
             }
         }
 
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
                 const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
-                const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                const bool has_v_cache = transformer_kv.v_l[il] != nullptr && need_kv;
 
                 // Write value type
-                const int32_t v_type_i = has_v_cache ? (int32_t) kv_self.v_l[il]->type : -1;
+                const int32_t v_type_i = has_v_cache ? (int32_t) transformer_kv.v_l[il]->type : -1;
                 write(&v_type_i, sizeof(v_type_i));
 
                 // Write row size of value
-                const uint64_t v_size_row = has_v_cache ? ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa) : 0;
+                const uint64_t v_size_row = has_v_cache ? ggml_row_size(transformer_kv.v_l[il]->type, n_embd_v_gqa) : 0;
                 write(&v_size_row, sizeof(v_size_row));
 
                 if (!has_v_cache) {
@@ -8442,23 +8442,23 @@ struct llama_data_write {
                 for (const auto & range : cell_ranges) {
                     const size_t range_size = range.second - range.first;
                     const size_t buf_size = range_size * v_size_row;
-                    write_tensor_data(kv_self.v_l[il], range.first * v_size_row, buf_size, il);
+                    write_tensor_data(transformer_kv.v_l[il], range.first * v_size_row, buf_size, il);
                 }
             }
         }
         else if (v_state == 1) {
             // When v is transposed, we also need the element size and get the element ranges from each row
-            const uint32_t kv_size = kv_self.size;
+            const uint32_t kv_size = transformer_kv.size;
             for (uint32_t il = 0; il < n_layer; ++il) {
                 const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
-                const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                const bool has_v_cache = transformer_kv.v_l[il] != nullptr && need_kv;
 
                 // Write value type
-                const int32_t v_type_i = has_v_cache ? (int32_t) kv_self.v_l[il]->type : -1;
+                const int32_t v_type_i = has_v_cache ? (int32_t) transformer_kv.v_l[il]->type : -1;
                 write(&v_type_i, sizeof(v_type_i));
 
                 // Write element size
-                const uint32_t v_size_el = has_v_cache ? ggml_type_size(kv_self.v_l[il]->type) : 0;
+                const uint32_t v_size_el = has_v_cache ? ggml_type_size(transformer_kv.v_l[il]->type) : 0;
                 write(&v_size_el, sizeof(v_size_el));
 
                 // Write GQA embedding size
@@ -8476,13 +8476,13 @@ struct llama_data_write {
                         const size_t range_size = range.second - range.first;
                         const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                         const size_t buf_size = range_size * v_size_el;
-                        write_tensor_data(kv_self.v_l[il], src_offset, buf_size, il);
+                        write_tensor_data(transformer_kv.v_l[il], src_offset, buf_size, il);
                     }
                 }
             }
         }
 
-        const uint32_t qnext_state = llama_kv_has_qnext_state_storage(kv_self) ? 1 : 0;
+        const uint32_t qnext_state = llama_kv_has_qnext_state_storage(transformer_kv) ? 1 : 0;
         write(&qnext_state, sizeof(qnext_state));
 
         if (qnext_state != 0) {
@@ -8501,9 +8501,9 @@ struct llama_data_write {
                     const uint32_t n_slots = (uint32_t) ctx->default_decoder.s_l[il]->ne[1];
                     if (seq_id == -1) {
                         s_rows = n_slots;
-                    } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id) && (uint32_t) seq_id < kv_self.size) {
-                        llama_seq_id src_seq_id = kv_self.cells[seq_id].src;
-                        if (llama_kv_qnext_seq_id_in_range(kv_self, src_seq_id)) {
+                    } else if (llama_kv_qnext_seq_id_in_range(transformer_kv, seq_id) && (uint32_t) seq_id < transformer_kv.size) {
+                        llama_seq_id src_seq_id = transformer_kv.cells[seq_id].src;
+                        if (llama_kv_qnext_seq_id_in_range(transformer_kv, src_seq_id)) {
                             s_rows = 1;
                             s_offset = (size_t) src_seq_id * s_size_row;
                         }
@@ -8520,29 +8520,29 @@ struct llama_data_write {
     }
 
     void write_kv_cache(const struct llama_context * ctx, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
-        const struct llama_kv_cache & kv_self = ctx->kv_self;
+        const struct llama_kv_cache & transformer_kv = ctx->transformer_kv;
         std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
         uint32_t cell_count = 0;
 
         // Count the number of cells with the specified seq_id
         // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = kv_self.size;
-        for (uint32_t i = 0; i < kv_self.size; ++i) {
-            const auto & cell = kv_self.cells[i];
+        uint32_t cell_range_begin = transformer_kv.size;
+        for (uint32_t i = 0; i < transformer_kv.size; ++i) {
+            const auto & cell = transformer_kv.cells[i];
             if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
                 ++cell_count;
-                if (cell_range_begin == kv_self.size) {
+                if (cell_range_begin == transformer_kv.size) {
                     cell_range_begin = i;
                 }
             } else {
-                if (cell_range_begin != kv_self.size) {
+                if (cell_range_begin != transformer_kv.size) {
                     cell_ranges.emplace_back(cell_range_begin, i);
-                    cell_range_begin = kv_self.size;
+                    cell_range_begin = transformer_kv.size;
                 }
             }
         }
-        if (cell_range_begin != kv_self.size) {
-            cell_ranges.emplace_back(cell_range_begin, kv_self.size);
+        if (cell_range_begin != transformer_kv.size) {
+            cell_ranges.emplace_back(cell_range_begin, transformer_kv.size);
         }
 
         // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
@@ -8554,7 +8554,7 @@ struct llama_data_write {
 
         write(&cell_count, sizeof(cell_count));
 
-        write_kv_cache_meta(kv_self, cell_ranges, seq_id);
+        write_kv_cache_meta(transformer_kv, cell_ranges, seq_id);
         write_kv_cache_data(ctx, cell_ranges, seq_id, flags);
     }
 };
@@ -8648,12 +8648,12 @@ struct llama_data_read {
     }
 
     bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
-        struct llama_kv_cache & kv_self = ctx->kv_self;
+        struct llama_kv_cache & transformer_kv = ctx->transformer_kv;
 
         if (dest_seq_id != -1) {
             // single sequence
 
-            llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
+            llama_kv_cache_seq_rm(transformer_kv, dest_seq_id, -1, -1);
 
             llama_batch batch = llama_batch_init(cell_count, 0, 1);
             batch.n_tokens = cell_count;
@@ -8674,34 +8674,34 @@ struct llama_data_read {
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = dest_seq_id;
             }
-            if (!llama_kv_cache_find_slot(kv_self, batch)) {
+            if (!llama_kv_cache_find_slot(transformer_kv, batch)) {
                 llama_batch_free(batch);
                 LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
                 return false;
             }
 
-            // DEBUG CHECK: kv_self.head should be our first cell, kv_self.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
+            // DEBUG CHECK: transformer_kv.head should be our first cell, transformer_kv.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
             // Assume that this is one contiguous block of cells
-            GGML_ASSERT(kv_self.head + cell_count <= kv_self.size);
-            GGML_ASSERT(kv_self.cells[kv_self.head].pos == batch.pos[0]);
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
-            GGML_ASSERT(kv_self.cells[kv_self.head].has_seq_id(dest_seq_id));
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].has_seq_id(dest_seq_id));
+            GGML_ASSERT(transformer_kv.head + cell_count <= transformer_kv.size);
+            GGML_ASSERT(transformer_kv.cells[transformer_kv.head].pos == batch.pos[0]);
+            GGML_ASSERT(transformer_kv.cells[transformer_kv.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
+            GGML_ASSERT(transformer_kv.cells[transformer_kv.head].has_seq_id(dest_seq_id));
+            GGML_ASSERT(transformer_kv.cells[transformer_kv.head + cell_count - 1].has_seq_id(dest_seq_id));
 
             // Cleanup
             llama_batch_free(batch);
         } else {
             // whole KV cache restore
 
-            if (cell_count > kv_self.size) {
+            if (cell_count > transformer_kv.size) {
                 LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
                 return false;
             }
 
-            llama_kv_cache_clear(kv_self);
+            llama_kv_cache_clear(transformer_kv);
 
             for (uint32_t i = 0; i < cell_count; ++i) {
-                llama_kv_cell & cell = kv_self.cells[i];
+                llama_kv_cell & cell = transformer_kv.cells[i];
 
                 llama_pos pos;
                 uint32_t  n_seq_id;
@@ -8724,8 +8724,8 @@ struct llama_data_read {
                 }
             }
 
-            kv_self.head = 0;
-            kv_self.used = cell_count;
+            transformer_kv.head = 0;
+            transformer_kv.used = cell_count;
         }
 
         return true;
@@ -8770,7 +8770,7 @@ struct llama_data_read {
 
     bool read_kv_cache_data(struct llama_context * ctx, uint32_t cell_count, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
         const struct llama_hparams & hparams = ctx->model.hparams;
-        struct llama_kv_cache & kv_self = ctx->kv_self;
+        struct llama_kv_cache & transformer_kv = ctx->transformer_kv;
         bool need_kv = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
         // v_state: 0 -> not transposed V cache
         //          1 -> transposed V cache
@@ -8780,17 +8780,17 @@ struct llama_data_read {
         read_to(&v_state, sizeof(v_state));
         read_to(&n_layer, sizeof(n_layer));
 
-        if (n_layer != kv_self.k_l.size()) {
+        if (n_layer != transformer_kv.k_l.size()) {
             LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer);
             return false;
         }
-        if (cell_count > kv_self.size) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, kv_self.size);
+        if (cell_count > transformer_kv.size) {
+            LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, transformer_kv.size);
             return false;
         }
 
-	// Currently the only way there is no V cache (and thus v_state is 2) requires flash_attn, and flash_attn sets kv_self.v_trans to false
-        if (kv_self.v_trans != (v_state == 1)) {
+	// Currently the only way there is no V cache (and thus v_state is 2) requires flash_attn, and flash_attn sets transformer_kv.v_trans to false
+        if (transformer_kv.v_trans != (v_state == 1)) {
             LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
             return false;
         }
@@ -8800,7 +8800,7 @@ struct llama_data_read {
             const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
-            const bool has_k_cache = kv_self.k_l[il] != nullptr && need_kv;
+            const bool has_k_cache = transformer_kv.k_l[il] != nullptr && need_kv;
 
 
             // Read type of key
@@ -8812,7 +8812,7 @@ struct llama_data_read {
                     return false;
                 }
             } else {
-                const int32_t k_type_i = (int32_t) kv_self.k_l[il]->type;
+                const int32_t k_type_i = (int32_t) transformer_kv.k_l[il]->type;
                 if (k_type_i != k_type_i_ref) {
                     LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
                     return false;
@@ -8829,7 +8829,7 @@ struct llama_data_read {
                 }
                 continue;
             }
-            const size_t k_size_row = (ctx->cparams.mla_attn == 0) ? ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa) : ggml_row_size(kv_self.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
+            const size_t k_size_row = (ctx->cparams.mla_attn == 0) ? ggml_row_size(transformer_kv.k_l[il]->type, n_embd_k_gqa) : ggml_row_size(transformer_kv.k_l[il]->type, kv_lora_rank + n_embd_head_qk_rope);
             if (k_size_row != k_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
                 return false;
@@ -8837,10 +8837,10 @@ struct llama_data_read {
 
             if (cell_count) {
                 // Read and set the keys for the whole cell range
-                if (kv_self.k_l[il]->extra) {
-                    read_kv_cache_data_split(ctx, kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head, k_size_row, cell_count, il);
+                if (transformer_kv.k_l[il]->extra) {
+                    read_kv_cache_data_split(ctx, transformer_kv.k_l[il], read(cell_count * k_size_row), transformer_kv.head, k_size_row, cell_count, il);
                 } else {
-                    ggml_backend_tensor_set(kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head * k_size_row, cell_count * k_size_row);
+                    ggml_backend_tensor_set(transformer_kv.k_l[il], read(cell_count * k_size_row), transformer_kv.head * k_size_row, cell_count * k_size_row);
                 }
             }
         }
@@ -8848,7 +8848,7 @@ struct llama_data_read {
         if (v_state == 0) {
             for (uint32_t il = 0; il < n_layer; ++il) {
                 const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
-                const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                const bool has_v_cache = transformer_kv.v_l[il] != nullptr && need_kv;
 
                 // Read type of value
                 int32_t v_type_i_ref;
@@ -8859,7 +8859,7 @@ struct llama_data_read {
                         return false;
                     }
                 } else {
-                    const int32_t v_type_i = (int32_t) kv_self.v_l[il]->type;
+                    const int32_t v_type_i = (int32_t) transformer_kv.v_l[il]->type;
                     if (v_type_i != v_type_i_ref) {
                         LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
                         return false;
@@ -8876,7 +8876,7 @@ struct llama_data_read {
                     }
                     continue;
                 }
-                const size_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
+                const size_t v_size_row = ggml_row_size(transformer_kv.v_l[il]->type, n_embd_v_gqa);
                 if (v_size_row != v_size_row_ref) {
                     LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                     return false;
@@ -8884,10 +8884,10 @@ struct llama_data_read {
 
                 if (cell_count) {
                     // Read and set the values for the whole cell range
-                    if (kv_self.v_l[il]->extra) {
-                        read_kv_cache_data_split(ctx, kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head, v_size_row, cell_count, il);
+                    if (transformer_kv.v_l[il]->extra) {
+                        read_kv_cache_data_split(ctx, transformer_kv.v_l[il], read(cell_count * v_size_row), transformer_kv.head, v_size_row, cell_count, il);
                     } else {
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head * v_size_row, cell_count * v_size_row);
+                        ggml_backend_tensor_set(transformer_kv.v_l[il], read(cell_count * v_size_row), transformer_kv.head * v_size_row, cell_count * v_size_row);
                     }
                 }
             }
@@ -8896,7 +8896,7 @@ struct llama_data_read {
             // For each layer, read the values for each cell (transposed)
             for (uint32_t il = 0; il < n_layer; ++il) {
                 const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
-                const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                const bool has_v_cache = transformer_kv.v_l[il] != nullptr && need_kv;
 
                 // Read type of value
                 int32_t v_type_i_ref;
@@ -8907,7 +8907,7 @@ struct llama_data_read {
                         return false;
                     }
                 } else {
-                    const int32_t v_type_i = (int32_t) kv_self.v_l[il]->type;
+                    const int32_t v_type_i = (int32_t) transformer_kv.v_l[il]->type;
                     if (v_type_i != v_type_i_ref) {
                         LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
                         return false;
@@ -8923,7 +8923,7 @@ struct llama_data_read {
                         return false;
                     }
                 } else {
-                    const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
+                    const size_t v_size_el = ggml_type_size(transformer_kv.v_l[il]->type);
                     if (v_size_el != v_size_el_ref) {
                         LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);
                         return false;
@@ -8946,14 +8946,14 @@ struct llama_data_read {
                 }
 
                 if (cell_count) {
-                    const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
-                    if (kv_self.v_l[il]->extra) {
+                    const size_t v_size_el = ggml_type_size(transformer_kv.v_l[il]->type);
+                    if (transformer_kv.v_l[il]->extra) {
                         throw std::runtime_error("Transposed V cache is not sypported with split mode 'graph'");
                     }
                     // For each row in the transposed matrix, read the values for the whole cell range
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (kv_self.head + j * kv_self.size) * v_size_el;
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
+                        const size_t dst_offset = (transformer_kv.head + j * transformer_kv.size) * v_size_el;
+                        ggml_backend_tensor_set(transformer_kv.v_l[il], read(cell_count * v_size_el), dst_offset, cell_count * v_size_el);
                     }
                 }
             }
@@ -8962,7 +8962,7 @@ struct llama_data_read {
         uint32_t qnext_state_ref = 0;
         read_to(&qnext_state_ref, sizeof(qnext_state_ref));
 
-        const bool has_qnext_state = llama_kv_has_qnext_state_storage(kv_self);
+        const bool has_qnext_state = llama_kv_has_qnext_state_storage(transformer_kv);
         if ((qnext_state_ref != 0) != has_qnext_state) {
             LLAMA_LOG_ERROR("%s: incompatible qwen3next state cache presence\n", __func__);
             return false;
@@ -9006,7 +9006,7 @@ struct llama_data_read {
                     const uint32_t n_slots = (uint32_t) ctx->default_decoder.s_l[il]->ne[1];
                     if (seq_id == -1) {
                         s_rows = n_slots;
-                    } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id)) {
+                    } else if (llama_kv_qnext_seq_id_in_range(transformer_kv, seq_id)) {
                         s_rows = 1;
                         s_dst_row = (uint32_t) seq_id;
                     }
@@ -9712,7 +9712,7 @@ int32_t llama_mtp_fused_draft_invoke(
     out->n_steps = 0;
 
     // Resolve the next position (one past the current accepted boundary).
-    const llama_pos pos_base = (llama_pos) ctx->kv_self.head;
+    const llama_pos pos_base = (llama_pos) ctx->transformer_kv.head;
     const llama_seq_id seq_id_0 = 0;
 
     // Phase 38 C: read LLAMA_MTP_FUSED_EXTEND env knob. When set to a

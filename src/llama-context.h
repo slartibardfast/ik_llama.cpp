@@ -229,7 +229,11 @@ struct llama_context {
 
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
-    struct llama_kv_cache       kv_self;
+    // PHASE45 D9.6g: renamed from `kv_self` to reflect that the
+    // K/V cache is the transformer's session-shared storage.
+    // Architecturally session-owned; storage moves to llama_session
+    // at D9.8 when llama_context deletes.
+    struct llama_kv_cache       transformer_kv;
     struct llama_control_vector cvec;
 
     std::vector<float> scale_data;

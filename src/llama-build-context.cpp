@@ -41,7 +41,7 @@ llm_build_context::llm_build_context(
         hparams          (model.hparams),
         cparams          (lctx.cparams),
         batch            (batch),
-        kv_self          (lctx.kv_self),
+        kv_self          (lctx.transformer_kv),
         n_embd           (hparams.n_embd),
         n_layer          (hparams.n_layer),
         n_rot            (hparams.n_rot),

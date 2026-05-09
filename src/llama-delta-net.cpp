@@ -60,7 +60,7 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         }
     }
 
-    const uint32_t qnext_state_slots = llm_build_context::llama_kv_qnext_state_slots(lctx.kv_self);
+    const uint32_t qnext_state_slots = llm_build_context::llama_kv_qnext_state_slots(lctx.transformer_kv);
     GGML_ASSERT(qnext_state_slots > 0);
 
     // Reserve-graph builds may not carry explicit sequence IDs, in which case
@@ -70,7 +70,7 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         GGML_ASSERT((uint32_t) s < qnext_state_slots);
     }
 
-    save_per_step_states = lctx.kv_self.save_per_step_ssm && batch.n_tokens > 1;
+    save_per_step_states = lctx.transformer_kv.save_per_step_ssm && batch.n_tokens > 1;
 }
 
 delta_net::~delta_net() = default;
@@ -464,7 +464,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
     auto & model   = lctx.model;
     auto & hparams = model.hparams;
-    auto & kv_self = lctx.kv_self;
+    auto & kv_self = lctx.transformer_kv;
 
     int64_t head_k_dim  = hparams.ssm_d_state;
     int64_t num_k_heads = hparams.ssm_n_group;

@@ -8,7 +8,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
     auto & model   = lctx.model;
     auto & hparams = model.hparams;
     auto & cparams = lctx.cparams;
-    auto & kv_self = lctx.kv_self;
+    auto & kv_self = lctx.transformer_kv;
     int n_device = model.splits.size();
     GGML_ASSERT(n_device > 1);
     GGML_ASSERT(cparams.flash_attn);
