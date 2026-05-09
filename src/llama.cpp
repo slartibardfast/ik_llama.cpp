@@ -5586,6 +5586,26 @@ static int llama_decode_internal(
                     } else {
                         ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
                     }
+
+                    // C.1 diagnostic: per-row L2 norm of logits, gated by env.
+                    // Dumps after sync to localize whether divergence is in
+                    // hidden state (pre-output-projection) or in output proj.
+                    static const bool dump_logits_norms = []() {
+                        const char * v = getenv("LLAMA_DUMP_LOGITS_NORMS");
+                        return v && *v && *v != '0';
+                    }();
+                    if (dump_logits_norms) {
+                        ggml_backend_synchronize(backend_res);
+                        for (int row = 0; row < n_outputs_new; ++row) {
+                            double l2 = 0.0;
+                            for (int j = 0; j < n_vocab; ++j) {
+                                const float v = logits_out[(size_t) row * n_vocab + j];
+                                l2 += (double) v * v;
+                            }
+                            fprintf(stderr, "[c1.diag] logits row %d/%d (n_tokens=%u, n_outputs=%d, ne[1]=%lld): L2=%.10f\n",
+                                    row, n_outputs_new, n_tokens, lctx.decoder_ref->n_outputs, (long long) res->ne[1], sqrt(l2));
+                        }
+                    }
                 }
             }
 #ifdef GGML_USE_CUDA
@@ -5617,6 +5637,26 @@ static int llama_decode_internal(
                             GGML_ASSERT( n_outputs_prev_embd + n_outputs_new_embd <= n_outputs_embd);
                             GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd <= (int64_t) lctx.decoder_ref->embd_size);
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new_embd*n_embd*sizeof(float));
+
+                            // C.1 diagnostic: env-gated per-row L2 norm dump of the
+                            // pre-norm hidden state (h_pre_norm). Localizes the
+                            // np>1 slot divergence to before / after the lm_head.
+                            static const bool dump_embd_norms = []() {
+                                const char * v = getenv("LLAMA_DUMP_EMBD_NORMS");
+                                return v && *v && *v != '0';
+                            }();
+                            if (dump_embd_norms) {
+                                ggml_backend_synchronize(backend_embd);
+                                for (int row = 0; row < n_outputs_new_embd; ++row) {
+                                    double l2 = 0.0;
+                                    for (int j = 0; j < n_embd; ++j) {
+                                        const float v = embd_out[(size_t) row * n_embd + j];
+                                        l2 += (double) v * v;
+                                    }
+                                    fprintf(stderr, "[c1.diag] embd row %d/%d (n_tokens=%u, n_outputs=%d): L2=%.10f\n",
+                                            row, n_outputs_new_embd, n_tokens, lctx.decoder_ref->n_outputs, sqrt(l2));
+                                }
+                            }
 
                             // NOTE: a device-resident residual capture (commit 70150c6d) was
                             // tried here. It introduced a stale-data path that broke draft
