@@ -289,7 +289,15 @@ void server_context::init() {
                 params_base.speculative.cparams_dft.mtp_op_type  = MTP_OP_WARMUP;
                 params_base.speculative.cparams_dft.embeddings   = true;
 
-                slot.has_mtp = true;
+                // C.1 diagnostic gate: env-disable the server-level MTP per-slot
+                // logic without disabling the model's MTP graph (cparams.mtp).
+                // Tests whether the bug is in server-side MTP scheduling vs.
+                // the model's verify forward.
+                static const bool disable_server_mtp = []() {
+                    const char * v = getenv("LLAMA_DISABLE_SERVER_MTP");
+                    return v && *v && *v != '0';
+                }();
+                slot.has_mtp = !disable_server_mtp;
                 slot.params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
                 slot.params.speculative.n_min = 0;
                 slot.params.speculative.cparams_dft = params_base.speculative.cparams_dft;
