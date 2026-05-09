@@ -187,7 +187,14 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             inpL = cur;
         }
 
-        if (lctx.cparams.mtp) {
+        // C.1 diagnostic gate: env-disable the h_pre_norm extra-output side
+        // effect that fires when -mtp is on. Tests whether the dup+set_output
+        // is the source of np>1 slot divergence.
+        static const bool disable_h_pre_norm = []() {
+            const char * v = getenv("LLAMA_DISABLE_H_PRE_NORM");
+            return v && *v && *v != '0';
+        }();
+        if (lctx.cparams.mtp && !disable_h_pre_norm) {
             // See build_qwen35moe() above for the rationale on the
             // "h_pre_norm" tag + lctx.default_decoder.t_h_pre_norm stash.
             struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
