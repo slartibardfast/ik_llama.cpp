@@ -207,6 +207,37 @@ struct llama_session;
 // migrated fields live on it before any user-created decoder exists).
 #include "llama-decoder-internal.h"
 
+// ─────────────────────────────────────────────────────────────────────
+// PHASE45 D9.8 (PENDING) — `llama_context` is going away.
+//
+// All decoder-runtime fields (perf counters, output buffers, recurrent
+// state, scheduler, MTP/draft/inp_*) extracted to `llama_decoder` at
+// D9.6.b–h. The remaining fields below are architecturally session-
+// scoped and will migrate to `llama_session` at D9.8. Until D9.8 lands:
+//
+//   ❌  NEW CODE MUST NOT add `lctx.field` reads or writes for the
+//       fields listed below. Use the session API surface
+//       (`llama_session_*`) or pass a `llama_session *` directly.
+//   ✅  Existing `lctx.field` callsites stay until D9.8 ports them
+//       en bloc; they're already counted in the ~365-callsite migration.
+//
+// Field → D9.8 migration target:
+//   cparams, sampling             → session
+//   transformer_kv (was kv_self)  → session.transformer_kv
+//   cvec                          → session.cvec
+//   scale_data                    → session.scale_data
+//   lora_adapters                 → session.lora_adapters
+//   backends, backend_{cpu,metal,blas} → session.backends
+//   has_evaluated_once            → session
+//   t_start_us, t_load_us         → session lifecycle markers
+//   embd_enc, seq_ids_enc         → session
+//   inp_embd_enc                  → session (encoder-only graph input)
+//   prev (Prev), cache_copies     → session graph-cache state
+//
+// `session_ref` and `default_decoder` (added at D9.6a/b) are scaffolding
+// and delete with the struct at D9.8. `decoder_ref` does too — its
+// callers move to taking `llama_decoder *` directly.
+// ─────────────────────────────────────────────────────────────────────
 struct llama_context {
 
     llama_context(const llama_model & model);
