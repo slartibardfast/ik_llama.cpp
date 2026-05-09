@@ -142,6 +142,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // Diagnostic: env-gated trace for the row-asymmetric-warp-reduction
+    // path (gqa_ratio=6, hs=256, ne[1]>=2 fires this path on a |B|>1 ubatch).
+    // Set LLAMA_KERNEL_DIVERGENCE_TRACE=1 to log each invocation. Read-once
+    // at first call; default-zero cost.
+    static const bool divergence_trace = []() {
+        const char * v = getenv("LLAMA_KERNEL_DIVERGENCE_TRACE");
+        return v && *v && *v != '0';
+    }();
+    if (divergence_trace) {
+        const int gqa = (int)(Q->ne[2] / K->ne[2]);
+        fprintf(stderr, "[divergence] FA mma_f16 hs=%d ne[1]=%d gqa=%d\n",
+                (int)Q->ne[0], (int)Q->ne[1], gqa);
+    }
+
     // As mentioned above, the new-new MMA is slower then the new MMA.
     ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
     //ggml_cuda_flash_attn_ext_mma_new(ctx, dst);

@@ -676,6 +676,18 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     // ggml_concat at the end of this function then aborts on dtype mismatch.
     const bool force_reduce_cast = (cur->ne[1] > 32);
 
+    // Diagnostic: env-gated trace for the |B|>1 fast-path-vs-blocks-loop
+    // divergence in DeltaNet. Set LLAMA_KERNEL_DIVERGENCE_TRACE=1 to log each
+    // call's path selection. Read-once at first invocation; default-zero cost.
+    static const bool divergence_trace = []() {
+        const char * v = getenv("LLAMA_KERNEL_DIVERGENCE_TRACE");
+        return v && *v && *v != '0';
+    }();
+    if (divergence_trace) {
+        fprintf(stderr, "[divergence] DeltaNet build_layer_attn_linear il=%d ne[1]=%d path=%s\n",
+                il, (int)cur->ne[1], all_same_seq ? "all_same_seq_fast" : "blocks_loop");
+    }
+
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
