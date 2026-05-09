@@ -220,11 +220,18 @@ if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_include_directories(test-cuda-concurrent-event PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(test-cuda-concurrent-event PRIVATE CUDA::cudart)
+    llama_build_and_test(test-cuda-draft-overlap-flag.cpp)
 endif()
 
 # PHASE46 B.4: NDJSON trace emit unit test (CPU-only).
 llama_build_and_test(test-trace-ndjson.cpp)
 target_include_directories(test-trace-ndjson PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# PHASE46 B.5: replay-trace offline diff/summary unit test (Python, CPU-only).
+add_test(NAME test-replay-trace-offline
+         COMMAND ${CMAKE_COMMAND} -E env
+                 python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-replay-trace-offline.py)
+set_property(TEST test-replay-trace-offline PROPERTY LABELS python)
 
 if (GGML_CUDA)
 

@@ -48,6 +48,21 @@ GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback,
 // shapes vary. Exposed for tests that bound cache growth.
 GGML_API GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend);
 
+// PHASE46 E.1 — opt-in async-overlap gate.
+//
+// Returns nonzero if the caller (typically a draft-graph dispatch site)
+// should schedule its work on the per-device draft_streams[] with a
+// fork/join event guarding the merge into the main stream. Off by default
+// (Phase 38 E ground truth: on sm_75, decode is memory-bandwidth-bound
+// and async overlap measures negative). On sm_80+ where SM slack exists
+// the user can opt in via LLAMA_DRAFT_OVERLAP=1.
+//
+// The flag is read once at first call and cached. Callers should test it
+// at the dispatch boundary; downstream the fork/join is enforced by
+// ggml_backend_concurrent_event_{fork,join} so the merge is deterministic
+// regardless of overlap.
+GGML_API GGML_CALL int ggml_backend_cuda_draft_overlap_enabled(void);
+
 // CUDA graph cache instrumentation surface. All functions return 0 / -1
 // when GGML_CUDA_GRAPH_PROBE is unset or when the underlying probe step
 // has not yet landed. Tests treat any zero return as RED.

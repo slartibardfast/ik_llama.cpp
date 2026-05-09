@@ -5518,6 +5518,16 @@ extern "C" cudaStream_t ggml_backend_cuda_concurrent_event_stream(ggml_backend_c
     return ctx->slot_streams[slot_idx];
 }
 
+// PHASE46 E.1: opt-in draft-overlap gate. Read-once, cached. Default off
+// (Phase 38 E baseline). See ggml-cuda.h for the contract.
+GGML_CALL int ggml_backend_cuda_draft_overlap_enabled(void) {
+    static const int enabled = []() {
+        const char * v = std::getenv("LLAMA_DRAFT_OVERLAP");
+        return (v && *v && *v != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
 static ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_name,
     /* .free                    = */ ggml_backend_cuda_free,
