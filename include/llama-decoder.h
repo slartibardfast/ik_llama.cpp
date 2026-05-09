@@ -95,6 +95,15 @@ extern "C" {
     LLAMA_API void llama_decoder_set_warmup    (struct llama_decoder * decoder, bool warmup);
     LLAMA_API void llama_decoder_set_fast_argmax(struct llama_decoder * decoder, bool enabled);
 
+    // Spec-decoding recurrent-state checkpoint (PHASE45 D9.4 — port of
+    // llama_spec_ckpt_* from ctx-shaped to decoder-shaped). Bodies forward
+    // to the existing llama_spec_ckpt_*(ctx, …) implementation. The
+    // ctx-shaped API will delete with llama_context at D9.8.
+    LLAMA_API int  llama_decoder_spec_ckpt_init   (struct llama_decoder * decoder, int mode, int max_tokens);
+    LLAMA_API bool llama_decoder_spec_ckpt_save   (struct llama_decoder * decoder, llama_seq_id seq_id);
+    LLAMA_API bool llama_decoder_spec_ckpt_restore(struct llama_decoder * decoder, llama_seq_id seq_id, llama_pos n_past, int step);
+    LLAMA_API void llama_decoder_spec_ckpt_discard(struct llama_decoder * decoder);
+
     // Forward pass
     LLAMA_API int32_t llama_decoder_decode(struct llama_decoder * decoder, struct llama_batch batch);
     LLAMA_API int32_t llama_decoder_encode(struct llama_decoder * decoder, struct llama_batch batch);

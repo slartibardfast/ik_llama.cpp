@@ -112,6 +112,23 @@ void llama_decoder_set_fast_argmax(struct llama_decoder * decoder, bool enabled)
     llama_set_fast_argmax_for_verify(llama_session_internal_context(decoder->session), enabled);
 }
 
+int llama_decoder_spec_ckpt_init(struct llama_decoder * decoder, int mode, int max_tokens) {
+    if (!decoder || !decoder->session) return 0;
+    return llama_spec_ckpt_init(llama_session_internal_context(decoder->session), mode, max_tokens);
+}
+bool llama_decoder_spec_ckpt_save(struct llama_decoder * decoder, llama_seq_id seq_id) {
+    if (!decoder || !decoder->session) return false;
+    return llama_spec_ckpt_save(llama_session_internal_context(decoder->session), seq_id);
+}
+bool llama_decoder_spec_ckpt_restore(struct llama_decoder * decoder, llama_seq_id seq_id, llama_pos n_past, int step) {
+    if (!decoder || !decoder->session) return false;
+    return llama_spec_ckpt_restore(llama_session_internal_context(decoder->session), seq_id, n_past, step);
+}
+void llama_decoder_spec_ckpt_discard(struct llama_decoder * decoder) {
+    if (!decoder || !decoder->session) return;
+    llama_spec_ckpt_discard(llama_session_internal_context(decoder->session));
+}
+
 int32_t llama_decoder_decode(struct llama_decoder * decoder, struct llama_batch batch) {
     if (!decoder || !decoder->session) return -1;
     apply_decoder_params_to_ctx(llama_session_internal_context(decoder->session), decoder->params);
