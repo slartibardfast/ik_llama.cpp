@@ -17,6 +17,7 @@
 
 #include "llama-session.h"
 #include "llama-session-internal.h"
+#include "llama-context.h"  // PHASE45 D9.6a: set ctx->session_ref
 #include "llama.h"
 
 #include <cstring>
@@ -86,6 +87,7 @@ struct llama_session * llama_session_create(struct llama_model * model, struct l
     s->ctx      = ctx;
     s->owns_ctx = true;
     s->params   = params;
+    ctx->session_ref = s;  // PHASE45 D9.6a: back-ref for transitional helpers
     return s;
 }
 
@@ -98,6 +100,7 @@ struct llama_session * llama_session_adopt(struct llama_context * ctx) {
     s->params.n_seq_max     = llama_n_seq_max(ctx);
     s->params.n_batch       = llama_n_batch(ctx);
     s->params.n_ubatch      = llama_n_ubatch(ctx);
+    ctx->session_ref        = s;  // PHASE45 D9.6a: back-ref for transitional helpers
     return s;
 }
 

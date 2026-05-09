@@ -197,6 +197,12 @@ struct llama_control_vector {
     }
 };
 
+// Forward declarations for the PHASE45 D9.6a back-reference pointers.
+// llama_context will be deleted at D9.8 once all fields migrate out;
+// these refs delete with it.
+struct llama_session;
+struct llama_decoder;
+
 struct llama_context {
 
     llama_context(const llama_model & model);
@@ -204,6 +210,13 @@ struct llama_context {
     ~llama_context();
 
     const struct llama_model & model;
+
+    // PHASE45 D9.6a: back-references set by llama_session_adopt / _create
+    // and llama_decoder_create. Internal helpers that take `lctx` reach
+    // the new owning types via these (transitional; the helpers
+    // themselves migrate to take session/decoder directly during D9.6b-h).
+    struct llama_session * session_ref = nullptr;
+    struct llama_decoder * decoder_ref = nullptr;
 
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;

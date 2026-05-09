@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-impl.h"
+#include <random>  // PHASE45 D9.6a: was transitively pulled in pre-extraction
 #include <unordered_map>
 struct llama_sampling {
     llama_sampling(int32_t n_vocab) : n_vocab(n_vocab) {}

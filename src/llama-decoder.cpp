@@ -15,6 +15,7 @@
 #include "llama-decoder.h"
 #include "llama-session.h"
 #include "llama-session-internal.h"
+#include "llama-context.h"  // PHASE45 D9.6a: set ctx->decoder_ref
 #include "llama.h"
 
 struct llama_decoder {
@@ -65,7 +66,9 @@ struct llama_decoder * llama_decoder_create(struct llama_session * session, stru
     d->params  = params;
     d->role    = params.role;
 
-    apply_decoder_params_to_ctx(llama_session_internal_context(session), params);
+    llama_context * ctx = llama_session_internal_context(session);
+    apply_decoder_params_to_ctx(ctx, params);
+    if (ctx) ctx->decoder_ref = d;  // PHASE45 D9.6a: back-ref
     return d;
 }
 
