@@ -13,16 +13,11 @@
 //
 
 #include "llama-decoder.h"
+#include "llama-decoder-internal.h"
 #include "llama-session.h"
 #include "llama-session-internal.h"
 #include "llama-context.h"  // PHASE45 D9.6a: set ctx->decoder_ref
 #include "llama.h"
-
-struct llama_decoder {
-    struct llama_session    * session = nullptr;
-    struct llama_decoder_params params{};
-    enum   llama_decoder_role role    = LLAMA_DECODER_PRIMARY;
-};
 
 static void apply_decoder_params_to_ctx(struct llama_context * ctx, const struct llama_decoder_params & p) {
     if (ctx == nullptr) return;
@@ -68,11 +63,21 @@ struct llama_decoder * llama_decoder_create(struct llama_session * session, stru
 
     llama_context * ctx = llama_session_internal_context(session);
     apply_decoder_params_to_ctx(ctx, params);
-    if (ctx) ctx->decoder_ref = d;  // PHASE45 D9.6a: back-ref
+    if (ctx) ctx->decoder_ref = d;  // PHASE45 D9.6b: swap from default_decoder
     return d;
 }
 
 void llama_decoder_free(struct llama_decoder * decoder) {
+    if (decoder == nullptr) return;
+    // PHASE45 D9.6b: revert decoder_ref to default_decoder so any
+    // subsequent ctx-shaped accesses (e.g. shutdown timing prints) hit
+    // the ctx-owned default rather than dangling memory.
+    if (decoder->session != nullptr) {
+        llama_context * ctx = llama_session_internal_context(decoder->session);
+        if (ctx != nullptr && ctx->decoder_ref == decoder) {
+            ctx->decoder_ref = &ctx->default_decoder;
+        }
+    }
     delete decoder;
 }
 

@@ -201,7 +201,11 @@ struct llama_control_vector {
 // llama_context will be deleted at D9.8 once all fields migrate out;
 // these refs delete with it.
 struct llama_session;
-struct llama_decoder;
+
+// PHASE45 D9.6b: include the full llama_decoder definition so we can
+// hold a default_decoder member by value (perf counters and other
+// migrated fields live on it before any user-created decoder exists).
+#include "llama-decoder-internal.h"
 
 struct llama_context {
 
@@ -216,6 +220,11 @@ struct llama_context {
     // the new owning types via these (transitional; the helpers
     // themselves migrate to take session/decoder directly during D9.6b-h).
     struct llama_session * session_ref = nullptr;
+
+    // PHASE45 D9.6b: default decoder owns perf counters etc. before
+    // llama_decoder_create runs. ctx ctor points decoder_ref at it;
+    // llama_decoder_create reassigns to the user's heap decoder.
+    struct llama_decoder   default_decoder;
     struct llama_decoder * decoder_ref = nullptr;
 
     struct llama_cparams        cparams;
@@ -238,16 +247,10 @@ struct llama_context {
 
     bool has_evaluated_once = false;
 
+    // PHASE45 D9.6b: lifecycle markers stay on ctx (session-shaped data;
+    // distinct from per-decoder eval timing).
     int64_t t_start_us;
     int64_t t_load_us;
-    int64_t t_p_eval_us = 0;
-    int64_t t_eval_us   = 0;
-
-    int64_t t_compute_start_us = 0;
-    int64_t n_queued_tokens = 0;
-
-    int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
-    int32_t n_eval   = 0; // number of eval calls
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_t buf_output = nullptr;

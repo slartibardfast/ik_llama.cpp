@@ -693,6 +693,10 @@ llama_context::llama_context(const llama_model & model)
     } else {
         cache_copies.resize(2*hparams.n_layer);
     }
+    // PHASE45 D9.6b: every ctx has a decoder_ref from construction onward.
+    // Warmup decode runs against default_decoder; llama_decoder_create
+    // reassigns this pointer once the user's decoder lands.
+    decoder_ref = &default_decoder;
 }
 
 void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
@@ -5070,10 +5074,10 @@ static int llama_decode_internal(
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
-    if (lctx.t_compute_start_us == 0) {
-        lctx.t_compute_start_us = ggml_time_us();
+    if (lctx.decoder_ref->t_compute_start_us == 0) {
+        lctx.decoder_ref->t_compute_start_us = ggml_time_us();
     }
-    lctx.n_queued_tokens += n_tokens_all;
+    lctx.decoder_ref->n_queued_tokens += n_tokens_all;
 
     auto & kv_self = lctx.kv_self;
 
@@ -5866,11 +5870,11 @@ static int llama_encode_internal(
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
-    if (lctx.t_compute_start_us == 0) {
-        lctx.t_compute_start_us = ggml_time_us();
+    if (lctx.decoder_ref->t_compute_start_us == 0) {
+        lctx.decoder_ref->t_compute_start_us = ggml_time_us();
     }
 
-    lctx.n_queued_tokens += n_tokens;
+    lctx.decoder_ref->n_queued_tokens += n_tokens;
 
     const int64_t n_embd = hparams.n_embd;
 
@@ -10015,22 +10019,23 @@ void llama_synchronize(struct llama_context * ctx) {
     // this should only happen when using batch size 1 to evaluate a batch
 
     // add the evaluation to the stats
-    if (ctx->n_queued_tokens == 1) {
-        ctx->t_eval_us += ggml_time_us() - ctx->t_compute_start_us;
-        ctx->n_eval++;
-    } else if (ctx->n_queued_tokens > 1) {
-        ctx->t_p_eval_us += ggml_time_us() - ctx->t_compute_start_us;
-        ctx->n_p_eval += ctx->n_queued_tokens;
+    auto * dec = ctx->decoder_ref;
+    if (dec->n_queued_tokens == 1) {
+        dec->t_eval_us += ggml_time_us() - dec->t_compute_start_us;
+        dec->n_eval++;
+    } else if (dec->n_queued_tokens > 1) {
+        dec->t_p_eval_us += ggml_time_us() - dec->t_compute_start_us;
+        dec->n_p_eval += dec->n_queued_tokens;
     }
 
     // get a more accurate load time, upon first eval
-    if (ctx->n_queued_tokens > 0 && !ctx->has_evaluated_once) {
+    if (dec->n_queued_tokens > 0 && !ctx->has_evaluated_once) {
         ctx->t_load_us = ggml_time_us() - ctx->t_start_us;
         ctx->has_evaluated_once = true;
     }
 
-    ctx->n_queued_tokens = 0;
-    ctx->t_compute_start_us = 0;
+    dec->n_queued_tokens = 0;
+    dec->t_compute_start_us = 0;
 }
 
 float * llama_get_logits(struct llama_context * ctx) {
@@ -11189,17 +11194,18 @@ int llama_split_prefix(char * dest, size_t maxlen, const char * split_path, int 
 }
 
 struct llama_timings llama_get_timings(struct llama_context * ctx) {
+    auto * dec = ctx->decoder_ref;
     struct llama_timings result = {
         /*.t_start_ms  =*/ 1e-3 * ctx->t_start_us,
         /*.t_end_ms    =*/ 1.00 * ggml_time_ms(),
         /*.t_load_ms   =*/ 1e-3 * ctx->t_load_us,
         /*.t_sample_ms =*/ 1e-3 * ctx->sampling.t_sample_us,
-        /*.t_p_eval_ms =*/ 1e-3 * ctx->t_p_eval_us,
-        /*.t_eval_ms   =*/ 1e-3 * ctx->t_eval_us,
+        /*.t_p_eval_ms =*/ 1e-3 * dec->t_p_eval_us,
+        /*.t_eval_ms   =*/ 1e-3 * dec->t_eval_us,
 
         /*.n_sample =*/ std::max(1, ctx->sampling.n_sample),
-        /*.n_p_eval =*/ std::max(0, ctx->n_p_eval),
-        /*.n_eval   =*/ std::max(1, ctx->n_eval),
+        /*.n_p_eval =*/ std::max(0, dec->n_p_eval),
+        /*.n_eval   =*/ std::max(1, dec->n_eval),
     };
 
     return result;
@@ -11220,9 +11226,10 @@ void llama_print_timings(struct llama_context * ctx) {
 }
 
 void llama_reset_timings(struct llama_context * ctx) {
-    ctx->t_start_us  = ggml_time_us();
-    ctx->t_eval_us   = ctx->n_eval   = 0;
-    ctx->t_p_eval_us = ctx->n_p_eval = 0;
+    auto * dec = ctx->decoder_ref;
+    ctx->t_start_us       = ggml_time_us();
+    dec->t_eval_us        = dec->n_eval   = 0;
+    dec->t_p_eval_us      = dec->n_p_eval = 0;
 
     ctx->sampling.reset_timings();
 }
@@ -11261,23 +11268,24 @@ void llama_dump_timing_info_yaml(FILE * stream, const llama_context * ctx) {
     fprintf(stream, "###########\n");
     fprintf(stream, "\n");
 
+    const auto * dec = ctx->decoder_ref;
     fprintf(stream, "mst_eval: %.2f  # ms / token during generation\n",
-            1.0e-3 * ctx->t_eval_us / ctx->n_eval);
+            1.0e-3 * dec->t_eval_us / dec->n_eval);
     fprintf(stream, "mst_p_eval: %.2f  # ms / token during prompt processing\n",
-            1.0e-3 * ctx->t_p_eval_us / ctx->n_p_eval);
+            1.0e-3 * dec->t_p_eval_us / dec->n_p_eval);
     fprintf(stream, "mst_sample: %.2f  # ms / token during sampling\n",
             1.0e-3 * ctx->sampling.t_sample_us / ctx->sampling.n_sample);
-    fprintf(stream, "n_eval: %d  # number of tokens generated (excluding the first one)\n", ctx->n_eval);
-    fprintf(stream, "n_p_eval: %d  # number of tokens processed in batches at the beginning\n", ctx->n_p_eval);
+    fprintf(stream, "n_eval: %d  # number of tokens generated (excluding the first one)\n", dec->n_eval);
+    fprintf(stream, "n_p_eval: %d  # number of tokens processed in batches at the beginning\n", dec->n_p_eval);
     fprintf(stream, "n_sample: %d  # number of sampled tokens\n", ctx->sampling.n_sample);
-    fprintf(stream, "t_eval_us: %" PRId64 "  # total microseconds spent generating tokens\n", ctx->t_eval_us);
+    fprintf(stream, "t_eval_us: %" PRId64 "  # total microseconds spent generating tokens\n", dec->t_eval_us);
     fprintf(stream, "t_load_us: %" PRId64 "  # total microseconds spent loading the model\n", ctx->t_load_us);
-    fprintf(stream, "t_p_eval_us: %" PRId64 "  # total microseconds spent prompt processing\n", ctx->t_p_eval_us);
+    fprintf(stream, "t_p_eval_us: %" PRId64 "  # total microseconds spent prompt processing\n", dec->t_p_eval_us);
     fprintf(stream, "t_sample_us: %" PRId64 "  # total microseconds spent sampling\n", ctx->sampling.t_sample_us);
     fprintf(stream, "ts_eval: %.2f  # tokens / second during generation\n",
-            1.0e6 * ctx->n_eval / ctx->t_eval_us);
+            1.0e6 * dec->n_eval / dec->t_eval_us);
     fprintf(stream, "ts_p_eval: %.2f  # tokens / second during prompt processing\n",
-            1.0e6 * ctx->n_p_eval / ctx->t_p_eval_us);
+            1.0e6 * dec->n_p_eval / dec->t_p_eval_us);
     fprintf(stream, "ts_sample: %.2f  # tokens / second during sampling\n",
             1.0e6 * ctx->sampling.n_sample / ctx->sampling.t_sample_us);
 }
