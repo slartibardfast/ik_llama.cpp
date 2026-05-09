@@ -613,7 +613,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     // exact-size differences inside a bucket don't break correctness.
     if (GGML_PAD(kv_self.n, 64) != GGML_PAD((int64_t)prev->n_kv, 64))
                                                   { g_can_reuse_last_miss_reason = 7;  return false; }
-    if (n_outputs != prev->n_outputs)             { g_can_reuse_last_miss_reason = 8;  return false; }
+    if (decoder_ref->n_outputs != prev->n_outputs)             { g_can_reuse_last_miss_reason = 8;  return false; }
     if (cparams.mtp_op_type != prev->mtp_op_type) { g_can_reuse_last_miss_reason = 9;  return false; }
     if (!update_cache_copies())                   { g_can_reuse_last_miss_reason = 10; return false; }
     g_can_reuse_last_miss_reason = 0;
@@ -712,7 +712,8 @@ llama_context::~llama_context() {
         ggml_backend_free(backend);
     }
 
-    ggml_backend_buffer_free(buf_output);
+    // PHASE45 D9.6c: buf_output now lives on decoder; default_decoder
+    // (held by-value) frees its own buffer in ~llama_decoder.
 
     // Phase 38 B3: cleanup persistent chain-residual buffer.
     if (mtp_persist_buf != nullptr) {
@@ -4128,7 +4129,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_out_ids->buffer));
         int32_t * data = (int32_t *) lctx.inp_out_ids->data;
 
-        if (lctx.n_outputs == n_tokens) {
+        if (lctx.decoder_ref->n_outputs == n_tokens) {
             for (int i = 0; i < n_tokens; ++i) {
                 data[i] = i;
             }
@@ -4140,12 +4141,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
             // the graph needs to have been passed the correct number of outputs
-            GGML_ASSERT(lctx.n_outputs == n_outputs);
-        } else if (lctx.n_outputs == 1) {
+            GGML_ASSERT(lctx.decoder_ref->n_outputs == n_outputs);
+        } else if (lctx.decoder_ref->n_outputs == 1) {
             // only keep last output
             data[0] = n_tokens - 1;
         } else {
-            GGML_ASSERT(lctx.n_outputs == 0);
+            GGML_ASSERT(lctx.decoder_ref->n_outputs == 0);
         }
         }
 #if IK_PRINT_TIMING == 2
@@ -4828,46 +4829,46 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     const size_t logits_size = has_logits ? n_vocab*n_outputs_max : 0;
     const size_t embd_size   = has_embd   ?  n_embd*n_outputs_max : 0;
 
-    if (lctx.output_ids.empty()) {
+    if (lctx.decoder_ref->output_ids.empty()) {
         // init, never resized afterwards
-        lctx.output_ids.resize(n_batch);
+        lctx.decoder_ref->output_ids.resize(n_batch);
     }
 
-    const size_t prev_size = lctx.buf_output ? ggml_backend_buffer_get_size(lctx.buf_output) : 0;
+    const size_t prev_size = lctx.decoder_ref->buf_output ? ggml_backend_buffer_get_size(lctx.decoder_ref->buf_output) : 0;
     const size_t new_size  = (logits_size + embd_size) * sizeof(float);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
-    if (!lctx.buf_output || prev_size < new_size) {
-        if (lctx.buf_output) {
+    if (!lctx.decoder_ref->buf_output || prev_size < new_size) {
+        if (lctx.decoder_ref->buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_INFO("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
-            ggml_backend_buffer_free(lctx.buf_output);
-            lctx.buf_output = nullptr;
-            lctx.logits = nullptr;
-            lctx.embd = nullptr;
+            ggml_backend_buffer_free(lctx.decoder_ref->buf_output);
+            lctx.decoder_ref->buf_output = nullptr;
+            lctx.decoder_ref->logits = nullptr;
+            lctx.decoder_ref->embd = nullptr;
         }
 
-        lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
-        if (lctx.buf_output == nullptr) {
+        lctx.decoder_ref->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
+        if (lctx.decoder_ref->buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
     }
 
-    float * output_base = (float *) ggml_backend_buffer_get_base(lctx.buf_output);
+    float * output_base = (float *) ggml_backend_buffer_get_base(lctx.decoder_ref->buf_output);
 
-    lctx.logits = has_logits ? output_base               : nullptr;
-    lctx.embd   = has_embd   ? output_base + logits_size : nullptr;
+    lctx.decoder_ref->logits = has_logits ? output_base               : nullptr;
+    lctx.decoder_ref->embd   = has_embd   ? output_base + logits_size : nullptr;
 
-    lctx.output_size = n_outputs_max;
-    lctx.logits_size = logits_size;
-    lctx.embd_size   = embd_size;
+    lctx.decoder_ref->output_size = n_outputs_max;
+    lctx.decoder_ref->logits_size = logits_size;
+    lctx.decoder_ref->embd_size   = embd_size;
 
     // set all ids as invalid (negative)
-    std::fill(lctx.output_ids.begin(), lctx.output_ids.end(), -1);
+    std::fill(lctx.decoder_ref->output_ids.begin(), lctx.decoder_ref->output_ids.end(), -1);
 
     if (has_mtp) {
         // MTP uses a large output footprint, clear only the active region.
@@ -4876,10 +4877,10 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
             memset(output_base, 0, clear_size);
         }
     } else {
-        ggml_backend_buffer_clear(lctx.buf_output, 0);
+        ggml_backend_buffer_clear(lctx.decoder_ref->buf_output, 0);
     }
 
-    lctx.n_outputs = 0;
+    lctx.decoder_ref->n_outputs = 0;
 
     return n_outputs_max;
 }
@@ -5106,7 +5107,7 @@ static int llama_decode_internal(
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             n_outputs += batch_all.logits[i] != 0;
         }
-    } else if (lctx.logits_all || embd_pooled) {
+    } else if (lctx.decoder_ref->logits_all || embd_pooled) {
         n_outputs = n_tokens_all;
     } else {
         // keep last output only
@@ -5125,19 +5126,19 @@ static int llama_decode_internal(
         int32_t i_logits = 0;
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             if (batch_all.logits[i]) {
-                lctx.output_ids[i] = i_logits++;
+                lctx.decoder_ref->output_ids[i] = i_logits++;
             } else {
-                lctx.output_ids[i] = -1;
+                lctx.decoder_ref->output_ids[i] = -1;
             }
         }
     } else if (n_outputs == 1 && n_tokens_all > 0) {
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
-            lctx.output_ids[i] = -1;
+            lctx.decoder_ref->output_ids[i] = -1;
         }
-        lctx.output_ids[n_tokens_all - 1] = 0;
+        lctx.decoder_ref->output_ids[n_tokens_all - 1] = 0;
     } else {
         for (uint32_t i = 0; i < std::max<uint32_t>(n_outputs, n_outputs_embd); ++i) {
-            lctx.output_ids[i] = i;
+            lctx.decoder_ref->output_ids[i] = i;
         }
     }
 
@@ -5220,7 +5221,7 @@ static int llama_decode_internal(
             }
 
             // needs to happen before the graph is built
-            lctx.n_outputs = n_outputs_new;
+            lctx.decoder_ref->n_outputs = n_outputs_new;
         }
 
         int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
@@ -5370,7 +5371,7 @@ static int llama_decode_internal(
                  cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED);
             if (_cache_prev_eligible) {
                 lctx.prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
-                        (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
+                        (int)u_batch.all_seq_id, (int)lctx.decoder_ref->n_outputs, (int)lctx.kv_self.n,
                         (int)u_batch.n_tokens,
                         cparams.mtp_op_type,
                         cparams.mtp_fused_n_steps,
@@ -5392,7 +5393,7 @@ static int llama_decode_internal(
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor * embd = nullptr;
 
-        if (lctx.n_outputs == 0) {
+        if (lctx.decoder_ref->n_outputs == 0) {
             // no output
             res = nullptr;
         }
@@ -5481,10 +5482,10 @@ static int llama_decode_internal(
                 cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
                 GGML_ASSERT(backend_res != nullptr);
-                GGML_ASSERT(lctx.logits != nullptr);
+                GGML_ASSERT(lctx.decoder_ref->logits != nullptr);
 
-                float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
-                const int32_t n_outputs_new = lctx.n_outputs;
+                float * logits_out = lctx.decoder_ref->logits + n_outputs_prev*n_vocab;
+                const int32_t n_outputs_new = lctx.decoder_ref->n_outputs;
 
 #ifdef GGML_USE_CUDA
                 // MTP fast path: argmax + softmax-prob on device, then 8 B/row
@@ -5558,7 +5559,7 @@ static int llama_decode_internal(
 
                 if (n_outputs_new) {
                     GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
-                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.decoder_ref->logits_size);
 
                     if (res->ne[1] == n_tokens && n_outputs_new < n_tokens) {
                         int32_t i_out = 0;
@@ -5598,13 +5599,13 @@ static int llama_decode_internal(
                 case LLAMA_POOLING_TYPE_NONE:
                     {
                         // extract token embeddings
-                        GGML_ASSERT(lctx.embd != nullptr);
-                        float * embd_out = lctx.embd + n_outputs_prev_embd*n_embd;
-                        const int32_t n_outputs_new_embd = has_mtp ? n_tokens : lctx.n_outputs;
+                        GGML_ASSERT(lctx.decoder_ref->embd != nullptr);
+                        float * embd_out = lctx.decoder_ref->embd + n_outputs_prev_embd*n_embd;
+                        const int32_t n_outputs_new_embd = has_mtp ? n_tokens : lctx.decoder_ref->n_outputs;
 
                         if (n_outputs_new_embd) {
                             GGML_ASSERT( n_outputs_prev_embd + n_outputs_new_embd <= n_outputs_embd);
-                            GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd <= (int64_t) lctx.embd_size);
+                            GGML_ASSERT((n_outputs_prev_embd + n_outputs_new_embd)*n_embd <= (int64_t) lctx.decoder_ref->embd_size);
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new_embd*n_embd*sizeof(float));
 
                             // NOTE: a device-resident residual capture (commit 70150c6d) was
@@ -5618,7 +5619,7 @@ static int llama_decode_internal(
                 case LLAMA_POOLING_TYPE_LAST:
                     {
                         // extract sequence embeddings
-                        auto & embd_seq_out = lctx.embd_seq;
+                        auto & embd_seq_out = lctx.decoder_ref->embd_seq;
                         embd_seq_out.clear();
 
                         for (uint32_t i = 0; i < n_tokens; i++) {
@@ -5794,8 +5795,8 @@ static int llama_decode_internal(
             }
         }
 
-        n_outputs_prev += lctx.n_outputs;
-        n_outputs_prev_embd += has_mtp ? n_tokens : lctx.n_outputs;
+        n_outputs_prev += lctx.decoder_ref->n_outputs;
+        n_outputs_prev_embd += has_mtp ? n_tokens : lctx.decoder_ref->n_outputs;
         cur_token += n_tokens;
         if (reset_previous) {
             // We need to discard this graph. Otherwise, iwith CUDA graphs enabled, the graph will get resused and this will reset the
@@ -5806,7 +5807,7 @@ static int llama_decode_internal(
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    lctx.n_outputs = n_outputs;
+    lctx.decoder_ref->n_outputs = n_outputs;
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //llama_synchronize(&lctx);
@@ -5891,11 +5892,11 @@ static int llama_encode_internal(
     };
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        lctx.output_ids[i] = i;
+        lctx.decoder_ref->output_ids[i] = i;
     }
 
     lctx.inp_embd_enc = NULL;
-    lctx.n_outputs = n_tokens;
+    lctx.decoder_ref->n_outputs = n_tokens;
 
     const int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
     GGML_ASSERT(n_threads > 0);
@@ -5978,16 +5979,16 @@ static int llama_encode_internal(
                     }
                 }
             } else {
-                GGML_ASSERT(lctx.embd != nullptr);
+                GGML_ASSERT(lctx.decoder_ref->embd != nullptr);
 
                 switch (cparams.pooling_type) {
                     case LLAMA_POOLING_TYPE_NONE:
                         {
                             // extract token embeddings
-                            GGML_ASSERT(lctx.embd != nullptr);
-                            float * embd_out = lctx.embd;
+                            GGML_ASSERT(lctx.decoder_ref->embd != nullptr);
+                            float * embd_out = lctx.decoder_ref->embd;
 
-                            GGML_ASSERT(n_tokens*n_embd <= (int64_t) lctx.embd_size);
+                            GGML_ASSERT(n_tokens*n_embd <= (int64_t) lctx.decoder_ref->embd_size);
                             ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_tokens*n_embd*sizeof(float));
                         } break;
                     case LLAMA_POOLING_TYPE_MEAN:
@@ -5995,7 +5996,7 @@ static int llama_encode_internal(
                     case LLAMA_POOLING_TYPE_LAST:
                         {
                             // extract sequence embeddings
-                            auto & embd_seq_out = lctx.embd_seq;
+                            auto & embd_seq_out = lctx.decoder_ref->embd_seq;
                             embd_seq_out.clear();
 
                             for (uint32_t i = 0; i < n_tokens; i++) {
@@ -7166,7 +7167,7 @@ struct llama_context * llama_init_from_model(
     ctx->abort_callback_data = params.abort_callback_data;
 
     ctx->sampling.rng = std::mt19937(params.seed);
-    ctx->logits_all   = params.logits_all;
+    ctx->decoder_ref->logits_all   = params.logits_all;
     // build worst-case graph for encoder if a model contains encoder
     ctx->is_encoding  = llama_model_has_encoder(model);
 
@@ -7408,8 +7409,8 @@ struct llama_context * llama_init_from_model(
             }
 
             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buffer_name(ctx->buf_output),
-                    ggml_backend_buffer_get_size(ctx->buf_output) / 1024.0 / 1024.0);
+                    ggml_backend_buffer_name(ctx->decoder_ref->buf_output),
+                    ggml_backend_buffer_get_size(ctx->decoder_ref->buf_output) / 1024.0 / 1024.0);
         }
 
         // scheduler and compute buffers
@@ -8303,14 +8304,14 @@ struct llama_data_write {
     }
 
     void write_output_ids(const struct llama_context * ctx) {
-        const uint32_t n_outputs = ctx->n_outputs;
+        const uint32_t n_outputs = ctx->decoder_ref->n_outputs;
 
         std::vector<int32_t> output_pos;
 
         const size_t    n_batch = ctx->cparams.n_batch;
-        const auto & output_ids = ctx->output_ids;
+        const auto & output_ids = ctx->decoder_ref->output_ids;
 
-        GGML_ASSERT(n_outputs <= ctx->output_size);
+        GGML_ASSERT(n_outputs <= ctx->decoder_ref->output_size);
 
         output_pos.resize(n_outputs);
 
@@ -8332,22 +8333,22 @@ struct llama_data_write {
     }
 
     void write_logits(const struct llama_context * ctx) {
-        const uint64_t logits_size = std::min((uint64_t) ctx->logits_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_vocab);
+        const uint64_t logits_size = std::min((uint64_t) ctx->decoder_ref->logits_size, (uint64_t) ctx->decoder_ref->n_outputs * ctx->model.hparams.n_vocab);
 
         write(&logits_size, sizeof(logits_size));
 
         if (logits_size) {
-            write(ctx->logits, logits_size * sizeof(float));
+            write(ctx->decoder_ref->logits, logits_size * sizeof(float));
         }
     }
 
     void write_embeddings(const struct llama_context * ctx) {
-        const uint64_t embeddings_size = std::min((uint64_t) ctx->embd_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_embd);
+        const uint64_t embeddings_size = std::min((uint64_t) ctx->decoder_ref->embd_size, (uint64_t) ctx->decoder_ref->n_outputs * ctx->model.hparams.n_embd);
 
         write(&embeddings_size, sizeof(embeddings_size));
 
         if (embeddings_size) {
-            write(ctx->embd, embeddings_size * sizeof(float));
+            write(ctx->decoder_ref->embd, embeddings_size * sizeof(float));
         }
     }
 
@@ -8610,10 +8611,10 @@ struct llama_data_read {
                 if ((uint32_t) id >= ctx->cparams.n_batch) {
                     throw std::runtime_error(format("invalid output id, %d does not fit in batch size of %u", id, ctx->cparams.n_batch));
                 }
-                ctx->output_ids[id] = i;
+                ctx->decoder_ref->output_ids[id] = i;
             }
 
-            ctx->n_outputs = n_outputs;
+            ctx->decoder_ref->n_outputs = n_outputs;
         }
     }
 
@@ -8621,12 +8622,12 @@ struct llama_data_read {
         uint64_t logits_size;
         read_to(&logits_size, sizeof(logits_size));
 
-        if (ctx->logits_size < logits_size) {
+        if (ctx->decoder_ref->logits_size < logits_size) {
             throw std::runtime_error("logits buffer too small");
         }
 
         if (logits_size) {
-            read_to(ctx->logits, logits_size * sizeof(float));
+            read_to(ctx->decoder_ref->logits, logits_size * sizeof(float));
         }
     }
 
@@ -8634,12 +8635,12 @@ struct llama_data_read {
         uint64_t embeddings_size;
         read_to(&embeddings_size, sizeof(embeddings_size));
 
-        if (ctx->embd_size < embeddings_size) {
+        if (ctx->decoder_ref->embd_size < embeddings_size) {
             throw std::runtime_error("embeddings buffer too small");
         }
 
         if (embeddings_size) {
-            read_to(ctx->embd, embeddings_size * sizeof(float));
+            read_to(ctx->decoder_ref->embd, embeddings_size * sizeof(float));
         }
     }
 
@@ -10041,7 +10042,7 @@ void llama_synchronize(struct llama_context * ctx) {
 float * llama_get_logits(struct llama_context * ctx) {
     llama_synchronize(ctx);
 
-    return ctx->logits;
+    return ctx->decoder_ref->logits;
 }
 
 float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
@@ -10049,30 +10050,30 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
     llama_synchronize(ctx);
 
     try {
-        if (ctx->logits == nullptr) {
+        if (ctx->decoder_ref->logits == nullptr) {
             throw std::runtime_error("no logits");
         }
 
         if (i < 0) {
-            j = ctx->n_outputs + i;
+            j = ctx->decoder_ref->n_outputs + i;
             if (j < 0) {
-                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
+                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->decoder_ref->n_outputs));
             }
-        } else if ((size_t) i >= ctx->output_ids.size()) {
-            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
+        } else if ((size_t) i >= ctx->decoder_ref->output_ids.size()) {
+            throw std::runtime_error(format("out of range [0, %lu)", ctx->decoder_ref->output_ids.size()));
         } else {
-            j = ctx->output_ids[i];
+            j = ctx->decoder_ref->output_ids[i];
         }
 
         if (j < 0) {
             throw std::runtime_error(format("batch.logits[%d] != true", i));
         }
-        if (j >= ctx->n_outputs) {
+        if (j >= ctx->decoder_ref->n_outputs) {
             // This should not happen
-            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
+            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->decoder_ref->n_outputs));
         }
 
-        return ctx->logits + j*ctx->model.hparams.n_vocab;
+        return ctx->decoder_ref->logits + j*ctx->model.hparams.n_vocab;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -10085,7 +10086,7 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
 float * llama_get_embeddings(struct llama_context * ctx) {
     llama_synchronize(ctx);
 
-    return ctx->embd;
+    return ctx->decoder_ref->embd;
 }
 
 float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
@@ -10094,30 +10095,30 @@ float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
     llama_synchronize(ctx);
 
     try {
-        if (ctx->embd == nullptr) {
+        if (ctx->decoder_ref->embd == nullptr) {
             throw std::runtime_error("no embeddings");
         }
 
         if (i < 0) {
-            j = ctx->n_outputs + i;
+            j = ctx->decoder_ref->n_outputs + i;
             if (j < 0) {
-                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->n_outputs));
+                throw std::runtime_error(format("negative index out of range [0, %d)", ctx->decoder_ref->n_outputs));
             }
-        } else if ((size_t) i >= ctx->output_ids.size()) {
-            throw std::runtime_error(format("out of range [0, %lu)", ctx->output_ids.size()));
+        } else if ((size_t) i >= ctx->decoder_ref->output_ids.size()) {
+            throw std::runtime_error(format("out of range [0, %lu)", ctx->decoder_ref->output_ids.size()));
         } else {
-            j = ctx->output_ids[i];
+            j = ctx->decoder_ref->output_ids[i];
         }
 
         if (j < 0) {
             throw std::runtime_error(format("batch.logits[%d] != true", i));
         }
-        if (j >= ctx->n_outputs) {
+        if (j >= ctx->decoder_ref->n_outputs) {
             // This should not happen
-            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
+            throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->decoder_ref->n_outputs));
         }
 
-        return ctx->embd + j*ctx->model.hparams.n_embd;
+        return ctx->decoder_ref->embd + j*ctx->model.hparams.n_embd;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -10130,8 +10131,8 @@ float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
 float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id) {
     llama_synchronize(ctx);
 
-    auto it = ctx->embd_seq.find(seq_id);
-    if (it == ctx->embd_seq.end()) {
+    auto it = ctx->decoder_ref->embd_seq.find(seq_id);
+    if (it == ctx->decoder_ref->embd_seq.end()) {
         return nullptr;
     }
 
@@ -11353,7 +11354,7 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
         return;
     }
     // Copy into context-owned buffer so the value survives the next
-    // llama_decode's llama_output_reserve (which repoints lctx.embd).
+    // llama_decode's llama_output_reserve (which repoints lctx.decoder_ref->embd).
     const size_t n_embd = (size_t) ctx->model.hparams.n_embd;
     ctx->draft_input_hidden_state_buf.assign(hidden_state, hidden_state + n_embd);
     ctx->draft_input_hidden_state = ctx->draft_input_hidden_state_buf.data();
