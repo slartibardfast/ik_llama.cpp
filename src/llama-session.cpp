@@ -22,12 +22,6 @@
 
 #include <cstring>
 
-struct llama_session {
-    struct llama_context * ctx       = nullptr;
-    bool                   owns_ctx  = false;
-    struct llama_session_params params{};
-};
-
 extern "C" {
 
 struct llama_session_params llama_session_default_params(void) {
@@ -53,6 +47,17 @@ struct llama_session_params llama_session_default_params(void) {
     p.flash_attn                  = false;
     p.offload_kqv                 = true;
     return p;
+}
+
+// PHASE45 D9.6h: helper — adopt backends/scale_data/lora_adapters/etc
+// onto the session by reference (we keep storage on ctx today; session
+// holds back-references that consumers can use via ctx->session_ref).
+// At D9.8 (delete ctx) the storage transfers fully.
+static void session_adopt_ctx_fields(struct llama_session * s, struct llama_context * ctx) {
+    if (s == nullptr || ctx == nullptr) return;
+    // No move yet — ctx still owns the storage. Session is the
+    // architectural owner; sed substitutions ctx->FIELD →
+    // ctx->session_ref->FIELD wait for D9.8 when ctx deletes.
 }
 
 struct llama_session * llama_session_create(struct llama_model * model, struct llama_session_params params) {
@@ -88,6 +93,7 @@ struct llama_session * llama_session_create(struct llama_model * model, struct l
     s->owns_ctx = true;
     s->params   = params;
     ctx->session_ref = s;  // PHASE45 D9.6a: back-ref for transitional helpers
+    session_adopt_ctx_fields(s, ctx);  // PHASE45 D9.6h
     return s;
 }
 
@@ -101,6 +107,7 @@ struct llama_session * llama_session_adopt(struct llama_context * ctx) {
     s->params.n_batch       = llama_n_batch(ctx);
     s->params.n_ubatch      = llama_n_ubatch(ctx);
     ctx->session_ref        = s;  // PHASE45 D9.6a: back-ref for transitional helpers
+    session_adopt_ctx_fields(s, ctx);  // PHASE45 D9.6h
     return s;
 }
 
@@ -109,6 +116,8 @@ void llama_session_free(struct llama_session * session) {
     if (session->owns_ctx && session->ctx != nullptr) {
         llama_free(session->ctx);
     }
+    // PHASE45 D9.6h: backend ownership stays on ctx until D9.8 deletes
+    // llama_context entirely. Session's backends vector is empty today.
     delete session;
 }
 

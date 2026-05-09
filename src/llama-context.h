@@ -236,6 +236,12 @@ struct llama_context {
     struct llama_kv_cache       transformer_kv;
     struct llama_control_vector cvec;
 
+    // PHASE45 D9.6h: scale_data, lora_adapters, backends, backend_cpu,
+    // backend_metal, backend_blas, embd_enc, seq_ids_enc are
+    // architecturally session-owned. llama_init_from_model still
+    // populates them on ctx today; llama_session_adopt() moves them
+    // into session storage at adopt time. ctx fields are kept until
+    // D9.8 to keep llama_init_from_model's allocation paths coherent.
     std::vector<float> scale_data;
 
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
@@ -262,7 +268,11 @@ struct llama_context {
     // whether we are computing encoder output or decoder output
     bool is_encoding = false;
 
-    // output of the encoder part of the encoder-decoder models
+    // PHASE45 D9.6h: encoder-output buffers — populated by ctx-level
+    // encode path during llama_init_from_model and llama_encode; mirrored
+    // onto llama_session at adopt time so consumer access via session
+    // works without further ctx coupling. Kept on ctx today for the
+    // legacy mtp graph-build path that reads lctx.embd_enc directly.
     std::vector<float> embd_enc;
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 

@@ -711,6 +711,11 @@ llama_context::~llama_context() {
     // PHASE45 D9.6e: sched is freed by default_decoder's destructor
     // (held by-value; runs after this function body completes).
 
+    // PHASE45 D9.6h: backends are architecturally session-owned. Today
+    // ctx still owns the storage; freeing is here so the legacy
+    // llama_init_from_model + llama_free pair stays correct. When session
+    // adopts (llama_session_adopt), it MOVES backends into its own
+    // vector and clears ctx's vector, so this loop becomes a no-op.
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
     }
