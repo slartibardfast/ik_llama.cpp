@@ -2066,7 +2066,16 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         int idx_out = ggml_backend_sched_get_backend_idx(lctx.default_decoder.sched, lctx.model.output->buffer);
         if (idx_out >= 0) idx = idx_out;
         const bool is_qwen_mtp = lctx.model.arch == LLM_ARCH_QWEN35 && lctx.cparams.mtp;
-        if (cur->op == GGML_OP_REDUCE && cur->src[idx] && !is_qwen_mtp) {
+        // C.1 diagnostic gate: env-disable the is_qwen_mtp carve-out so we
+        // can test whether the cross-device REDUCE materialization (skipped
+        // by the carve-out) is the source of np>1 slot divergence at
+        // -mtp + multi-GPU. Read-once at first call.
+        static const bool disable_qwen_mtp_carveout = []() {
+            const char * v = getenv("LLAMA_DISABLE_MTP_REDUCE_CARVEOUT");
+            return v && *v && *v != '0';
+        }();
+        const bool effective_is_qwen_mtp = is_qwen_mtp && !disable_qwen_mtp_carveout;
+        if (cur->op == GGML_OP_REDUCE && cur->src[idx] && !effective_is_qwen_mtp) {
             // avoid copy to main GPU
             cur->view_src = cur->src[idx];
         }
