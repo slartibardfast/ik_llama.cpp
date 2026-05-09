@@ -4933,7 +4933,7 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
             if (src_t != nullptr && ggml_nbytes(src_t) >= ggml_nbytes(dst)) {
                 ggml_backend_tensor_copy(src_t, dst);
                 static const bool input_chk =
-                    (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
+                    llama_env_truthy("LLAMA_MTP_INPUT_CHECKSUM");
                 if (input_chk) {
                     fprintf(stderr,
                         "[mtp-input-chk] op=DRAFT_GEN_FUSED seed=persist[%d] nbytes=%zu (D2D)\n",
@@ -4954,7 +4954,7 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
 
     static const bool input_chk =
-        (getenv("LLAMA_MTP_INPUT_CHECKSUM") != nullptr);
+        llama_env_truthy("LLAMA_MTP_INPUT_CHECKSUM");
     if (input_chk) {
         const char * op_label = "?";
         switch (lctx.cparams.mtp_op_type) {
@@ -5532,7 +5532,7 @@ static int llama_decode_internal(
 
                         {
                             static const bool perstep_stats =
-                                (getenv("LLAMA_MTP_FUSED_STATS") != nullptr);
+                                llama_env_truthy("LLAMA_MTP_FUSED_STATS");
                             if (perstep_stats && draftgen_fast) {
                                 const int32_t pos0 = u_batch.pos ? (int32_t) u_batch.pos[0] : -1;
                                 for (int i = 0; i < rows_to_pull; ++i) {
@@ -5707,7 +5707,7 @@ static int llama_decode_internal(
                     lctx.mtp_fused_results_probs[k] = 1.0f;
                 }
                 static const bool mtp_fused_stats =
-                    (getenv("LLAMA_MTP_FUSED_STATS") != nullptr);
+                    llama_env_truthy("LLAMA_MTP_FUSED_STATS");
                 if (mtp_fused_stats) {
                     const int32_t pos_k = u_batch.pos ? (int32_t) u_batch.pos[k] : -1;
                     fprintf(stderr,
@@ -7044,7 +7044,7 @@ struct llama_context * llama_init_from_model(
     // Phase 36 Step 3: env-gated until A/B comparison shows the hook
     // path is a strict win at production context. Server CLI flag can
     // be wired up once the inline-hook bake-out lands.
-    cparams.mtp_inline_kv_hook = (getenv("LLAMA_MTP_INLINE_KV") != nullptr);
+    cparams.mtp_inline_kv_hook = llama_env_truthy("LLAMA_MTP_INLINE_KV");
     cparams.mtp_fused_n_steps = 0;
     cparams.mtp_fused_n_extend = 0;
     cparams.worst_graph_tokens = params.worst_case_tokens;
@@ -9651,7 +9651,7 @@ int32_t llama_decode(
     // LLAMA_PROFILE_DECODE; zero cost when off. Format ($1=label,
     // $2=microseconds) matches scripts/profile-mtp-draft-cycle.sh
     // grep patterns; bucket by op= field for verify/draft/update_accepted.
-    static const bool _prof_decode = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+    static const bool _prof_decode = llama_env_truthy("LLAMA_PROFILE_DECODE");
     const int64_t _decode_t0 = _prof_decode ? ggml_time_us() : 0;
 
     const int ret = llama_decode_internal(*ctx, batch);

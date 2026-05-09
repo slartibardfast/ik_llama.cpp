@@ -47,6 +47,18 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 
 //
+// Env-gate truthiness check (PHASE45 D9.x sweep, lesson from
+// `feedback_verify_test_mechanism_before_trusting`):
+// `getenv() != nullptr` treats `VAR=0` as set; this helper treats
+// `VAR=0` and `VAR=` as unset. Use this for boolean env gates so that
+// `LLAMA_FOO=0 cmd` actually disables the flag.
+//
+static inline bool llama_env_truthy(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+//
 // helpers
 //
 

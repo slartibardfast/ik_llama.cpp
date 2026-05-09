@@ -32,6 +32,7 @@
 #include "llama-session.h"
 #include "llama-session-internal.h"
 #include "llama-decoder.h"
+#include "llama-impl.h"  // llama_env_truthy
 
 #include <cmath>
 #include <cstdlib>
@@ -97,7 +98,7 @@ int32_t llama_spec_mtp_draft(
     // production server. On any failure (env not set, n outside fused range,
     // dispatch rc != 0, n_steps == 0), fall through to per-step.
     {
-        static const bool fused_enabled = (std::getenv("LLAMA_MTP_FUSED") != nullptr);
+        static const bool fused_enabled = (llama_env_truthy("LLAMA_MTP_FUSED"));
         if (fused_enabled && n_draft_max > 1 && n_draft_max <= LLAMA_MTP_FUSED_MAX) {
             llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN_FUSED);
             llama_mtp_fused_result fr{};

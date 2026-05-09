@@ -20,6 +20,14 @@ extern "C" void probe_top2_push(int32_t t1, int32_t t2);
 #include <iomanip>
 #include <map>
 
+// PHASE45 D9.x sweep: env-gate truthiness check (treats VAR=0 / VAR= as unset).
+// See feedback_verify_test_mechanism_before_trusting auto-memory entry.
+static inline bool env_truthy(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -625,7 +633,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
     const bool verbose;
 
     common_speculative_state_ngram_mod(enum common_speculative_type type, common_ngram_mod & mod)
-        : common_speculative_state(type), mod(mod), verbose(std::getenv("LLAMA_TRACE") != nullptr) {
+        : common_speculative_state(type), mod(mod), verbose(env_truthy("LLAMA_TRACE")) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
     }
 
@@ -1439,7 +1447,7 @@ void mtp_accept_tokens(
     // server's accept tail (server-context.cpp:3968 etc.) trims
     // rejected positions on both main + MTP layers. The separate
     // MTP_OP_UPDATE_ACCEPTED dispatch is therefore redundant — skip it.
-    static const bool _hook_on = (getenv("LLAMA_MTP_INLINE_KV") != nullptr);
+    static const bool _hook_on = env_truthy("LLAMA_MTP_INLINE_KV");
     if (_hook_on) {
         // Note: caller is expected to issue llama_kv_cache_seq_rm on
         // its own (ctx, seq_id, slot.n_past, -1). We don't do it here

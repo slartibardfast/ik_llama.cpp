@@ -16,6 +16,14 @@
 #include <regex>
 #include <exception>
 
+// PHASE45 D9.x sweep: env-gate truthiness check (treats VAR=0 / VAR= as unset).
+// See feedback_verify_test_mechanism_before_trusting auto-memory entry.
+static inline bool env_truthy(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+
 static void log_text(const gpt_params & params_base, const std::string & text) {
     if (params_base.minilog) {
         LOG_TEE("%s\n", text.c_str());
@@ -3229,7 +3237,7 @@ void server_context::add_sampled_tokens() {
                 // chain-residual seed for the next fused so prepare
                 // reads persist[step] D2D instead of host-bouncing.
                 static const bool _chain_residual_enabled =
-                    (getenv("LLAMA_MTP_CHAIN_RESIDUAL_SEED") != nullptr);
+                    env_truthy("LLAMA_MTP_CHAIN_RESIDUAL_SEED");
                 static const bool _full_2_enabled =
                     (getenv("LLAMA_MTP_FULL_2") != nullptr);
                 if ((_chain_residual_enabled || _full_2_enabled)
@@ -4370,7 +4378,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
         // when off. Per-batch-shape histogram dumped every 100 decodes. Used
         // for verify@K latency scaling probes during MTP optimisation.
-        static const bool _prof_decode = (getenv("LLAMA_PROFILE_DECODE") != nullptr);
+        static const bool _prof_decode = env_truthy("LLAMA_PROFILE_DECODE");
         struct decode_stat { long long sum_ns = 0; long long n = 0; long long min_ns = 0; long long max_ns = 0; };
         static std::map<int, decode_stat> _prof_stats;
         std::chrono::high_resolution_clock::time_point _prof_t0;

@@ -36,6 +36,14 @@
 #include <functional>
 #include <cfloat>
 
+// PHASE45 D9.x sweep: env-gate truthiness check (treats VAR=0 / VAR= as unset).
+// See feedback_verify_test_mechanism_before_trusting auto-memory entry.
+static inline bool env_truthy(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+
 #define DEFAULT_INTERPOLATION_MODE ((int)GGML_SCALE_MODE_BILINEAR | (int)GGML_SCALE_FLAG_ALIGN_CORNERS)
 
 // TODO: allow to pass callback from user code
@@ -473,7 +481,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         kq_type = ctx_params.kq_type;
-        debug_graph = std::getenv("MTMD_DEBUG_GRAPH") != nullptr;
+        debug_graph = env_truthy("MTMD_DEBUG_GRAPH");
         //backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         backend_cpu = ggml_backend_cpu_init();
         if (!backend_cpu) {

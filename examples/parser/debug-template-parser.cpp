@@ -14,6 +14,14 @@
 #include <sstream>
 #include <string>
 
+// PHASE45 D9.x sweep: env-gate truthiness check (treats VAR=0 / VAR= as unset).
+// See feedback_verify_test_mechanism_before_trusting auto-memory entry.
+static inline bool env_truthy(const char * name) {
+    const char * v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+
 using json = nlohmann::ordered_json;
 
 enum class output_mode {
@@ -362,7 +370,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (opts.debug_jinja || std::getenv("LLAMA_DEBUG_JINJA") != nullptr) {
+    if (opts.debug_jinja || std::env_truthy("LLAMA_DEBUG_JINJA")) {
         jinja::enable_debug(true);
     }
 
