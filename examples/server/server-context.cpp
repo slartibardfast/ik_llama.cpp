@@ -3857,7 +3857,7 @@ static void restore_speculative_checkpoint(
                 for (int j = 0; j < re_batch.n_tokens; j++) {
                     re_batch.logits[j] = true;
                 }
-                llama_set_embeddings(ctx, true);  // free fn; no decoder in scope (D9.x port)
+                llama_decoder_set_embeddings(decoder, true);
             }
 
             const int ret = llama_decode(ctx, re_batch);
@@ -3870,7 +3870,7 @@ static void restore_speculative_checkpoint(
                 const int n_accepted = (int)ids.size();
                 slot.mtp_hidden_state.resize(n_accepted * n_embd);
                 for (int j = 0; j < n_accepted; j++) {
-                    const float * emb_j = llama_get_embeddings_ith(ctx, j);  // free fn; no decoder in scope (D9.x port)
+                    const float * emb_j = llama_decoder_get_embeddings_ith(decoder, j);
                     if (emb_j) {
                         memcpy(slot.mtp_hidden_state.data() + j * n_embd, emb_j, n_embd * sizeof(float));
                     }
@@ -4210,7 +4210,7 @@ inline int32_t check_ban_phrase(server_slot& slot) {
     return -1;
 }
 
-inline void rewind_context(server_slot& slot, int32_t ban_pos) {
+inline void rewind_context(server_slot& slot, llama_session * session, int32_t ban_pos) {
     slot.rewind_count++;
     
     int32_t buffer_start_pos = slot.n_past - (int32_t)slot.token_buffer.size() + 1;
@@ -4257,7 +4257,7 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.n_past = slot.cache_tokens.n_tokens();
     
     // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.n_past, -1);  // free fn; no session in scope (D9.x port)
+    llama_session_kv_seq_rm(session, slot.id, slot.n_past, -1);
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -4310,7 +4310,7 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
     }
 
     if (ban_pos >= 0 && allow_rewind) {
-        rewind_context(slot, ban_pos);
+        rewind_context(slot, session, ban_pos);
         slot.rewind_status = true;
     }
     else if (buffer_full || !next_token) {
