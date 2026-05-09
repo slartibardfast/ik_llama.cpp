@@ -28,7 +28,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        lctx.default_decoder.inp_mtp_states = hidden_states_from_main_model;
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
@@ -41,9 +41,9 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
-        cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
-        ggml_set_input(lctx.inp_s_seq_qnext);
+        lctx.default_decoder.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+        cb(lctx.default_decoder.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
+        ggml_set_input(lctx.default_decoder.inp_s_seq_qnext);
 
         float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -88,7 +88,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
             cb(embd_copy, "h_pre_norm", -1);
             ggml_set_output(embd_copy);
-            lctx.t_h_pre_norm = embd_copy;
+            lctx.default_decoder.t_h_pre_norm = embd_copy;
         }
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
@@ -102,12 +102,12 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             const int il_mtp = hparams.n_layer - 1;
             const auto & mtp_layer = model.layers[il_mtp];
             ggml_tensor * mtp_kv = build_qwen35_mtp_kv_only(
-                    mtp_layer, inpL, lctx.inp_tokens,
+                    mtp_layer, inpL, lctx.default_decoder.inp_tokens,
                     n_embd_head, gf, inp_pos, KQ_mask);
             cb(mtp_kv, "mtp_kv_inline_moe", il_mtp);
             ggml_build_forward_expand(gf, mtp_kv);
-            ++lctx.mtp_hook_fire_count;
-            ++lctx.mtp_inline_decode_count;
+            ++lctx.default_decoder.mtp_hook_fire_count;
+            ++lctx.default_decoder.mtp_inline_decode_count;
         }
     }
 
@@ -141,7 +141,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         }
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        lctx.default_decoder.inp_mtp_states = hidden_states_from_main_model;
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
@@ -154,9 +154,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
-        lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
-        cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
-        ggml_set_input(lctx.inp_s_seq_qnext);
+        lctx.default_decoder.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
+        cb(lctx.default_decoder.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
+        ggml_set_input(lctx.default_decoder.inp_s_seq_qnext);
 
         float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -187,11 +187,11 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         if (lctx.cparams.mtp) {
             // See build_qwen35moe() above for the rationale on the
-            // "h_pre_norm" tag + lctx.t_h_pre_norm stash.
+            // "h_pre_norm" tag + lctx.default_decoder.t_h_pre_norm stash.
             struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
             cb(embd_copy, "h_pre_norm", -1);
             ggml_set_output(embd_copy);
-            lctx.t_h_pre_norm = embd_copy;
+            lctx.default_decoder.t_h_pre_norm = embd_copy;
         }
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
@@ -203,12 +203,12 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             const int il_mtp = hparams.n_layer - 1;
             const auto & mtp_layer = model.layers[il_mtp];
             ggml_tensor * mtp_kv = build_qwen35_mtp_kv_only(
-                    mtp_layer, inpL, lctx.inp_tokens,
+                    mtp_layer, inpL, lctx.default_decoder.inp_tokens,
                     n_embd_head, gf, inp_pos, KQ_mask);
             cb(mtp_kv, "mtp_kv_inline", il_mtp);
             ggml_build_forward_expand(gf, mtp_kv);
-            ++lctx.mtp_hook_fire_count;
-            ++lctx.mtp_inline_decode_count;
+            ++lctx.default_decoder.mtp_hook_fire_count;
+            ++lctx.default_decoder.mtp_inline_decode_count;
         }
     }
 
@@ -452,37 +452,37 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
     const auto & mtp_layer = model.layers[il_mtp];
 
     // Initial hidden state input (h_pre_norm from verify, 1 row).
-    // Filled by prepare_mtp_graph_inputs from lctx.draft_input_hidden_state.
+    // Filled by prepare_mtp_graph_inputs from lctx.default_decoder.draft_input_hidden_state.
     ggml_tensor * inp_states = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, 1);
     ggml_set_name(inp_states, "inp_mtp_states");
     ggml_set_input(inp_states);
-    lctx.inp_mtp_states = inp_states;
+    lctx.default_decoder.inp_mtp_states = inp_states;
 
     // Token tensor sized for the batch (n_tokens = n_draft). Step 0
     // reads index 0 (seed_token); steps k>0 use argmax_{k-1} in-graph.
-    lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    cb(lctx.inp_tokens, "inp_tokens", -1);
-    ggml_set_input(lctx.inp_tokens);
+    lctx.default_decoder.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    cb(lctx.default_decoder.inp_tokens, "inp_tokens", -1);
+    ggml_set_input(lctx.default_decoder.inp_tokens);
 
     // Position tensor: matches build_inp_pos() — for MROPE/IMROPE,
     // 4 entries per token; otherwise 1 per token. Step k slices its
     // n_pos_per_embd-element segment via ggml_view_1d below.
     const int n_pos_per_embd = (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
                                 hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
-    lctx.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens * n_pos_per_embd);
-    cb(lctx.inp_pos, "inp_pos", -1);
-    ggml_set_input(lctx.inp_pos);
+    lctx.default_decoder.inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens * n_pos_per_embd);
+    cb(lctx.default_decoder.inp_pos, "inp_pos", -1);
+    ggml_set_input(lctx.default_decoder.inp_pos);
 
     // KQ_mask: (n_kv, n_tokens * GGML_KQ_MASK_PAD). Each step k uses a
     // (n_kv, GGML_KQ_MASK_PAD) view at row offset k*GGML_KQ_MASK_PAD —
     // satisfies the flash-attention requirement that mask->ne[1] >=
     // GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) for single-token queries.
     // Per-step visibility filled by llama_set_inputs.
-    lctx.inp_KQ_mask = ggml_new_tensor_2d(
+    lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_2d(
         ctx0, flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
         n_kv, (int64_t)n_tokens * GGML_KQ_MASK_PAD);
-    cb(lctx.inp_KQ_mask, "KQ_mask", -1);
-    ggml_set_input(lctx.inp_KQ_mask);
+    cb(lctx.default_decoder.inp_KQ_mask, "KQ_mask", -1);
+    ggml_set_input(lctx.default_decoder.inp_KQ_mask);
 
     ggml_tensor * prev_residual = inp_states;
     ggml_tensor * argmaxes[LLAMA_MTP_FUSED_MAX] = {};
@@ -495,7 +495,7 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
         // though the outer build context has n_tokens = n_draft.
         ggml_tensor * tok_id_k;
         if (k == 0) {
-            tok_id_k = ggml_view_1d(ctx0, lctx.inp_tokens, 1, 0);
+            tok_id_k = ggml_view_1d(ctx0, lctx.default_decoder.inp_tokens, 1, 0);
         } else {
             tok_id_k = argmaxes[k-1];
         }
@@ -503,19 +503,19 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
         // Per-step inp_pos view: n_pos_per_embd elements at offset
         // k * n_pos_per_embd. For MROPE/IMROPE this is 4 elements per
         // step; otherwise 1.
-        ggml_tensor * pos_k = ggml_view_1d(ctx0, lctx.inp_pos,
+        ggml_tensor * pos_k = ggml_view_1d(ctx0, lctx.default_decoder.inp_pos,
             n_pos_per_embd,
-            (size_t) k * n_pos_per_embd * lctx.inp_pos->nb[0]);
+            (size_t) k * n_pos_per_embd * lctx.default_decoder.inp_pos->nb[0]);
 
         // Per-step KQ_mask view: (n_kv, GGML_KQ_MASK_PAD) at row offset
         // k * GGML_KQ_MASK_PAD. The mask's first row is the actual
         // visibility for step k's query; the remaining KQ_MASK_PAD-1
         // rows are padding (FA reads them but they don't affect output
         // for n_queries=1).
-        ggml_tensor * mask_k = ggml_view_2d(ctx0, lctx.inp_KQ_mask,
-            lctx.inp_KQ_mask->ne[0], GGML_KQ_MASK_PAD,
-            lctx.inp_KQ_mask->nb[1],
-            (size_t) k * GGML_KQ_MASK_PAD * lctx.inp_KQ_mask->nb[1]);
+        ggml_tensor * mask_k = ggml_view_2d(ctx0, lctx.default_decoder.inp_KQ_mask,
+            lctx.default_decoder.inp_KQ_mask->ne[0], GGML_KQ_MASK_PAD,
+            lctx.default_decoder.inp_KQ_mask->nb[1],
+            (size_t) k * GGML_KQ_MASK_PAD * lctx.default_decoder.inp_KQ_mask->nb[1]);
 
         // Phase 36 #3: route through the shared chain-residual primitive
         // (the SAME primitive build_qwen35_mtp uses).
@@ -538,13 +538,13 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
         // just k+1<n_draft) as set_output. The exposed tensor is the
         // hidden state at position S_k+(k+1) — exactly what the next
         // cycle's fused decode needs as its seed when verify accepts
-        // k drafts. Indexed via lctx.mtp_fused_chain_residuals[k].
+        // k drafts. Indexed via lctx.default_decoder.mtp_fused_chain_residuals[k].
         normed = ggml_dup(ctx0, normed);
         char nm_residual[40];
         snprintf(nm_residual, sizeof(nm_residual), "mtp_chain_residual_%d", k);
         ggml_set_name(normed, nm_residual);
         ggml_set_output(normed);
-        lctx.mtp_fused_chain_residuals[k] = normed;
+        lctx.default_decoder.mtp_fused_chain_residuals[k] = normed;
         cb(normed, "mtp_chain_residual", il_mtp);
 
         if (k + 1 < n_chain) {
@@ -631,10 +631,10 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
             ggml_set_name(offsets, nm_off);
             ggml_set_input(offsets);
             // Stash the tensor pointer + values; set_inputs fills.
-            lctx.mtp_fused_offset_t[k] = offsets;
-            lctx.mtp_fused_offset_n_dev[k] = (int32_t) dev_amaxes.size();
+            lctx.default_decoder.mtp_fused_offset_t[k] = offsets;
+            lctx.default_decoder.mtp_fused_offset_n_dev[k] = (int32_t) dev_amaxes.size();
             for (int d = 0; d < (int)dev_amaxes.size(); ++d) {
-                lctx.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/ + d] = (int32_t) device_offset_const[d];
+                lctx.default_decoder.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/ + d] = (int32_t) device_offset_const[d];
             }
 
             // Concat per-device argmaxes (each shape [1]) into shape (n_dev,).
@@ -734,8 +734,8 @@ ggml_cgraph * llm_build_context::build_qwen35_mtp_fused(int n_draft, int n_exten
     // them. The chain_residual tensors for k in [0, n_chain) are
     // already set_output and referenced via prev_residual chain;
     // ggml_build_forward_expand on the LAST one ensures no DCE.
-    if (lctx.mtp_fused_chain_residuals[n_chain - 1] != nullptr) {
-        ggml_build_forward_expand(gf, lctx.mtp_fused_chain_residuals[n_chain - 1]);
+    if (lctx.default_decoder.mtp_fused_chain_residuals[n_chain - 1] != nullptr) {
+        ggml_build_forward_expand(gf, lctx.default_decoder.mtp_fused_chain_residuals[n_chain - 1]);
     }
 
     return gf;

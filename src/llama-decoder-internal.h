@@ -15,6 +15,8 @@
 #include "llama.h"
 #include "llama-decoder.h"
 #include "llama-impl.h"   // PHASE45 D9.6d: full llama_split_tensor definition
+#include "qnext-state-slot-allocator.h"  // PHASE45 D9.6f: qnext slot allocator type
+#include "ggml.h"         // PHASE45 D9.6f: ggml_free for ~llama_decoder
 #include "ggml-backend.h"
 
 #include <vector>
@@ -86,6 +88,98 @@ struct llama_decoder {
     // kv_cache.split_s_l. Same lifetime caveat as s_l.
     std::vector<struct llama_split_tensor> split_s_l;
 
+    // PHASE45 D9.6f: graph input tensors (formerly on llama_context).
+    // Per-decoder because verify and draft build independent graphs.
+    struct ggml_tensor * inp_tokens      = nullptr; // I32 [n_batch]
+    struct ggml_tensor * inp_embd        = nullptr; // F32 [n_embd, n_batch]
+    struct ggml_tensor * inp_pos         = nullptr; // I32 [n_batch]
+    struct ggml_tensor * inp_out_ids     = nullptr; // I32 [n_outputs]
+    struct ggml_tensor * inp_KQ_mask     = nullptr; // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_KQ_mask_swa = nullptr; // F32 [kv_size, n_batch]
+    struct ggml_tensor * inp_K_shift     = nullptr; // I32 [kv_size]
+    struct ggml_tensor * inp_mean        = nullptr; // F32 [n_batch, n_batch]
+    struct ggml_tensor * inp_cls         = nullptr; // I32 [n_batch]
+    struct ggml_tensor * inp_s_copy      = nullptr; // I32 [kv_size]
+    struct ggml_tensor * inp_s_mask      = nullptr; // F32 [1, n_kv]
+    struct ggml_tensor * inp_s_seq       = nullptr; // I32 [n_kv, n_batch]
+    struct ggml_tensor * inp_s_seq_qnext = nullptr; // I32 [1, n_batch]
+    struct ggml_tensor * inp_pos_bucket    = nullptr; // I32 [n_batch|n_kv, n_batch]
+    struct ggml_tensor * inp_KQ_mask_cross = nullptr; // F32 [n_outputs_enc, n_batch]
+    struct ggml_tensor * inp_scale         = nullptr; // F32 [n_tokens]
+    struct ggml_tensor * inp_mtp_states    = nullptr;
+
+    // PHASE45 D9.6f: per-seq slot allocator for the linear-attn recurrent
+    // state buffer (s_l[il]); maps llama_seq_id -> slot index.
+    qnext_state_slot_allocator qnext_slot_alloc;
+    // Phase 3 instrumentation: count how many times the qwen3next mixed-seq
+    // chunking sub-batch was triggered.
+    uint64_t qnext_mixed_seq_fallback_count = 0;
+
+    // PHASE45 D9.6f: PHASE36 chain-seed buffer + pointer.
+    std::vector<float> draft_input_hidden_state_buf;
+    const float *      draft_input_hidden_state = nullptr;
+
+    // PHASE45 D9.6f: PHASE36 cycle counter (verify-decode tally).
+    int64_t mtp_cycle_counter = 0;
+
+    // PHASE45 D9.6f: MTP DRAFT_GEN device-side residual cache.
+    void *  draft_residual_dev          = nullptr;
+    size_t  draft_residual_dev_nbytes   = 0;
+    size_t  draft_residual_dev_capacity = 0;
+    int     draft_residual_dev_device   = -1;
+    bool    draft_residual_dev_valid    = false;
+
+    // PHASE45 D9.6f: MTP DRAFT_GEN argmax cache.
+    bool                  draft_argmax_valid = false;
+    int32_t               draft_argmax_n     = 0;
+    std::vector<int32_t>  draft_argmax_ids;
+    std::vector<float>    draft_argmax_probs;
+
+    // PHASE45 D9.6f: optional top-2 cache (LLAMA_PROBE_TOP2 / tree-K=2 path).
+    bool                  draft_top2_armed = false;
+    std::vector<int32_t>  draft_argmax_top2_ids;
+
+    // PHASE45 D9.6f: caller-controlled enable for the verify-step
+    // argmax-cache fast path.
+    bool fast_argmax_for_verify = false;
+
+    // PHASE45 D9.6f: pre-final-norm residual stream tag from the main
+    // forward graph (qwen35 / qwen35moe + cparams.mtp).
+    struct ggml_tensor * t_h_pre_norm = nullptr;
+
+    // PHASE45 D9.6f: PHASE36 Step 1 fused multi-draft cgraph counters.
+    int32_t mtp_fused_last_compute_count = 0;
+
+    int32_t mtp_fused_results_n = 0;
+    llama_token mtp_fused_results_tokens[8] = {};
+    float       mtp_fused_results_probs[8]  = {};
+
+    int32_t mtp_fused_offset_buf[8 * 16 /*MAX_DEVICES*/] = {};
+    struct ggml_tensor * mtp_fused_offset_t[8] = {};
+    int32_t mtp_fused_offset_n_dev[8] = {};
+
+    // PHASE45 D9.6f: per-chain-step residuals from the fused cgraph.
+    struct ggml_tensor * mtp_fused_chain_residuals[8] = {};
+
+    // PHASE45 D9.6f: deferred extraction state (Phase 38 E).
+    bool                  mtp_fused_skip_extraction = false;
+    struct ggml_cgraph *  mtp_fused_pending_gf      = nullptr;
+    int                   mtp_fused_pending_n_steps = 0;
+    int                   mtp_fused_async_guess     = -1;
+
+    // PHASE45 D9.6f: persistent chain-residual buffer (Phase 38 B).
+    struct ggml_context     * mtp_persist_ctx = nullptr;
+    ggml_backend_buffer_t     mtp_persist_buf = nullptr;
+    struct ggml_tensor      * mtp_persist[8]  = {};
+    int                       mtp_persist_n   = 0;
+
+    // PHASE45 D9.6f: chain-residual seed step request (Phase 37 #2.2).
+    int32_t pending_chain_residual_step = -1;
+
+    // PHASE45 D9.6f: MTP per-ubatch hook counters.
+    uint64_t mtp_hook_fire_count    = 0;
+    uint64_t mtp_inline_decode_count = 0;
+
     ~llama_decoder() {
         // PHASE45 D9.6c: decoder owns its output buffer; default_decoder
         // (held by-value in llama_context) frees on ctx teardown.
@@ -99,6 +193,16 @@ struct llama_decoder {
         if (owns_sched && sched != nullptr) {
             ggml_backend_sched_free(sched);
             sched = nullptr;
+        }
+        // PHASE45 D9.6f: persistent chain-residual buffer cleanup
+        // (Phase 38 B3). Today only default_decoder allocates these.
+        if (mtp_persist_buf != nullptr) {
+            ggml_backend_buffer_free(mtp_persist_buf);
+            mtp_persist_buf = nullptr;
+        }
+        if (mtp_persist_ctx != nullptr) {
+            ggml_free(mtp_persist_ctx);
+            mtp_persist_ctx = nullptr;
         }
     }
 };

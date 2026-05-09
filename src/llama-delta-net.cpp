@@ -655,7 +655,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const {
-    GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
+    GGML_ASSERT(lctx.default_decoder.inp_s_seq_qnext != nullptr);
 
     auto & model = lctx.model;
     auto & hparams = model.hparams;
@@ -678,7 +678,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
     }
 
     // Phase D: split the batch into contiguous-by-seq blocks and dispatch
@@ -711,7 +711,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     ggml_tensor * out = nullptr;
     for (const auto & blk : blocks) {
         ggml_tensor * cur_blk = ggml_view_2d(ctx0, cur, cur->ne[0], blk.len, cur->nb[1], (size_t) blk.start * cur->nb[1]);
-        ggml_tensor * inp_s_seq_qnext_blk = ggml_view_2d(ctx0, lctx.inp_s_seq_qnext, 1, blk.len, lctx.inp_s_seq_qnext->nb[1], (size_t) blk.start * lctx.inp_s_seq_qnext->nb[1]);
+        ggml_tensor * inp_s_seq_qnext_blk = ggml_view_2d(ctx0, lctx.default_decoder.inp_s_seq_qnext, 1, blk.len, lctx.default_decoder.inp_s_seq_qnext->nb[1], (size_t) blk.start * lctx.default_decoder.inp_s_seq_qnext->nb[1]);
 
         const bool reset_state_blk = batch.pos != nullptr && batch.pos[blk.start] == 0;
         const uint32_t state_seq_id_blk = (uint32_t) blk.seq_id;

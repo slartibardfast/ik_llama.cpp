@@ -578,7 +578,7 @@ void llama_context::reset_scheduler() {
     // independent (context-owned backend buffer) and survive
     // sched_reset, so they are NOT touched here.
     for (int _i = 0; _i < 8; ++_i) {
-        mtp_fused_chain_residuals[_i] = nullptr;
+        default_decoder.mtp_fused_chain_residuals[_i] = nullptr;
     }
 }
 
@@ -718,15 +718,8 @@ llama_context::~llama_context() {
     // PHASE45 D9.6c: buf_output now lives on decoder; default_decoder
     // (held by-value) frees its own buffer in ~llama_decoder.
 
-    // Phase 38 B3: cleanup persistent chain-residual buffer.
-    if (mtp_persist_buf != nullptr) {
-        ggml_backend_buffer_free(mtp_persist_buf);
-        mtp_persist_buf = nullptr;
-    }
-    if (mtp_persist_ctx != nullptr) {
-        ggml_free(mtp_persist_ctx);
-        mtp_persist_ctx = nullptr;
-    }
+    // PHASE45 D9.6f: persistent chain-residual buffer (Phase 38 B3) is
+    // freed by default_decoder's destructor, which runs after this body.
 }
 
 //
@@ -3996,9 +3989,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 static void llama_set_k_shift(llama_context & lctx) {
     const int64_t kv_size = lctx.kv_self.size;
 
-    assert(ggml_backend_buffer_is_host(lctx.inp_K_shift->buffer));
+    assert(ggml_backend_buffer_is_host(lctx.default_decoder.inp_K_shift->buffer));
 
-    int32_t * data = (int32_t *) lctx.inp_K_shift->data;
+    int32_t * data = (int32_t *) lctx.default_decoder.inp_K_shift->data;
 
     for (int i = 0; i < kv_size; ++i) {
         data[i] = lctx.kv_self.cells[i].delta;
@@ -4008,9 +4001,9 @@ static void llama_set_k_shift(llama_context & lctx) {
 static void llama_set_s_copy(llama_context & lctx) {
     const int64_t kv_size = lctx.kv_self.size;
 
-    assert(ggml_backend_buffer_is_host(lctx.inp_s_copy->buffer));
+    assert(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_copy->buffer));
 
-    int32_t * data = (int32_t *) lctx.inp_s_copy->data;
+    int32_t * data = (int32_t *) lctx.default_decoder.inp_s_copy->data;
 
     for (int i = 0; i < kv_size; ++i) {
         data[i] = lctx.kv_self.cells[i].src;
@@ -4056,7 +4049,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
         const int64_t n_tokens = batch.n_tokens;
 
-        ggml_backend_tensor_set(lctx.inp_tokens, batch.token, 0, n_tokens*ggml_element_size(lctx.inp_tokens));
+        ggml_backend_tensor_set(lctx.default_decoder.inp_tokens, batch.token, 0, n_tokens*ggml_element_size(lctx.default_decoder.inp_tokens));
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(token): %d us\n", int(tim2-tim1));
@@ -4070,14 +4063,14 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         const int64_t n_embd   = hparams.n_embd;
         const int64_t n_tokens = batch.n_tokens;
 
-        ggml_backend_tensor_set(lctx.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.inp_embd));
+        ggml_backend_tensor_set(lctx.default_decoder.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.default_decoder.inp_embd));
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(embd): %d us\n", int(tim2-tim1));
 #endif
     }
 
-    if (batch.pos && lctx.inp_pos) {
+    if (batch.pos && lctx.default_decoder.inp_pos) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
 #endif
@@ -4091,9 +4084,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 pos_data[2 * n_tokens + i] = batch.pos[i];
                 pos_data[3 * n_tokens + i] = 0; // 4th dim is 0
             }
-            ggml_backend_tensor_set(lctx.inp_pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(lctx.inp_pos));
+            ggml_backend_tensor_set(lctx.default_decoder.inp_pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(lctx.default_decoder.inp_pos));
         } else {
-            ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(lctx.inp_pos));
+            ggml_backend_tensor_set(lctx.default_decoder.inp_pos, batch.pos, 0, n_tokens*n_pos_per_embd*ggml_element_size(lctx.default_decoder.inp_pos));
         }
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
@@ -4101,18 +4094,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
     }
 
-    if (lctx.inp_pos && lctx.inp_scale) {
+    if (lctx.default_decoder.inp_pos && lctx.default_decoder.inp_scale) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
 #endif
         int n_tokens = batch.n_tokens;
-        GGML_ASSERT(ggml_nelements(lctx.inp_scale) >= n_tokens);
+        GGML_ASSERT(ggml_nelements(lctx.default_decoder.inp_scale) >= n_tokens);
         if (int(lctx.scale_data.size()) < n_tokens) lctx.scale_data.resize(n_tokens);
         int n_pos_per_token = 1;
         for (int i = 0; i < n_tokens; ++i) {
             lctx.scale_data[i] = std::log(std::floor((batch.pos[i] + 1.0f) / hparams.n_attn_temp_floor_scale) + 1.0f) * hparams.f_attn_temp_scale + 1.0f;
         }
-        ggml_backend_tensor_set(lctx.inp_scale, lctx.scale_data.data(), 0, n_tokens*n_pos_per_token*ggml_element_size(lctx.inp_scale));
+        ggml_backend_tensor_set(lctx.default_decoder.inp_scale, lctx.scale_data.data(), 0, n_tokens*n_pos_per_token*ggml_element_size(lctx.default_decoder.inp_scale));
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(scale): %d us\n", int(tim2-tim1));
@@ -4125,12 +4118,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
         const int64_t n_tokens = batch.n_tokens;
         if (n_tokens > 1 && !cparams.mtp) {
-            GGML_ASSERT(lctx.inp_out_ids && "every model that can must skip unused outputs");
+            GGML_ASSERT(lctx.default_decoder.inp_out_ids && "every model that can must skip unused outputs");
         }
 
-        if (lctx.inp_out_ids && lctx.inp_out_ids->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_out_ids->buffer));
-        int32_t * data = (int32_t *) lctx.inp_out_ids->data;
+        if (lctx.default_decoder.inp_out_ids && lctx.default_decoder.inp_out_ids->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_out_ids->buffer));
+        int32_t * data = (int32_t *) lctx.default_decoder.inp_out_ids->data;
 
         if (lctx.decoder_ref->n_outputs == n_tokens) {
             for (int i = 0; i < n_tokens; ++i) {
@@ -4165,7 +4158,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         "causal attention is not supported by this model"
     );
 
-    if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa) {
+    if (lctx.default_decoder.inp_KQ_mask || lctx.default_decoder.inp_KQ_mask_swa) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();
 #endif
@@ -4186,19 +4179,19 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // padding (FA reads them but for n_queries=1 they don't
         // affect the output).
         if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED &&
-            cparams.causal_attn && !lctx.is_encoding && lctx.inp_KQ_mask) {
+            cparams.causal_attn && !lctx.is_encoding && lctx.default_decoder.inp_KQ_mask) {
 
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask->buffer));
             GGML_ASSERT(!hparams.use_alibi);
-            GGML_ASSERT(lctx.inp_KQ_mask_swa == nullptr);
+            GGML_ASSERT(lctx.default_decoder.inp_KQ_mask_swa == nullptr);
 
             const int64_t n_kv     = kv_self.n;
             const int64_t n_tokens = batch.n_tokens;
             const int64_t pad      = GGML_KQ_MASK_PAD;
             const bool    fa       = cparams.flash_attn;
 
-            float     * mdf32 = fa ? nullptr : (float     *) lctx.inp_KQ_mask->data;
-            ggml_half * mdf16 = fa ? (ggml_half *) lctx.inp_KQ_mask->data : nullptr;
+            float     * mdf32 = fa ? nullptr : (float     *) lctx.default_decoder.inp_KQ_mask->data;
+            ggml_half * mdf16 = fa ? (ggml_half *) lctx.default_decoder.inp_KQ_mask->data : nullptr;
             const ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
             const ggml_half h_zero = ggml_fp32_to_fp16(0.f);
 
@@ -4233,14 +4226,14 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             printf("set_inputs(mask:fused): %d us\n", int(tim2-tim1));
 #endif
             // Per-step offset tensors for per-device argmax reduction.
-            // Filled from lctx.mtp_fused_offset_buf (set at graph
+            // Filled from lctx.default_decoder.mtp_fused_offset_buf (set at graph
             // build time per step from the split-tensor metadata).
             for (int k = 0; k < cparams.mtp_fused_n_steps; ++k) {
-                ggml_tensor * t_off = lctx.mtp_fused_offset_t[k];
+                ggml_tensor * t_off = lctx.default_decoder.mtp_fused_offset_t[k];
                 if (t_off == nullptr) continue;
-                const int n_dev = lctx.mtp_fused_offset_n_dev[k];
+                const int n_dev = lctx.default_decoder.mtp_fused_offset_n_dev[k];
                 ggml_backend_tensor_set(t_off,
-                        &lctx.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/],
+                        &lctx.default_decoder.mtp_fused_offset_buf[k * 16 /*MAX_DEVICES*/],
                         0, n_dev * sizeof(int32_t));
             }
             // Skip the rest of the KQ_mask block.
@@ -4258,21 +4251,21 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             ggml_half * data_f16     = nullptr;
             ggml_half * data_swa_f16 = nullptr;
 
-            if (lctx.inp_KQ_mask) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+            if (lctx.default_decoder.inp_KQ_mask) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask->buffer));
                 if (cparams.flash_attn) {
-                    data_f16 = (ggml_half *)lctx.inp_KQ_mask->data;
+                    data_f16 = (ggml_half *)lctx.default_decoder.inp_KQ_mask->data;
                 } else {
-                    data = (float *) lctx.inp_KQ_mask->data;
+                    data = (float *) lctx.default_decoder.inp_KQ_mask->data;
                 }
             }
 
-            if (lctx.inp_KQ_mask_swa) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask_swa->buffer));
+            if (lctx.default_decoder.inp_KQ_mask_swa) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask_swa->buffer));
                 if (cparams.flash_attn) {
-                    data_swa_f16 = (ggml_half *) lctx.inp_KQ_mask_swa->data;
+                    data_swa_f16 = (ggml_half *) lctx.default_decoder.inp_KQ_mask_swa->data;
                 } else {
-                    data_swa = (float *) lctx.inp_KQ_mask_swa->data;
+                    data_swa = (float *) lctx.default_decoder.inp_KQ_mask_swa->data;
                 }
             }
 
@@ -4466,28 +4459,28 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             const int64_t n_tokens = batch.n_tokens;
             const int64_t n_stride = hparams.causal_attn && !lctx.is_encoding ? kv_self.n : n_tokens;
 
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask->buffer));
 
             float * data     = nullptr;
             float * data_swa = nullptr;
             ggml_half * data_f16     = nullptr;
             ggml_half * data_swa_f16 = nullptr;
 
-            if (lctx.inp_KQ_mask) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
+            if (lctx.default_decoder.inp_KQ_mask) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask->buffer));
                 if (cparams.flash_attn) {
-                    data_f16 = (ggml_half *)lctx.inp_KQ_mask->data;
+                    data_f16 = (ggml_half *)lctx.default_decoder.inp_KQ_mask->data;
                 } else {
-                    data = (float *) lctx.inp_KQ_mask->data;
+                    data = (float *) lctx.default_decoder.inp_KQ_mask->data;
                 }
             }
 
-            if (lctx.inp_KQ_mask_swa) {
-                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask_swa->buffer));
+            if (lctx.default_decoder.inp_KQ_mask_swa) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask_swa->buffer));
                 if (cparams.flash_attn) {
-                    data_swa_f16 = (ggml_half *) lctx.inp_KQ_mask_swa->data;
+                    data_swa_f16 = (ggml_half *) lctx.default_decoder.inp_KQ_mask_swa->data;
                 } else {
-                    data_swa = (float *) lctx.inp_KQ_mask_swa->data;
+                    data_swa = (float *) lctx.default_decoder.inp_KQ_mask_swa->data;
                 }
             }
 
@@ -4560,11 +4553,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(lctx.inp_mean);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_mean->buffer));
+        GGML_ASSERT(lctx.default_decoder.inp_mean);
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_mean->buffer));
 
-        float * data = (float *) lctx.inp_mean->data;
-        memset(lctx.inp_mean->data, 0, n_tokens * n_tokens * ggml_element_size(lctx.inp_mean));
+        float * data = (float *) lctx.default_decoder.inp_mean->data;
+        memset(lctx.default_decoder.inp_mean->data, 0, n_tokens * n_tokens * ggml_element_size(lctx.default_decoder.inp_mean));
 
         std::vector<uint64_t> sum(n_tokens, 0);
         for (int i = 0; i < n_tokens; ++i) {
@@ -4592,11 +4585,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_CLS) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(lctx.inp_cls);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_cls->buffer));
+        GGML_ASSERT(lctx.default_decoder.inp_cls);
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_cls->buffer));
 
-        uint32_t * data = (uint32_t *) lctx.inp_cls->data;
-        memset(lctx.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.inp_cls));
+        uint32_t * data = (uint32_t *) lctx.default_decoder.inp_cls->data;
+        memset(lctx.default_decoder.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.default_decoder.inp_cls));
 
         for (int i = 0; i < n_tokens; ++i) {
             const llama_seq_id seq_id = batch.seq_id[i][0];
@@ -4613,11 +4606,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_LAST) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(lctx.inp_cls);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_cls->buffer));
+        GGML_ASSERT(lctx.default_decoder.inp_cls);
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_cls->buffer));
 
-        uint32_t * data = (uint32_t *) lctx.inp_cls->data;
-        memset(lctx.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.inp_cls));
+        uint32_t * data = (uint32_t *) lctx.default_decoder.inp_cls->data;
+        memset(lctx.default_decoder.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.default_decoder.inp_cls));
 
         std::vector<int> last_pos(n_tokens, -1);
         std::vector<int> last_row(n_tokens, -1);
@@ -4644,9 +4637,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (kv_self.recurrent) {
         const int64_t n_kv = kv_self.n;
 
-        if (lctx.inp_s_mask) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_mask->buffer));
-            float * data = (float *) lctx.inp_s_mask->data;
+        if (lctx.default_decoder.inp_s_mask) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_mask->buffer));
+            float * data = (float *) lctx.default_decoder.inp_s_mask->data;
 
             // states which are not affected by the current batch are left untouched
             for (int i = 0; i < n_kv; ++i) {
@@ -4666,11 +4659,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // update the correct state(s)/sequence(s) for each token of the batch.
         // Like with the KQ_mask, if a token in the batch has multiple sequences,
         // they are assumed to be equivalent (not here, but in ggml_ssm_scan and ggml_ssm_conv).
-        if (lctx.inp_s_seq) {
+        if (lctx.default_decoder.inp_s_seq) {
             const int64_t n_tokens = batch.n_tokens;
 
-            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq->buffer));
-            int32_t * data = (int32_t *) lctx.inp_s_seq->data;
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_seq->buffer));
+            int32_t * data = (int32_t *) lctx.default_decoder.inp_s_seq->data;
 
             for (int j = 0; j < n_tokens; ++j) {
                 const int32_t n_seq = batch.n_seq_id[j];
@@ -4688,16 +4681,16 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
-    if (lctx.inp_s_seq_qnext) {
+    if (lctx.default_decoder.inp_s_seq_qnext) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
-        int32_t * data = (int32_t *) lctx.inp_s_seq_qnext->data;
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_seq_qnext->buffer));
+        int32_t * data = (int32_t *) lctx.default_decoder.inp_s_seq_qnext->data;
 
         // Lazy-init the per-seq state-slot allocator on first use. Slot
         // count comes from the recurrent state buffer's second dim;
         // kv_cache_init sized it to llama_qwen3next_state_slots(cparams, kv_size).
-        if (lctx.qnext_slot_alloc.n_slots == 0) {
+        if (lctx.default_decoder.qnext_slot_alloc.n_slots == 0) {
             int32_t n_slots = 0;
             for (size_t il = 0; il < lctx.default_decoder.s_l.size(); ++il) {
                 if (lctx.default_decoder.s_l[il] != nullptr) {
@@ -4706,7 +4699,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
             if (n_slots <= 0) n_slots = (int32_t) std::max<uint32_t>(1, lctx.cparams.n_seq_max);
-            lctx.qnext_slot_alloc.init(n_slots);
+            lctx.default_decoder.qnext_slot_alloc.init(n_slots);
         }
 
         // Map each token's seq_id to its allocated state slot. The
@@ -4741,18 +4734,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 batch.n_seq_id[j] > 0 && batch.seq_id[j] != nullptr) {
                 sid = batch.seq_id[j][0];
             }
-            const int32_t slot = lctx.qnext_slot_alloc.alloc(sid);
-            GGML_ASSERT(slot >= 0 && slot < lctx.qnext_slot_alloc.n_slots);
+            const int32_t slot = lctx.default_decoder.qnext_slot_alloc.alloc(sid);
+            GGML_ASSERT(slot >= 0 && slot < lctx.default_decoder.qnext_slot_alloc.n_slots);
             data[j] = slot;
         }
     }
 
-    if (lctx.inp_pos_bucket) {
+    if (lctx.default_decoder.inp_pos_bucket) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_pos_bucket->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_pos_bucket->buffer));
 
-        int32_t * data = (int32_t *) lctx.inp_pos_bucket->data;
+        int32_t * data = (int32_t *) lctx.default_decoder.inp_pos_bucket->data;
 
         if (!lctx.is_encoding) {
             const int64_t n_kv = kv_self.n;
@@ -4781,13 +4774,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         ggml_backend_tensor_set(lctx.inp_embd_enc, lctx.embd_enc.data(), 0, ggml_nbytes(lctx.inp_embd_enc));
     }
 
-    if (!lctx.is_encoding && lctx.inp_KQ_mask_cross) {
+    if (!lctx.is_encoding && lctx.default_decoder.inp_KQ_mask_cross) {
         const int64_t n_output_enc = lctx.embd_enc.size() / hparams.n_embd;
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_KQ_mask_cross->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_KQ_mask_cross->buffer));
 
-        float * data = (float *) lctx.inp_KQ_mask_cross->data;
+        float * data = (float *) lctx.default_decoder.inp_KQ_mask_cross->data;
 
         for (int h = 0; h < 1; ++h) {
             for (int j = 0; j < n_tokens; ++j) {
@@ -4915,7 +4908,7 @@ static void llama_graph_compute(
 }
 
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
-    ggml_tensor * dst = lctx.inp_mtp_states;
+    ggml_tensor * dst = lctx.default_decoder.inp_mtp_states;
 
     // Phase 38 B: chain-residual seed (D2D, no host bounce). When the
     // caller has armed pending_chain_residual_step AND the persistent
@@ -4934,10 +4927,10 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     // Auto-clears the arm bit so a later decode without re-arm falls
     // through to the host-bounce path (existing semantics preserved).
     {
-        const int step = lctx.pending_chain_residual_step;
-        lctx.pending_chain_residual_step = -1;
-        if (step >= 0 && step < lctx.mtp_persist_n) {
-            ggml_tensor * src_t = lctx.mtp_persist[step];
+        const int step = lctx.default_decoder.pending_chain_residual_step;
+        lctx.default_decoder.pending_chain_residual_step = -1;
+        if (step >= 0 && step < lctx.default_decoder.mtp_persist_n) {
+            ggml_tensor * src_t = lctx.default_decoder.mtp_persist[step];
             if (src_t != nullptr && ggml_nbytes(src_t) >= ggml_nbytes(dst)) {
                 ggml_backend_tensor_copy(src_t, dst);
                 static const bool input_chk =
@@ -4953,7 +4946,7 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
         }
     }
 
-    const float * src = lctx.draft_input_hidden_state;
+    const float * src = lctx.default_decoder.draft_input_hidden_state;
     if (!src) {
         LLAMA_LOG_ERROR("%s: Source hidden state is null\n", __func__);
         return false;
@@ -5001,7 +4994,7 @@ static int llama_decode_internal(
     // reuse), the pointer would still reference the prior graph's tensor
     // memory. Clear it here so callers can detect "no fresh main graph
     // built this decode" via a null pointer.
-    lctx.t_h_pre_norm = nullptr;
+    lctx.default_decoder.t_h_pre_norm = nullptr;
     // Phase 36 diagnostic: bump cycle counter at each verify decode so
     // fused / per-step stats prints can be cycle-aligned. The server
     // routes verify and MTP draft through DIFFERENT llama_context
@@ -5012,12 +5005,12 @@ static int llama_decode_internal(
     if (lctx.cparams.mtp_op_type == MTP_OP_NONE) {
         ++_global_mtp_cycle;
     }
-    lctx.mtp_cycle_counter = _global_mtp_cycle;
+    lctx.default_decoder.mtp_cycle_counter = _global_mtp_cycle;
     if (getenv("LLAMA_MTP_CYCLE_DBG")) {
         fprintf(stderr, "[mtp-cycle-dbg] op_type=%d mtp=%d cycle=%lld\n",
                 (int) lctx.cparams.mtp_op_type,
                 (int) lctx.cparams.mtp,
-                (long long) lctx.mtp_cycle_counter);
+                (long long) lctx.default_decoder.mtp_cycle_counter);
     }
     // Same stale-pointer guard for the per-step offset tensors used by
     // the fused chain's per-device argmax + reduction. Set only when
@@ -5048,14 +5041,14 @@ static int llama_decode_internal(
     // updated only at end-of-fused-compute extraction.
     if (lctx.cparams.mtp_op_type != MTP_OP_DRAFT_GEN_FUSED) {
         for (int _i = 0; _i < 8; ++_i) {
-            lctx.mtp_fused_offset_t[_i] = nullptr;
-            lctx.mtp_fused_offset_n_dev[_i] = 0;
-            lctx.mtp_fused_chain_residuals[_i] = nullptr;
+            lctx.default_decoder.mtp_fused_offset_t[_i] = nullptr;
+            lctx.default_decoder.mtp_fused_offset_n_dev[_i] = 0;
+            lctx.default_decoder.mtp_fused_chain_residuals[_i] = nullptr;
         }
     } else {
         for (int _i = 0; _i < 8; ++_i) {
-            lctx.mtp_fused_offset_t[_i] = nullptr;
-            lctx.mtp_fused_offset_n_dev[_i] = 0;
+            lctx.default_decoder.mtp_fused_offset_t[_i] = nullptr;
+            lctx.default_decoder.mtp_fused_offset_n_dev[_i] = 0;
         }
     }
     const uint32_t n_tokens_all = batch_all.n_tokens;
@@ -5182,11 +5175,11 @@ static int llama_decode_internal(
                     single_seq_run++;
                 }
                 n_tokens = single_seq_run;
-                lctx.qnext_mixed_seq_fallback_count++;
+                lctx.default_decoder.qnext_mixed_seq_fallback_count++;
                 if (!warned_qnext_mixed_repeat) {
                     LLAMA_LOG_WARN("%s: qwen3next interleaved batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
                                    __func__, single_seq_run, orig_n_tokens,
-                                   (unsigned long long) lctx.qnext_mixed_seq_fallback_count);
+                                   (unsigned long long) lctx.default_decoder.qnext_mixed_seq_fallback_count);
                     warned_qnext_mixed_repeat = true;
                 }
             }
@@ -5472,13 +5465,13 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             // Invalidate any stale draft-argmax cache from a previous decode.
-            lctx.draft_argmax_valid = false;
-            lctx.draft_argmax_n     = 0;
+            lctx.default_decoder.draft_argmax_valid = false;
+            lctx.default_decoder.draft_argmax_n     = 0;
             // Snapshot+consume the verify-fast-path arming so the caller must
             // re-arm per decode (matches llama_set_draft_input_hidden_state's
             // single-shot semantics).
-            const bool fast_verify_armed = lctx.fast_argmax_for_verify;
-            lctx.fast_argmax_for_verify  = false;
+            const bool fast_verify_armed = lctx.default_decoder.fast_argmax_for_verify;
+            lctx.default_decoder.fast_argmax_for_verify  = false;
 
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP &&
@@ -5509,16 +5502,16 @@ static int llama_decode_internal(
                         if (*num_str >= '0' && *num_str <= '9') cuda_device = atoi(num_str);
 
                         const int rows_to_pull = (int)res->ne[1];
-                        lctx.draft_argmax_ids.resize(rows_to_pull);
-                        lctx.draft_argmax_probs.resize(rows_to_pull);
+                        lctx.default_decoder.draft_argmax_ids.resize(rows_to_pull);
+                        lctx.default_decoder.draft_argmax_probs.resize(rows_to_pull);
 
                         // Top-2 buffer only sized when caller has armed the
                         // top-2 variant. nullptr below preserves the HEAD
                         // fast path identical to before.
                         int32_t * top2_out = nullptr;
-                        if (lctx.draft_top2_armed) {
-                            lctx.draft_argmax_top2_ids.resize(rows_to_pull);
-                            top2_out = lctx.draft_argmax_top2_ids.data();
+                        if (lctx.default_decoder.draft_top2_armed) {
+                            lctx.default_decoder.draft_argmax_top2_ids.resize(rows_to_pull);
+                            top2_out = lctx.default_decoder.draft_argmax_top2_ids.data();
                         }
 
                         // Ensure backend compute that produced res->data is complete before
@@ -5530,13 +5523,13 @@ static int llama_decode_internal(
                             res->data,
                             rows_to_pull,
                             n_vocab,
-                            lctx.draft_argmax_ids.data(),
-                            lctx.draft_argmax_probs.data(),
+                            lctx.default_decoder.draft_argmax_ids.data(),
+                            lctx.default_decoder.draft_argmax_probs.data(),
                             top2_out,
                             cuda_device);
 
-                        lctx.draft_argmax_valid = true;
-                        lctx.draft_argmax_n     = rows_to_pull;
+                        lctx.default_decoder.draft_argmax_valid = true;
+                        lctx.default_decoder.draft_argmax_n     = rows_to_pull;
 
                         {
                             static const bool perstep_stats =
@@ -5546,11 +5539,11 @@ static int llama_decode_internal(
                                 for (int i = 0; i < rows_to_pull; ++i) {
                                     fprintf(stderr,
                                             "[mtp-perstep-stats] cycle=%lld pos=%d row=%d tok=%d prob=%.4f\n",
-                                            (long long) lctx.mtp_cycle_counter,
+                                            (long long) lctx.default_decoder.mtp_cycle_counter,
                                             pos0,
                                             i,
-                                            lctx.draft_argmax_ids[i],
-                                            lctx.draft_argmax_probs[i]);
+                                            lctx.default_decoder.draft_argmax_ids[i],
+                                            lctx.default_decoder.draft_argmax_probs[i]);
                                 }
                             }
                         }
@@ -5658,9 +5651,9 @@ static int llama_decode_internal(
         // capture) is deferred to llama_mtp_fused_extract_results
         // called by the server AFTER both dispatches complete.
         // The cgraph is stashed for extract_results to iterate.
-        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED && lctx.mtp_fused_skip_extraction) {
-            lctx.mtp_fused_pending_gf = gf;
-            lctx.mtp_fused_pending_n_steps = cparams.mtp_fused_n_steps;
+        if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED && lctx.default_decoder.mtp_fused_skip_extraction) {
+            lctx.default_decoder.mtp_fused_pending_gf = gf;
+            lctx.default_decoder.mtp_fused_pending_n_steps = cparams.mtp_fused_n_steps;
             // Skip extraction; will run in extract_results.
         } else if (cparams.mtp_op_type == MTP_OP_DRAFT_GEN_FUSED) {
             // Phase 38 E: extract argmax/prob for ALL chain steps,
@@ -5675,7 +5668,7 @@ static int llama_decode_internal(
             // observed).
             const int n_steps_emit = cparams.mtp_fused_n_steps;
             const int n_steps = std::min(n_steps_emit + cparams.mtp_fused_n_extend, 8);
-            lctx.mtp_fused_results_n = n_steps_emit;  // emitted draft count
+            lctx.default_decoder.mtp_fused_results_n = n_steps_emit;  // emitted draft count
             // Sync once to make all output tensors readable.
             ggml_backend_sched_synchronize(lctx.default_decoder.sched);
             for (int k = 0; k < n_steps; ++k) {
@@ -5700,19 +5693,19 @@ static int llama_decode_internal(
                         fprintf(stderr,
                                 "[mtp-fused] ISSUE F: step=%d argmax=%d out of vocab [0,%d) — split lm_head + on-device argmax is broken\n",
                                 k, v, n_vocab);
-                        lctx.mtp_fused_results_tokens[k] = -1;
+                        lctx.default_decoder.mtp_fused_results_tokens[k] = -1;
                     } else {
-                        lctx.mtp_fused_results_tokens[k] = (llama_token) v;
+                        lctx.default_decoder.mtp_fused_results_tokens[k] = (llama_token) v;
                     }
                 } else {
-                    lctx.mtp_fused_results_tokens[k] = -1;
+                    lctx.default_decoder.mtp_fused_results_tokens[k] = -1;
                 }
                 if (t_p) {
                     float v = 0.0f;
                     ggml_backend_tensor_get(t_p, &v, 0, sizeof(v));
-                    lctx.mtp_fused_results_probs[k] = v;
+                    lctx.default_decoder.mtp_fused_results_probs[k] = v;
                 } else {
-                    lctx.mtp_fused_results_probs[k] = 1.0f;
+                    lctx.default_decoder.mtp_fused_results_probs[k] = 1.0f;
                 }
                 static const bool mtp_fused_stats =
                     llama_env_truthy("LLAMA_MTP_FUSED_STATS");
@@ -5720,11 +5713,11 @@ static int llama_decode_internal(
                     const int32_t pos_k = u_batch.pos ? (int32_t) u_batch.pos[k] : -1;
                     fprintf(stderr,
                             "[mtp-fused-stats] cycle=%lld pos=%d step=%d tok=%d prob=%.4f\n",
-                            (long long) lctx.mtp_cycle_counter,
+                            (long long) lctx.default_decoder.mtp_cycle_counter,
                             pos_k,
                             k,
-                            (int) lctx.mtp_fused_results_tokens[k],
-                            (float) lctx.mtp_fused_results_probs[k]);
+                            (int) lctx.default_decoder.mtp_fused_results_tokens[k],
+                            (float) lctx.default_decoder.mtp_fused_results_probs[k]);
                 }
             }
 
@@ -5741,7 +5734,7 @@ static int llama_decode_internal(
             // the assignment differs; we accept the slower path as
             // edge-case.
             {
-                bool need_init = (lctx.mtp_persist_ctx == nullptr);
+                bool need_init = (lctx.default_decoder.mtp_persist_ctx == nullptr);
                 if (need_init) {
                     // Allocate ggml_context with overhead for 8
                     // tensor headers (no_alloc).
@@ -5750,30 +5743,30 @@ static int llama_decode_internal(
                         /*.mem_buffer =*/ NULL,
                         /*.no_alloc   =*/ true,
                     };
-                    lctx.mtp_persist_ctx = ggml_init(init_params);
-                    GGML_ASSERT(lctx.mtp_persist_ctx != nullptr);
+                    lctx.default_decoder.mtp_persist_ctx = ggml_init(init_params);
+                    GGML_ASSERT(lctx.default_decoder.mtp_persist_ctx != nullptr);
                     const int64_t n_embd_persist = lctx.model.hparams.n_embd;
                     for (int _k = 0; _k < 8; ++_k) {
-                        lctx.mtp_persist[_k] = ggml_new_tensor_2d(
-                            lctx.mtp_persist_ctx, GGML_TYPE_F32,
+                        lctx.default_decoder.mtp_persist[_k] = ggml_new_tensor_2d(
+                            lctx.default_decoder.mtp_persist_ctx, GGML_TYPE_F32,
                             n_embd_persist, 1);
                         char nm[40];
                         snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
-                        ggml_set_name(lctx.mtp_persist[_k], nm);
+                        ggml_set_name(lctx.default_decoder.mtp_persist[_k], nm);
                     }
                     // Pick the buft from chain_residuals[0]'s assigned
                     // backend so the persist buffer lives on the same
                     // device (avoids cross-device D2D on the hot path).
-                    ggml_backend_t bk0 = lctx.mtp_fused_chain_residuals[0]
+                    ggml_backend_t bk0 = lctx.default_decoder.mtp_fused_chain_residuals[0]
                         ? ggml_backend_sched_get_tensor_backend(
-                              lctx.default_decoder.sched, lctx.mtp_fused_chain_residuals[0])
+                              lctx.default_decoder.sched, lctx.default_decoder.mtp_fused_chain_residuals[0])
                         : nullptr;
                     ggml_backend_buffer_type_t buft = bk0
                         ? ggml_backend_get_default_buffer_type(bk0)
                         : llama_default_buffer_type_cpu(true);
-                    lctx.mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
-                        lctx.mtp_persist_ctx, buft);
-                    GGML_ASSERT(lctx.mtp_persist_buf != nullptr);
+                    lctx.default_decoder.mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                        lctx.default_decoder.mtp_persist_ctx, buft);
+                    GGML_ASSERT(lctx.default_decoder.mtp_persist_buf != nullptr);
                 }
 
                 // D2D copy each chain_residual to its persist slot.
@@ -5787,14 +5780,14 @@ static int llama_decode_internal(
                 const int n_chain_capture = n_steps + cparams.mtp_fused_n_extend;
                 int captured = 0;
                 for (int k = 0; k < n_chain_capture && k < 8; ++k) {
-                    ggml_tensor * src_t = lctx.mtp_fused_chain_residuals[k];
-                    ggml_tensor * dst_t = lctx.mtp_persist[k];
+                    ggml_tensor * src_t = lctx.default_decoder.mtp_fused_chain_residuals[k];
+                    ggml_tensor * dst_t = lctx.default_decoder.mtp_persist[k];
                     if (src_t == nullptr || dst_t == nullptr) break;
                     if (ggml_nbytes(src_t) != ggml_nbytes(dst_t)) break;
                     ggml_backend_tensor_copy(src_t, dst_t);
                     ++captured;
                 }
-                lctx.mtp_persist_n = captured;
+                lctx.default_decoder.mtp_persist_n = captured;
             }
         }
 
@@ -8192,8 +8185,8 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
     // free-list. Partial removals (e.g. spec rollback) must NOT release; the seq
     // continues to need its slot on the next decode.
     if (ok && seq_id >= 0 && p0 <= 0 && p1 < 0 &&
-        ctx->qnext_slot_alloc.n_slots > 0) {
-        ctx->qnext_slot_alloc.release(seq_id);
+        ctx->default_decoder.qnext_slot_alloc.n_slots > 0) {
+        ctx->default_decoder.qnext_slot_alloc.release(seq_id);
     }
     return ok;
 }
@@ -8208,8 +8201,8 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
     // physical state-row copy via llama_set_s_copy at decode time; this keeps
     // the allocator map consistent so the fill-site sees the right slot index
     // for seq_id_dst on its next batch.
-    if (seq_id_dst >= 0 && ctx->qnext_slot_alloc.n_slots > 0) {
-        ctx->qnext_slot_alloc.alloc(seq_id_dst);
+    if (seq_id_dst >= 0 && ctx->default_decoder.qnext_slot_alloc.n_slots > 0) {
+        ctx->default_decoder.qnext_slot_alloc.alloc(seq_id_dst);
     }
 }
 
@@ -9697,7 +9690,7 @@ void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
 }
 
 struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx) {
-    return ctx ? ctx->t_h_pre_norm : nullptr;
+    return ctx ? ctx->default_decoder.t_h_pre_norm : nullptr;
 }
 
 int32_t llama_mtp_fused_draft_invoke(
@@ -9707,12 +9700,12 @@ int32_t llama_mtp_fused_draft_invoke(
         int32_t                          n_steps,
         struct llama_mtp_fused_result *  out) {
     // seed_hidden may be nullptr — in that case, the caller has already
-    // populated ctx->draft_input_hidden_state via
+    // populated ctx->default_decoder.draft_input_hidden_state via
     // llama_set_draft_input_hidden_state and we should not overwrite it.
     if (!ctx || !out || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
         return -1;
     }
-    if (seed_hidden == nullptr && ctx->draft_input_hidden_state == nullptr) {
+    if (seed_hidden == nullptr && ctx->default_decoder.draft_input_hidden_state == nullptr) {
         // Neither path provided a seed.
         return -1;
     }
@@ -9752,7 +9745,7 @@ int32_t llama_mtp_fused_draft_invoke(
     // Push the seed hidden state through the existing host→device
     // bounce slot. set_inputs copies it into the inp_mtp_states tensor
     // built by build_qwen35_mtp_fused. If seed_hidden is null, the
-    // caller already set ctx->draft_input_hidden_state — leave it.
+    // caller already set ctx->default_decoder.draft_input_hidden_state — leave it.
     if (seed_hidden != nullptr) {
         llama_set_draft_input_hidden_state(ctx, seed_hidden);
     }
@@ -9779,7 +9772,7 @@ int32_t llama_mtp_fused_draft_invoke(
     // Fused dispatch produces exactly one ggml_backend_sched_graph_compute
     // call (single cgraph). The internal counter is updated via the
     // backend tracking; we set the public-API value here.
-    ctx->mtp_fused_last_compute_count = (rc == 0) ? 1 : 0;
+    ctx->default_decoder.mtp_fused_last_compute_count = (rc == 0) ? 1 : 0;
 
     llama_batch_free(batch);
     ctx->cparams.mtp_op_type        = saved_op_type;
@@ -9790,33 +9783,33 @@ int32_t llama_mtp_fused_draft_invoke(
         return rc < 0 ? rc : -2;
     }
 
-    out->n_steps = ctx->mtp_fused_results_n;
+    out->n_steps = ctx->default_decoder.mtp_fused_results_n;
     for (int k = 0; k < out->n_steps && k < LLAMA_MTP_FUSED_MAX; ++k) {
-        out->tokens[k] = ctx->mtp_fused_results_tokens[k];
-        out->probs[k]  = ctx->mtp_fused_results_probs[k];
+        out->tokens[k] = ctx->default_decoder.mtp_fused_results_tokens[k];
+        out->probs[k]  = ctx->default_decoder.mtp_fused_results_probs[k];
     }
     return 0;
 }
 
 int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx) {
-    return ctx ? ctx->mtp_fused_last_compute_count : 0;
+    return ctx ? ctx->default_decoder.mtp_fused_last_compute_count : 0;
 }
 
 // Phase 38 E: accessors for speculative.cpp coordination.
 int32_t llama_mtp_get_persist_n(struct llama_context * ctx) {
-    return ctx ? ctx->mtp_persist_n : 0;
+    return ctx ? ctx->default_decoder.mtp_persist_n : 0;
 }
 bool llama_mtp_has_pending_async(struct llama_context * ctx) {
-    return ctx && ctx->mtp_fused_pending_gf != nullptr;
+    return ctx && ctx->default_decoder.mtp_fused_pending_gf != nullptr;
 }
 int32_t llama_mtp_get_async_guess(struct llama_context * ctx) {
-    return ctx ? ctx->mtp_fused_async_guess : -1;
+    return ctx ? ctx->default_decoder.mtp_fused_async_guess : -1;
 }
 void llama_mtp_set_async_guess(struct llama_context * ctx, int32_t guess) {
-    if (ctx) ctx->mtp_fused_async_guess = guess;
+    if (ctx) ctx->default_decoder.mtp_fused_async_guess = guess;
 }
 int32_t llama_mtp_get_pending_chain_residual_step(struct llama_context * ctx) {
-    return ctx ? ctx->pending_chain_residual_step : -1;
+    return ctx ? ctx->default_decoder.pending_chain_residual_step : -1;
 }
 
 int32_t llama_mtp_set_persist_from_host(
@@ -9830,45 +9823,45 @@ int32_t llama_mtp_set_persist_from_host(
 
     // Lazy-init persist buffer (reuse the pattern from
     // llama_decode_internal post-compute extraction).
-    if (ctx->mtp_persist_ctx == nullptr) {
+    if (ctx->default_decoder.mtp_persist_ctx == nullptr) {
         ggml_init_params init_params = {
             /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
-        ctx->mtp_persist_ctx = ggml_init(init_params);
-        if (ctx->mtp_persist_ctx == nullptr) return -1;
+        ctx->default_decoder.mtp_persist_ctx = ggml_init(init_params);
+        if (ctx->default_decoder.mtp_persist_ctx == nullptr) return -1;
         for (int _k = 0; _k < 8; ++_k) {
-            ctx->mtp_persist[_k] = ggml_new_tensor_2d(
-                ctx->mtp_persist_ctx, GGML_TYPE_F32, n_embd, 1);
+            ctx->default_decoder.mtp_persist[_k] = ggml_new_tensor_2d(
+                ctx->default_decoder.mtp_persist_ctx, GGML_TYPE_F32, n_embd, 1);
             char nm[40];
             snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
-            ggml_set_name(ctx->mtp_persist[_k], nm);
+            ggml_set_name(ctx->default_decoder.mtp_persist[_k], nm);
         }
         // Pick buft from inp_mtp_states's backend (same device path
         // the seed will eventually flow to).
-        ggml_backend_t bk0 = ctx->inp_mtp_states
-            ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->inp_mtp_states)
+        ggml_backend_t bk0 = ctx->default_decoder.inp_mtp_states
+            ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->default_decoder.inp_mtp_states)
             : nullptr;
         ggml_backend_buffer_type_t buft = bk0
             ? ggml_backend_get_default_buffer_type(bk0)
             : llama_default_buffer_type_cpu(true);
-        ctx->mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
-            ctx->mtp_persist_ctx, buft);
-        if (ctx->mtp_persist_buf == nullptr) return -1;
+        ctx->default_decoder.mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            ctx->default_decoder.mtp_persist_ctx, buft);
+        if (ctx->default_decoder.mtp_persist_buf == nullptr) return -1;
     }
 
     // H2D each row.
     int captured = 0;
     for (int k = 0; k < cap_n; ++k) {
-        ggml_tensor * dst_t = ctx->mtp_persist[k];
+        ggml_tensor * dst_t = ctx->default_decoder.mtp_persist[k];
         if (dst_t == nullptr) break;
         const size_t nbytes_row = (size_t) n_embd * sizeof(float);
         if (ggml_nbytes(dst_t) < nbytes_row) break;
         ggml_backend_tensor_set(dst_t, src + (size_t) k * n_embd, 0, nbytes_row);
         ++captured;
     }
-    ctx->mtp_persist_n = captured;
+    ctx->default_decoder.mtp_persist_n = captured;
     return 0;
 }
 
@@ -9882,7 +9875,7 @@ int32_t llama_mtp_fused_dispatch_async(
     if (ctx == nullptr || n_steps <= 0 || n_steps > LLAMA_MTP_FUSED_MAX) {
         return -1;
     }
-    if (ctx->mtp_fused_pending_gf != nullptr) {
+    if (ctx->default_decoder.mtp_fused_pending_gf != nullptr) {
         // A prior async dispatch is still pending — caller must
         // extract first.
         return -2;
@@ -9895,7 +9888,7 @@ int32_t llama_mtp_fused_dispatch_async(
     }
 
     // Flag for llama_decode_internal to skip post-compute extraction.
-    ctx->mtp_fused_skip_extraction = true;
+    ctx->default_decoder.mtp_fused_skip_extraction = true;
 
     llama_mtp_fused_result fr{};
     const int32_t rc = llama_mtp_fused_draft_invoke(
@@ -9904,8 +9897,8 @@ int32_t llama_mtp_fused_dispatch_async(
     // mtp_fused_pending_gf is now set if the dispatch succeeded
     // (post-compute block stashed gf instead of extracting).
     if (rc != 0) {
-        ctx->mtp_fused_skip_extraction = false;
-        ctx->mtp_fused_pending_gf = nullptr;
+        ctx->default_decoder.mtp_fused_skip_extraction = false;
+        ctx->default_decoder.mtp_fused_pending_gf = nullptr;
         return rc;
     }
     return 0;
@@ -9918,12 +9911,12 @@ int32_t llama_mtp_fused_extract_results(
     if (ctx == nullptr || out == nullptr) {
         return -1;
     }
-    if (ctx->mtp_fused_pending_gf == nullptr) {
+    if (ctx->default_decoder.mtp_fused_pending_gf == nullptr) {
         return -1;  // No async dispatch pending.
     }
 
-    ggml_cgraph * gf = ctx->mtp_fused_pending_gf;
-    const int n_steps_emit = ctx->mtp_fused_pending_n_steps;
+    ggml_cgraph * gf = ctx->default_decoder.mtp_fused_pending_gf;
+    const int n_steps_emit = ctx->default_decoder.mtp_fused_pending_n_steps;
     const int n_extend = ctx->cparams.mtp_fused_n_extend;
     const int n_steps = std::min(n_steps_emit + n_extend, 8);
     const int n_chain = n_steps_emit + n_extend;
@@ -9931,7 +9924,7 @@ int32_t llama_mtp_fused_extract_results(
     // Sync ctx_mtp's stream — wait for the async kernels to complete.
     ggml_backend_sched_synchronize(ctx->default_decoder.sched);
 
-    ctx->mtp_fused_results_n = n_steps_emit;  // Phase 38 E: extract all
+    ctx->default_decoder.mtp_fused_results_n = n_steps_emit;  // Phase 38 E: extract all
     // chain steps' argmax (including EXTEND steps); n_steps_emit is
     // the consumer-visible count.
     for (int k = 0; k < n_steps; ++k) {
@@ -9948,58 +9941,58 @@ int32_t llama_mtp_fused_extract_results(
             int32_t v = 0;
             ggml_backend_tensor_get(t_a, &v, 0, sizeof(v));
             const int32_t n_vocab = (int32_t) ctx->model.hparams.n_vocab;
-            ctx->mtp_fused_results_tokens[k] =
+            ctx->default_decoder.mtp_fused_results_tokens[k] =
                 (v < 0 || v >= n_vocab) ? -1 : (llama_token) v;
         } else {
-            ctx->mtp_fused_results_tokens[k] = -1;
+            ctx->default_decoder.mtp_fused_results_tokens[k] = -1;
         }
         if (t_p) {
             float v = 0.0f;
             ggml_backend_tensor_get(t_p, &v, 0, sizeof(v));
-            ctx->mtp_fused_results_probs[k] = v;
+            ctx->default_decoder.mtp_fused_results_probs[k] = v;
         } else {
-            ctx->mtp_fused_results_probs[k] = 1.0f;
+            ctx->default_decoder.mtp_fused_results_probs[k] = 1.0f;
         }
     }
 
     // Capture persist (Phase 38 B). Lazy-init if needed.
     {
-        bool need_init = (ctx->mtp_persist_ctx == nullptr);
+        bool need_init = (ctx->default_decoder.mtp_persist_ctx == nullptr);
         if (need_init) {
             ggml_init_params init_params = {
                 /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
-            ctx->mtp_persist_ctx = ggml_init(init_params);
+            ctx->default_decoder.mtp_persist_ctx = ggml_init(init_params);
             const int64_t n_embd_persist = ctx->model.hparams.n_embd;
             for (int _k = 0; _k < 8; ++_k) {
-                ctx->mtp_persist[_k] = ggml_new_tensor_2d(
-                    ctx->mtp_persist_ctx, GGML_TYPE_F32,
+                ctx->default_decoder.mtp_persist[_k] = ggml_new_tensor_2d(
+                    ctx->default_decoder.mtp_persist_ctx, GGML_TYPE_F32,
                     n_embd_persist, 1);
                 char nm[40];
                 snprintf(nm, sizeof(nm), "mtp_persist_residual_%d", _k);
-                ggml_set_name(ctx->mtp_persist[_k], nm);
+                ggml_set_name(ctx->default_decoder.mtp_persist[_k], nm);
             }
-            ggml_backend_t bk0 = ctx->mtp_fused_chain_residuals[0]
-                ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->mtp_fused_chain_residuals[0])
+            ggml_backend_t bk0 = ctx->default_decoder.mtp_fused_chain_residuals[0]
+                ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->default_decoder.mtp_fused_chain_residuals[0])
                 : nullptr;
             ggml_backend_buffer_type_t buft = bk0
                 ? ggml_backend_get_default_buffer_type(bk0)
                 : llama_default_buffer_type_cpu(true);
-            ctx->mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
-                ctx->mtp_persist_ctx, buft);
+            ctx->default_decoder.mtp_persist_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                ctx->default_decoder.mtp_persist_ctx, buft);
         }
         int captured = 0;
         for (int k = 0; k < n_chain && k < 8; ++k) {
-            ggml_tensor * src_t = ctx->mtp_fused_chain_residuals[k];
-            ggml_tensor * dst_t = ctx->mtp_persist[k];
+            ggml_tensor * src_t = ctx->default_decoder.mtp_fused_chain_residuals[k];
+            ggml_tensor * dst_t = ctx->default_decoder.mtp_persist[k];
             if (src_t == nullptr || dst_t == nullptr) break;
             if (ggml_nbytes(src_t) != ggml_nbytes(dst_t)) break;
             ggml_backend_tensor_copy(src_t, dst_t);
             ++captured;
         }
-        ctx->mtp_persist_n = captured;
+        ctx->default_decoder.mtp_persist_n = captured;
     }
 
     // Fill out struct. n_steps is the EMITTED draft count
@@ -10007,18 +10000,18 @@ int32_t llama_mtp_fused_extract_results(
     // chain steps including EXTEND steps (so callers using Phase 38 E
     // speculative dispatch can read tokens[n_use] for the all-accept
     // bonus prediction).
-    out->n_steps = ctx->mtp_fused_results_n;
+    out->n_steps = ctx->default_decoder.mtp_fused_results_n;
     int fill_n = n_steps;
     if (fill_n > LLAMA_MTP_FUSED_MAX) fill_n = LLAMA_MTP_FUSED_MAX;
     for (int k = 0; k < fill_n; ++k) {
-        out->tokens[k] = ctx->mtp_fused_results_tokens[k];
-        out->probs[k]  = ctx->mtp_fused_results_probs[k];
+        out->tokens[k] = ctx->default_decoder.mtp_fused_results_tokens[k];
+        out->probs[k]  = ctx->default_decoder.mtp_fused_results_probs[k];
     }
 
     // Reset pending state.
-    ctx->mtp_fused_skip_extraction = false;
-    ctx->mtp_fused_pending_gf = nullptr;
-    ctx->mtp_fused_pending_n_steps = 0;
+    ctx->default_decoder.mtp_fused_skip_extraction = false;
+    ctx->default_decoder.mtp_fused_pending_gf = nullptr;
+    ctx->default_decoder.mtp_fused_pending_n_steps = 0;
     return 0;
 }
 
@@ -11360,52 +11353,52 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
     if (hidden_state == nullptr) {
-        ctx->draft_input_hidden_state = nullptr;
+        ctx->default_decoder.draft_input_hidden_state = nullptr;
         return;
     }
     // Copy into context-owned buffer so the value survives the next
     // llama_decode's llama_output_reserve (which repoints lctx.decoder_ref->embd).
     const size_t n_embd = (size_t) ctx->model.hparams.n_embd;
-    ctx->draft_input_hidden_state_buf.assign(hidden_state, hidden_state + n_embd);
-    ctx->draft_input_hidden_state = ctx->draft_input_hidden_state_buf.data();
+    ctx->default_decoder.draft_input_hidden_state_buf.assign(hidden_state, hidden_state + n_embd);
+    ctx->default_decoder.draft_input_hidden_state = ctx->default_decoder.draft_input_hidden_state_buf.data();
 }
 
 void llama_set_draft_input_chain_residual(struct llama_context * ctx, int chain_step) {
     if (ctx == nullptr) return;
-    ctx->pending_chain_residual_step = chain_step < 0 ? -1 : chain_step;
+    ctx->default_decoder.pending_chain_residual_step = chain_step < 0 ? -1 : chain_step;
 }
 
 bool llama_get_draft_argmax(struct llama_context * ctx, int32_t i, int32_t * out_id, float * out_prob) {
-    if (ctx == nullptr || !ctx->draft_argmax_valid) return false;
+    if (ctx == nullptr || !ctx->default_decoder.draft_argmax_valid) return false;
     int32_t idx = i;
-    if (idx < 0) idx = ctx->draft_argmax_n + idx;
-    if (idx < 0 || idx >= ctx->draft_argmax_n) return false;
-    if (out_id)   *out_id   = ctx->draft_argmax_ids[idx];
-    if (out_prob) *out_prob = ctx->draft_argmax_probs[idx];
+    if (idx < 0) idx = ctx->default_decoder.draft_argmax_n + idx;
+    if (idx < 0 || idx >= ctx->default_decoder.draft_argmax_n) return false;
+    if (out_id)   *out_id   = ctx->default_decoder.draft_argmax_ids[idx];
+    if (out_prob) *out_prob = ctx->default_decoder.draft_argmax_probs[idx];
     return true;
 }
 
 void llama_arm_draft_top2(struct llama_context * ctx, bool enable) {
     if (ctx == nullptr) return;
-    ctx->draft_top2_armed = enable;
+    ctx->default_decoder.draft_top2_armed = enable;
     if (!enable) {
-        ctx->draft_argmax_top2_ids.clear();
+        ctx->default_decoder.draft_argmax_top2_ids.clear();
     }
 }
 
 bool llama_get_draft_top2(struct llama_context * ctx, int32_t i, int32_t * out_id) {
-    if (ctx == nullptr || !ctx->draft_argmax_valid) return false;
-    if ((int32_t)ctx->draft_argmax_top2_ids.size() < ctx->draft_argmax_n) return false;
+    if (ctx == nullptr || !ctx->default_decoder.draft_argmax_valid) return false;
+    if ((int32_t)ctx->default_decoder.draft_argmax_top2_ids.size() < ctx->default_decoder.draft_argmax_n) return false;
     int32_t idx = i;
-    if (idx < 0) idx = ctx->draft_argmax_n + idx;
-    if (idx < 0 || idx >= ctx->draft_argmax_n) return false;
-    if (out_id) *out_id = ctx->draft_argmax_top2_ids[idx];
+    if (idx < 0) idx = ctx->default_decoder.draft_argmax_n + idx;
+    if (idx < 0 || idx >= ctx->default_decoder.draft_argmax_n) return false;
+    if (out_id) *out_id = ctx->default_decoder.draft_argmax_top2_ids[idx];
     return true;
 }
 
 void llama_set_fast_argmax_for_verify(struct llama_context * ctx, bool enable) {
     if (ctx == nullptr) return;
-    ctx->fast_argmax_for_verify = enable;
+    ctx->default_decoder.fast_argmax_for_verify = enable;
 }
 
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts) {

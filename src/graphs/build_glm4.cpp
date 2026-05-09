@@ -29,7 +29,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
         ggml_set_input(hidden_states_from_main_model);
 
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        lctx.default_decoder.inp_mtp_states = hidden_states_from_main_model;
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];

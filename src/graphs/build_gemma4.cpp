@@ -412,7 +412,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     ggml_tensor * inp_per_layer = nullptr;
     if (model.tok_embd_per_layer) {
         if (batch.token) {
-            inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_tokens);
+            inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.default_decoder.inp_tokens);
             inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, hparams.n_embd_per_layer, n_layer, n_tokens);
             inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float) hparams.n_embd_per_layer));
             cb(inp_per_layer, "inp_per_layer_selected", -1);
