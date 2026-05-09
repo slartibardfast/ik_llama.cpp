@@ -156,53 +156,57 @@ struct common_speculative_state {
 
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
-    llama_context * ctx_mtp = nullptr;
+    llama_context * ctx_mtp = nullptr;  // PHASE45 D9.5: stays nullptr (no separate ctx)
 
-    // PHASE45 D8.3: forward to libllama spec_loop. session adopts ctx_mtp
-    // (non-owning); decoders + spec_loop are owned here and freed before
-    // llama_free(ctx_mtp). The verify decoder is required by the
-    // spec_loop_create API contract; in single-draft MTP it is the same
-    // context as the draft, and only the draft decoder's forward fires
-    // inside gen_drafts. Sampler is dropped — spec_mtp_draft is greedy
-    // by construction (matches the GGML_UNUSED in
-    // common_sampler_sample_speculative).
+    // PHASE45 D9.5: collapsed-context MTP. The MTP draft now writes layer
+    // N-1 of the SHARED ctx_tgt's KV cache (per the architectural decision
+    // in PHASE45.md "PHASE39 collapsed-context MTP wrapping"). No more
+    // per-slot ctx_mtp. Per-slot wrappers stay (session_mtp, decoders,
+    // loop) but adopt ctx_tgt rather than allocating a separate ctx.
+    // Server's get_mtp_ctx callers fall back to ctx_tgt when nullptr is
+    // returned (server-context.cpp:3831, 3879).
+    //
+    // seq_id is per-slot — passed in at construction (was hardcoded 0 in
+    // D8.3 because each slot had its own ctx_mtp). The shared ctx
+    // requires correct seq_id partitioning.
     llama_session   * session_mtp = nullptr;
     llama_decoder   * verify_dec  = nullptr;
     llama_decoder   * draft_dec   = nullptr;
     llama_spec_loop * loop        = nullptr;
+    llama_seq_id      seq_id      = 0;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
-            const llama_context_params & mtp_cparams)
+            const llama_context_params & /*mtp_cparams*/,
+            llama_seq_id seq_id_)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
+        , seq_id(seq_id_)
     {
-        const llama_model * model = llama_get_model(ctx_tgt);
-        ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), mtp_cparams);
-        if (ctx_mtp) {
-            LOG_INF("%s: created MTP context (n_ctx=%d)\n", __func__, llama_n_ctx(ctx_mtp));
+        // No more ctx_mtp allocation. Adopt the shared ctx_tgt directly.
+        // mtp_cparams is unused (kept in signature for ABI stability of
+        // the old common_speculative_init call sites until D9.6).
+        session_mtp = llama_session_adopt(ctx_tgt);
 
-            session_mtp = llama_session_adopt(ctx_mtp);
+        llama_decoder_params verify_p = llama_decoder_default_params(LLAMA_DECODER_VERIFY);
+        llama_decoder_params draft_p  = llama_decoder_default_params(LLAMA_DECODER_DRAFT_MTP);
+        verify_dec = llama_decoder_create(session_mtp, verify_p);
+        draft_dec  = llama_decoder_create(session_mtp, draft_p);
 
-            llama_decoder_params verify_p = llama_decoder_default_params(LLAMA_DECODER_VERIFY);
-            llama_decoder_params draft_p  = llama_decoder_default_params(LLAMA_DECODER_DRAFT_MTP);
-            verify_dec = llama_decoder_create(session_mtp, verify_p);
-            draft_dec  = llama_decoder_create(session_mtp, draft_p);
+        llama_spec_loop_params lp = llama_spec_loop_default_params();
+        loop = llama_spec_loop_create(verify_dec, &draft_dec, 1, lp);
 
-            llama_spec_loop_params lp = llama_spec_loop_default_params();
-            loop = llama_spec_loop_create(verify_dec, &draft_dec, 1, lp);
-        } else {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
-        }
+        LOG_INF("%s: collapsed-context MTP on shared ctx (seq_id=%d)\n",
+                __func__, (int) seq_id);
     }
 
     ~common_speculative_state_mtp() override {
         if (loop)        llama_spec_loop_free(loop);
         if (draft_dec)   llama_decoder_free(draft_dec);
         if (verify_dec)  llama_decoder_free(verify_dec);
-        if (session_mtp) llama_session_free(session_mtp);  // non-owning; doesn't touch ctx_mtp
-        if (ctx_mtp)     llama_free(ctx_mtp);
+        if (session_mtp) llama_session_free(session_mtp);  // non-owning; doesn't touch ctx_tgt
+        // ctx_mtp stays nullptr; nothing to free.
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -215,13 +219,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_token id_last,
             llama_tokens & result) override {
 
-        const int32_t      n_past = (int32_t)prompt_tgt.size();
-        const llama_seq_id seq_id = 0;
+        const int32_t n_past = (int32_t)prompt_tgt.size();
 
-        // Pre-clean any leftover draft cells from prior cycles.
-        const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
+        // Pre-clean any leftover draft cells from prior cycles. The
+        // shared ctx_tgt's KV stores per-slot draft cells under
+        // seq_id=this->seq_id (slot-specific).
+        const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_tgt, seq_id);
         if (mtp_pos_max >= n_past) {
-            llama_kv_cache_seq_rm(ctx_mtp, seq_id, n_past, -1);
+            llama_kv_cache_seq_rm(ctx_tgt, seq_id, n_past, -1);
         }
 
         if (!loop) { result.clear(); return; }
@@ -1046,7 +1051,8 @@ done:
 //
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
+        llama_context             * ctx_tgt,
+        llama_seq_id                seq_id) {
     llama_context * ctx_dft = nullptr;
     if (params.model_dft) {
         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
@@ -1134,10 +1140,14 @@ common_speculative * common_speculative_init(
             case COMMON_SPECULATIVE_TYPE_MTP: {
                 auto mtp_state = std::make_unique<common_speculative_state_mtp>(config.type,
                     /* .ctx_tgt      = */ ctx_tgt,
-                    /* .mtp_cparams  = */ params.cparams_dft
+                    /* .mtp_cparams  = */ params.cparams_dft,
+                    /* .seq_id       = */ seq_id
                 );
-                if (!mtp_state->ctx_mtp) {
-                    LOG_ERR("%s: failed to create MTP context\n", __func__);
+                // PHASE45 D9.5: ctx_mtp is intentionally nullptr (no
+                // separate MTP context; the shared ctx_tgt is used).
+                // Verify the spec_loop wrapper succeeded instead.
+                if (!mtp_state->loop) {
+                    LOG_ERR("%s: failed to create spec_loop on shared ctx\n", __func__);
                     return nullptr;
                 }
                 impls.push_back(std::move(mtp_state));

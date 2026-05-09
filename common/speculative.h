@@ -21,7 +21,8 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt);
+        llama_context             * ctx_tgt,
+        llama_seq_id                seq_id = 0);  // PHASE45 D9.5: per-slot seq_id for shared ctx
 
 void common_speculative_free(common_speculative * spec);
 

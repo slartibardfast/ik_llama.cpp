@@ -308,7 +308,7 @@ void server_context::init() {
         }
         // try speculative decoding
         if (can_spec) {
-            slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+            slot.spec = common_speculative_init(params_base.speculative, slot.ctx, slot.id);
             if (slot.spec) {
                 if (mctx) {
                     SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
