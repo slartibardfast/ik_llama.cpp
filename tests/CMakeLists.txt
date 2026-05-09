@@ -220,6 +220,13 @@ if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_include_directories(test-cuda-concurrent-event PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(test-cuda-concurrent-event PRIVATE CUDA::cudart)
+endif()
+
+# PHASE46 B.4: NDJSON trace emit unit test (CPU-only).
+llama_build_and_test(test-trace-ndjson.cpp)
+target_include_directories(test-trace-ndjson PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if (GGML_CUDA)
 
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.

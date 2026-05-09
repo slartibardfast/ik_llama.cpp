@@ -12,6 +12,7 @@
 #include "llama-spec.h"
 #include "llama-session.h"
 #include "llama-session-internal.h"  // PHASE45 D10.b: ctx-equality check via session
+#include "llama-trace.h"             // PHASE46 B.4: NDJSON trace emit
 
 #include <cstdlib>
 #include <cstdio>
@@ -75,6 +76,8 @@ int32_t llama_spec_loop_gen_drafts(
     if (loop->drafts.empty())                       return -1;
     if (drafts_out == nullptr || n_draft_max <= 0)  return -1;
 
+    llama_trace_emit(LLAMA_TRACE_EV_FORK_DRAFT, (int) seq_id, loop->n_verify_steps, n_past, /*n_drafted=*/-1, /*n_accepted=*/-1);
+
     const int32_t n = llama_spec_mtp_draft(
             loop->verify,
             loop->drafts[0],
@@ -91,16 +94,21 @@ int32_t llama_spec_loop_gen_drafts(
     } else {
         loop->last_accepted.clear();
     }
+
+    llama_trace_emit(LLAMA_TRACE_EV_JOIN_DRAFT, (int) seq_id, loop->n_verify_steps, n_past, /*n_drafted=*/n, /*n_accepted=*/-1);
     return n;
 }
 
 void llama_spec_loop_accept_n(struct llama_spec_loop * loop, int32_t n_accepted) {
     if (loop == nullptr || n_accepted <= 0) return;
+    const int n_drafted_before = loop->last_accepted.empty() ? 0 : (int) loop->last_accepted.size();
     loop->n_accepted     += n_accepted;
     loop->n_verify_steps += 1;
     if ((size_t) n_accepted < loop->last_accepted.size()) {
         loop->last_accepted.resize(n_accepted);
     }
+    const int code = (n_accepted > 0) ? LLAMA_TRACE_EV_ACCEPT : LLAMA_TRACE_EV_REJECT;
+    llama_trace_emit(code, /*slot_id=*/-1, loop->n_verify_steps, /*pos=*/-1, n_drafted_before, n_accepted);
 }
 
 int32_t llama_spec_loop_gen_drafts_batched(
@@ -130,6 +138,12 @@ int32_t llama_spec_loop_gen_drafts_batched(
         if (llama_session_internal_context(llama_decoder_session(loops[i]->drafts[0])) != draft_ctx) return -1;
     }
 
+    if (llama_trace_enabled()) {
+        for (int32_t i = 0; i < n_loops; ++i) {
+            llama_trace_emit(LLAMA_TRACE_EV_FORK_DRAFT, (int) slots[i].seq_id, loops[i]->n_verify_steps, slots[i].n_past, -1, -1);
+        }
+    }
+
     const int32_t n = llama_spec_mtp_draft_batched(
             verify, draft,
             slots, n_loops,
@@ -150,6 +164,13 @@ int32_t llama_spec_loop_gen_drafts_batched(
     } else {
         for (int32_t i = 0; i < n_loops; ++i) {
             loops[i]->last_accepted.clear();
+        }
+    }
+
+    if (llama_trace_enabled()) {
+        for (int32_t i = 0; i < n_loops; ++i) {
+            const int k = (n > 0) ? outs[i].n_drafted : 0;
+            llama_trace_emit(LLAMA_TRACE_EV_JOIN_DRAFT, (int) slots[i].seq_id, loops[i]->n_verify_steps, slots[i].n_past, k, -1);
         }
     }
     return n;

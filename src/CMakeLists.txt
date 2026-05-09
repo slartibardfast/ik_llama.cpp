@@ -69,6 +69,8 @@ add_library(llama
             llama-kv-txn.cpp
             llama-spec-loop.cpp
             llama-spec-mtp.cpp
+            llama-trace.h
+            llama-trace.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
