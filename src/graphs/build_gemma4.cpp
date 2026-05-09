@@ -312,7 +312,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
     }
 
     int idx = lctx.model.default_layer_device[lctx.model.hparams.n_layer];
-    int idx_out = ggml_backend_sched_get_backend_idx(lctx.sched, lctx.model.output->buffer);
+    int idx_out = ggml_backend_sched_get_backend_idx(lctx.default_decoder.sched, lctx.model.output->buffer);
     if (idx_out >= 0) idx = idx_out;
     auto cur = inpL->src[idx];
     if (!cur) {

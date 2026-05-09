@@ -58,12 +58,34 @@ struct llama_decoder {
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
+    // PHASE45 D9.6e: scheduler + compute-meta + abort callback (formerly
+    // on llama_context). Today there is one sched per ctx, shared across
+    // all decoders dispatching against the same session. Until per-decoder
+    // graph reservation lands, the ctx-owned default_decoder holds these
+    // fields; user decoders (verify, draft) leave them empty and reach
+    // the shared sched via ctx->default_decoder.sched. The `owns_sched`
+    // flag lets future per-decoder allocators set this true and trigger
+    // free-on-destruct without breaking the shared default_decoder path.
+    std::vector<uint8_t> buf_compute_meta;
+    ggml_backend_sched_t sched = nullptr;
+    bool                 owns_sched = false;
+
+    ggml_abort_callback abort_callback      = nullptr;
+    void *              abort_callback_data = nullptr;
+
     ~llama_decoder() {
         // PHASE45 D9.6c: decoder owns its output buffer; default_decoder
         // (held by-value in llama_context) frees on ctx teardown.
         if (buf_output != nullptr) {
             ggml_backend_buffer_free(buf_output);
             buf_output = nullptr;
+        }
+        // PHASE45 D9.6e: only the sched-owning decoder frees. Today
+        // owns_sched is true only on default_decoder; future per-decoder
+        // graph reservation will set true on user decoders too.
+        if (owns_sched && sched != nullptr) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
         }
     }
 };

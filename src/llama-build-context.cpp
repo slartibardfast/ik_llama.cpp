@@ -83,7 +83,7 @@ llm_build_context::llm_build_context(
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
         cb               (cb),
-        buf_compute_meta (lctx.buf_compute_meta) {
+        buf_compute_meta (lctx.default_decoder.buf_compute_meta) {
             // all initializations should be done in init()
 }
 
@@ -167,7 +167,7 @@ ggml_cgraph * llm_build_context::build_k_shift() {
             for (auto * backend : lctx.backends) {
                 // Figure out which backend KV cache belongs to
                 if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft)) {
-                    ggml_backend_sched_set_tensor_backend(lctx.sched, tmp, backend);
+                    ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, tmp, backend);
                     break;
                 }
             }
@@ -2063,7 +2063,7 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         }
     } else {
         int idx = lctx.model.default_layer_device[lctx.model.hparams.n_layer];
-        int idx_out = ggml_backend_sched_get_backend_idx(lctx.sched, lctx.model.output->buffer);
+        int idx_out = ggml_backend_sched_get_backend_idx(lctx.default_decoder.sched, lctx.model.output->buffer);
         if (idx_out >= 0) idx = idx_out;
         const bool is_qwen_mtp = lctx.model.arch == LLM_ARCH_QWEN35 && lctx.cparams.mtp;
         if (cur->op == GGML_OP_REDUCE && cur->src[idx] && !is_qwen_mtp) {
@@ -2165,7 +2165,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         if (!lctx.cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU
-                ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+                ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, cur, lctx.backend_cpu);
             }
         }
 
@@ -2177,7 +2177,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
                 for (auto * backend : lctx.backends) {
                     if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft) &&
                         (ggml_backend_supports_op(backend, cur) || ggml_backend_offload_op(backend, cur))) {
-                        ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                        ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, cur, backend);
                         break;
                     }
                 }

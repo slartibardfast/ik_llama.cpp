@@ -601,7 +601,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     auto input = delta_input;
     if (input->op == GGML_OP_REDUCE) {
         if (kv_self.s_l[il]) {
-            int idx_s_l = ggml_backend_sched_get_backend_idx(lctx.sched, kv_self.s_l[il]->buffer);
+            int idx_s_l = ggml_backend_sched_get_backend_idx(lctx.default_decoder.sched, kv_self.s_l[il]->buffer);
             if (idx_s_l >= 0) idx = idx_s_l;
         }
         if (input->src[idx]) {

@@ -570,7 +570,7 @@ struct llama_context::Prev {
 };
 
 void llama_context::reset_scheduler() {
-    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_reset(default_decoder.sched);
     prev.reset();
     // Phase 37 #2.1 / Phase 38 B: sched_reset frees the prior graph's
     // tensor backing buffers. The sched-owned chain_residual tensor
@@ -697,6 +697,8 @@ llama_context::llama_context(const llama_model & model)
     // Warmup decode runs against default_decoder; llama_decoder_create
     // reassigns this pointer once the user's decoder lands.
     decoder_ref = &default_decoder;
+    // PHASE45 D9.6e: default_decoder owns the shared scheduler today.
+    default_decoder.owns_sched = true;
 }
 
 void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
@@ -706,7 +708,8 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
 }
 
 llama_context::~llama_context() {
-    ggml_backend_sched_free(sched);
+    // PHASE45 D9.6e: sched is freed by default_decoder's destructor
+    // (held by-value; runs after this function body completes).
 
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
@@ -4898,7 +4901,7 @@ static void llama_graph_compute(
 
     if (lctx.backend_cpu != nullptr) {
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
-        ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+        ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.default_decoder.abort_callback, lctx.default_decoder.abort_callback_data);
     }
 #ifdef GGML_USE_BLAS
     if (lctx.backend_blas != nullptr) {
@@ -4906,9 +4909,9 @@ static void llama_graph_compute(
     }
 #endif
 
-    ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+    ggml_backend_sched_graph_compute_async(lctx.default_decoder.sched, gf);
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.sched));
+    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.default_decoder.sched));
 }
 
 static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
@@ -5337,7 +5340,7 @@ static int llama_decode_internal(
 #endif
         if (!_can_reuse_hit) {
             lctx.reset_scheduler();
-            ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            ggml_backend_sched_set_eval_callback(lctx.default_decoder.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_reset(...): %d us\n", int(tim2-tim1));
@@ -5355,7 +5358,7 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            ggml_backend_sched_alloc_graph(lctx.default_decoder.sched, gf);
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -5480,7 +5483,7 @@ static int llama_decode_internal(
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP &&
                 cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
-                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.default_decoder.sched, res);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(lctx.decoder_ref->logits != nullptr);
 
@@ -5592,7 +5595,7 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.default_decoder.sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             switch (cparams.pooling_type) {
@@ -5674,7 +5677,7 @@ static int llama_decode_internal(
             const int n_steps = std::min(n_steps_emit + cparams.mtp_fused_n_extend, 8);
             lctx.mtp_fused_results_n = n_steps_emit;  // emitted draft count
             // Sync once to make all output tensors readable.
-            ggml_backend_sched_synchronize(lctx.sched);
+            ggml_backend_sched_synchronize(lctx.default_decoder.sched);
             for (int k = 0; k < n_steps; ++k) {
                 char nm_a[32], nm_p[32];
                 snprintf(nm_a, sizeof(nm_a), "mtp_argmax_%d", k);
@@ -5763,7 +5766,7 @@ static int llama_decode_internal(
                     // device (avoids cross-device D2D on the hot path).
                     ggml_backend_t bk0 = lctx.mtp_fused_chain_residuals[0]
                         ? ggml_backend_sched_get_tensor_backend(
-                              lctx.sched, lctx.mtp_fused_chain_residuals[0])
+                              lctx.default_decoder.sched, lctx.mtp_fused_chain_residuals[0])
                         : nullptr;
                     ggml_backend_buffer_type_t buft = bk0
                         ? ggml_backend_get_default_buffer_type(bk0)
@@ -5928,7 +5931,7 @@ static int llama_encode_internal(
     }
 
     lctx.reset_scheduler();
-    ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+    ggml_backend_sched_set_eval_callback(lctx.default_decoder.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
     ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch, false);
 
@@ -5952,7 +5955,7 @@ static int llama_encode_internal(
         }
     }
 
-    ggml_backend_sched_alloc_graph(lctx.sched, gf);
+    ggml_backend_sched_alloc_graph(lctx.default_decoder.sched, gf);
 
     llama_set_inputs(lctx, batch);
 
@@ -5961,7 +5964,7 @@ static int llama_encode_internal(
     // extract embeddings
     if (embd) {
         if (cparams.mtp_op_type == MTP_OP_NONE) {
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.default_decoder.sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
             if (llama_model_has_decoder(&lctx.model)) {
@@ -6265,7 +6268,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             ggml_cgraph * gf = llm_build_context::llama_build_graph_k_shift(lctx);
 
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            ggml_backend_sched_alloc_graph(lctx.default_decoder.sched, gf);
 
             llama_set_k_shift(lctx);
 
@@ -6291,7 +6294,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             ggml_cgraph * gf = llm_build_context::llama_build_graph_s_copy(lctx);
 
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            ggml_backend_sched_alloc_graph(lctx.default_decoder.sched, gf);
 
             llama_set_s_copy(lctx);
 
@@ -6331,7 +6334,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
         // initialize scheduler with the worst-case graph
         lctx.reset_scheduler();
-        if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
+        if (!ggml_backend_sched_reserve(lctx.default_decoder.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         }
     }
@@ -7163,8 +7166,8 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_INFO("%s: cuda_params   = %s\n", __func__, (const char *)cparams.cuda_params);
     }
 
-    ctx->abort_callback      = params.abort_callback;
-    ctx->abort_callback_data = params.abort_callback_data;
+    ctx->default_decoder.abort_callback      = params.abort_callback;
+    ctx->default_decoder.abort_callback_data = params.abort_callback_data;
 
     ctx->sampling.rng = std::mt19937(params.seed);
     ctx->decoder_ref->logits_all   = params.logits_all;
@@ -7430,7 +7433,7 @@ struct llama_context * llama_init_from_model(
             const size_t max_nodes = model->max_nodes(n_tokens);
 
             // buffer used to store the computation graph and the tensor meta data
-            ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+            ctx->default_decoder.buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
             // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
             bool pipeline_parallel =
@@ -7443,10 +7446,10 @@ struct llama_context * llama_init_from_model(
             // currently this is only implemented in the CUDA backend
             pipeline_parallel = false;
 #endif
-            ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
+            ctx->default_decoder.sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
 
             if (pipeline_parallel) {
-                LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
+                LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->default_decoder.sched));
             }
 
             llama_repack_up_gate_exps(*ctx);
@@ -7457,13 +7460,13 @@ struct llama_context * llama_init_from_model(
             ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true, cparams.worst_graph_tokens);
 
             // initialize scheduler with the worst-case graph
-            bool gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+            bool gf_success = ggml_backend_sched_reserve(ctx->default_decoder.sched, gf);
             if (!gf_success)
             {
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                    ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
-                    gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
+                    ctx->default_decoder.sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    gf_success = ggml_backend_sched_reserve(ctx->default_decoder.sched, gf);
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
@@ -7475,7 +7478,7 @@ struct llama_context * llama_init_from_model(
             for (size_t i = 0; i < ctx->backends.size(); i++) {
                 ggml_backend_t backend = ctx->backends[i];
                 ggml_backend_buffer_type_t buft = backend_buft[i];
-                size_t size = ggml_backend_sched_get_buffer_size(ctx->sched, backend);
+                size_t size = ggml_backend_sched_get_buffer_size(ctx->default_decoder.sched, backend);
                 if (size > 1) {
                     LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                             ggml_backend_buft_name(buft),
@@ -7484,7 +7487,7 @@ struct llama_context * llama_init_from_model(
             }
 
             // note: the number of splits during measure is higher than during inference due to the kv shift
-            int n_splits = ggml_backend_sched_get_n_splits(ctx->sched);
+            int n_splits = ggml_backend_sched_get_n_splits(ctx->default_decoder.sched);
             LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, gf->n_nodes);
             LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits);
         }
@@ -7499,17 +7502,17 @@ struct llama_context * llama_init_from_model(
                 LLAMA_LOG_INFO("XXXXXXXXXXXXXXXXXXXXX Setting offload policy for op %s to %s\n",
                         ggml_op_name(ggml_op(op)), on_off ? "ON" : "OFF");
             }
-            ggml_backend_sched_set_op_offload(ctx->sched, ggml_op(op), on_off);
+            ggml_backend_sched_set_op_offload(ctx->default_decoder.sched, ggml_op(op), on_off);
         }
     }
 
     if (params.only_active_experts) {
         LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling\n", __func__);
-        ggml_backend_sched_set_only_active_experts(ctx->sched, true);
+        ggml_backend_sched_set_only_active_experts(ctx->default_decoder.sched, true);
     }
     if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH && (!model->has_tensor_overrides() || cparams.split_mode_graph_scheduling)) {
-        ggml_backend_sched_set_split_mode_graph(ctx->sched, true, cparams.scheduler_async);
-        ggml_backend_sched_set_max_extra_alloc(ctx->sched, params.max_extra_alloc);
+        ggml_backend_sched_set_split_mode_graph(ctx->default_decoder.sched, true, cparams.scheduler_async);
+        ggml_backend_sched_set_max_extra_alloc(ctx->default_decoder.sched, params.max_extra_alloc);
         if (model->has_tensor_overrides() && cparams.split_mode_graph_scheduling) {
             LLAMA_LOG_INFO("XXXXXXXX Split Mode Graph Scheduling is FORCED despite tensor overrides due to user choice.\n");
             LLAMA_LOG_INFO("XXXXXXXX It may or might NOT infer properly due to unsupported combinations between SMGS and every possible tensor overrides.\n");
@@ -9565,8 +9568,8 @@ uint32_t llama_n_threads_batch(struct llama_context * ctx) {
 }
 
 void llama_set_abort_callback(struct llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
-    ctx->abort_callback      = abort_callback;
-    ctx->abort_callback_data = abort_callback_data;
+    ctx->default_decoder.abort_callback      = abort_callback;
+    ctx->default_decoder.abort_callback_data = abort_callback_data;
 }
 
 void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {
@@ -9838,7 +9841,7 @@ int32_t llama_mtp_set_persist_from_host(
         // Pick buft from inp_mtp_states's backend (same device path
         // the seed will eventually flow to).
         ggml_backend_t bk0 = ctx->inp_mtp_states
-            ? ggml_backend_sched_get_tensor_backend(ctx->sched, ctx->inp_mtp_states)
+            ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->inp_mtp_states)
             : nullptr;
         ggml_backend_buffer_type_t buft = bk0
             ? ggml_backend_get_default_buffer_type(bk0)
@@ -9919,7 +9922,7 @@ int32_t llama_mtp_fused_extract_results(
     const int n_chain = n_steps_emit + n_extend;
 
     // Sync ctx_mtp's stream — wait for the async kernels to complete.
-    ggml_backend_sched_synchronize(ctx->sched);
+    ggml_backend_sched_synchronize(ctx->default_decoder.sched);
 
     ctx->mtp_fused_results_n = n_steps_emit;  // Phase 38 E: extract all
     // chain steps' argmax (including EXTEND steps); n_steps_emit is
@@ -9972,7 +9975,7 @@ int32_t llama_mtp_fused_extract_results(
                 ggml_set_name(ctx->mtp_persist[_k], nm);
             }
             ggml_backend_t bk0 = ctx->mtp_fused_chain_residuals[0]
-                ? ggml_backend_sched_get_tensor_backend(ctx->sched, ctx->mtp_fused_chain_residuals[0])
+                ? ggml_backend_sched_get_tensor_backend(ctx->default_decoder.sched, ctx->mtp_fused_chain_residuals[0])
                 : nullptr;
             ggml_backend_buffer_type_t buft = bk0
                 ? ggml_backend_get_default_buffer_type(bk0)
@@ -10013,7 +10016,7 @@ int32_t llama_mtp_fused_extract_results(
 }
 
 void llama_synchronize(struct llama_context * ctx) {
-    ggml_backend_sched_synchronize(ctx->sched);
+    ggml_backend_sched_synchronize(ctx->default_decoder.sched);
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -11342,10 +11345,10 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 }
 
 void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_off) {
-    if (!lctx || !lctx->sched) return;
+    if (!lctx || !lctx->default_decoder.sched) return;
     const char * op_name = op < 0 || op >= int(GGML_OP_COUNT) ? "all ops" : ggml_op_name(ggml_op(op));
     printf("XXXXXXXXXXXXXXXXXXXXXXXXXXXX offload(%s) = %d\n", op_name, on_or_off);
-    ggml_backend_sched_set_op_offload(lctx->sched, ggml_op(op), on_or_off);
+    ggml_backend_sched_set_op_offload(lctx->default_decoder.sched, ggml_op(op), on_or_off);
 }
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {

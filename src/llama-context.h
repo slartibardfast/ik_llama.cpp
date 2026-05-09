@@ -262,12 +262,9 @@ struct llama_context {
     std::vector<float> embd_enc;
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 
-    // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
-    ggml_backend_sched_t sched = nullptr;
-
-    ggml_abort_callback abort_callback      = nullptr;
-    void *              abort_callback_data = nullptr;
+    // PHASE45 D9.6e: scheduler + compute-meta + abort callback moved to
+    // llama_decoder (held by default_decoder; shared across all decoders
+    // until per-decoder graph reservation lands).
 
     // Phase 36 chain-seed fix: copy-on-set, not pointer-on-set.
     // The previous `const float *` design held a pointer into lctx.embd
