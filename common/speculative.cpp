@@ -6,6 +6,7 @@
 #include "llama-session.h"
 #include "llama-decoder.h"
 #include "llama-spec-loop.h"
+#include "llama-trace.h"             // PHASE46 B.4.a: NDJSON trace emit
 #include "log.h"
 
 extern "C" void probe_top2_push(int32_t t1, int32_t t2);
@@ -183,6 +184,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_spec_loop * loop        = nullptr;
     llama_seq_id      seq_id      = 0;
 
+    // PHASE46 B.4.a: stashed by draft() so accept() can attribute n_drafted
+    // to the trace event. The collapsed-context MTP path bypasses
+    // llama_spec_loop_accept_n where the trace emit is otherwise wired.
+    int               last_n_drafted = 0;
+    int64_t           last_pos       = 0;
+    int64_t           step           = 0;
+
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
@@ -255,10 +263,28 @@ struct common_speculative_state_mtp : public common_speculative_state {
         } else {
             result.clear();
         }
+
+        last_n_drafted = (int) std::max(0, n);
+        last_pos       = (int64_t) n_past;
     }
 
     void accept(uint16_t n_accepted) override {
-        GGML_UNUSED(n_accepted);
+        // PHASE46 B.4.a: emit ACCEPT/REJECT into the NDJSON trace. The
+        // FORK_DRAFT/JOIN_DRAFT events fire inside llama_spec_loop_gen_drafts
+        // (called from draft()), but the spec-loop's own accept_n hook is
+        // bypassed by collapsed-context MTP — the verify+accept happens in
+        // common_speculative_check (above the loop). Emit here so traces
+        // line up per (slot, step) for B.5 replay validation.
+        const int code = (n_accepted > 0)
+                             ? LLAMA_TRACE_EV_ACCEPT
+                             : LLAMA_TRACE_EV_REJECT;
+        llama_trace_emit(code,
+                         (int) seq_id,
+                         step,
+                         last_pos,
+                         last_n_drafted,
+                         (int) n_accepted);
+        ++step;
     }
 };
 
