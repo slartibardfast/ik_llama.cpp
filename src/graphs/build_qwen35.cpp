@@ -45,6 +45,14 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         cb(lctx.default_decoder.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
         ggml_set_input(lctx.default_decoder.inp_s_seq_qnext);
 
+        // PHASE46 C.1 step 5: mask format (n_seq_max, n_batch) for multi-seq SSM dispatch.
+        // mask[k, t] = 1 iff token t belongs to seq k. Consumed by ggml_ssm_conv when
+        // n_state_seqs > 1 (sq->ne[0] == n_kv assert).
+        const int64_t n_seq_max_local = (int64_t) lctx.cparams.n_seq_max;
+        lctx.default_decoder.inp_s_seq_qnext_multi = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_seq_max_local, n_tokens);
+        cb(lctx.default_decoder.inp_s_seq_qnext_multi, "inp_s_seq_qnext_multi", -1);
+        ggml_set_input(lctx.default_decoder.inp_s_seq_qnext_multi);
+
         float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
         const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
@@ -166,6 +174,14 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         lctx.default_decoder.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
         cb(lctx.default_decoder.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
         ggml_set_input(lctx.default_decoder.inp_s_seq_qnext);
+
+        // PHASE46 C.1 step 5: mask format (n_seq_max, n_batch) for multi-seq SSM dispatch.
+        // mask[k, t] = 1 iff token t belongs to seq k. Consumed by ggml_ssm_conv when
+        // n_state_seqs > 1 (sq->ne[0] == n_kv assert).
+        const int64_t n_seq_max_local = (int64_t) lctx.cparams.n_seq_max;
+        lctx.default_decoder.inp_s_seq_qnext_multi = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_seq_max_local, n_tokens);
+        cb(lctx.default_decoder.inp_s_seq_qnext_multi, "inp_s_seq_qnext_multi", -1);
+        ggml_set_input(lctx.default_decoder.inp_s_seq_qnext_multi);
 
         float KQ_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
