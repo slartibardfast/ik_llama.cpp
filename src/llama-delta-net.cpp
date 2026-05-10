@@ -664,11 +664,18 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
                 ggml_build_forward_expand(gf, qkv_cpy);
             }
 
+            // PHASE46 C.1 L.8.d fix: propagate state_seq_ids_multi into the
+            // graph-split per-device build_qkv. Without this, build_qkv's
+            // use_multi_seq check at delta-net.cpp:366 stays false on this
+            // path, leaving conv_states with n_kv=1 while the dispatcher
+            // already passed a (n_state_seqs, n_tokens) mask — triggering the
+            // ggml_ssm_conv `sq->ne[0] == n_kv` assert (1 != 3) on 27B at np>=3.
             auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
                                state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
                                l.ssm_beta_alpha ? 0 : 1, il, cb, gf,
-                               save_per_step_states, per_step_ckpt_d);
+                               save_per_step_states, per_step_ckpt_d,
+                               state_seq_ids_multi);
             split_norm = (ggml_split_tensor_t *)l.ssm_norm->extra;
             GGML_ASSERT(split_norm && split_norm->splits[id]);
             auto split_ssm_out = (ggml_split_tensor_t *)l.ssm_out->extra;

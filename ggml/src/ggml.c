@@ -10382,6 +10382,28 @@ struct ggml_tensor * ggml_ssm_conv(
     const int64_t n_tokens = x->ne[1];
     const int64_t n_kv     = s->ne[2];
 
+    // PHASE46 C.1 L.8.d instrumentation: print all shapes feeding the
+    // ssm_conv asserts so the multi-seq dispatch shape mismatch can be
+    // localized when LLAMA_DBG_SSM_CONV=1. Cheap; fires once per layer.
+    {
+        static const char * dbg = NULL;
+        static int dbg_init = 0;
+        if (!dbg_init) { dbg = getenv("LLAMA_DBG_SSM_CONV"); dbg_init = 1; }
+        if (dbg && *dbg && *dbg != '0') {
+            fprintf(stderr,
+                "[ssm_conv.dbg] s.ne=[%lld,%lld,%lld] x.ne=[%lld,%lld] c.ne=[%lld,%lld] sq.ne=[%lld,%lld] "
+                "d_conv=%lld d_inner=%lld n_tokens=%lld n_kv=%lld  expect: sq.ne[0]==n_kv (%s) sq.ne[1]==n_tokens (%s)\n",
+                (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2],
+                (long long) x->ne[0], (long long) x->ne[1],
+                (long long) c->ne[0], (long long) c->ne[1],
+                (long long) sq->ne[0], (long long) sq->ne[1],
+                (long long) d_conv, (long long) d_inner, (long long) n_tokens, (long long) n_kv,
+                (sq->ne[0] == n_kv) ? "OK" : "FAIL",
+                (sq->ne[1] == n_tokens) ? "OK" : "FAIL");
+            fflush(stderr);
+        }
+    }
+
     GGML_ASSERT( s->ne[0] == d_conv - 1);
     GGML_ASSERT( s->ne[1] == d_inner);
     GGML_ASSERT( x->ne[0] == d_inner);
