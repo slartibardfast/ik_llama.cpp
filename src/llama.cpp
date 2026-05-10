@@ -5591,6 +5591,51 @@ static int llama_decode_internal(
             }
         }
 
+        // PHASE46 C.1 iter 38: env-gated per-layer per-slot hash dump
+        // (LLAMA_DUMP_LAYER_HASH=1) for first-divergence bisection. Walks
+        // all `l_out_NN` tagged nodes from build_qwen35.cpp; hashes each
+        // token's column (= one slot's residual at this layer) and prints.
+        // Find the first layer where any slot's hash diverges from majority.
+        {
+            static const bool dump_layer_hash = []() {
+                const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+                return v && *v && *v != '0';
+            }();
+            if (dump_layer_hash) {
+                ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+                for (int ni = 0; ni < gf->n_nodes; ++ni) {
+                    const ggml_tensor * t = gf->nodes[ni];
+                    if (!t || !t->name[0]) continue;
+                    if (strncmp(t->name, "l_out_", 6) != 0) continue;
+                    const int64_t cols = t->ne[0];  // n_embd
+                    const int64_t rows = t->ne[1];  // n_tokens
+                    if (cols <= 0 || rows <= 0) continue;
+                    // Use ggml_nbytes to handle non-natural strides safely.
+                    const size_t actual_bytes = ggml_nbytes(t);
+                    if (actual_bytes == 0) continue;
+                    std::vector<unsigned char> tmp(actual_bytes);
+                    ggml_backend_tensor_get(t, tmp.data(), 0, actual_bytes);
+                    fprintf(stderr, "[layer_hash] %s ne=[%lld,%lld] nb=[%zu,%zu]:", t->name,
+                            (long long) cols, (long long) rows, t->nb[0], t->nb[1]);
+                    // Hash each row using its actual stride. nb[0]=elem size, nb[1]=row stride.
+                    const size_t row_stride = t->nb[1];
+                    const size_t col_stride = t->nb[0];
+                    const size_t row_bytes = (size_t)(cols * col_stride);
+                    for (int64_t r = 0; r < rows && r < 16; ++r) {
+                        uint64_t h = 5381;
+                        const unsigned char * rp = tmp.data() + (size_t) r * row_stride;
+                        if ((size_t)((r+1) * row_stride) > actual_bytes) break;
+                        for (size_t b = 0; b < row_bytes; ++b) {
+                            h = ((h << 5) + h) ^ rp[b];
+                        }
+                        fprintf(stderr, " s%lld=%016llx", (long long) r, (unsigned long long) h);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+            }
+        }
+
         // C.1 diagnostic: env-gated dump of ONE specific layer's output (per
         // LLAMA_DUMP_LAYER) for finding the first row-asymmetric layer.
         // Tagged "l_out_dump" by build_qwen35.cpp.

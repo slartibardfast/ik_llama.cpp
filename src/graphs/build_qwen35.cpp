@@ -219,6 +219,22 @@ ggml_cgraph * llm_build_context::build_qwen35() {
                 ggml_set_output(cur);
             }
 
+            // PHASE46 C.1 iter 38: env-gated dump of ALL layer outputs for
+            // first-divergence bisection. LLAMA_DUMP_LAYER_HASH=1 tags every
+            // layer's residual stream as `l_out_NN`. Post-decode walker
+            // hashes each slot's column to find the first layer where slots
+            // diverge. Adds 65 tagged tensors × ~100KB host buffer; trivial.
+            static const bool dump_layer_hash = []() {
+                const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+                return v && *v && *v != '0';
+            }();
+            if (dump_layer_hash) {
+                char nm[32];
+                snprintf(nm, sizeof(nm), "l_out_%02d", il);
+                ggml_set_name(cur, nm);
+                ggml_set_output(cur);
+            }
+
             inpL = cur;
         }
 
