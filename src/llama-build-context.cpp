@@ -363,15 +363,21 @@ ggml_tensor * llm_build_context::build_inp_out_ids() {
 }
 
 ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
+    // PHASE46 C.1 fork-join Tier 1: pad mask rows to (n_tokens + GGML_KQ_MASK_PAD - 1)
+    // so a per-token FA call (q->ne[1]==1) can use a 32-row mask view starting at any
+    // token index without going out-of-bounds. Standard usage (single FA call with
+    // q->ne[1]==n_tokens) only reads rows [0, n_tokens); the trailing padding rows are
+    // never read, so the extra allocation is dead memory in non-fork-join paths.
+    const int64_t mask_rows_padded = GGML_PAD(n_tokens + GGML_KQ_MASK_PAD - 1, GGML_KQ_MASK_PAD);
     if (causal && flash_attn) {
-        lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, mask_rows_padded);
         cb(lctx.default_decoder.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.default_decoder.inp_KQ_mask);
         return lctx.default_decoder.inp_KQ_mask;
     }
     lctx.default_decoder.inp_KQ_mask = causal
-        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
-        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     mask_rows_padded)
+        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, mask_rows_padded);
     cb(lctx.default_decoder.inp_KQ_mask, "KQ_mask", -1);
     ggml_set_input(lctx.default_decoder.inp_KQ_mask);
 
@@ -380,16 +386,18 @@ ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
 
 ggml_tensor * llm_build_context::build_inp_KQ_mask_swa(bool causal) {
     GGML_ASSERT(hparams.n_swa > 0);
+    // PHASE46 C.1 fork-join: same mask-row padding extension as build_inp_KQ_mask.
+    const int64_t mask_rows_padded = GGML_PAD(n_tokens + GGML_KQ_MASK_PAD - 1, GGML_KQ_MASK_PAD);
     if (causal && flash_attn) {
-        lctx.default_decoder.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        lctx.default_decoder.inp_KQ_mask_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, mask_rows_padded);
         cb(lctx.default_decoder.inp_KQ_mask_swa, "KQ_mask_swa", -1);
         ggml_set_input(lctx.default_decoder.inp_KQ_mask_swa);
         return lctx.default_decoder.inp_KQ_mask_swa;
     }
 
     lctx.default_decoder.inp_KQ_mask_swa = causal
-        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
-        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     mask_rows_padded)
+        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, mask_rows_padded);
     cb(lctx.default_decoder.inp_KQ_mask_swa, "KQ_mask_swa", -1);
     ggml_set_input(lctx.default_decoder.inp_KQ_mask_swa);
 
@@ -1603,21 +1611,55 @@ static ggml_tensor * llm_build_kqv(
                     0);
         cb(v, "v", il);
 
-        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        // PHASE46 C.1 fork-join Tier 1: when the ubatch packs >1 tokens (np>1
+        // batched decode, or any prefill at np>1), the existing single FA call
+        // has |B|>1 which exposes row-asymmetric warp-reduction non-determinism
+        // in the wmma/mma kernels. Split into per-token FA calls, each with
+        // |B|==1 (deterministic by construction), and concat outputs along the
+        // n_tokens axis. Single-token paths (production np=1 decode) keep the
+        // original single-call behavior.
+        static const bool fork_fa_per_token = []() {
+            const char * v = getenv("LLAMA_FA_NO_FORK");
+            const bool disabled = v && *v && *v != '0';
+            return !disabled;
+        }();
+        auto build_fa = [&](ggml_tensor * q_in, ggml_tensor * mask_in) -> ggml_tensor * {
+            ggml_tensor * out = ggml_flash_attn_ext(ctx, q_in, k, v, mask_in, kq_scale,
+                hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, "fa", il);
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        if (n_swa > 0) {
-            ((int32_t *)cur->op_params)[4] = n_swa;
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+            if (n_swa > 0) {
+                ((int32_t *)out->op_params)[4] = n_swa;
+            }
+            // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
+            // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
+            if (should_use_f32_precision) {
+                ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+            }
+            return out;
+        };
+        if (n_tokens > 1 && fork_fa_per_token) {
+            std::vector<ggml_tensor *> outs(n_tokens);
+            for (int t = 0; t < n_tokens; ++t) {
+                ggml_tensor * q_t = ggml_view_4d(ctx, q,
+                    q->ne[0], 1, q->ne[2], q->ne[3],
+                    q->nb[1], q->nb[2], q->nb[3],
+                    t * q->nb[1]);
+                ggml_tensor * mask_t = ggml_view_2d(ctx, kq_mask,
+                    kq_mask->ne[0], GGML_KQ_MASK_PAD,
+                    kq_mask->nb[1],
+                    t * kq_mask->nb[1]);
+                outs[t] = build_fa(q_t, mask_t);
+                cb(outs[t], "fa", il);
+            }
+            cur = outs[0];
+            for (int t = 1; t < n_tokens; ++t) {
+                cur = ggml_concat(ctx, cur, outs[t], 2);
+            }
+        } else {
+            cur = build_fa(q, kq_mask);
+            cb(cur, "fa", il);
         }
-
-        // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
-        // For DeepSeek-2, it is perfectly fine with fp16 for PP, but I get gibberish when uding fp16 for TG.
-        // Not sure if it is really a matter of insufficient precision, or I have made a mistake in the fattn-vec-f16 kernel.
-        if (should_use_f32_precision) {
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-        }
-        //ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
 
         if (cparams.v_cache_hadamard) {
             cur = ggml_hadamard(ctx, cur, n_embd_head_v);
