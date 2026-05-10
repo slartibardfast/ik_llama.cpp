@@ -1362,6 +1362,7 @@ void compute_helper(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, in
         auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
         int ik = nk1 - k_step;
         for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
+        if (ik < 0) ik = nk1 - k_step;  // no zero mask cell found -> treat row as all-valid (vs. all-masked)
         ik += k_step;
         for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #ifdef __aarch64__
@@ -1427,6 +1428,7 @@ void compute_helper_q(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, 
             auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
             int ik = nk1 - k_step;
             for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
+            if (ik < 0) ik = nk1 - k_step;  // no zero mask cell found -> treat row as all-valid (vs. all-masked)
             ik += k_step;
             for (int k1 = 0; k1 < ik/k_step; ++k1) {
                 HelperQ80R8<Dk>::repack(k_step, kh.block, kh.stride, q8r8);
@@ -1458,6 +1460,7 @@ void compute_helper_q(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, 
         auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
         int ik = nk1 - k_step;
         for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
+        if (ik < 0) ik = nk1 - k_step;  // no zero mask cell found -> treat row as all-valid (vs. all-masked)
         ik += k_step;
         for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #if FA_TIMING
@@ -1980,6 +1983,7 @@ struct FlashAttnBF16 {
             auto Mc = (const uint16_t *)(mr + (q_step - 1)*stride_m);
             int ik = nk1 - k_step;
             for (; ik >=0 && Mc[ik] != 0; ik -= k_step);
+            if (ik < 0) ik = nk1 - k_step;  // no zero mask cell found -> treat row as all-valid (vs. all-masked)
             ik += k_step;
             for (int k1 = 0; k1 < ik/k_step; ++k1) {
 #if FA_TIMING
