@@ -5530,8 +5530,16 @@ static int llama_decode_internal(
                     const char * v = getenv("LLAMA_DISABLE_MTP_VERIFY_FAST");
                     return v && *v && *v != '0';
                 }();
-                const bool effective_verify_fast = verify_fast && !disable_mtp_verify_fast;
-                if ((draftgen_fast || effective_verify_fast) && n_outputs_new > 0 && res->ne[1] > 0) {
+                // C.1 diagnostic gate: also disable the cuda mtp_argmax for
+                // DRAFT_GEN forwards. Together with verify_fast disable, ALL
+                // cuda mtp_argmax calls are off.
+                static const bool disable_mtp_draftgen_fast = []() {
+                    const char * v = getenv("LLAMA_DISABLE_MTP_DRAFTGEN_FAST");
+                    return v && *v && *v != '0';
+                }();
+                const bool effective_verify_fast   = verify_fast && !disable_mtp_verify_fast;
+                const bool effective_draftgen_fast = draftgen_fast && !disable_mtp_draftgen_fast;
+                if ((effective_draftgen_fast || effective_verify_fast) && n_outputs_new > 0 && res->ne[1] > 0) {
                     ggml_backend_buffer_t res_buf = res->buffer;
                     const char * res_buf_name = res_buf ? ggml_backend_buffer_name(res_buf) : nullptr;
                     if (res_buf_name && strstr(res_buf_name, "CUDA") != nullptr) {
