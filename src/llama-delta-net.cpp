@@ -285,12 +285,18 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_beta_gate(llama_context
                 split_sizes_ba[0] * ggml_element_size(mixed_ba_reshaped));
         cb(a, "a", il);
 
-        beta  = ggml_cont_4d(ctx0, b, num_v_heads, 1, n_tok, 1);
-        alpha = ggml_cont_3d(ctx0, a, num_v_heads, n_tok, 1);
+        // PHASE46 C.1 L.8.c fix: build_fused_delta_net asserts beta->ne[3] == n_seqs
+        // and gate->ne[2] == n_seqs (delta-net.cpp:96-97). Hardcoding ne[3]=1 for
+        // beta and ne[2]=1 for alpha forced n_seqs=1 in the multi-seq dispatch path.
+        // n_tok == n_seq_tokens * n_seqs, so this is a metadata reinterpretation only;
+        // when n_seqs=1 the shape is equivalent to the previous (..., n_tok, 1) form.
+        beta  = ggml_cont_4d(ctx0, b, num_v_heads, 1, n_seq_tokens, n_seqs);
+        alpha = ggml_cont_3d(ctx0, a, num_v_heads, n_seq_tokens, n_seqs);
     } else {
         beta = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_beta, cur);
         cb(beta, "beta", il);
-        beta = ggml_reshape_4d(ctx0, beta, num_v_heads, 1, n_tok, 1);
+        // PHASE46 C.1 L.8.c fix: same as above — beta needs ne[3]==n_seqs.
+        beta = ggml_reshape_4d(ctx0, beta, num_v_heads, 1, n_seq_tokens, n_seqs);
         cb(beta, "beta_reshaped", il);
         alpha = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_alpha, cur);
         cb(alpha, "alpha", il);

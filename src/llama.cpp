@@ -4688,8 +4688,21 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (lctx.default_decoder.inp_s_seq_qnext) {
         const int64_t n_tokens = batch.n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_seq_qnext->buffer));
-        int32_t * data = (int32_t *) lctx.default_decoder.inp_s_seq_qnext->data;
+        // PHASE46 C.1 L.8.c2: when LLAMA_DNET_MULTI_SEQ=1 is the only consumer
+        // of qnext slot info (multi-seq dispatch path uses inp_s_seq_qnext_multi
+        // instead), the graph allocator prunes the legacy inp_s_seq_qnext
+        // tensor, leaving its buffer == nullptr. The pre-existing
+        // GGML_ASSERT(ggml_backend_buffer_is_host(...->buffer)) here would
+        // segfault on the NULL buffer. Skip the legacy fill in that case;
+        // slot computation still runs (allocator state must be live) and
+        // writes to a local buffer so the downstream multi-seq mask fill
+        // gets correct slot indices.
+        const bool legacy_buf_ok =
+            lctx.default_decoder.inp_s_seq_qnext->buffer &&
+            ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_seq_qnext->buffer);
+        int32_t * data = legacy_buf_ok
+            ? (int32_t *) lctx.default_decoder.inp_s_seq_qnext->data
+            : nullptr;
 
         // Lazy-init the per-seq state-slot allocator on first use. Slot
         // count comes from the recurrent state buffer's second dim;
@@ -4732,6 +4745,15 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // engine-level state-broadcast op). Deferred. The structural
         // fix (per-seq state isolation) is still the core win — slots
         // 1..N-1 produce coherent text after their cold-start prefix.
+        // Slot indices buffer: write to host data[] when legacy buffer present,
+        // else to a local stack buffer so the multi-seq mask fill below still
+        // sees correct values (and the slot allocator state stays live).
+        std::vector<int32_t> slot_buf;
+        int32_t * slot_target = data;
+        if (slot_target == nullptr) {
+            slot_buf.resize((size_t) n_tokens);
+            slot_target = slot_buf.data();
+        }
         for (int64_t j = 0; j < n_tokens; ++j) {
             llama_seq_id sid = 0;
             if (batch.n_seq_id != nullptr && batch.seq_id != nullptr &&
@@ -4740,7 +4762,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
             const int32_t slot = lctx.default_decoder.qnext_slot_alloc.alloc(sid);
             GGML_ASSERT(slot >= 0 && slot < lctx.default_decoder.qnext_slot_alloc.n_slots);
-            data[j] = slot;
+            slot_target[j] = slot;
         }
 
         // PHASE46 C.1 step 5: fill the multi-seq mask tensor used by ggml_ssm_conv
@@ -4756,7 +4778,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             GGML_ASSERT(nt == n_tokens);
             for (int64_t k = 0; k < n_kv; ++k) {
                 for (int64_t j = 0; j < n_tokens; ++j) {
-                    mdata[k * nt + j] = (data[j] == (int32_t) k) ? 1 : 0;
+                    mdata[k * nt + j] = (slot_target[j] == (int32_t) k) ? 1 : 0;
                 }
             }
         }
