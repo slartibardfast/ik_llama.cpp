@@ -1730,8 +1730,20 @@ struct test_flash_attn_ext_batched_det : public test_case {
         // batch — any divergence indicates per-batch FP non-determinism in
         // the kernel, which is the production bug we want to catch.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t);
             const char * nm = ggml_get_name(t);
+            // Mask: production-shaped all-valid (F16 0). ggml_flash_attn_ext
+            // expects mask cells in {0 (valid), -INFINITY (masked)}; random
+            // F16 values are outside that domain and produce algorithmically
+            // divergent output between iqk CPU FA and the GPU kernels even
+            // though both compute well-defined results. Determinism testing
+            // only requires identical inputs across batches, so an all-valid
+            // mask suffices and matches production usage.
+            if (nm && strcmp(nm, "m_det") == 0) {
+                std::vector<uint8_t> zero(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, zero.data(), 0, ggml_nbytes(t));
+                continue;
+            }
+            init_tensor_uniform(t);
             if (!nm) continue;
             if (strcmp(nm, "q_det") != 0 && strcmp(nm, "k_det") != 0 && strcmp(nm, "v_det") != 0) {
                 continue;
