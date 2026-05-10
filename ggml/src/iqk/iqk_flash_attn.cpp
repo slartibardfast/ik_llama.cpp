@@ -185,7 +185,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 #endif
         }
         barrier(barrier_data);
-        GGML_ABORT("Fatal error");
+        return false;  // unsupported KV combination -> let caller fall back to vanilla CPU FA
     }
 
     if (n_swa > 0 && mask) {
