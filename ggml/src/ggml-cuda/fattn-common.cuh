@@ -851,7 +851,7 @@ void launch_fattn(
         scale, max_bias, m0, m1, softcap, n_head_log2,
         Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-        mask ? mask->ne[1] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,
+        mask ? mask->ne[1] : 0, mask ? mask->ne[3] : 1, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,
         Q->nb[1], Q->nb[2], Q->nb[3],
         nb11, nb12, nb13,
         nb21, nb22, nb23,

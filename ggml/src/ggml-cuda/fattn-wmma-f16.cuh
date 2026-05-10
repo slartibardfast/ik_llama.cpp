@@ -92,12 +92,13 @@ static __global__ void flash_attn_ext_f16(
     constexpr int kqs_padded = FATTN_KQ_STRIDE + 8;
     constexpr int kqar = sizeof(KQ_acc_t)/sizeof(half);
 
+    const int sequence  = blockIdx.z;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const float * Q_f   = (const float *) (Q + nb02* blockIdx.y              + nb01*ic0);
-    const half  * K_h   = (const half  *) (K + nb12*(blockIdx.y / gqa_ratio));
-    const half  * V_h   = (const half  *) (V + nb22*(blockIdx.y / gqa_ratio)); // K and V have same shape
-    const half  * maskh = (const half  *)  mask + (nb31/sizeof(half))* ic0;
-    const half2 * mask2 = (const half2 *)  mask + (nb31/sizeof(half))*(ic0/2);
+    const float * Q_f   = (const float *) (Q + nb03*sequence + nb02* blockIdx.y              + nb01*ic0);
+    const half  * K_h   = (const half  *) (K + nb13*sequence + nb12*(blockIdx.y / gqa_ratio));
+    const half  * V_h   = (const half  *) (V + nb23*sequence + nb22*(blockIdx.y / gqa_ratio)); // K and V have same shape
+    const half  * maskh = (const half  *) (mask + nb33*(sequence % ne33)) + (nb31/sizeof(half))* ic0;
+    const half2 * mask2 = (const half2 *) (mask + nb33*(sequence % ne33)) + (nb31/sizeof(half))*(ic0/2);
     [[maybe_unused]] const float * sinks_f = sinks ? (const float *)sinks + blockIdx.y : nullptr;
 
     const int stride_Q = nb01 / sizeof(float);
@@ -417,7 +418,7 @@ static __global__ void flash_attn_ext_f16(
             if (parallel_blocks == 1) {
                 dst_val /= KQ_rowsum_j;
             }
-            dst[j_dst*gridDim.y*Dv + blockIdx.y*Dv + i] = dst_val;
+            dst[(sequence*parallel_blocks*ne01 + j_dst)*gridDim.y*Dv + blockIdx.y*Dv + i] = dst_val;
         }
 
         if (parallel_blocks == 1 || threadIdx.x != 0) {
@@ -431,7 +432,7 @@ static __global__ void flash_attn_ext_f16(
             dst_meta_val.x = __low2float(KQ_max_h2[j0/nwarps]);
         }
         dst_meta_val.y = KQ_rowsum_j;
-        dst_meta[(ic0 + j_VKQ)*gridDim.y*parallel_blocks + blockIdx.y*parallel_blocks + ip] = dst_meta_val;
+        dst_meta[(sequence*ne01 + ic0 + j_VKQ)*gridDim.y*parallel_blocks + blockIdx.y*parallel_blocks + ip] = dst_meta_val;
     }
 #else
    NO_DEVICE_CODE;
