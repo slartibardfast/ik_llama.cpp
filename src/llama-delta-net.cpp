@@ -321,29 +321,22 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     const int64_t state_dim      = conv_state_dim + ssm_state_dim;
     GGML_ASSERT(qnext_state_slots > 0);
 
-    // PHASE46 C.1 fix: multi-seq dispatch reshapes 2D qkv_mixed/beta/gate
-    // to 3D (X, n_seq_tokens, n_seqs) so the SSM kernel sees n_seqs > 1.
-    // build_qkvz produces 2D outputs; we promote here just before SSM dispatch.
+    // PHASE46 C.1 fix: derive n_seq_tokens and n_seqs from state_seq_ids_multi
+    // when multi-seq, otherwise from qkv_mixed shape. ssm_conv requires 2D
+    // qkv_mixed input — DO NOT reshape qkv_mixed itself. The downstream
+    // q_conv/k_conv/v_conv views (line 412+) already use n_seq_tokens/n_seqs
+    // to construct 4D views with correct strides, so the multi-seq slicing
+    // is correct as long as n_seq_tokens and n_seqs are right.
+    int64_t n_seq_tokens;
+    int64_t n_seqs;
     if (state_seq_ids_multi != nullptr && !state_seq_ids_multi->empty() && qkv_mixed->ne[2] == 1) {
-        const int64_t n_seqs_new = (int64_t) state_seq_ids_multi->size();
-        GGML_ASSERT(qkv_mixed->ne[1] % n_seqs_new == 0 && "qkv_mixed n_tokens must be divisible by n_seqs");
-        const int64_t n_seq_tokens_new = qkv_mixed->ne[1] / n_seqs_new;
-        qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens_new, n_seqs_new);
-        // beta and gate have shape (1, n_tokens, n_heads) or similar — reshape
-        // their token axis to (n_seq_tokens, n_seqs) similarly. Need to check
-        // their actual shapes at runtime.
-        // Beta shape: (1, n_tokens, num_v_heads, 1) per build_beta_gate
-        if (beta->ne[3] == 1 && beta->ne[1] == qkv_mixed->ne[1] * n_seqs_new) {
-            beta = ggml_reshape_4d(ctx0, beta, beta->ne[0], n_seq_tokens_new, beta->ne[2], n_seqs_new);
-        }
-        // Gate shape: (n_tokens, 1, num_v_heads, 1) per build_beta_gate
-        if (gate->ne[3] == 1 && gate->ne[0] == qkv_mixed->ne[1] * n_seqs_new) {
-            gate = ggml_reshape_4d(ctx0, gate, n_seq_tokens_new, n_seqs_new, gate->ne[2], 1);
-        }
+        n_seqs = (int64_t) state_seq_ids_multi->size();
+        GGML_ASSERT(qkv_mixed->ne[1] % n_seqs == 0 && "qkv_mixed n_tokens must be divisible by n_seqs");
+        n_seq_tokens = qkv_mixed->ne[1] / n_seqs;
+    } else {
+        n_seq_tokens = qkv_mixed->ne[1];
+        n_seqs       = qkv_mixed->ne[2];
     }
-
-    const int64_t n_seq_tokens = qkv_mixed->ne[1];
-    const int64_t n_seqs       = qkv_mixed->ne[2];
     const int64_t n_tok        = n_seq_tokens * n_seqs;
 
     size_t state_row_size = 0;
