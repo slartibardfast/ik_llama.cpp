@@ -553,8 +553,14 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             bool force_reduce_cast,
             const std::vector<uint32_t> * state_seq_ids_multi) const {
 
+    // PHASE46 C.1 fix L.8.b: when state_seq_ids_multi is non-null, n_seqs is N
+    // (the number of state sequences the multi-seq dispatch is processing),
+    // not 1. This propagates correctly into build_beta_gate so the gate
+    // tensor gets shape (num_v_heads, n_seq_tokens, n_seqs=N) — matching
+    // build_fused_delta_net's assert at delta-net.cpp:96.
+    const bool use_multi_seq_outer = (state_seq_ids_multi != nullptr) && !state_seq_ids_multi->empty();
     const int64_t n_tok = delta_input->ne[1];
-    const int64_t n_seqs = 1;
+    const int64_t n_seqs = use_multi_seq_outer ? (int64_t) state_seq_ids_multi->size() : 1;
     //const int64_t n_seq_tokens = n_tok;
 
     auto & model   = lctx.model;
@@ -928,10 +934,22 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
             // internally when state_seq_ids_multi is non-empty.
             // PHASE46 C.1 step 5: pass the (n_seq_max, n_tokens) mask tensor
             // into the multi-seq SSM dispatch. ggml_ssm_conv asserts
-            // sq->ne[0] == n_kv where n_kv = n_state_seqs > 1, so the legacy
-            // (1, n_tokens) per-token slot-index tensor would not satisfy.
+            // sq->ne[0] == n_kv where n_kv = n_state_seqs, so we view-slice the
+            // mask to the active n_state_seqs rows. Assumes state_seq_ids are
+            // contiguous slots [0..N-1]; see L.8.d for the general case where
+            // active slots are non-contiguous (e.g. {0, 2}).
+            const int64_t n_state_seqs_local = (int64_t) state_seq_ids.size();
+            ggml_tensor * sq_full = lctx.default_decoder.inp_s_seq_qnext_multi;
+            ggml_tensor * sq_view;
+            if (sq_full && n_state_seqs_local < sq_full->ne[0]) {
+                sq_view = ggml_view_2d(ctx0, sq_full, n_state_seqs_local, sq_full->ne[1],
+                                        sq_full->nb[1], 0);
+                sq_view = ggml_cont(ctx0, sq_view);
+            } else {
+                sq_view = sq_full;
+            }
             ggml_tensor * out_multi = build_layer_attn_linear_core(ctx0, gf, cur,
-                lctx.default_decoder.inp_s_seq_qnext_multi, inp_out_ids,
+                sq_view, inp_out_ids,
                 state_seq_ids[0], reset_any, il, cb, force_reduce_cast,
                 &state_seq_ids);
             return out_multi;
