@@ -32,7 +32,7 @@ typedef void (* fattn_new_mma_kernel_t)(
         const uint32_t n_head_log2,
         const int ne00, const int ne01, const int ne02, const int ne03,
         const int ne10, const int ne11, const int ne12, const int ne13,
-        const int ne31, const int nb31,
+        const int ne31, const int ne33, const int nb31, const int nb33,
         const int nb01, const int nb02, const int nb03,
         const int nb11, const int nb12, const int nb13,
         const int nb21, const int nb22, const int nb23,
@@ -1458,7 +1458,7 @@ static __global__ void flash_attn_ext_f16(
         const uint32_t n_head_log2,
         const int ne00, const int ne01, const int ne02, const int ne03,
         const int ne10, const int ne11, const int ne12, const int ne13,
-        const int ne31, const int nb31,
+        const int ne31, const int ne33, const int nb31, const int nb33,
         const int nb01, const int nb02, const int nb03,
         const int nb11, const int nb12, const int nb13,
         const int nb21, const int nb22, const int nb23,
@@ -1518,7 +1518,7 @@ static __global__ void flash_attn_ext_f16(
 
         const float2 * Q_f2    = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const half2  * K_h2    = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-        const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) mask + int64_t(nb31/sizeof(half2))*jt*ncols1 : nullptr;
+        const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) (mask + nb33*(sequence % ne33) + nb31*jt*ncols1) : nullptr;
         float2       * dstk    = ((float2 *) dst) + (sequence*ne01*ne02 + zt_Q) * (DV/2);
 
         const half2 * V_h2 = mla ? K_h2 + (DKQ/2 - DV/2) : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -1529,7 +1529,7 @@ static __global__ void flash_attn_ext_f16(
         int kb0_start_kernel = kb0_start * kb_niter;
         int kb0_stop_kernel  = kb0_stop  * kb_niter;
         if (KV_max) {
-            kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[jt] / c::nbatch_fa);
+            kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*ne31 + jt] / c::nbatch_fa);
         }
 
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1565,7 +1565,7 @@ static __global__ void flash_attn_ext_f16(
 
     const float2 * Q_f2    = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const half2  * K_h2    = (const half2  *) (K + nb13*sequence + nb12*z_KV);
-    const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) mask + (nb31/sizeof(half2))*jt*ncols1 : nullptr;
+    const half2  * mask_h2 = ncols2 > 1 || mask ? (const half2  *) (mask + nb33*(sequence % ne33) + nb31*jt*ncols1) : nullptr;
     float2       * dstk    = ((float2 *) dst) + (sequence*ne01*ne02 + zt_Q) * (DV/2);
 
     const half2 * V_h2 = mla ? K_h2 + (DKQ/2 - DV/2) : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -1576,7 +1576,7 @@ static __global__ void flash_attn_ext_f16(
     int kb0_start_kernel = kb0_start * kb_niter;
     int kb0_stop_kernel  = kb0_stop  * kb_niter;
     if (KV_max) {
-        kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[jt] / c::nbatch_fa);
+        kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*ne31 + jt] / c::nbatch_fa);
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -1591,7 +1591,8 @@ static __global__ void flash_attn_ext_f16(
     GGML_UNUSED(n_head_log2); GGML_UNUSED(logit_softcap); GGML_UNUSED(ne00);
     GGML_UNUSED(ne01); GGML_UNUSED(ne02); GGML_UNUSED(ne03); GGML_UNUSED(ne10);
     GGML_UNUSED(ne11); GGML_UNUSED(ne12); GGML_UNUSED(ne13); GGML_UNUSED(ne31);
-    GGML_UNUSED(nb31); GGML_UNUSED(nb01); GGML_UNUSED(nb02); GGML_UNUSED(nb03);
+    GGML_UNUSED(ne33); GGML_UNUSED(nb31); GGML_UNUSED(nb33);
+    GGML_UNUSED(nb01); GGML_UNUSED(nb02); GGML_UNUSED(nb03);
     GGML_UNUSED(nb11); GGML_UNUSED(nb12); GGML_UNUSED(nb13); GGML_UNUSED(nb21);
     GGML_UNUSED(nb22); GGML_UNUSED(nb23); GGML_UNUSED(ne0); GGML_UNUSED(ne1);
     GGML_UNUSED(ne2); GGML_UNUSED(ne3);
@@ -1604,9 +1605,8 @@ template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup(
         float * __restrict__ dst, const float2 * __restrict__ dst_fixup, const int ne01, const int ne02,
-        const int ne11, const int ne12) {
+        const int ne03, const int ne11, const int ne12) {
     constexpr int ncols = ncols1*ncols2;
-    constexpr int ne03  = 1;
 
     const int bidx0 = blockIdx.x;
     const int j     = blockIdx.y;
@@ -1826,8 +1826,6 @@ static void launch_fattn_new_mma(
 
     GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && "Incorrect KV cache padding.");
 
-    GGML_ASSERT(Q->ne[3] == 1);
-
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
     const int id  = ggml_cuda_get_device();
@@ -2022,7 +2020,7 @@ static void launch_fattn_new_mma(
         scale, max_bias, m0, m1, logit_softcap, ctx.fa_offset, n_head_log2,
         Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-        mask ? mask->ne[1] : 0, mask ? mask->nb[1] : 0,
+        mask ? mask->ne[1] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[3] : 0,
         Q->nb[1], Q->nb[2], Q->nb[3],
         nb11, nb12, nb13,
         nb21, nb22, nb23,
@@ -2037,7 +2035,7 @@ static void launch_fattn_new_mma(
 
             flash_attn_stream_k_fixup<DV, ncols1, ncols2>
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
-                ((float *) KQV->data, dst_tmp_meta.ptr, Q->ne[1], Q->ne[2], K->ne[1], K->ne[2]);
+                ((float *) KQV->data, dst_tmp_meta.ptr, Q->ne[1], Q->ne[2], Q->ne[3], K->ne[1], K->ne[2]);
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
