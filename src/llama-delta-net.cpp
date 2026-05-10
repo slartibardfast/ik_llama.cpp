@@ -424,19 +424,53 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    ggml_tensor * new_conv_states = ggml_view_2d(ctx0, conv_output_raw, ssm_d_conv - 1, conv_dim,
-            ssm_d_conv * ggml_element_size(conv_output_raw),
-            (1 + conv_dim * n_tok) * ggml_element_size(conv_output_raw));
-    auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
-    cb(new_conv_states_cont, "new_conv_states_cont", il);
-    ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
-    ggml_tensor * new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, 1);
+    // PHASE46 C.1 fix step 3/4: handle multi-seq output layout from ggml_ssm_conv.
+    // The conv portion of conv_output_raw spans (d_conv, d_inner, n_state_seqs);
+    // for multi-seq, we need a 3D view (one slice per seq) instead of the legacy
+    // 2D slice. New_state already has shape (head_v_dim, head_v_dim, num_v_heads,
+    // n_state_seqs) from step 2/4.
+    ggml_tensor * new_conv_flat;
+    ggml_tensor * new_ssm_flat;
+    if (use_multi_seq) {
+        // 3D view of conv state portion: (d_conv-1, conv_dim, n_state_seqs).
+        // Stride pattern matches the legacy 2D view but extended to 3D.
+        ggml_tensor * new_conv_states_3d = ggml_view_3d(ctx0, conv_output_raw,
+                ssm_d_conv - 1, conv_dim, n_state_seqs,
+                ssm_d_conv * ggml_element_size(conv_output_raw),
+                ssm_d_conv * conv_dim * ggml_element_size(conv_output_raw),
+                (1 + conv_dim * n_tok) * ggml_element_size(conv_output_raw));
+        auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states_3d);
+        cb(new_conv_states_cont, "new_conv_states_cont_multi", il);
+        new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, n_state_seqs);
+        new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, n_state_seqs);
+    } else {
+        ggml_tensor * new_conv_states = ggml_view_2d(ctx0, conv_output_raw, ssm_d_conv - 1, conv_dim,
+                ssm_d_conv * ggml_element_size(conv_output_raw),
+                (1 + conv_dim * n_tok) * ggml_element_size(conv_output_raw));
+        auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
+        cb(new_conv_states_cont, "new_conv_states_cont", il);
+        new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
+        new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, 1);
+    }
     ggml_tensor * new_state_flat = ggml_concat(ctx0, new_conv_flat, new_ssm_flat, 0);
     cb(new_state_flat, "new_state_flat", il);
 
-    auto state_cpy = ggml_cpy(ctx0, new_state_flat, state_dst);
-    cb(state_cpy, "state_cpy", il);
-    ggml_build_forward_expand(gf, state_cpy);
+    if (use_multi_seq) {
+        // Per-seq writeback: copy each row of new_state_flat back to its seq cell.
+        for (int64_t i = 0; i < n_state_seqs; ++i) {
+            ggml_tensor * src_row = ggml_view_2d(ctx0, new_state_flat, state_dim, 1,
+                    new_state_flat->nb[1], (size_t) i * new_state_flat->nb[1]);
+            ggml_tensor * dst_row = ggml_view_2d(ctx0, state_all, state_dim, 1,
+                    state_row_size, (size_t) (*state_seq_ids_multi)[i] * state_row_size);
+            auto cpy = ggml_cpy(ctx0, src_row, dst_row);
+            cb(cpy, "state_cpy_multi", il);
+            ggml_build_forward_expand(gf, cpy);
+        }
+    } else {
+        auto state_cpy = ggml_cpy(ctx0, new_state_flat, state_dst);
+        cb(state_cpy, "state_cpy", il);
+        ggml_build_forward_expand(gf, state_cpy);
+    }
 
     return output;
 }
