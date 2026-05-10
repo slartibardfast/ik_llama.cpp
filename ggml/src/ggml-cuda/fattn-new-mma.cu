@@ -1529,7 +1529,7 @@ static __global__ void flash_attn_ext_f16(
         int kb0_start_kernel = kb0_start * kb_niter;
         int kb0_stop_kernel  = kb0_stop  * kb_niter;
         if (KV_max) {
-            kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*ne31 + jt] / c::nbatch_fa);
+            kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*iter_j + jt] / c::nbatch_fa);
         }
 
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -1576,7 +1576,7 @@ static __global__ void flash_attn_ext_f16(
     int kb0_start_kernel = kb0_start * kb_niter;
     int kb0_stop_kernel  = kb0_stop  * kb_niter;
     if (KV_max) {
-        kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*ne31 + jt] / c::nbatch_fa);
+        kb0_stop_kernel  = min(kb0_stop_kernel,  KV_max[sequence*iter_j + jt] / c::nbatch_fa);
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
