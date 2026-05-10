@@ -5612,7 +5612,9 @@ static int llama_decode_internal(
                         strncmp(t->name, "kcur_", 5) != 0 &&
                         strncmp(t->name, "vcur_", 5) != 0 &&
                         strncmp(t->name, "qaux_", 5) != 0 &&
-                        strncmp(t->name, "knorm_", 6) != 0) continue;
+                        strncmp(t->name, "knorm_", 6) != 0 &&
+                        strncmp(t->name, "krope_", 6) != 0 &&
+                        strncmp(t->name, "khad_", 5) != 0) continue;
                     const int64_t cols = t->ne[0];  // n_embd
                     const int64_t rows = t->ne[1];  // n_tokens
                     if (cols <= 0 || rows <= 0) continue;

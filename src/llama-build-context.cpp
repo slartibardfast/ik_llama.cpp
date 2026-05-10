@@ -2682,6 +2682,21 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 }
                 cb(Qcur, "Qcur", il_cb);
                 cb(Kcur, "Kcur", il_cb);
+                // PHASE46 C.1 iter 47: post-RoPE K dump
+                {
+                    static const bool dump_postrope = []() {
+                        const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+                        return v && *v && *v != '0';
+                    }();
+                    if (dump_postrope) {
+                        char nm[40];
+                        snprintf(nm, sizeof(nm), "krope_%02d", il);
+                        ggml_tensor * snap = ggml_dup(ctx0, Kcur);
+                        ggml_set_name(snap, nm);
+                        ggml_set_output(snap);
+                        ggml_build_forward_expand(gf, snap);
+                    }
+                }
                 if (inp_attn_scale) {
                     Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
                     cb(Qcur, "Qcur_temp_scaled", il_cb);
@@ -2691,6 +2706,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     Kcur = ggml_hadamard(ctx0, Kcur, hparams.n_embd_head_k(il));
                     cb(Qcur, "Qcur_hadamard", il_cb);
                     cb(Kcur, "Kcur_hadamard", il_cb);
+                    // PHASE46 C.1 iter 47: post-Hadamard K dump
+                    static const bool dump_posthadk = []() {
+                        const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+                        return v && *v && *v != '0';
+                    }();
+                    if (dump_posthadk) {
+                        char nm[40];
+                        snprintf(nm, sizeof(nm), "khad_%02d", il);
+                        ggml_tensor * snap = ggml_dup(ctx0, Kcur);
+                        ggml_set_name(snap, nm);
+                        ggml_set_output(snap);
+                        ggml_build_forward_expand(gf, snap);
+                    }
                 }
                 if (cparams.v_cache_hadamard) {
                     Vcur = ggml_hadamard(ctx0, Vcur, hparams.n_embd_head_v(il));
@@ -2883,6 +2911,21 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     }
     cb(Qcur, "Qcur_roped", il);
     cb(Kcur, "Kcur_roped", il);
+    // PHASE46 C.1 iter 47: post-RoPE K dump (simple path, single-GPU)
+    {
+        static const bool dump_postrope_simple = []() {
+            const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+            return v && *v && *v != '0';
+        }();
+        if (dump_postrope_simple) {
+            char nm[40];
+            snprintf(nm, sizeof(nm), "krope_%02d", il);
+            ggml_tensor * snap = ggml_dup(ctx0, Kcur);
+            ggml_set_name(snap, nm);
+            ggml_set_output(snap);
+            ggml_build_forward_expand(gf, snap);
+        }
+    }
 
     if (inp_attn_scale) {
         Qcur = ggml_mul(ctx0, Qcur, inp_attn_scale);
