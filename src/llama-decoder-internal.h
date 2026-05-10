@@ -103,6 +103,7 @@ struct llama_decoder {
     struct ggml_tensor * inp_s_mask      = nullptr; // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq       = nullptr; // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext = nullptr; // I32 [1, n_batch]
+    struct ggml_tensor * inp_s_seq_qnext_multi = nullptr; // I32 [n_seq_max, n_batch] (PHASE46 C.1 step 5: mask format for multi-seq SSM dispatch)
     struct ggml_tensor * inp_pos_bucket    = nullptr; // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_KQ_mask_cross = nullptr; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale         = nullptr; // F32 [n_tokens]
