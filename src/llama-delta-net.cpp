@@ -591,6 +591,24 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         }
         auto cur = ggml_reduce(ctx0, results.data(), n_device, GGML_OP_ADD);
         ggml_build_forward_expand(gf, cur);
+        // C.1 diagnostic (Phase 1): tag SSM block post-reduce output for
+        // layer 0 in multi-GPU graph-split path. Compares against l_out_dump
+        // (post-FFN) to localize whether layer-0 row-asymmetry is in SSM
+        // (build_qkv + reduce) or in FFN/cvec downstream.
+        static const bool dump_ssm_l0 = []() {
+            const char * v = getenv("LLAMA_DUMP_SSM_L0");
+            return v && *v && *v != '0';
+        }();
+        if (dump_ssm_l0 && il == 0) {
+            ggml_set_name(cur, "ssm_out_dump_l0");
+            ggml_set_output(cur);
+            static int build_count = 0;
+            if (build_count < 5) {
+                fprintf(stderr, "[c1.diag.ssm.gate.split] tagged ssm_out_dump_l0 at il=0 build=%d ne[0]=%lld ne[1]=%lld\n",
+                        build_count, (long long) cur->ne[0], (long long) cur->ne[1]);
+                ++build_count;
+            }
+        }
         return cur;
     }
 
@@ -649,7 +667,9 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     output = ggml_add(ctx0, gated_output, input);
     cb(output, "ssm_output", il);
     // C.1 diagnostic: env-gated set_output of SSM kernel post-gate output for
-    // layer 0 only. Tagged "ssm_out_dump_l0" so walker can find it.
+    // layer 0 only. Tagged "ssm_out_dump_l0" so walker can find it. Phase 1
+    // fix-localization: compare per-row L2 here vs at l_out_dump (post-FFN).
+    // If asymmetric here → bug in build_qkv. If symmetric → bug in FFN/cvec.
     static const bool dump_ssm_l0 = []() {
         const char * v = getenv("LLAMA_DUMP_SSM_L0");
         return v && *v && *v != '0';
@@ -657,6 +677,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     if (dump_ssm_l0 && il == 0) {
         ggml_set_name(output, "ssm_out_dump_l0");
         ggml_set_output(output);
+        // Build-time announce so we know the gate is executing.
+        static int build_count = 0;
+        if (build_count < 5) {
+            fprintf(stderr, "[c1.diag.ssm.gate] tagged ssm_out_dump_l0 at il=0 build=%d ne[1]=%lld\n",
+                    build_count, (long long) output->ne[1]);
+            ++build_count;
+        }
     }
     return output;
     //return build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
