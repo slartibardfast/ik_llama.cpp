@@ -201,6 +201,10 @@ llama_build_and_test(
     peg-parser/tests.h
 )
 llama_build_and_test(test-regex-partial.cpp)
+# PHASE46 C.1 iter 48: backend ops test (FA batched-determinism among others)
+if (GGML_CUDA)
+    llama_build_and_test(test-backend-ops.cpp)
+endif()
 llama_build_and_test(test-q4-0-ar16-cpu.cpp)
 if (GGML_CUDA)
     llama_build_and_test(test-q4-0-ar16-cuda.cpp)
