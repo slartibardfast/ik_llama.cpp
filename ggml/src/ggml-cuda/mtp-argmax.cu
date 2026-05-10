@@ -1,6 +1,12 @@
 #include "common.cuh"
 #include "ggml-cuda.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 // Per-row argmax + softmax-prob over [n_rows, n_vocab] logits, fully on device.
 //
 // Replaces the host-side argmax + softmax-denom computation in
@@ -275,6 +281,31 @@ extern "C" GGML_CALL void ggml_backend_cuda_mtp_argmax_with_prob_to_host(
     if (n_rows <= 0 || n_vocab <= 0) return;
 
     ggml_cuda_set_device(device);
+
+    // C.1 diagnostic: env-gated per-row INPUT-LOGITS hash dump. Hashes are
+    // computed by D2H copying each row of logits_dev into a host scratch
+    // buffer, then summing element-wise XOR. If row hashes differ across
+    // slots in the same call, the bug is upstream of this kernel. Off by
+    // default; significant cost when on (n_rows D2H copies per call).
+    static const bool _diag_logits_hash = []() {
+        const char * v = getenv("LLAMA_DIAG_MTP_LOGITS_HASH");
+        return v && *v && *v != '0';
+    }();
+    if (_diag_logits_hash && n_rows > 1) {
+        std::vector<float> tmp((size_t) n_vocab);
+        for (int r = 0; r < n_rows; ++r) {
+            cudaMemcpy(tmp.data(), (const char *)logits_dev + (size_t) r * n_vocab * sizeof(float),
+                       n_vocab * sizeof(float), cudaMemcpyDeviceToHost);
+            uint64_t h = 0;
+            double l2 = 0.0;
+            for (int j = 0; j < n_vocab; ++j) {
+                h ^= (uint64_t) __builtin_bswap32(*reinterpret_cast<uint32_t*>(&tmp[j])) * (uint64_t) (j+1);
+                l2 += (double) tmp[j] * tmp[j];
+            }
+            fprintf(stderr, "[c1.diag.mtp_argmax] r%d/%d n_vocab=%d hash=0x%016llx L2=%.6f\n",
+                    r, n_rows, n_vocab, (unsigned long long) h, sqrt(l2));
+        }
+    }
 
     static int32_t * cached_ids_dev[GGML_CUDA_MAX_DEVICES]      = {0};
     static float   * cached_probs_dev[GGML_CUDA_MAX_DEVICES]    = {0};
