@@ -49,6 +49,15 @@ struct qnext_state_slot_allocator {
     // Idempotent: returns existing slot if seq is already mapped;
     // otherwise pops a free slot, maps seq -> slot, returns it.
     // Returns -1 if the free list is empty (n_seq_max was too small).
+    //
+    // PHASE46 C.1 iter 28: prefer (seq % n_slots) as the slot index when
+    // available, so slot assignment becomes deterministic by seq_id rather
+    // than arrival order. Iter 27 evidence: 27B + np=3 + dual-GPU + cuda
+    // graphs=0 produces same two distinct sha256s every trial but the
+    // divergent slot rotates across trials. Hypothesis: arrival-order LIFO
+    // here is the rotation source. Falls back to LIFO pop if the preferred
+    // slot is already taken (e.g. a long-running seq A holds slot
+    // (A % n_slots) and a new seq B with B % n_slots == A % n_slots arrives).
     int32_t alloc(llama_seq_id seq) {
         auto it = slot_of.find(seq);
         if (it != slot_of.end()) {
@@ -57,6 +66,16 @@ struct qnext_state_slot_allocator {
         if (free_list.empty()) {
             return -1;
         }
+        // Try the seq_id-canonical slot first.
+        const int32_t preferred = (int32_t)(((uint64_t) seq) % (uint64_t) n_slots);
+        for (size_t i = 0; i < free_list.size(); ++i) {
+            if (free_list[i] == preferred) {
+                free_list.erase(free_list.begin() + i);
+                slot_of[seq] = preferred;
+                return preferred;
+            }
+        }
+        // Fall back to LIFO pop when preferred slot is taken.
         int32_t slot = free_list.back();
         free_list.pop_back();
         slot_of[seq] = slot;
