@@ -5480,6 +5480,39 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
+        // C.1 diagnostic (Phase 2): per-device pre-reduce SSM dump.
+        {
+            static const bool dump_per_dev = []() {
+                const char * v = getenv("LLAMA_DUMP_SSM_PER_DEV");
+                return v && *v && *v != '0';
+            }();
+            if (dump_per_dev) {
+                ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+                for (int ni = 0; ni < gf->n_nodes; ++ni) {
+                    const ggml_tensor * t = gf->nodes[ni];
+                    if (!t || !t->name[0]) continue;
+                    if (strncmp(t->name, "ssm_predev_dump_d", 17) != 0) continue;
+                    const int64_t cols = t->ne[0];
+                    const int64_t rows = t->ne[1];
+                    if (cols <= 0 || rows <= 0) continue;
+                    const size_t need = (size_t)(cols * rows);
+                    std::vector<float> tmp(need);
+                    ggml_backend_tensor_get(t, tmp.data(), 0, need * sizeof(float));
+                    fprintf(stderr, "[c1.diag.ssm_predev] %s ne[0]=%lld ne[1]=%lld:",
+                            t->name, (long long) cols, (long long) rows);
+                    for (int64_t r = 0; r < rows && r < 8; ++r) {
+                        double l2 = 0.0;
+                        for (int64_t c = 0; c < cols; ++c) {
+                            const float v = tmp[(size_t)r * cols + c];
+                            l2 += (double) v * v;
+                        }
+                        fprintf(stderr, " r%lld=%.6f", (long long) r, sqrt(l2));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
         // C.1 diagnostic: env-gated dump of ALL ssm_out_dump_l0 tensors in
         // the graph (multi-block per-slot SSM outputs at layer 0). Each block
         // call in blocks_loop creates one tensor with this tag. Walker finds

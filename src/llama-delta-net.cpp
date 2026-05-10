@@ -588,6 +588,28 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             }
             ggml_build_forward_expand(gf, gated_output);
             results[id] = gated_output;
+            // C.1 diagnostic (Phase 2): tag per-device PRE-REDUCE output for
+            // layer 0. Compares per-device per-row L2 across slots to determine
+            // whether the kernel is asymmetric (per-device differs per slot)
+            // or only the cross-device reduce is asymmetric (per-device equal
+            // per slot, post-reduce differs).
+            static const bool dump_ssm_per_dev = []() {
+                const char * v = getenv("LLAMA_DUMP_SSM_PER_DEV");
+                return v && *v && *v != '0';
+            }();
+            if (dump_ssm_per_dev && il == 0) {
+                char nm[40];
+                snprintf(nm, sizeof(nm), "ssm_predev_dump_d%d", id);
+                ggml_set_name(gated_output, nm);
+                ggml_set_output(gated_output);
+                ggml_build_forward_expand(gf, gated_output);
+                static int build_count = 0;
+                if (build_count < 6) {
+                    fprintf(stderr, "[c1.diag.ssm.gate.predev] tagged %s id=%d ne[0]=%lld ne[1]=%lld build=%d\n",
+                            gated_output->name, id, (long long) gated_output->ne[0], (long long) gated_output->ne[1], build_count);
+                    ++build_count;
+                }
+            }
         }
         auto cur = ggml_reduce(ctx0, results.data(), n_device, GGML_OP_ADD);
         ggml_build_forward_expand(gf, cur);
