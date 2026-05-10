@@ -1679,6 +1679,75 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// PHASE46 C.1 iter 48: batched-determinism test for FA.
+// Validates that with Q.ne[3] = N batches all initialized to byte-equal data,
+// FA produces byte-equal output per batch. Ensures kernels correctly index
+// K/V via ne[3] dimension AND don't introduce per-batch FP non-determinism.
+//
+// Because the test framework compares GPU output to CPU reference, any
+// per-batch divergence on GPU will manifest as GPU != CPU mismatch. CPU
+// FA is deterministic, so all CPU batch outputs are bytewise identical
+// (when inputs are identical); GPU divergence breaks the comparison.
+struct test_flash_attn_ext_batched_det : public test_case {
+    const int64_t hs;       // head size
+    const int64_t nh;       // num q heads
+    const int64_t nh_kv;    // num kv heads (for GQA)
+    const int64_t kv;       // kv size (cells per slot)
+    const int64_t nb;       // n_tokens per batch
+    const int64_t n_batch;  // batch size = number of slots
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nh_kv, kv, nb, n_batch, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_batched_det(int64_t hs = 128, int64_t nh = 24, int64_t nh_kv = 4,
+                                     int64_t kv = 8, int64_t nb = 1, int64_t n_batch = 8,
+                                     ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), n_batch(n_batch), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs_padded = GGML_PAD(hs, ggml_blck_size(type_KV));
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs_padded, nb,    nh,    n_batch);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv,    nh_kv, n_batch);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv,    nh_kv, n_batch);
+        // 2D mask broadcasts across batches — ggml's FA API enforces ne[2]==ne[3]==1.
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, GGML_PAD(nb, GGML_KQ_MASK_PAD), 1, 1);
+        ggml_set_name(q, "q_det");
+        ggml_set_name(k, "k_det");
+        ggml_set_name(v, "v_det");
+        ggml_set_name(m, "m_det");
+        return ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Initialize randomly then replicate batch 0 across all batches for
+        // q_det/k_det/v_det. Forces FA to compute identical output per
+        // batch — any divergence indicates per-batch FP non-determinism in
+        // the kernel, which is the production bug we want to catch.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            const char * nm = ggml_get_name(t);
+            if (!nm) continue;
+            if (strcmp(nm, "q_det") != 0 && strcmp(nm, "k_det") != 0 && strcmp(nm, "v_det") != 0) {
+                continue;
+            }
+            if (t->ne[3] <= 1) continue;
+            const size_t total_bytes = ggml_nbytes(t);
+            const size_t bytes_per_batch = total_bytes / t->ne[3];
+            std::vector<char> b0(bytes_per_batch);
+            ggml_backend_tensor_get(t, b0.data(), 0, bytes_per_batch);
+            for (int64_t b = 1; b < t->ne[3]; b++) {
+                ggml_backend_tensor_set(t, b0.data(), b * bytes_per_batch, bytes_per_batch);
+            }
+        }
+    }
+};
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -2479,6 +2548,39 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
                     }
                 }
             }
+        }
+    }
+
+    // PHASE46 C.1 iter 48: batched-determinism FA tests.
+    // Each instance triggers a specific FA kernel dispatcher path. With Q, K, V
+    // populated identically across all `n_batch` slots, FA must produce
+    // byte-equal output per slot — a property required by the multi-slot
+    // determinism work. Configurations chosen to exercise:
+    //   - vec-f16 / vec-f32  (Q.ne[1]=1, fp16 cache, head_dim=128)
+    //   - mma-new            (Q.ne[1]=1, GQA 6:1, head_dim=128 — production decode)
+    //   - tile-f16 / tile-f32 (Q.ne[1]>1, prefill-style)
+    //   - wmma-f16           (fallback path)
+    {
+        // Decode-style: Q.ne[1] = 1, GQA 6:1 (matches Qwen3.6 27B: 24 q heads / 4 kv heads)
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            for (int64_t n_batch : {2, 4, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                    /*hs=*/128, /*nh=*/24, /*nh_kv=*/4, /*kv=*/8, /*nb=*/1, n_batch, type_KV));
+            }
+        }
+        // Prefill-style: Q.ne[1] > 1
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            for (int64_t nb : {4, 16}) {
+                for (int64_t n_batch : {2, 4}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                        /*hs=*/128, /*nh=*/24, /*nh_kv=*/4, /*kv=*/32, nb, n_batch, type_KV));
+                }
+            }
+        }
+        // Non-GQA path (tile-f16/f32): nh == nh_kv
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                /*hs=*/128, /*nh=*/8, /*nh_kv=*/8, /*kv=*/16, /*nb=*/4, /*n_batch=*/4, type_KV));
         }
     }
 
