@@ -201,13 +201,27 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             const char * v = getenv("LLAMA_DISABLE_H_PRE_NORM");
             return v && *v && *v != '0';
         }();
+        // C.1 fix attempt: use inpL DIRECTLY as h_pre_norm output, no dup.
+        // Hypothesis: the ggml_dup at multi-slot decode produces NaN due to
+        // a sync race between graph compute and async copy. Without the dup,
+        // the output references the live inpL tensor whose data is properly
+        // synchronized through the main compute path.
+        static const bool no_dup_h_pre_norm = []() {
+            const char * v = getenv("LLAMA_NO_DUP_H_PRE_NORM");
+            return v && *v && *v != '0';
+        }();
         if (lctx.cparams.mtp && !disable_h_pre_norm) {
             // See build_qwen35moe() above for the rationale on the
             // "h_pre_norm" tag + lctx.default_decoder.t_h_pre_norm stash.
-            struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
-            cb(embd_copy, "h_pre_norm", -1);
-            ggml_set_output(embd_copy);
-            lctx.default_decoder.t_h_pre_norm = embd_copy;
+            ggml_tensor * embd_target;
+            if (no_dup_h_pre_norm) {
+                embd_target = inpL;
+            } else {
+                embd_target = ggml_dup(ctx0, inpL);
+            }
+            cb(embd_target, "h_pre_norm", -1);
+            ggml_set_output(embd_target);
+            lctx.default_decoder.t_h_pre_norm = embd_target;
         }
 
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
