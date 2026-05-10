@@ -517,7 +517,8 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * delta_input, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb,
-            bool force_reduce_cast) const {
+            bool force_reduce_cast,
+            const std::vector<uint32_t> * state_seq_ids_multi) const {
 
     const int64_t n_tok = delta_input->ne[1];
     const int64_t n_seqs = 1;
@@ -740,7 +741,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf,
-        save_per_step_states, per_step_ckpt);
+        save_per_step_states, per_step_ckpt,
+        state_seq_ids_multi);
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
     if (inp_out_ids) {
@@ -862,6 +864,37 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
             }
         }
         blocks.push_back({run_start, batch.n_tokens - run_start, run_sid});
+    }
+
+    // PHASE46 C.1 fix step 4/4: env-gated multi-seq dispatch when all blocks
+    // have same length. Replaces N per-block kernel calls with 1 multi-seq call.
+    // Eliminates the per-block first-call-diverges bug. Falls back to per-block
+    // when blocks have heterogeneous lengths or env not set.
+    static const bool multi_seq_dispatch = []() {
+        const char * v = getenv("LLAMA_DNET_MULTI_SEQ");
+        return v && *v && *v != '0';
+    }();
+    if (multi_seq_dispatch && blocks.size() > 1) {
+        bool all_same_length = true;
+        const int64_t blk0_len = blocks[0].len;
+        bool reset_any = false;
+        for (const auto & blk : blocks) {
+            if (blk.len != blk0_len) { all_same_length = false; break; }
+            if (batch.pos != nullptr && batch.pos[blk.start] == 0) reset_any = true;
+        }
+        if (all_same_length) {
+            std::vector<uint32_t> state_seq_ids;
+            state_seq_ids.reserve(blocks.size());
+            for (const auto & blk : blocks) state_seq_ids.push_back((uint32_t) blk.seq_id);
+            // Pass cur as-is (n_embd, n_tokens). Inside build_qkv, qkv_mixed
+            // will be reshaped to (qkv_dim, blk0_len, n_seqs). The cur shape
+            // matches because n_tokens = blk0_len * n_seqs.
+            ggml_tensor * out_multi = build_layer_attn_linear_core(ctx0, gf, cur,
+                lctx.default_decoder.inp_s_seq_qnext, inp_out_ids,
+                state_seq_ids[0], reset_any, il, cb, force_reduce_cast,
+                &state_seq_ids);
+            return out_multi;
+        }
     }
 
     ggml_tensor * out = nullptr;

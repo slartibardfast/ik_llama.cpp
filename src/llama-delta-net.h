@@ -23,7 +23,9 @@ struct delta_net {
     ggml_tensor * build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb,
-            bool force_reduce_cast) const;
+            bool force_reduce_cast,
+            // PHASE46 C.1 fix: optional multi-seq state for the SSM dispatch.
+            const std::vector<uint32_t> * state_seq_ids_multi = nullptr) const;
 
     ggml_tensor * build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const;
