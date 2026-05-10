@@ -221,9 +221,13 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
             // PHASE46 C.1 iter 38: env-gated dump of ALL layer outputs for
             // first-divergence bisection. LLAMA_DUMP_LAYER_HASH=1 tags every
-            // layer's residual stream as `l_out_NN`. Post-decode walker
-            // hashes each slot's column to find the first layer where slots
-            // diverge. Adds 65 tagged tensors × ~100KB host buffer; trivial.
+            // layer's residual stream as `l_out_NN`.
+            //
+            // Iter 41 fix: previous version called set_output directly on
+            // `cur`, but cur is reused across layers (the residual stream),
+            // so the output buffer was overwritten and all layer dumps
+            // showed the SAME final state. ggml_dup forces a fresh tensor
+            // allocation per layer so each l_out_NN keeps its own data.
             static const bool dump_layer_hash = []() {
                 const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
                 return v && *v && *v != '0';
@@ -231,8 +235,10 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             if (dump_layer_hash) {
                 char nm[32];
                 snprintf(nm, sizeof(nm), "l_out_%02d", il);
-                ggml_set_name(cur, nm);
-                ggml_set_output(cur);
+                ggml_tensor * snapshot = ggml_dup(ctx0, cur);
+                ggml_set_name(snapshot, nm);
+                ggml_set_output(snapshot);
+                ggml_build_forward_expand(gf, snapshot);
             }
 
             inpL = cur;

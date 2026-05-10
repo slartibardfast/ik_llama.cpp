@@ -5617,18 +5617,25 @@ static int llama_decode_internal(
                     ggml_backend_tensor_get(t, tmp.data(), 0, actual_bytes);
                     fprintf(stderr, "[layer_hash] %s ne=[%lld,%lld] nb=[%zu,%zu]:", t->name,
                             (long long) cols, (long long) rows, t->nb[0], t->nb[1]);
-                    // Hash each row using its actual stride. nb[0]=elem size, nb[1]=row stride.
+                    // FNV-1a 64-bit + first-2-elements raw as anti-collision check.
                     const size_t row_stride = t->nb[1];
                     const size_t col_stride = t->nb[0];
                     const size_t row_bytes = (size_t)(cols * col_stride);
                     for (int64_t r = 0; r < rows && r < 16; ++r) {
-                        uint64_t h = 5381;
+                        uint64_t h = 0xcbf29ce484222325ULL;  // FNV offset basis
                         const unsigned char * rp = tmp.data() + (size_t) r * row_stride;
                         if ((size_t)((r+1) * row_stride) > actual_bytes) break;
                         for (size_t b = 0; b < row_bytes; ++b) {
-                            h = ((h << 5) + h) ^ rp[b];
+                            h ^= rp[b];
+                            h *= 0x100000001b3ULL;  // FNV prime
                         }
-                        fprintf(stderr, " s%lld=%016llx", (long long) r, (unsigned long long) h);
+                        // Also dump first 8 bytes (2 BF16 elems or 1 F32 elem) for direct comparison
+                        uint64_t raw_head = 0;
+                        for (size_t b = 0; b < 8 && b < row_bytes; ++b) {
+                            raw_head |= ((uint64_t) rp[b]) << (b*8);
+                        }
+                        fprintf(stderr, " s%lld=%016llx#%016llx", (long long) r,
+                                (unsigned long long) h, (unsigned long long) raw_head);
                     }
                     fprintf(stderr, "\n");
                 }
