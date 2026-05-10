@@ -54,14 +54,17 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> tokens_list;
     tokens_list = ::common_tokenize(model, params.prompt, true);
 
-    const int n_kv_req = tokens_list.size() + (n_predict - tokens_list.size())*n_parallel;
+    // PHASE46 C.1 iter 40: per-slot prompt copies → each slot owns prompt_len + (n_predict-prompt_len) cells.
+    const int n_kv_req = n_predict * n_parallel;
 
     // initialize the context
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
 
     ctx_params.n_ctx   = n_kv_req;
-    ctx_params.n_batch = std::max(n_predict, n_parallel);
+    // PHASE46 C.1 iter 40: per-slot prompt fan-out → batch must hold prompt_len × n_parallel
+    ctx_params.n_batch = std::max((int)(tokens_list.size() * n_parallel), std::max(n_predict, n_parallel));
+    ctx_params.n_ubatch = ctx_params.n_batch;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
@@ -93,18 +96,25 @@ int main(int argc, char ** argv) {
 
     // create a llama_batch
     // we use this object to submit token data for decoding
-    llama_batch batch = llama_batch_init(std::max(tokens_list.size(), (size_t) n_parallel), 0, n_parallel);
+    // PHASE46 C.1 iter 40: size for prompt × n_parallel since each slot
+    // gets its own copy of the prompt tokens (qwen3next requirement).
+    llama_batch batch = llama_batch_init(std::max(tokens_list.size() * (size_t) n_parallel, (size_t) n_parallel), 0, n_parallel);
 
     std::vector<llama_seq_id> seq_ids(n_parallel, 0);
     for (int32_t i = 0; i < n_parallel; ++i) {
         seq_ids[i] = i;
     }
 
-    // evaluate the initial prompt
-    for (size_t i = 0; i < tokens_list.size(); ++i) {
-        common_batch_add(batch, tokens_list[i], i, seq_ids, false);
+    // PHASE46 C.1 iter 40: per-slot prompt fan-out so qwen3next (which
+    // requires single-seq-id per token) can run with concurrent slots
+    // sharing the same prompt content. Each slot gets its own copy of
+    // the prompt tokens at its own batch positions.
+    for (int32_t slot = 0; slot < n_parallel; ++slot) {
+        for (size_t i = 0; i < tokens_list.size(); ++i) {
+            common_batch_add(batch, tokens_list[i], i, { slot }, false);
+        }
     }
-    GGML_ASSERT(batch.n_tokens == (int) tokens_list.size());
+    GGML_ASSERT(batch.n_tokens == (int) tokens_list.size() * n_parallel);
 
     if (llama_model_has_encoder(model)) {
         if (llama_encode(ctx, batch)) {
@@ -121,8 +131,16 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, decoder_start_token_id, 0, seq_ids, false);
     }
 
-    // llama_decode will output logits only for the last token of the prompt
-    batch.logits[batch.n_tokens - 1] = true;
+    // llama_decode will output logits only for the last token of EACH slot's prompt.
+    // PHASE46 C.1 iter 40: with per-slot fan-out, slot k's last token is at index
+    // (k+1)*prompt_len - 1.
+    {
+        const size_t prompt_len = tokens_list.size();
+        for (int32_t slot = 0; slot < n_parallel; ++slot) {
+            int32_t idx = (slot + 1) * (int32_t) prompt_len - 1;
+            if (idx < batch.n_tokens) batch.logits[idx] = true;
+        }
+    }
 
     if (llama_decode(ctx, batch) != 0) {
         LOG_TEE("%s: llama_decode() failed\n", __func__);
@@ -146,9 +164,17 @@ int main(int argc, char ** argv) {
 
     // remember the batch index of the last token for each parallel sequence
     // we need this to determine which logits to sample from
-    std::vector<int32_t> i_batch(n_parallel, batch.n_tokens - 1);
+    // PHASE46 C.1 iter 40: per-slot last-token index since each slot has
+    // its own prompt copy at offset slot*prompt_len.
+    std::vector<int32_t> i_batch(n_parallel);
+    {
+        const size_t prompt_len = tokens_list.size();
+        for (int32_t slot = 0; slot < n_parallel; ++slot) {
+            i_batch[slot] = (slot + 1) * (int32_t) prompt_len - 1;
+        }
+    }
 
-    int n_cur    = batch.n_tokens;
+    int n_cur    = (int) tokens_list.size();
     int n_decode = 0;
 
     const auto t_main_start = ggml_time_us();
