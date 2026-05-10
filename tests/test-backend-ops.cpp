@@ -2572,15 +2572,25 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     //   - tile-f16 / tile-f32 (Q.ne[1]>1, prefill-style)
     //   - wmma-f16           (fallback path)
     {
-        // KV size must be padded to FATTN_KQ_STRIDE (256) for the mma kernels.
-        // Decode-style: Q.ne[1] = 1, GQA 6:1 (matches Qwen3.6 27B: 24 q heads / 4 kv heads)
+        // Vec path FIRST: Q.ne[1]=1, no GQA, fp16/fp32 K/V — should hit vec-f16/f32.
+        // These kernels do NOT have the Q.ne[3]==1 assert and may already work.
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                /*hs=*/128, /*nh=*/8, /*nh_kv=*/8, /*kv=*/256, /*nb=*/1, /*n_batch=*/4, type_KV));
+        }
+        // Non-GQA path: nh == nh_kv, Q.ne[1] > 1
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                /*hs=*/128, /*nh=*/8, /*nh_kv=*/8, /*kv=*/256, /*nb=*/4, /*n_batch=*/4, type_KV));
+        }
+        // Decode-style: Q.ne[1] = 1, GQA 6:1 (matches Qwen3.6 27B prod) — hits mma_new
         for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
             for (int64_t n_batch : {2, 4, 8}) {
                 test_cases.emplace_back(new test_flash_attn_ext_batched_det(
                     /*hs=*/128, /*nh=*/24, /*nh_kv=*/4, /*kv=*/256, /*nb=*/1, n_batch, type_KV));
             }
         }
-        // Prefill-style: Q.ne[1] > 1
+        // Prefill-style: Q.ne[1] > 1 with GQA (mma-f16)
         for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
             for (int64_t nb : {4, 16}) {
                 for (int64_t n_batch : {2, 4}) {
@@ -2588,11 +2598,6 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
                         /*hs=*/128, /*nh=*/24, /*nh_kv=*/4, /*kv=*/512, nb, n_batch, type_KV));
                 }
             }
-        }
-        // Non-GQA path (tile-f16/f32): nh == nh_kv
-        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
-            test_cases.emplace_back(new test_flash_attn_ext_batched_det(
-                /*hs=*/128, /*nh=*/8, /*nh_kv=*/8, /*kv=*/256, /*nb=*/4, /*n_batch=*/4, type_KV));
         }
     }
 
