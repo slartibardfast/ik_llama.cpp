@@ -5166,7 +5166,16 @@ static int llama_decode_internal(
             std::vector<qnext_seq_block> blocks;
             const auto pattern = qnext_analyze_seq_pattern(ubatch_view, blocks);
 
-            if (pattern == QNEXT_SEQ_INTERLEAVED) {
+            // C.1 fix attempt: env-gated force per-seq sub-batching even
+            // for CONTIGUOUS_BLOCKS (multi-slot decode). When set, EVERY
+            // multi-seq ubatch is split into per-seq sub-ubatches.
+            // Trades batched-decode throughput for bit-determinism.
+            static const bool force_per_seq_subbatch = []() {
+                const char * v = getenv("LLAMA_FORCE_PER_SEQ_SUBBATCH");
+                return v && *v && *v != '0';
+            }();
+            const bool effective_force_split = force_per_seq_subbatch && pattern != QNEXT_SEQ_SINGLE;
+            if (pattern == QNEXT_SEQ_INTERLEAVED || effective_force_split) {
                 // Truly interleaved (e.g. [A,B,A,B]): the unique-seq-map
                 // fast path rejects, contiguous-block dispatch can't cover
                 // it. Fall back to the longest single-seq run.
@@ -5182,13 +5191,15 @@ static int llama_decode_internal(
                 n_tokens = single_seq_run;
                 lctx.default_decoder.qnext_mixed_seq_fallback_count++;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next interleaved batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
-                                   __func__, single_seq_run, orig_n_tokens,
+                    LLAMA_LOG_WARN("%s: qwen3next %s batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
+                                   __func__, (pattern == QNEXT_SEQ_INTERLEAVED) ? "interleaved" : "force-per-seq",
+                                   single_seq_run, orig_n_tokens,
                                    (unsigned long long) lctx.default_decoder.qnext_mixed_seq_fallback_count);
                     warned_qnext_mixed_repeat = true;
                 }
             }
-            // SINGLE and CONTIGUOUS_BLOCKS: pass through unchanged.
+            // SINGLE: pass through unchanged.
+            // CONTIGUOUS_BLOCKS: pass through unchanged unless force_per_seq_subbatch.
         }
 
         llama_batch u_batch = {
