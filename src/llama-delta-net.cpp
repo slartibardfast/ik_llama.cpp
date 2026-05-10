@@ -313,7 +313,6 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     // decode fix that eliminates the per-block first-call-diverges bug.
     // For now, the parameter is plumbed through; the multi-seq state
     // assembly is in the body below (next iteration).
-    GGML_UNUSED(state_seq_ids_multi);
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -321,6 +320,27 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     const int64_t ssm_state_dim  = head_v_dim * head_v_dim * num_v_heads;
     const int64_t state_dim      = conv_state_dim + ssm_state_dim;
     GGML_ASSERT(qnext_state_slots > 0);
+
+    // PHASE46 C.1 fix: multi-seq dispatch reshapes 2D qkv_mixed/beta/gate
+    // to 3D (X, n_seq_tokens, n_seqs) so the SSM kernel sees n_seqs > 1.
+    // build_qkvz produces 2D outputs; we promote here just before SSM dispatch.
+    if (state_seq_ids_multi != nullptr && !state_seq_ids_multi->empty() && qkv_mixed->ne[2] == 1) {
+        const int64_t n_seqs_new = (int64_t) state_seq_ids_multi->size();
+        GGML_ASSERT(qkv_mixed->ne[1] % n_seqs_new == 0 && "qkv_mixed n_tokens must be divisible by n_seqs");
+        const int64_t n_seq_tokens_new = qkv_mixed->ne[1] / n_seqs_new;
+        qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens_new, n_seqs_new);
+        // beta and gate have shape (1, n_tokens, n_heads) or similar — reshape
+        // their token axis to (n_seq_tokens, n_seqs) similarly. Need to check
+        // their actual shapes at runtime.
+        // Beta shape: (1, n_tokens, num_v_heads, 1) per build_beta_gate
+        if (beta->ne[3] == 1 && beta->ne[1] == qkv_mixed->ne[1] * n_seqs_new) {
+            beta = ggml_reshape_4d(ctx0, beta, beta->ne[0], n_seq_tokens_new, beta->ne[2], n_seqs_new);
+        }
+        // Gate shape: (n_tokens, 1, num_v_heads, 1) per build_beta_gate
+        if (gate->ne[3] == 1 && gate->ne[0] == qkv_mixed->ne[1] * n_seqs_new) {
+            gate = ggml_reshape_4d(ctx0, gate, n_seq_tokens_new, n_seqs_new, gate->ne[2], 1);
+        }
+    }
 
     const int64_t n_seq_tokens = qkv_mixed->ne[1];
     const int64_t n_seqs       = qkv_mixed->ne[2];
@@ -886,9 +906,13 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
             std::vector<uint32_t> state_seq_ids;
             state_seq_ids.reserve(blocks.size());
             for (const auto & blk : blocks) state_seq_ids.push_back((uint32_t) blk.seq_id);
-            // Pass cur as-is (n_embd, n_tokens). Inside build_qkv, qkv_mixed
-            // will be reshaped to (qkv_dim, blk0_len, n_seqs). The cur shape
-            // matches because n_tokens = blk0_len * n_seqs.
+            // Reshape cur to 3D (n_embd, n_seq_tokens, n_seqs) so qkv_mixed
+            // emerges from build_qkvz with the right shape and the SSM kernel
+            // sees n_seqs > 1. Memory layout unchanged — same contiguous data,
+            // just reinterpreted as 3 sequences of blk0_len tokens each.
+            // Pass cur as 2D (build_qkvz assumes 2D). The multi-seq awareness
+            // is plumbed via state_seq_ids_multi; build_qkv reshapes qkv_mixed
+            // internally when state_seq_ids_multi is non-empty.
             ggml_tensor * out_multi = build_layer_attn_linear_core(ctx0, gf, cur,
                 lctx.default_decoder.inp_s_seq_qnext, inp_out_ids,
                 state_seq_ids[0], reset_any, il, cb, force_reduce_cast,
