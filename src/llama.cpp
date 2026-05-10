@@ -5678,7 +5678,9 @@ static int llama_decode_internal(
                                 return v && *v && *v != '0';
                             }();
                             if (dump_embd_norms) {
-                                ggml_backend_synchronize(backend_embd);
+                                // Full scheduler sync — single-backend sync may
+                                // not cover cross-device producers of the dup.
+                                ggml_backend_sched_synchronize(lctx.default_decoder.sched);
                                 for (int row = 0; row < n_outputs_new_embd; ++row) {
                                     double l2 = 0.0;
                                     for (int j = 0; j < n_embd; ++j) {
