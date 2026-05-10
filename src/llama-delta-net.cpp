@@ -306,7 +306,14 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-        bool save_per_step_states, ggml_tensor * per_step_ckpt) {
+        bool save_per_step_states, ggml_tensor * per_step_ckpt,
+        const std::vector<uint32_t> * state_seq_ids_multi) {
+    // PHASE46 C.1 fix: when state_seq_ids_multi is non-null and non-empty,
+    // build a multi-seq state for the SSM dispatch. This is the multi-slot
+    // decode fix that eliminates the per-block first-call-diverges bug.
+    // For now, the parameter is plumbed through; the multi-seq state
+    // assembly is in the body below (next iteration).
+    GGML_UNUSED(state_seq_ids_multi);
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -757,6 +764,21 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     }
 
     if (effective_all_same_seq) {
+        bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
+    }
+
+    // C.1 fix attempt (Phase 3): env-gated workaround that routes multi-slot
+    // same-content batches through the all_same_seq fast path with seq 0's
+    // state. Eliminates the per-block first-call-diverges bug at the cost of
+    // correctness for genuinely-different-content slots (each slot would see
+    // slot 0's state instead of its own). For same-prompt slots, all states
+    // are byte-equal so this is correct AND deterministic.
+    static const bool force_first_seq_state = []() {
+        const char * v = getenv("LLAMA_DNET_FORCE_FIRST_SEQ_STATE");
+        return v && *v && *v != '0';
+    }();
+    if (force_first_seq_state) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
     }

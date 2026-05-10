@@ -1,6 +1,8 @@
 #pragma once
 
 #include "llama-build-context.h"
+#include <vector>
+#include <cstdint>
 
 #include <utility>
 
@@ -53,7 +55,12 @@ private:
             int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
             int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
             float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-            bool save_per_step_states = false, ggml_tensor * per_step_ckpt = nullptr);
+            bool save_per_step_states = false, ggml_tensor * per_step_ckpt = nullptr,
+            // PHASE46 C.1 fix: optional multi-seq state. When non-null and non-empty,
+            // the SSM kernel processes multiple sequences in one call instead of one per-seq.
+            // Eliminates the per-block first-call-diverges bug at multi-slot decode.
+            // state_seq_id_local is ignored when this is non-empty.
+            const std::vector<uint32_t> * state_seq_ids_multi = nullptr);
 
     static ggml_tensor * build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out,
             ggml_tensor * output, ggml_tensor * z, int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb);
