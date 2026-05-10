@@ -4992,6 +4992,18 @@ static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to batch
 
+    // C.1 fix attempt: env-gated full sched sync at the START of every
+    // llama_decode call. Tests whether cross-llama_decode state leak (when
+    // multiple decode calls fire in rapid succession from concurrent slots)
+    // is the np>1 +mtp +concurrent +same-prompt slot divergence source.
+    static const bool sync_at_decode_start = []() {
+        const char * v = getenv("LLAMA_SYNC_AT_DECODE_START");
+        return v && *v && *v != '0';
+    }();
+    if (sync_at_decode_start) {
+        ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+    }
+
     lctx.is_encoding = false;
     // Stale-pointer guard: t_h_pre_norm is set by the qwen35 / qwen35moe
     // graph builders only on the main forward path. If the next decode
