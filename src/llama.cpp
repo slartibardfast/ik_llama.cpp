@@ -5608,7 +5608,11 @@ static int llama_decode_internal(
                     if (!t || !t->name[0]) continue;
                     if (strncmp(t->name, "l_out_", 6) != 0 &&
                         strncmp(t->name, "attn_out_", 9) != 0 &&
-                        strncmp(t->name, "ffn_out_", 8) != 0) continue;
+                        strncmp(t->name, "ffn_out_", 8) != 0 &&
+                        strncmp(t->name, "kcur_", 5) != 0 &&
+                        strncmp(t->name, "vcur_", 5) != 0 &&
+                        strncmp(t->name, "qaux_", 5) != 0 &&
+                        strncmp(t->name, "knorm_", 6) != 0) continue;
                     const int64_t cols = t->ne[0];  // n_embd
                     const int64_t rows = t->ne[1];  // n_tokens
                     if (cols <= 0 || rows <= 0) continue;

@@ -1882,6 +1882,32 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_con
     ggml_build_forward_expand(gf, Qaux);
     ggml_build_forward_expand(gf, Kcur);
     ggml_build_forward_expand(gf, Vcur);
+
+    // PHASE46 C.1 iter 45: env-gated dump of K_cur and V_cur (just-computed
+    // K and V before cache write/RoPE) for cross-slot comparison.
+    // LLAMA_DUMP_LAYER_HASH=1 same gate.
+    static const bool dump_kv_cur = []() {
+        const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+        return v && *v && *v != '0';
+    }();
+    if (dump_kv_cur) {
+        char nm[40];
+        snprintf(nm, sizeof(nm), "kcur_%02d", il);
+        ggml_tensor * snap_k = ggml_dup(ctx0, Kcur);
+        ggml_set_name(snap_k, nm);
+        ggml_set_output(snap_k);
+        ggml_build_forward_expand(gf, snap_k);
+        snprintf(nm, sizeof(nm), "vcur_%02d", il);
+        ggml_tensor * snap_v = ggml_dup(ctx0, Vcur);
+        ggml_set_name(snap_v, nm);
+        ggml_set_output(snap_v);
+        ggml_build_forward_expand(gf, snap_v);
+        snprintf(nm, sizeof(nm), "qaux_%02d", il);
+        ggml_tensor * snap_q = ggml_dup(ctx0, Qaux);
+        ggml_set_name(snap_q, nm);
+        ggml_set_output(snap_q);
+        ggml_build_forward_expand(gf, snap_q);
+    }
     auto row_size = ggml_row_size(Qaux->type, n_embd_head_k);
     // TODO: check why CUDA performance suffers so much if we don't make these two tensors contiguous
     auto Qcur = ggml_cont(ctx0, ggml_view_3d(ctx0, Qaux, n_embd_head_k, Qaux->ne[0]/(2*n_embd_head_k), n_tokens, 2*row_size, Qaux->nb[1], 0));
@@ -1898,6 +1924,15 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_con
         Kcur = llm_build_norm(ctx0, Kcur, hparams, k_norm, NULL, LLM_NORM_RMS, cb, il);
         cb(Kcur, "Kcur_normed", il);
         ggml_build_forward_expand(gf, Kcur);
+        // PHASE46 C.1 iter 46: dump post-k_norm K
+        if (dump_kv_cur) {
+            char nm[40];
+            snprintf(nm, sizeof(nm), "knorm_%02d", il);
+            ggml_tensor * snap = ggml_dup(ctx0, Kcur);
+            ggml_set_name(snap, nm);
+            ggml_set_output(snap);
+            ggml_build_forward_expand(gf, snap);
+        }
     }
     //gate = ggml_sigmoid(ctx0, gate);
     //gate = ggml_reshape_2d(ctx0, gate, gate->ne[0]*gate->ne[1], gate->ne[2]);
