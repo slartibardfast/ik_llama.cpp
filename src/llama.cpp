@@ -4742,6 +4742,24 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             GGML_ASSERT(slot >= 0 && slot < lctx.default_decoder.qnext_slot_alloc.n_slots);
             data[j] = slot;
         }
+
+        // PHASE46 C.1 step 5: fill the multi-seq mask tensor used by ggml_ssm_conv
+        // when n_state_seqs > 1. mask[k, t] = 1 iff token t belongs to seq slot k.
+        // Skip silently if the graph allocator pruned the tensor (no consumer yet,
+        // or this graph build does not include the path that uses it).
+        if (lctx.default_decoder.inp_s_seq_qnext_multi &&
+            lctx.default_decoder.inp_s_seq_qnext_multi->buffer &&
+            ggml_backend_buffer_is_host(lctx.default_decoder.inp_s_seq_qnext_multi->buffer)) {
+            int32_t * mdata = (int32_t *) lctx.default_decoder.inp_s_seq_qnext_multi->data;
+            const int64_t n_kv = lctx.default_decoder.inp_s_seq_qnext_multi->ne[0];
+            const int64_t nt   = lctx.default_decoder.inp_s_seq_qnext_multi->ne[1];
+            GGML_ASSERT(nt == n_tokens);
+            for (int64_t k = 0; k < n_kv; ++k) {
+                for (int64_t j = 0; j < n_tokens; ++j) {
+                    mdata[k * nt + j] = (data[j] == (int32_t) k) ? 1 : 0;
+                }
+            }
+        }
     }
 
     if (lctx.default_decoder.inp_pos_bucket) {
