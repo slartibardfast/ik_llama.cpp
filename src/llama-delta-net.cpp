@@ -648,6 +648,16 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     }
     output = ggml_add(ctx0, gated_output, input);
     cb(output, "ssm_output", il);
+    // C.1 diagnostic: env-gated set_output of SSM kernel post-gate output for
+    // layer 0 only. Tagged "ssm_out_dump_l0" so walker can find it.
+    static const bool dump_ssm_l0 = []() {
+        const char * v = getenv("LLAMA_DUMP_SSM_L0");
+        return v && *v && *v != '0';
+    }();
+    if (dump_ssm_l0 && il == 0) {
+        ggml_set_name(output, "ssm_out_dump_l0");
+        ggml_set_output(output);
+    }
     return output;
     //return build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
 

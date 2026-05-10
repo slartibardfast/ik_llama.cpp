@@ -5480,6 +5480,45 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
+        // C.1 diagnostic: env-gated dump of ALL ssm_out_dump_l0 tensors in
+        // the graph (multi-block per-slot SSM outputs at layer 0). Each block
+        // call in blocks_loop creates one tensor with this tag. Walker finds
+        // and dumps each — separately. So at multi-slot decode, we get N
+        // dumps per ubatch (N = number of blocks).
+        {
+            static const bool dump_ssm_l0 = []() {
+                const char * v = getenv("LLAMA_DUMP_SSM_L0");
+                return v && *v && *v != '0';
+            }();
+            if (dump_ssm_l0) {
+                ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+                int hit = 0;
+                for (int ni = 0; ni < gf->n_nodes; ++ni) {
+                    const ggml_tensor * t = gf->nodes[ni];
+                    if (!t || !t->name[0]) continue;
+                    if (strcmp(t->name, "ssm_out_dump_l0") != 0) continue;
+                    ++hit;
+                    const int64_t cols = t->ne[0];
+                    const int64_t rows = t->ne[1];
+                    if (cols <= 0 || rows <= 0) continue;
+                    const size_t need = (size_t)(cols * rows);
+                    std::vector<float> tmp(need);
+                    ggml_backend_tensor_get(t, tmp.data(), 0, need * sizeof(float));
+                    fprintf(stderr, "[c1.diag.ssm_l0] hit=%d ne[0]=%lld ne[1]=%lld:",
+                            hit, (long long) cols, (long long) rows);
+                    for (int64_t r = 0; r < rows && r < 4; ++r) {
+                        double l2 = 0.0;
+                        for (int64_t c = 0; c < cols; ++c) {
+                            const float v = tmp[(size_t)r * cols + c];
+                            l2 += (double) v * v;
+                        }
+                        fprintf(stderr, " r%lld=%.6f", (long long) r, sqrt(l2));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
         // C.1 diagnostic: env-gated dump of ONE specific layer's output (per
         // LLAMA_DUMP_LAYER) for finding the first row-asymmetric layer.
         // Tagged "l_out_dump" by build_qwen35.cpp.
