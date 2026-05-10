@@ -5480,6 +5480,42 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
+        // C.1 diagnostic: env-gated dump of ONE specific layer's output (per
+        // LLAMA_DUMP_LAYER) for finding the first row-asymmetric layer.
+        // Tagged "l_out_dump" by build_qwen35.cpp.
+        {
+            static const bool any_layer_dump = []() {
+                const char * v = getenv("LLAMA_DUMP_LAYER");
+                return v && *v;
+            }();
+            if (any_layer_dump) {
+                ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+                for (int ni = 0; ni < gf->n_nodes; ++ni) {
+                    const ggml_tensor * t = gf->nodes[ni];
+                    if (!t || !t->name[0]) continue;
+                    if (strcmp(t->name, "l_out_dump") != 0) continue;
+                    const int64_t cols = t->ne[0];
+                    const int64_t rows = t->ne[1];
+                    if (cols <= 0 || rows <= 0) continue;
+                    const size_t need = (size_t)(cols * rows);
+                    std::vector<float> tmp(need);
+                    ggml_backend_tensor_get(t, tmp.data(), 0, need * sizeof(float));
+                    fprintf(stderr, "[c1.diag.l_out_dump] ne[0]=%lld ne[1]=%lld:",
+                            (long long) cols, (long long) rows);
+                    for (int64_t r = 0; r < rows && r < 24; ++r) {
+                        double l2 = 0.0;
+                        for (int64_t c = 0; c < cols; ++c) {
+                            const float v = tmp[(size_t)r * cols + c];
+                            l2 += (double) v * v;
+                        }
+                        fprintf(stderr, " r%lld=%.6f", (long long) r, sqrt(l2));
+                    }
+                    fprintf(stderr, "\n");
+                    break;
+                }
+            }
+        }
+
         // C.1 diagnostic: env-gated dump of result_norm (lm_head input) per row.
         // Pairs with LLAMA_DUMP_RESULT_NORM in build_qwen35.cpp/build-context.cpp
         // which sets ggml_set_output on the post-final-norm tensor.

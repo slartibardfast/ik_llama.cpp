@@ -191,6 +191,18 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
 
+            // C.1 diagnostic: env-gated set_output of ONE specific layer
+            // (LLAMA_DUMP_LAYER=N). Tagged "l_out_dump" so the post-decode
+            // walker can find it. Memory-safe: only one layer marked.
+            static const int dump_layer_idx = []() {
+                const char * v = getenv("LLAMA_DUMP_LAYER");
+                return (v && *v) ? atoi(v) : -1;
+            }();
+            if (il == dump_layer_idx) {
+                ggml_set_name(cur, "l_out_dump");
+                ggml_set_output(cur);
+            }
+
             inpL = cur;
         }
 
