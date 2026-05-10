@@ -197,12 +197,38 @@ ggml_cgraph * llm_build_context::build_qwen35() {
                         KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
             }
 
+            // PHASE46 C.1 iter 42: sub-layer dump after attention/recurrent
+            // (BEFORE FFN). Same env-gate as l_out_NN. Pinpoints whether
+            // divergence enters in attn vs FFN at the suspect layer.
+            static const bool dump_layer_hash_sub = []() {
+                const char * v = getenv("LLAMA_DUMP_LAYER_HASH");
+                return v && *v && *v != '0';
+            }();
+            if (dump_layer_hash_sub) {
+                char nm[32];
+                snprintf(nm, sizeof(nm), "attn_out_%02d", il);
+                ggml_tensor * snapshot = ggml_dup(ctx0, cur);
+                ggml_set_name(snapshot, nm);
+                ggml_set_output(snapshot);
+                ggml_build_forward_expand(gf, snapshot);
+            }
+
             cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, cur,
                     model.layers[il].ffn_up,   NULL, NULL,
                     model.layers[il].ffn_gate, NULL, NULL,
                     model.layers[il].ffn_down, NULL, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+
+            // PHASE46 C.1 iter 42: post-FFN, pre-cvec dump.
+            if (dump_layer_hash_sub) {
+                char nm[32];
+                snprintf(nm, sizeof(nm), "ffn_out_%02d", il);
+                ggml_tensor * snapshot = ggml_dup(ctx0, cur);
+                ggml_set_name(snapshot, nm);
+                ggml_set_output(snapshot);
+                ggml_build_forward_expand(gf, snapshot);
+            }
 
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);

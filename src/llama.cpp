@@ -5606,7 +5606,9 @@ static int llama_decode_internal(
                 for (int ni = 0; ni < gf->n_nodes; ++ni) {
                     const ggml_tensor * t = gf->nodes[ni];
                     if (!t || !t->name[0]) continue;
-                    if (strncmp(t->name, "l_out_", 6) != 0) continue;
+                    if (strncmp(t->name, "l_out_", 6) != 0 &&
+                        strncmp(t->name, "attn_out_", 9) != 0 &&
+                        strncmp(t->name, "ffn_out_", 8) != 0) continue;
                     const int64_t cols = t->ne[0];  // n_embd
                     const int64_t rows = t->ne[1];  // n_tokens
                     if (cols <= 0 || rows <= 0) continue;
