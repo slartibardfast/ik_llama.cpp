@@ -673,9 +673,9 @@ static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
         const float2 * __restrict__ VKQ_meta,
         float * __restrict__ dst) {
-    VKQ_parts += parallel_blocks*Dv * gridDim.y*blockIdx.x;
-    VKQ_meta  += parallel_blocks    * gridDim.y*blockIdx.x;
-    dst       +=                 Dv * gridDim.y*blockIdx.x;
+    VKQ_parts += blockIdx.z*(gridDim.x*gridDim.y*parallel_blocks*Dv) + parallel_blocks*Dv * gridDim.y*blockIdx.x;
+    VKQ_meta  += blockIdx.z*(gridDim.x*gridDim.y*parallel_blocks)    + parallel_blocks    * gridDim.y*blockIdx.x;
+    dst       += blockIdx.z*(gridDim.x*gridDim.y*Dv)                 +                 Dv * gridDim.y*blockIdx.x;
 
     const int tid = threadIdx.x;
     __builtin_assume(tid < Dv);
