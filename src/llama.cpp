@@ -1349,12 +1349,11 @@ bool llama_kv_cache::checkpoint_alloc_shadows() {
 
         for (auto & entry : entries) {
             // Co-locating shadow with primary lets ggml_backend_tensor_copy operate D2D.
-            // That requires identical sizes, so the prior conv_only_shadow shrink is dropped
-            // — the saved VRAM was modest (the conv portion is a small fraction of the full
-            // recurrent state) and the D2D speedup eliminates the dominant per-checkpoint
-            // PCIe roundtrip in MTP draft loops.
-            const int64_t nelems = (int64_t)ggml_nelements(entry.primary);
-            ggml_tensor * shadow = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelems);
+            // That requires identical sizes AND identical layouts (ggml_backend_tensor_copy
+            // asserts ggml_are_same_layout). Use ggml_dup_tensor instead of ggml_new_tensor_1d
+            // so shadow inherits the primary's shape/strides — matches the split-shadow path
+            // and eliminates the GGML_ASSERT crash in single-GPU + -mtp configurations.
+            ggml_tensor * shadow = ggml_dup_tensor(ctx, entry.primary);
             ggml_format_name(shadow, "shadow_s_l%d", entry.il);
             ckpt.s_l_shadow[entry.il] = shadow;
         }
