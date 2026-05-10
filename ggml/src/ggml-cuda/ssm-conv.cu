@@ -687,6 +687,19 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 nc, nr, n_kv);
         }
 
+        // PHASE46 C.1 L.8.f fix: the three function-scope RAII guards
+        // (fast_path_ok_d, single_ok_d, single_slot_d declared in that order
+        // at lines 631-633) destruct at function end in REVERSE declaration
+        // order: single_slot_d → single_ok_d → fast_path_ok_d. The CUDA pool
+        // is strict LIFO (ggml-cuda.cu:563). For destruction to be valid,
+        // allocation must happen in DECLARATION order so that the reverse-
+        // declaration destruction pops the top of the pool stack correctly.
+        // Allocate fast_path_ok_d first, single_ok_d second, single_slot_d
+        // third (matching declaration order).
+        int32_t fast_path_ok_init = 1;
+        fast_path_ok_d.alloc(1);
+        CUDA_CHECK(cudaMemcpyAsync(fast_path_ok_d.get(), &fast_path_ok_init, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+
         // Phase B: runtime-single-seq detection.
         // Initialise single_ok=1 / single_slot=-1 then scan src3.
         single_ok_d.alloc(1);
@@ -709,13 +722,11 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         // Fast path for multi-sequence decode-like batches:
         // one token per unique sequence, no copy-to-multiple-sequences routing.
+        // (fast_path_ok_d was allocated above to match RAII destruction order.)
         ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
         ggml_cuda_pool_alloc<int32_t> seq_seen(ctx.pool(), n_kv);
-        int32_t fast_path_ok = 1;
-        fast_path_ok_d.alloc(1);
 
         CUDA_CHECK(cudaMemsetAsync(seq_seen.get(), 0, n_kv * sizeof(int32_t), ctx.stream()));
-        CUDA_CHECK(cudaMemcpyAsync(fast_path_ok_d.get(), &fast_path_ok, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
 
         constexpr int seq_map_block_size = 256;
         const dim3 seq_map_grid((n_t + seq_map_block_size - 1) / seq_map_block_size, 1, 1);
