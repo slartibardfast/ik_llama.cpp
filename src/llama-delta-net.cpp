@@ -336,7 +336,27 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 
     state_all = ggml_view_2d(ctx0, state_storage, state_dim, qnext_state_slots, state_row_size, 0);
 
-    ggml_tensor * state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
+    // PHASE46 C.1 fix step 2/4: build state_dst as either a single-row view
+    // (legacy) or a multi-row concat of per-seq views. n_state_seqs reflects
+    // the number of state rows the kernel will process.
+    const bool use_multi_seq = (state_seq_ids_multi != nullptr) && !state_seq_ids_multi->empty();
+    ggml_tensor * state_dst;
+    int64_t n_state_seqs;
+    if (use_multi_seq) {
+        n_state_seqs = (int64_t) state_seq_ids_multi->size();
+        std::vector<ggml_tensor *> views;
+        views.reserve((size_t) n_state_seqs);
+        for (uint32_t sid : *state_seq_ids_multi) {
+            views.push_back(ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, (size_t) sid * state_row_size));
+        }
+        state_dst = views[0];
+        for (size_t i = 1; i < views.size(); ++i) {
+            state_dst = ggml_concat(ctx0, state_dst, views[i], 1);
+        }
+    } else {
+        state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
+        n_state_seqs = 1;
+    }
     ggml_tensor * state_f32 = state_dst;
     if (state_f32->type != GGML_TYPE_F32) {
         state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
@@ -346,12 +366,12 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         cb(state_f32, "state_reset", il);
     }
 
-    ggml_tensor * conv_state_flat = ggml_view_2d(ctx0, state_f32, conv_state_dim, 1, state_f32->nb[1], 0);
-    ggml_tensor * ssm_state_flat  = ggml_view_2d(ctx0, state_f32, ssm_state_dim, 1, state_f32->nb[1],
+    ggml_tensor * conv_state_flat = ggml_view_2d(ctx0, state_f32, conv_state_dim, n_state_seqs, state_f32->nb[1], 0);
+    ggml_tensor * ssm_state_flat  = ggml_view_2d(ctx0, state_f32, ssm_state_dim, n_state_seqs, state_f32->nb[1],
             conv_state_dim * ggml_element_size(state_f32));
 
-    ggml_tensor * conv_states = ggml_reshape_3d(ctx0, conv_state_flat, ssm_d_conv - 1, conv_dim, 1);
-    ggml_tensor * state       = ggml_reshape_4d(ctx0, ssm_state_flat, head_v_dim, head_v_dim, num_v_heads, 1);
+    ggml_tensor * conv_states = ggml_reshape_3d(ctx0, conv_state_flat, ssm_d_conv - 1, conv_dim, n_state_seqs);
+    ggml_tensor * state       = ggml_reshape_4d(ctx0, ssm_state_flat, head_v_dim, head_v_dim, num_v_heads, n_state_seqs);
     cb(conv_states, "conv_states", il);
     cb(state, "state_predelta", il);
     ggml_build_forward_expand(gf, state);
