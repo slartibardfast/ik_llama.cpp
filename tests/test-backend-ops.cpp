@@ -2690,6 +2690,24 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
                 }
             }
         }
+
+        // PHASE5 production-binding: Qwen 3.6 27B has hs=256, nh=24, nh_kv=4
+        // (gqa_ratio=6). MEMORY 2026-05-09 narrowed the multi-slot bug to "FA
+        // mma_f16 row-asymmetric warp reductions at gqa_ratio=6, hs=256,
+        // ne[1]>=2". Earlier hs=128 coverage missed it. Cover both decode
+        // (nb=1) and MTP draft batching (nb=4 = 1 verify + 3 draft tokens).
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+            // Decode-style multi-slot: ne[3]>1 but ne[1]=1.
+            for (int64_t n_batch : {2, 4, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                    /*hs=*/256, /*nh=*/24, /*nh_kv=*/4, /*kv=*/256, /*nb=*/1, n_batch, type_KV));
+            }
+            // MTP-draft-batching style: ne[1]=4 (1 verify + 3 drafts) per slot.
+            for (int64_t n_batch : {2, 3, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_batched_det(
+                    /*hs=*/256, /*nh=*/24, /*nh_kv=*/4, /*kv=*/512, /*nb=*/4, n_batch, type_KV));
+            }
+        }
     }
 
     // these tests are disabled to save execution time, but they can be handy for debugging

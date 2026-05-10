@@ -617,23 +617,46 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
          struct ggml_context * ctx0,
           struct ggml_tensor * w,
           struct ggml_tensor * cur) {
-    struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-    for (auto & it : lctx.lora_adapters) {
-        struct llama_lora_weight * lora = it.first->get_weight(w);
-        if (lora == nullptr) {
-            continue;
+    auto compute_one = [&](struct ggml_tensor * x) -> struct ggml_tensor * {
+        struct ggml_tensor * r = ggml_mul_mat(ctx0, w, x);
+        for (auto & it : lctx.lora_adapters) {
+            struct llama_lora_weight * lora = it.first->get_weight(w);
+            if (lora == nullptr) continue;
+            const float alpha = it.first->alpha;
+            const float rank  = (float) lora->b->ne[0];
+            const float scale = alpha ? it.second * alpha / rank : it.second;
+            struct ggml_tensor * ab = ggml_mul_mat(ctx0, lora->b,
+                ggml_mul_mat(ctx0, lora->a, x));
+            ab = ggml_scale(ctx0, ab, scale);
+            r = ggml_add(ctx0, r, ab);
         }
-        const float alpha = it.first->alpha;
-        const float rank  = (float) lora->b->ne[0];
-        const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        return r;
+    };
+    // PHASE46 C.1 fork-join: when |B|>1 in the matmul input (np>1 batched
+    // ubatch), MMQ / cuBLAS may pick different kernel paths than at |B|==1,
+    // producing FP-different output. Fork into per-token matmul calls
+    // (each with cur_t->ne[1]==1) and concat along the n_tokens axis.
+    // Default-on; gate off via LLAMA_NO_MM_FORK=1.
+    static const bool fork_mm = []() {
+        const char * v = getenv("LLAMA_NO_MM_FORK");
+        return !(v && *v && *v != '0');
+    }();
+    if (cur->ne[1] > 1 && fork_mm) {
+        std::vector<ggml_tensor *> outs((size_t)cur->ne[1]);
+        for (int64_t t = 0; t < cur->ne[1]; ++t) {
+            ggml_tensor * cur_t = ggml_view_4d(ctx0, cur,
+                cur->ne[0], 1, cur->ne[2], cur->ne[3],
+                cur->nb[1], cur->nb[2], cur->nb[3],
+                t * cur->nb[1]);
+            outs[(size_t)t] = compute_one(cur_t);
+        }
+        ggml_tensor * res = outs[0];
+        for (size_t t = 1; t < outs.size(); ++t) {
+            res = ggml_concat(ctx0, res, outs[t], 1);
+        }
+        return res;
     }
-    return res;
+    return compute_one(cur);
 }
 
 ggml_tensor * llm_build_context::llm_build_lora_mm_id(
@@ -1638,6 +1661,14 @@ static ggml_tensor * llm_build_kqv(
             }
             return out;
         };
+        static const bool fa_fork_trace = []() {
+            const char * v = getenv("LLAMA_FA_FORK_TRACE");
+            return v && *v && *v != '0';
+        }();
+        if (fa_fork_trace) {
+            fprintf(stderr, "[fa-fork] llm_build_kqv il=%d n_tokens=%d fork=%d q->ne[1]=%d\n",
+                il, (int)n_tokens, (int)(n_tokens > 1 && fork_fa_per_token), (int)q->ne[1]);
+        }
         if (n_tokens > 1 && fork_fa_per_token) {
             std::vector<ggml_tensor *> outs(n_tokens);
             for (int t = 0; t < n_tokens; ++t) {
