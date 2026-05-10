@@ -4816,6 +4816,18 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     const auto & cparams = lctx.cparams;
     const auto & hparams = lctx.model.hparams;
 
+    // C.1 fix attempt: env-gated full sched sync at the very start of every
+    // llama_output_reserve call (which fires at start of every llama_decode).
+    // Ensures any in-flight async tensor_get from prior call completes
+    // before we potentially memset the embd buffer below.
+    static const bool sync_at_reserve = []() {
+        const char * v = getenv("LLAMA_SYNC_AT_RESERVE");
+        return v && *v && *v != '0';
+    }();
+    if (sync_at_reserve && lctx.default_decoder.sched) {
+        ggml_backend_sched_synchronize(lctx.default_decoder.sched);
+    }
+
     const size_t n_outputs_max = std::max(n_outputs, (size_t) cparams.n_seq_max);
 
     const auto n_batch = cparams.n_batch;
