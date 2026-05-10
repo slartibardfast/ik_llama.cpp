@@ -926,8 +926,12 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
             // Pass cur as 2D (build_qkvz assumes 2D). The multi-seq awareness
             // is plumbed via state_seq_ids_multi; build_qkv reshapes qkv_mixed
             // internally when state_seq_ids_multi is non-empty.
+            // PHASE46 C.1 step 5: pass the (n_seq_max, n_tokens) mask tensor
+            // into the multi-seq SSM dispatch. ggml_ssm_conv asserts
+            // sq->ne[0] == n_kv where n_kv = n_state_seqs > 1, so the legacy
+            // (1, n_tokens) per-token slot-index tensor would not satisfy.
             ggml_tensor * out_multi = build_layer_attn_linear_core(ctx0, gf, cur,
-                lctx.default_decoder.inp_s_seq_qnext, inp_out_ids,
+                lctx.default_decoder.inp_s_seq_qnext_multi, inp_out_ids,
                 state_seq_ids[0], reset_any, il, cb, force_reduce_cast,
                 &state_seq_ids);
             return out_multi;
