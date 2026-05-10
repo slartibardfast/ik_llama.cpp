@@ -2082,6 +2082,18 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         if (output_norm) {
             cur = llm_build_context::llm_build_norm(ctx, cur, lctx.model.hparams, output_norm, NULL, LLM_NORM_RMS, cb, -1);
             cb(cur, "result_norm", -1);
+            // C.1 diagnostic: env-gated set_output of the lm_head input tensor
+            // (post-final-norm hidden state). Used to localize whether the
+            // row-asymmetric lm_head output (observed via DIAG_MTP_LOGITS_HASH)
+            // originates from row-asymmetric INPUT to lm_head, or from the
+            // matmul itself.
+            static const bool dump_result_norm = []() {
+                const char * v = getenv("LLAMA_DUMP_RESULT_NORM");
+                return v && *v && *v != '0';
+            }();
+            if (dump_result_norm) {
+                ggml_set_output(cur);
+            }
         }
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
     }
