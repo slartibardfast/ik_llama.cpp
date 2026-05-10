@@ -4496,6 +4496,51 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
+    // C.1 fix attempt: env-gated per-seq serial dispatch. When set, splits
+    // batch into contiguous-seq sub-batches and dispatches each via its own
+    // llama_decode call. Trades multi-slot batched-decode throughput for
+    // bit-determinism. Use when -mtp + np>1 + same-prompt slot divergence
+    // matters more than throughput.
+    static const bool force_serial_per_seq = []() {
+        const char * v = getenv("LLAMA_FORCE_SERIAL_PER_SEQ");
+        return v && *v && *v != '0';
+    }();
+
+    if (force_serial_per_seq && batch.n_tokens > 1) {
+        // Walk contiguous-same-seq_id runs, dispatch each separately.
+        for (int32_t start = 0; start < batch.n_tokens; ) {
+            int32_t end = start + 1;
+            const llama_seq_id sid_start = (batch.n_seq_id && batch.n_seq_id[start] > 0 && batch.seq_id && batch.seq_id[start])
+                ? batch.seq_id[start][0] : -1;
+            while (end < batch.n_tokens) {
+                const llama_seq_id sid_end = (batch.n_seq_id && batch.n_seq_id[end] > 0 && batch.seq_id && batch.seq_id[end])
+                    ? batch.seq_id[end][0] : -1;
+                if (sid_end != sid_start) break;
+                end++;
+            }
+            const int32_t n_sub = end - start;
+            extend_context(n_sub);
+            llama_batch sub_view = {
+                n_sub,
+                batch.token + start,
+                nullptr,
+                batch.pos + start,
+                batch.n_seq_id + start,
+                batch.seq_id + start,
+                batch.logits + start,
+                0, 0, 0,
+            };
+            const int ret = llama_decode(ctx, sub_view);
+            if (ret != 0) {
+                LOG_ERROR("force-serial-per-seq sub-batch decode failed", {{"ret", ret}, {"start", start}, {"n_sub", n_sub}});
+                // Bail to outer error handling by returning.
+                return;
+            }
+            start = end;
+        }
+        return;  // bypass the chunked path below
+    }
+
     for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
         const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
         extend_context(n_tokens);
