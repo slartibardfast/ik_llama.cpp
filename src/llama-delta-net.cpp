@@ -864,7 +864,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
         const char * v = getenv("LLAMA_FORCE_BLOCKS_LOOP");
         return v && *v && *v != '0';
     }();
-    const bool effective_all_same_seq = all_same_seq && !force_blocks_loop;
+    // PHASE46 C.1 fork/join Tier 1: only take the all_same_seq fast path when
+    // |B|==1 (single token). For |B|>1, force blocks_loop — the fast path
+    // diverges from blocks_loop at |B|>1 and breaks per-slot byte-determinism.
+    const bool effective_all_same_seq = all_same_seq && !force_blocks_loop && cur->ne[1] == 1;
     if (divergence_trace) {
         fprintf(stderr, "[divergence] DeltaNet build_layer_attn_linear il=%d ne[1]=%d path=%s%s\n",
                 il, (int)cur->ne[1], effective_all_same_seq ? "all_same_seq_fast" : "blocks_loop",
