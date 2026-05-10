@@ -1760,6 +1760,69 @@ struct test_flash_attn_ext_batched_det : public test_case {
     }
 };
 
+// PHASE5 fork-join validation: detect batch-dim non-determinism in CUDA matmul.
+//
+// Production hypothesis: at np>1 + MTP, matmul kernel may select different code
+// paths (vec vs MMQ, tile size, split-K) based on n_tokens, producing FP-divergent
+// output across batch positions. We replicate input column 0 across all columns
+// and rely on CPU reference (deterministic GEMM) to detect divergence: if GPU
+// produces non-replicated output, NMSE between deterministic CPU and divergent
+// GPU spikes.
+//
+// F32 src1 only — bypasses the pre-existing f16-src1 / batched-bs assert at
+// ggml-cuda.cu:2009 and isolates batch-dim determinism from quantization noise.
+struct test_mul_mat_batched_det : public test_case {
+    const ggml_type type_a;
+    const int64_t   m;       // output dim (W rows)
+    const int64_t   k;       // input dim  (W cols / X rows)
+    const int64_t   n;       // n_tokens (X cols)
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, k, n);
+    }
+
+    double max_nmse_err() override {
+        // Strict — we want byte-determinism across replicated batch positions.
+        // F32 weights + F32 input have no quantization noise, so any divergence
+        // beyond ~1e-7 indicates batch-dependent kernel behavior.
+        return 1e-6;
+    }
+
+    test_mul_mat_batched_det(ggml_type type_a = GGML_TYPE_F32,
+                              int64_t m = 5120, int64_t k = 5120, int64_t n = 8)
+        : type_a(type_a), m(m), k(k), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a,        k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b_repl");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            const char * nm = ggml_get_name(t);
+            if (!nm) continue;
+            // Replicate input column 0 across all columns: forces batched
+            // matmul to compute identical output per column. CPU reference is
+            // deterministic; any per-column FP divergence in the GPU kernel
+            // surfaces as GPU != CPU mismatch.
+            if (strcmp(nm, "b_repl") == 0 && t->ne[1] > 1) {
+                const size_t bytes_per_col = t->nb[1];
+                std::vector<char> col0(bytes_per_col);
+                ggml_backend_tensor_get(t, col0.data(), 0, bytes_per_col);
+                for (int64_t i = 1; i < t->ne[1]; ++i) {
+                    ggml_backend_tensor_set(t, col0.data(), i * bytes_per_col, bytes_per_col);
+                }
+            }
+        }
+    }
+};
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -2181,6 +2244,22 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
         GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
         GGML_TYPE_BF16,
     };
+
+    // PHASE5 fork-join: matmul batch-determinism (registered first so it runs
+    // before the existing q4_0xf16 batched-bs tests at the same op trigger the
+    // pre-existing ggml-cuda.cu:2009 assert and abort the whole sweep).
+    // F32 weights catch raw kernel divergence; Q4_0/Q8_0 catch dequant +
+    // MMQ-vs-vec dispatch divergence (production 27B uses Q4_0).
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        for (int64_t n : {1, 2, 4, 8, 16}) {
+            // Wq / Wo  : 5120 -> 5120 (square)
+            test_cases.emplace_back(new test_mul_mat_batched_det(type_a, /*m=*/5120, /*k=*/5120, n));
+            // FFN gate/up : 5120 -> 12288
+            test_cases.emplace_back(new test_mul_mat_batched_det(type_a, /*m=*/12288, /*k=*/5120, n));
+            // FFN down    : 12288 -> 5120
+            test_cases.emplace_back(new test_mul_mat_batched_det(type_a, /*m=*/5120, /*k=*/12288, n));
+        }
+    }
 
     // unary ops
     for (int v : {0, 1}) {
