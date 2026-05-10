@@ -177,6 +177,17 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_qkvz(llama_context & lc
     cb(z, "z", il);
     ggml_build_forward_expand(gf, qkv_mixed);
     ggml_build_forward_expand(gf, z);
+    // C.1 debug: print shapes to diagnose multi-seq dispatch crash
+    static int dbg_count = 0;
+    if (dbg_count < 4 && getenv("LLAMA_DNET_MULTI_SEQ")) {
+        fprintf(stderr, "[c1.dbg.qkvz] il=%d input.ne=[%lld,%lld,%lld,%lld] qkv_mixed.ne=[%lld,%lld,%lld,%lld] n_tok=%lld nelems=%lld target=(%lld,%lld,1)\n",
+                il,
+                (long long)input->ne[0], (long long)input->ne[1], (long long)input->ne[2], (long long)input->ne[3],
+                (long long)qkv_mixed->ne[0], (long long)qkv_mixed->ne[1], (long long)qkv_mixed->ne[2], (long long)qkv_mixed->ne[3],
+                (long long)n_tok, (long long)ggml_nelements(qkv_mixed),
+                (long long)qkv_mixed->ne[0], (long long)n_tok);
+        ++dbg_count;
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_tok, 1);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
     return { qkv_mixed, z };
@@ -383,6 +394,14 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     ggml_tensor * ssm_state_flat  = ggml_view_2d(ctx0, state_f32, ssm_state_dim, n_state_seqs, state_f32->nb[1],
             conv_state_dim * ggml_element_size(state_f32));
 
+    // PHASE46 C.1 fix: make views contiguous before reshape. Required when
+    // multi-seq state was assembled via ggml_concat above (state_f32 may be
+    // contiguous but the offset views may have non-natural strides). The cont
+    // is a no-op for already-contiguous tensors.
+    if (n_state_seqs > 1) {
+        conv_state_flat = ggml_cont(ctx0, conv_state_flat);
+        ssm_state_flat  = ggml_cont(ctx0, ssm_state_flat);
+    }
     ggml_tensor * conv_states = ggml_reshape_3d(ctx0, conv_state_flat, ssm_d_conv - 1, conv_dim, n_state_seqs);
     ggml_tensor * state       = ggml_reshape_4d(ctx0, ssm_state_flat, head_v_dim, head_v_dim, num_v_heads, n_state_seqs);
     cb(conv_states, "conv_states", il);
@@ -455,7 +474,8 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states_3d);
         cb(new_conv_states_cont, "new_conv_states_cont_multi", il);
         new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, n_state_seqs);
-        new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, n_state_seqs);
+        // Force contiguous before reshape (new_state may have non-natural strides).
+        new_ssm_flat  = ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), ssm_state_dim, n_state_seqs);
     } else {
         ggml_tensor * new_conv_states = ggml_view_2d(ctx0, conv_output_raw, ssm_d_conv - 1, conv_dim,
                 ssm_d_conv * ggml_element_size(conv_output_raw),
