@@ -5486,8 +5486,21 @@ static int llama_decode_internal(
             // Snapshot+consume the verify-fast-path arming so the caller must
             // re-arm per decode (matches llama_set_draft_input_hidden_state's
             // single-shot semantics).
+            //
+            // C.1 fix: env-gated suppression of consume so the cuda fast-argmax
+            // path fires for ALL ubatches in the same llama_decode call, not
+            // just the first. Without this, the first ubatch uses cuda argmax
+            // and subsequent ubatches use host-side extraction — DIFFERENT
+            // code paths produce slightly different argmax probs, causing
+            // np>1 +mtp +concurrent +same-prompt slot divergence.
+            static const bool fast_argmax_persist = []() {
+                const char * v = getenv("LLAMA_FAST_ARGMAX_PERSIST");
+                return v && *v && *v != '0';
+            }();
             const bool fast_verify_armed = lctx.default_decoder.fast_argmax_for_verify;
-            lctx.default_decoder.fast_argmax_for_verify  = false;
+            if (!fast_argmax_persist) {
+                lctx.default_decoder.fast_argmax_for_verify  = false;
+            }
 
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP &&
@@ -5864,6 +5877,17 @@ static int llama_decode_internal(
             // recurrent state for each new token. This is probably not very relevant in practice because we basically never run TG with
             // empty context, but for the sake of correctness let's just do it.
             lctx.prev.reset();
+        }
+
+        // C.1 fix attempt: env-gated forced full sync between ubatches.
+        // Tests whether the np>1 +mtp +concurrent slot divergence is
+        // caused by cross-ubatch state leak in same llama_decode call.
+        static const bool sync_between_ubatches = []() {
+            const char * v = getenv("LLAMA_SYNC_BETWEEN_UBATCHES");
+            return v && *v && *v != '0';
+        }();
+        if (sync_between_ubatches) {
+            llama_synchronize(&lctx);
         }
     }
 
