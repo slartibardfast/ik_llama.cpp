@@ -21,10 +21,13 @@
 //       return 0;
 //   }
 //
-// One macro per check: DFLASH_REQUIRE(cond, "InvariantName"). On
-// failure the macro prints the sample index, RNG state, and which
-// spec invariant the assertion binds. Returns 1 from main() so
-// CTest registers RED.
+// One macro per check: DFLASH_REQUIRE(cond, <Allium name>) where
+// the second argument is the verbatim string-literal name of an
+// Allium @invariant from dflash.allium (e.g. "FuseProjectionFcWeight",
+// "AnchorPosPreserved"). scripts/check-bindings.py enforces that
+// every cited name is a real Allium invariant — typos and renames
+// fail the CI gate. On failure the macro prints the sample index,
+// the cited invariant name, and the file:line.
 //
 // Coverage policy: every test in tests/dflash-speculative/ that
 // uses random generation MUST cite a spec invariant in each
@@ -32,7 +35,7 @@
 // fuzzing. If you can't name the invariant the check binds, write
 // it as a concrete unit test instead.
 //
-// Spec: yarn-agentic/dflash_speculative.allium
+// Spec: specs/dflash/dflash.allium
 
 #pragma once
 
