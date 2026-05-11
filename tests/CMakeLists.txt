@@ -265,6 +265,9 @@ if (GGML_CUDA)
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
+    # Property-based test: binds spec invariants over randomly
+    # generated inputs. See dflash_properties.h for the framework.
+    llama_build_and_test(dflash-speculative/test-dflash-fc-projection-shape.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
