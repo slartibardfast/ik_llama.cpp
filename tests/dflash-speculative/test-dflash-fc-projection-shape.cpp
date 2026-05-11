@@ -2,7 +2,7 @@
 //
 // Property-based RED test for FuseProjectionFcWeight invariant.
 //
-// Spec: dflash_speculative.allium ProjectAndFuse contract,
+// Spec: specs/dflash/dflash.allium ProjectAndFuse contract,
 // invariant FuseProjectionFcWeight (provenance: vllm
 // qwen3_dflash.py:333-341, :656).
 //

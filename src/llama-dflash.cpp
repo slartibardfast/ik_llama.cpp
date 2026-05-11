@@ -8,8 +8,8 @@
 // tests/dflash-speculative/ bind on the eventual correct return
 // values; today they assert RED.
 //
-// Spec: yarn-agentic/dflash_speculative.allium
-// Design: yarn-agentic/PHASE_DFLASH_DESIGN.md
+// Spec: specs/dflash/dflash.allium
+// Design: specs/dflash/DESIGN.md
 
 #include "llama.h"
 

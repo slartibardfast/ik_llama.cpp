@@ -1,12 +1,12 @@
 // test-dflash-load-block-size.cpp
 //
-// Drives: dflash_speculative.allium @ invariant
+// Drives: specs/dflash/dflash.allium @ invariant
 //         BlockSizeFixedPerDeployment.
 //
 // Property: DraftBlock.block_size is a deployment-time constant
 // read from drafter GGUF metadata (key dflash.block_size). It is
 // stable across queries and cannot be reconfigured mid-session
-// without a fresh context. PHASE_DFLASH_DESIGN.md commits to
+// without a fresh context. specs/dflash/DESIGN.md commits to
 // starting at 8 (small ne[1] verify shape known-deterministic on
 // sm_75) and moving to 16 after Gate-5 binds determinism at the
 // larger shape.

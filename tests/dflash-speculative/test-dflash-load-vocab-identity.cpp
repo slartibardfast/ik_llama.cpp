@@ -1,6 +1,6 @@
 // test-dflash-load-vocab-identity.cpp
 //
-// Drives: dflash_speculative.allium @ invariant DrafterTargetVocabIdentity.
+// Drives: specs/dflash/dflash.allium @ invariant DrafterTargetVocabIdentity.
 //
 // Property: when a DFlash drafter is bound to a target context via
 // llama_set_dflash, the two models must share exact vocabulary —
@@ -23,7 +23,7 @@
 // (stub). Exit 77 (CTest skip) until a real drafter GGUF is
 // converted via convert_hf_to_gguf.py's DFlashModel class.
 //
-// Spec: yarn-agentic/dflash_speculative.allium @ invariant
+// Spec: specs/dflash/dflash.allium @ invariant
 //       DrafterTargetVocabIdentity
 //       SharedEmbedAndLMHead
 

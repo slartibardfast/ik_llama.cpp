@@ -1,6 +1,6 @@
 // test-dflash-symbols.cpp
 //
-// Compile-only RED test for dflash_speculative.allium API surface.
+// Compile-only RED test for specs/dflash/dflash.allium API surface.
 //
 // Drives:
 //   - existence of enum llama_dflash_layer_type {
@@ -22,7 +22,7 @@
 // compiles + links the runtime body returns 0; the per-invariant
 // tests in this bundle then drive behavioural slices.
 //
-// Spec: yarn-agentic/dflash_speculative.allium
+// Spec: specs/dflash/dflash.allium
 
 #include "llama.h"
 

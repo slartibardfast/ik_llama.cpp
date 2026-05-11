@@ -1717,8 +1717,8 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // -----------------------------------------------------------------
     // DFlash speculative decoding API surface (RED-first scaffold).
     //
-    // Spec: yarn-agentic/dflash_speculative.allium
-    // Design: yarn-agentic/PHASE_DFLASH_DESIGN.md
+    // Spec: specs/dflash/dflash.allium
+    // Design: specs/dflash/DESIGN.md
     // Stubs in src/llama-dflash.cpp return LLAMA_DFLASH_NOT_IMPLEMENTED
     // until the implementation lands.
     // -----------------------------------------------------------------

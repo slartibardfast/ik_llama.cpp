@@ -1,6 +1,6 @@
 // test-dflash-load-source-layer-count.cpp
 //
-// Drives: dflash_speculative.allium @ invariant
+// Drives: specs/dflash/dflash.allium @ invariant
 //         SourceLayerCountMatchesDrafterTraining.
 //
 // Property: the count of target source layers the drafter expects

@@ -2,8 +2,8 @@
 
 Behavioural test bundle for the DFlash speculative-decoding workstream.
 
-**Spec:** `yarn-agentic/dflash_speculative.allium`
-**Design:** `yarn-agentic/PHASE_DFLASH_DESIGN.md`
+**Spec:** `specs/dflash/dflash.allium`
+**Design:** `specs/dflash/DESIGN.md`
 **Branch:** `production/2026-q2-next` (yarn-agentic + ik_llama.cpp)
 
 These tests are **RED-first**: the symbol-surface test binds at compile

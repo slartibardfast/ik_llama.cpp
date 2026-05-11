@@ -1,6 +1,6 @@
 // test-dflash-load-dense-qwen3.cpp
 //
-// Drives: dflash_speculative.allium @ invariant DrafterIsDenseQwen3.
+// Drives: specs/dflash/dflash.allium @ invariant DrafterIsDenseQwen3.
 //
 // Property: a DFlash drafter is dense Qwen3 — its per-layer
 // attention type is either FULL_ATTENTION or SLIDING_ATTENTION,
