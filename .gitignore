@@ -143,3 +143,4 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+CMakeFiles/
