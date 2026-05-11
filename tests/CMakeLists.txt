@@ -254,6 +254,17 @@ if (GGML_CUDA)
     llama_build_and_test(mtp-verify-accept/test-accept-progress.cpp)
     llama_build_and_test(mtp-verify-accept/test-accept-probabilistic-rejected.cpp)
     llama_build_and_test(mtp-verify-accept/test-accept-committed-shape.cpp)
+
+    # dflash_speculative.allium — RED-first scaffolding for DFlash
+    # speculative decoding (z-lab/Qwen3.6-27B-DFlash drafter on
+    # Qwen3.6-27B target). See yarn-agentic/dflash_speculative.allium
+    # and PHASE_DFLASH_DESIGN.md. Symbols test binds at compile time;
+    # behavioural tests skip (exit 77) until implementation lands.
+    llama_build_and_test(dflash-speculative/test-dflash-symbols.cpp)
+    llama_build_and_test(dflash-speculative/test-dflash-load-vocab-identity.cpp)
+    llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
+    llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
+    llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW

@@ -46,6 +46,7 @@ add_library(llama
             ../include/llama-spec.h
             llama.cpp
             llama-vocab.cpp
+            llama-dflash.cpp
             llama-grammar.cpp
             llama-sampling.cpp
             llama-mmap.cpp

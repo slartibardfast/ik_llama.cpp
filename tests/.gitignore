@@ -4,3 +4,4 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!dflash-speculative

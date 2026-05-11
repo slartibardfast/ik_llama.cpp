@@ -1714,6 +1714,46 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // assert SingleGraphCompute.
     LLAMA_API int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx);
 
+    // -----------------------------------------------------------------
+    // DFlash speculative decoding API surface (RED-first scaffold).
+    //
+    // Spec: yarn-agentic/dflash_speculative.allium
+    // Design: yarn-agentic/PHASE_DFLASH_DESIGN.md
+    // Stubs in src/llama-dflash.cpp return LLAMA_DFLASH_NOT_IMPLEMENTED
+    // until the implementation lands.
+    // -----------------------------------------------------------------
+
+    enum llama_dflash_layer_type {
+        LLAMA_DFLASH_LAYER_FULL_ATTENTION    = 0,
+        LLAMA_DFLASH_LAYER_SLIDING_ATTENTION = 1,
+    };
+
+    enum llama_dflash_status {
+        LLAMA_DFLASH_OK                  = 0,
+        LLAMA_DFLASH_NOT_IMPLEMENTED     = -1,
+        LLAMA_DFLASH_INVALID_DRAFTER     = -2,
+        LLAMA_DFLASH_VOCAB_MISMATCH      = -3,
+        LLAMA_DFLASH_HYBRID_DRAFTER      = -4,
+        LLAMA_DFLASH_MISSING_METADATA    = -5,
+        LLAMA_DFLASH_MULTIMODAL_PROMPT   = -6,
+    };
+
+    LLAMA_API int32_t llama_set_dflash(
+            struct llama_context * ctx_tgt,
+            struct llama_model   * model_dft);
+
+    LLAMA_API int32_t llama_dflash_n_source_layers(const struct llama_model * model_dft);
+
+    LLAMA_API int32_t llama_dflash_block_size(const struct llama_model * model_dft);
+
+    LLAMA_API llama_token llama_dflash_mask_token_id(const struct llama_model * model_dft);
+
+    LLAMA_API int32_t llama_dflash_swa_window(const struct llama_model * model_dft, int32_t layer_idx);
+
+    LLAMA_API enum llama_dflash_layer_type llama_dflash_layer_type_at(
+            const struct llama_model * model_dft,
+            int32_t                    layer_idx);
+
 #ifdef __cplusplus
 }
 #endif
