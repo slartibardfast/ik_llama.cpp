@@ -630,6 +630,15 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        # DFlash drafter — non-layer tensors emitted at top level of safetensors
+        MODEL_TENSOR.DFLASH_FC: (
+            "fc",                       # z-lab DFlash drafter (DFlashDraftModel)
+        ),
+
+        MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
+            "hidden_norm",              # z-lab DFlash drafter (DFlashDraftModel)
+        ),
     }
 
     # architecture-specific block mappings

@@ -2255,6 +2255,79 @@ class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
 
 
+@Model.register("DFlashDraftModel")
+class DFlashModel(Qwen3Model):
+    """z-lab DFlash speculative drafter (e.g. Qwen3.6-27B-DFlash).
+
+    5-layer Qwen3-shape transformer with sliding-window attention, paired with
+    a target via target_layer_ids. Drafter weights are bf16 in safetensors;
+    cast to fp16 at convert time per kernel-design.md Lock #20.
+
+    Tensor naming in drafter safetensors lacks the `model.` prefix that the
+    standard converter mapping expects (e.g. `layers.0.self_attn.q_proj.weight`
+    instead of `model.layers.0.self_attn.q_proj.weight`). modify_tensors below
+    normalizes this. The drafter has no embed_tokens / lm_head — those are
+    materialized at server init from the target per the Allium invariant
+    SharedEmbedAndLMHead.
+    """
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def set_vocab(self):
+        # Drafter ships no tokenizer; vocab is shared with the target at
+        # server init. Emit nothing here.
+        pass
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        dflash_config = self.hparams.get("dflash_config", {})
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        mask_token_id = dflash_config.get("mask_token_id")
+        block_size = self.hparams.get("block_size")
+        layer_types = self.hparams.get("layer_types")
+
+        # Drafter binding metadata
+        # Pair with the existing production target (Qwen 3.6 27B, arch "qwen35").
+        self.gguf_writer.add_dflash_target_arch("qwen35")
+        # Drafter's hidden_size == target's hidden_size per kernel-design.md §2
+        # cross-model implications. Record target_n_embd for the server's inject
+        # K-proj weight dim check at runtime.
+        self.gguf_writer.add_dflash_target_n_embd(self.hparams["hidden_size"])
+
+        if target_layer_ids is not None:
+            self.gguf_writer.add_dflash_target_layer_ids(target_layer_ids)
+        if mask_token_id is not None:
+            self.gguf_writer.add_dflash_mask_token_id(mask_token_id)
+        if block_size is not None:
+            self.gguf_writer.add_dflash_block_size(block_size)
+        if layer_types is not None:
+            self.gguf_writer.add_dflash_layer_types(layer_types)
+
+        # Drafter has SWA on layers 0..3 (full attention on layer 4); record
+        # the sliding window so the runtime can dispatch the SWA mask path.
+        # Qwen2Model.set_gguf_parameters does not emit this for plain Qwen3.
+        if self.hparams.get("use_sliding_window") and (sw := self.hparams.get("sliding_window")) is not None:
+            self.gguf_writer.add_sliding_window(sw)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Drafter saves tensors without the `model.` prefix that map_tensor_name
+        # expects. Normalize before lookup.
+        if name.startswith("layers."):
+            name = "model." + name
+        elif name == "norm.weight":
+            # Final RMSNorm -> OUTPUT_NORM via the existing "model.norm" mapping.
+            name = "model.norm.weight"
+        # fc.weight and hidden_norm.weight map directly via tensor_mapping.py
+        # entries added for MODEL_TENSOR.DFLASH_FC / DFLASH_HIDDEN_NORM.
+
+        # BF16 -> FP16 cast (kernel-design.md Lock #20). Drafter weights ship
+        # as bf16; kernels operate fp16 at the boundary.
+        if data_torch.dtype == torch.bfloat16:
+            data_torch = data_torch.to(torch.float16)
+
+        return [(self.map_tensor_name(name), data_torch)]
+
+
 @Model.register("Ernie4_5_ForCausalLM", "Ernie4_5ForCausalLM")
 class Ernie4_5Model(Model):
     model_arch = gguf.MODEL_ARCH.ERNIE4_5

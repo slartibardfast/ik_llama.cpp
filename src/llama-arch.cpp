@@ -78,6 +78,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
     { LLM_ARCH_GEMMA4,          "gemma4"       },
+    { LLM_ARCH_DFLASH,          "dflash"       },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -237,6 +238,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_ADAPTER_TYPE,                  "adapter.type"       },
     { LLM_KV_ADAPTER_LORA_ALPHA,            "adapter.lora.alpha" },
+
+    // DFlash speculative drafter
+    { LLM_KV_DFLASH_TARGET_ARCH,            "%s.target_arch"      },
+    { LLM_KV_DFLASH_TARGET_N_EMBD,          "%s.target_n_embd"    },
+    { LLM_KV_DFLASH_TARGET_LAYER_IDS,       "%s.target_layer_ids" },
+    { LLM_KV_DFLASH_BLOCK_SIZE,             "%s.block_size"       },
+    { LLM_KV_DFLASH_MASK_TOKEN_ID,          "%s.mask_token_id"    },
+    { LLM_KV_DFLASH_LAYER_TYPES,            "%s.layer_types"      },
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}

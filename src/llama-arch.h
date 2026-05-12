@@ -77,6 +77,7 @@ enum llm_arch {
     LLM_ARCH_GLM_DSA,
     LLM_ARCH_MISTRAL4,
     LLM_ARCH_GEMMA4,
+    LLM_ARCH_DFLASH,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -230,6 +231,14 @@ enum llm_kv {
 
     LLM_KV_ADAPTER_TYPE,
     LLM_KV_ADAPTER_LORA_ALPHA,
+
+    // DFlash speculative drafter
+    LLM_KV_DFLASH_TARGET_ARCH,
+    LLM_KV_DFLASH_TARGET_N_EMBD,
+    LLM_KV_DFLASH_TARGET_LAYER_IDS,
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_MASK_TOKEN_ID,
+    LLM_KV_DFLASH_LAYER_TYPES,
 };
 
 struct LLM_KV {
@@ -357,6 +366,10 @@ enum llm_tensor {
     LLM_TENSOR_FFN_PRE_NORM_2,             // 105
     LLM_TENSOR_FFN_POST_NORM_1,
     LLM_TENSOR_FFN_POST_NORM_2,
+
+    // DFlash drafter
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
 
     LLM_TENSOR_UNKNOWN,
 };

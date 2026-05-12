@@ -782,6 +782,25 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    # DFlash speculative drafter
+    def add_dflash_target_arch(self, name: str) -> None:
+        self.add_string(Keys.LLM.DFLASH_TARGET_ARCH.format(arch=self.arch), name)
+
+    def add_dflash_target_n_embd(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DFLASH_TARGET_N_EMBD.format(arch=self.arch), value)
+
+    def add_dflash_target_layer_ids(self, ids: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.DFLASH_TARGET_LAYER_IDS.format(arch=self.arch), ids)
+
+    def add_dflash_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DFLASH_BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_dflash_mask_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DFLASH_MASK_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_dflash_layer_types(self, types: Sequence[str]) -> None:
+        self.add_array(Keys.LLM.DFLASH_LAYER_TYPES.format(arch=self.arch), types)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 

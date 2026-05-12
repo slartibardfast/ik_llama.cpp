@@ -94,6 +94,13 @@ class Keys:
         EXPERT_WEIGHTS_NORM               = "{arch}.expert_weights_norm"
         EXPERT_GATING_FUNC                = "{arch}.expert_gating_func"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+        # DFlash speculative drafter — paired-target binding metadata + draft config
+        DFLASH_TARGET_ARCH                = "{arch}.target_arch"
+        DFLASH_TARGET_N_EMBD              = "{arch}.target_n_embd"
+        DFLASH_TARGET_LAYER_IDS           = "{arch}.target_layer_ids"
+        DFLASH_BLOCK_SIZE                 = "{arch}.block_size"
+        DFLASH_MASK_TOKEN_ID              = "{arch}.mask_token_id"
+        DFLASH_LAYER_TYPES                = "{arch}.layer_types"
         POOLING_TYPE                      = "{arch}.pooling_type"
         LOGIT_SCALE                       = "{arch}.logit_scale"
         DECODER_START_TOKEN_ID            = "{arch}.decoder_start_token_id"
@@ -257,6 +264,7 @@ class MODEL_ARCH(IntEnum):
     MINIMAXM2    = auto()
     SMOLLM3      = auto()
     SEED_OSS     = auto()
+    DFLASH       = auto()
 
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
@@ -349,6 +357,8 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM          = auto()   # nextn tensors (glm4moe)
     NEXTN_SHARED_HEAD_HEAD = auto() # nextn tensors (glm4moe)
     NEXTN_SHARED_HEAD_NORM = auto() # nextn tensors (glm4moe)
+    DFLASH_FC              = auto() # DFlash drafter feature projection (concat of source-layer hidden states → drafter hidden_size)
+    DFLASH_HIDDEN_NORM     = auto() # DFlash drafter post-fc RMSNorm
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -406,6 +416,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MINIMAXM2:      "minimax-m2",
     MODEL_ARCH.SMOLLM3:        "smollm3",
     MODEL_ARCH.SEED_OSS:       "seed_oss",
+    MODEL_ARCH.DFLASH:         "dflash",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -500,6 +511,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    # DFlash drafter
+    MODEL_TENSOR.DFLASH_FC:                 "dflash_fc",
+    MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "dflash_hidden_norm",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -1383,6 +1397,25 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
+    ],
+    MODEL_ARCH.DFLASH: [
+        # token_embd and output (lm_head) are intentionally omitted — drafter shares
+        # them with the target per Allium invariant SharedEmbedAndLMHead. They are
+        # materialized at server init (T6) from the target GGUF.
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.DFLASH_FC,
+        MODEL_TENSOR.DFLASH_HIDDEN_NORM,
     ],
     # TODO
 }
