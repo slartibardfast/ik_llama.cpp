@@ -66,6 +66,14 @@ struct llama_cparams {
     int  mtp_fused_n_extend;
     int  worst_graph_tokens;
 
+    // DFlash extract-features hook. Capture residual-stream snapshots at
+    // the K source-layer indices for the DFlash drafter. When
+    // dflash_extract_count > 0, the qwen35 build graph dups the per-layer
+    // residual at each requested index, marks it ggml_set_output, and
+    // stashes the handle on default_decoder.t_dflash_extract[idx].
+    int      dflash_extract_count = 0;
+    int32_t  dflash_extract_layers[16] = {};
+
     enum ggml_type reduce_type;
     enum llama_pooling_type pooling_type;
     enum llama_mtp_op_type mtp_op_type;

@@ -7627,6 +7627,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_DFLASH:
         case LLM_ARCH_PHI2:
         case LLM_ARCH_PHI3:
         case LLM_ARCH_GEMMA:
@@ -9595,6 +9596,85 @@ void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
     ctx->cparams.causal_attn = causal_attn;
+}
+
+// Scheduler eval-callback that copies per-layer residual streams into the
+// decoder's host-side buffers when DFlash extract is configured. The
+// scheduler fires this for every computed node; we match on the
+// per-layer residual name ("l_out-N") produced by the qwen35 graph builder.
+static bool llama_dflash_extract_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    llama_context * ctx = (llama_context *) user_data;
+    if (ctx == nullptr || ctx->cparams.dflash_extract_count == 0) {
+        return false;
+    }
+    // Match name "l_out-<il>" — extract il, find matching configured slot.
+    const char * name = t->name;
+    if (strncmp(name, "l_out-", 6) != 0) {
+        return false;
+    }
+    int il = std::atoi(name + 6);
+    int slot = -1;
+    for (int k = 0; k < ctx->cparams.dflash_extract_count; ++k) {
+        if (ctx->cparams.dflash_extract_layers[k] == il) {
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    if (t->buffer == nullptr) {
+        return true;
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    auto & buf = ctx->default_decoder.dflash_extract_buf[slot];
+    buf.resize(nbytes / sizeof(float));
+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+    ctx->default_decoder.dflash_extract_n[slot] = buf.size();
+    return true;
+}
+
+void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n) {
+    if (n < 0) { n = 0; }
+    if (n > 16) { n = 16; }
+    ctx->cparams.dflash_extract_count = n;
+    for (int32_t i = 0; i < n; ++i) {
+        ctx->cparams.dflash_extract_layers[i] = layer_ids[i];
+    }
+    for (int32_t i = n; i < 16; ++i) {
+        ctx->cparams.dflash_extract_layers[i] = 0;
+    }
+    for (int32_t i = 0; i < 16; ++i) {
+        ctx->default_decoder.dflash_extract_buf[i].clear();
+        ctx->default_decoder.dflash_extract_n[i] = 0;
+    }
+    if (n > 0) {
+        ctx->cparams.cb_eval = llama_dflash_extract_cb_eval;
+        ctx->cparams.cb_eval_user_data = ctx;
+    } else {
+        // Only clear if our callback is the one installed — don't stomp
+        // user-supplied eval callbacks unrelated to DFlash.
+        if (ctx->cparams.cb_eval == llama_dflash_extract_cb_eval) {
+            ctx->cparams.cb_eval = nullptr;
+            ctx->cparams.cb_eval_user_data = nullptr;
+        }
+    }
+}
+
+size_t llama_get_dflash_extract_data(struct llama_context * ctx, int32_t idx, float * dst, size_t max_elements) {
+    if (idx < 0 || idx >= ctx->cparams.dflash_extract_count) {
+        return 0;
+    }
+    const size_t n = ctx->default_decoder.dflash_extract_n[idx];
+    if (n == 0) {
+        return 0;
+    }
+    const size_t to_copy = n < max_elements ? n : max_elements;
+    std::memcpy(dst, ctx->default_decoder.dflash_extract_buf[idx].data(), to_copy * sizeof(float));
+    return to_copy;
 }
 
 struct llama_batch llama_batch_get_one(

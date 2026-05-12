@@ -1089,6 +1089,19 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // DFlash: set the layer indices at which the qwen35 build graph will
+    // snapshot the residual stream during the next decode. n must be in
+    // [0, 16]. Pass n=0 to disable.
+    LLAMA_API void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n);
+
+    // DFlash: copy the residual-stream snapshot for the `idx`-th configured
+    // layer (matching the order passed to llama_set_dflash_extract_layers)
+    // into `dst`. Returns the number of float elements copied; returns 0 if
+    // idx is out of range, no extract is configured, or no graph has run.
+    // The snapshot is row-major [n_embd, n_tokens]; max_elements caps the
+    // write.
+    LLAMA_API size_t llama_get_dflash_extract_data(struct llama_context * ctx, int32_t idx, float * dst, size_t max_elements);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

@@ -74,6 +74,14 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
 
+            // DFlash extract hook: the per-layer residual `cur` is already
+            // named "l_out-<il>" by `cb` above and lives in gf (the next
+            // layer consumes it). Capture happens via cparams.cb_eval —
+            // the scheduler fires that callback for every computed node
+            // and our internal callback (installed by
+            // llama_set_dflash_extract_layers) matches on the layer name
+            // and copies the residual to a host buffer.
+
             inpL = cur;
         }
 
@@ -183,6 +191,10 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
+
+            // DFlash extract hook: see build_qwen35moe() for the rationale.
+            // Capture is via cparams.cb_eval matched on the "l_out-<il>"
+            // tensor name `cb` just assigned.
 
             inpL = cur;
         }

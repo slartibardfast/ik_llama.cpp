@@ -147,6 +147,13 @@ struct llama_decoder {
     // forward graph (qwen35 / qwen35moe + cparams.mtp).
     struct ggml_tensor * t_h_pre_norm = nullptr;
 
+    // DFlash per-layer residual snapshots. Populated by the eval-callback
+    // installed when cparams.dflash_extract_count > 0; each slot matches
+    // the index in cparams.dflash_extract_layers. n_elements is the
+    // contiguous float count actually written for the last decode.
+    std::vector<float> dflash_extract_buf[16];
+    size_t             dflash_extract_n[16] = {};
+
     // PHASE45 D9.6f: PHASE36 Step 1 fused multi-draft cgraph counters.
     int32_t mtp_fused_last_compute_count = 0;
 
