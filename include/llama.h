@@ -449,6 +449,9 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool is_drafter;       // PHASE46.md S1.T1.5: load as a paired drafter (e.g. DFlash). Bypasses
+                               // the loader-pair contract check (T1.3) and skips vocab/tokenizer load
+                               // — the caller has committed to pairing this model with a target at use.
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

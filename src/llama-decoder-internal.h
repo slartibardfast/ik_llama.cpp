@@ -105,6 +105,11 @@ struct llama_decoder {
     struct ggml_tensor * inp_s_seq_qnext = nullptr; // I32 [1, n_batch]
     struct ggml_tensor * inp_pos_bucket    = nullptr; // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_KQ_mask_cross = nullptr; // F32 [n_outputs_enc, n_batch]
+
+    // PHASE46 S1.T1.4: DFlash drafter input. F32 [n_target_pickoffs * n_embd, n_batch].
+    // Populated externally (by spec-loop or harness) with the concat of target
+    // hidden states at hparams.dflash.target_layer_ids before graph compute.
+    struct ggml_tensor * inp_dflash_target_hidden = nullptr;
     struct ggml_tensor * inp_scale         = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states    = nullptr;
 

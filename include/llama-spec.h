@@ -111,6 +111,28 @@ extern "C" {
             int32_t                             drafts_out_stride,
             llama_spec_mtp_slot_out           * outs);
 
+    // PHASE46 S1.T1.5: standalone forward over the DFlash drafter graph.
+    //
+    // Caller provides pre-stacked target hidden states (concat over the
+    // 5 target_layer_ids, each layer's residual at hidden_size; row-major
+    // [n_tokens, n_target_pickoffs * n_embd] = [n_tokens, 25600] for the
+    // production Qwen 3.6 27B / DFlash drafter pair). Drafter graph runs
+    // through fc + hidden_norm + 5 sliding/full blocks + output_norm and
+    // returns hidden states [n_tokens, n_embd] in row-major fp32.
+    //
+    // The drafter has no lm_head; logit projection happens in the
+    // spec-loop layer (S2.T2.5) by applying the TARGET model's
+    // output.weight to these hidden states.
+    //
+    // Requires ctx loaded with `llama_model_params::is_drafter = true`.
+    // Returns 0 on success; -1 on shape / capacity / arch mismatch.
+    LLAMA_API int32_t llama_dflash_drafter_forward(
+            struct llama_context * ctx,
+            const float          * target_hidden_data,
+            int32_t                n_tokens,
+            float                * out_hidden_data,
+            size_t                 out_capacity_floats);
+
 #ifdef __cplusplus
 }
 #endif

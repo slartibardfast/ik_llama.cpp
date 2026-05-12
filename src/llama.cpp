@@ -18,6 +18,7 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-quantize.h"
+#include "llama-spec.h"
 
 #include "unicode.h"
 
@@ -2378,7 +2379,16 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: nextn_predict_layers = %d\n",     __func__, hparams.nextn_predict_layers);
     }
 
-    vocab.print_info();
+    // PHASE46 S1.T1.5: vocab.print_info() reads default special_*_id values
+    // (e.g. special_bos_id defaults to 1) and indexes into id_to_token even
+    // when vocab was never loaded — for drafter mode (no tokenizer in GGUF)
+    // that triggers std::out_of_range. Skip when the vocab is empty.
+    // (vocab.get_type() defaults to LLAMA_VOCAB_TYPE_SPM, so the previous
+    // type-based check didn't fire; n_tokens() is the reliable empty-vocab
+    // signal.)
+    if (vocab.n_tokens() > 0) {
+        vocab.print_info();
+    }
 
 }
 
@@ -3929,13 +3939,15 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         // tokenizer, no embed_tokens, and no lm_head — all three are
         // delegated to a paired target model that MUST be loaded alongside.
         //
-        // T1.3 enforces this by refusing standalone load. Later phases that
-        // wire up the spec-loop dispatch (S3.T3.1+) will introduce an
-        // explicit "loaded as drafter" path that bypasses this check.
+        // T1.3 enforces this by refusing standalone load unless the caller
+        // has explicitly committed to pairing via `params.is_drafter = true`
+        // (PHASE46 S1.T1.5). The spec-loop integration (S3.T3.1+) and the
+        // standalone forward harness (`examples/dflash-drafter-forward`)
+        // both set is_drafter.
         //
         // Error message MUST match scripts/dflash_drafter_to_gguf.py
         // docstring's documented loader-contract text.
-        if (model.arch == LLM_ARCH_DFLASH_DRAFTER) {
+        if (model.arch == LLM_ARCH_DFLASH_DRAFTER && !params.is_drafter) {
             throw std::runtime_error(
                 "dflash_drafter GGUF requires a paired target model. "
                 "The drafter has no tokenizer / embed_tokens / lm_head "
@@ -3945,7 +3957,11 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         }
 
         try {
-            llm_load_hparams(ml, model);
+            // PHASE46 S1.T1.5: drafter has no tokenizer keys (LLM_KV_TOKENIZER_LIST
+            // absent). Pass ignore_vocab=true so the n_vocab fallback path
+            // doesn't throw on the missing array; the value comes from
+            // <arch>.vocab_size which the converter emits.
+            llm_load_hparams(ml, model, /*ignore_vocab=*/ params.is_drafter);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
@@ -3956,16 +3972,22 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             LLAMA_LOG_WARN("%s: deferred expert loading is only supported on Linux; ignoring defer_experts\n", __func__);
 #endif
         }
-        try {
-            LLM_KV kv(model.arch);
-            model.vocab.load(ml, kv);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+        // PHASE46 S1.T1.5 — drafter mode skips tokenizer/vocab load. The
+        // drafter GGUF carries no tokenizer keys (by design); attempting
+        // vocab load would throw. Caller takes responsibility for pairing.
+        if (!params.is_drafter) {
+            try {
+                LLM_KV kv(model.arch);
+                model.vocab.load(ml, kv);
+            } catch(const std::exception & e) {
+                throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+            }
         }
 
         llm_load_print_meta(ml, model);
 
-        if (model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
+        if (!params.is_drafter &&
+            model.vocab.get_type() != LLAMA_VOCAB_TYPE_NONE &&
             model.hparams.n_vocab != model.vocab.n_tokens()) {
             throw std::runtime_error("vocab size mismatch");
         }
@@ -6619,6 +6641,7 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.is_drafter                  =*/ false,
     };
 
 #ifdef GGML_USE_METAL
@@ -9727,6 +9750,148 @@ int32_t llama_decode(
 
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
     ctx->set_mtp_op_type(mtp_op_type);
+}
+
+// PHASE46 S1.T1.5: standalone forward over the DFlash drafter graph.
+// Bypasses llama_decode (which assumes token/embd inputs); builds and
+// computes the drafter graph directly, populating the
+// inp_dflash_target_hidden tensor with caller-provided hidden states.
+int32_t llama_dflash_drafter_forward(
+        struct llama_context * ctx,
+        const float          * target_hidden_data,
+        int32_t                n_tokens,
+        float                * out_hidden_data,
+        size_t                 out_capacity_floats) {
+    if (!ctx || !target_hidden_data || !out_hidden_data || n_tokens <= 0) {
+        return -1;
+    }
+    auto & lctx = *ctx;
+    if (lctx.model.arch != LLM_ARCH_DFLASH_DRAFTER) {
+        LLAMA_LOG_ERROR("%s: ctx model.arch is not LLM_ARCH_DFLASH_DRAFTER\n", __func__);
+        return -1;
+    }
+    const auto & hparams = lctx.model.hparams;
+    const int64_t n_embd = hparams.n_embd;
+
+    // Synthesize a batch with NEITHER token nor embd set. The drafter
+    // graph builder uses its own inp_dflash_target_hidden (allocated by
+    // build_dflash_drafter, populated below). llama_set_inputs gates
+    // inp_tokens / inp_embd population on batch.token / batch.embd, so
+    // leaving both null avoids writing into tensors the drafter graph
+    // doesn't allocate.
+    std::vector<llama_pos>     pos(n_tokens);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        pos[i] = i;
+    }
+    std::vector<int32_t>          n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id *>   seq_id_arr(n_tokens);
+    std::vector<llama_seq_id>     seq_ids(n_tokens, 0);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        seq_id_arr[i] = &seq_ids[i];
+    }
+    std::vector<int8_t> logits_flag(n_tokens, 0);
+    logits_flag[n_tokens - 1] = 1;
+
+    llama_batch batch = {};
+    batch.n_tokens    = n_tokens;
+    batch.token       = nullptr;
+    batch.embd        = nullptr;
+    batch.pos         = pos.data();
+    batch.n_seq_id    = n_seq_id.data();
+    batch.seq_id      = seq_id_arr.data();
+    batch.logits      = logits_flag.data();
+    batch.all_pos_0   = 0;
+    batch.all_pos_1   = 1;
+    batch.all_seq_id  = 0;
+
+    lctx.reset_scheduler();
+
+    ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch, false);
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: graph build failed\n", __func__);
+        return -1;
+    }
+
+    if (!ggml_backend_sched_alloc_graph(lctx.default_decoder.sched, gf)) {
+        LLAMA_LOG_ERROR("%s: scheduler allocation failed\n", __func__);
+        return -1;
+    }
+
+    // Custom minimal input population (skips llama_set_inputs, which
+    // asserts inp_out_ids and would also try to write batch.token/embd
+    // into never-allocated tensors). The drafter graph only reads:
+    //   inp_pos                       (RoPE positions)
+    //   inp_KQ_mask / inp_KQ_mask_swa (causal + SWA masks)
+    //   inp_dflash_target_hidden      (caller-provided hidden states)
+    auto & dec = lctx.default_decoder;
+
+    // Positions 0..n_tokens-1.
+    if (dec.inp_pos) {
+        std::vector<int32_t> pos_data(n_tokens);
+        for (int i = 0; i < n_tokens; ++i) {
+            pos_data[i] = i;
+        }
+        ggml_backend_tensor_set(
+            dec.inp_pos, pos_data.data(), 0,
+            std::min((size_t) n_tokens * sizeof(int32_t),
+                     (size_t) ggml_nbytes(dec.inp_pos)));
+    }
+
+    // KQ masks: zero-fill = "every token can attend to every position."
+    // The drafter graph compiles attention over a fresh KV slot at offset 0
+    // (cparams init); the zero-input verification does not require causal
+    // correctness in the mask (T1.6 will provide real masks via the
+    // spec-loop layer once that lands).
+    auto fill_mask_zero = [](ggml_tensor * t) {
+        if (!t) return;
+        const size_t bytes = ggml_nbytes(t);
+        std::vector<uint8_t> zeros(bytes, 0);
+        ggml_backend_tensor_set(t, zeros.data(), 0, bytes);
+    };
+    fill_mask_zero(dec.inp_KQ_mask);
+    fill_mask_zero(dec.inp_KQ_mask_swa);
+
+    // DFlash custom input: the (n_fc_in, n_tokens) hidden-state buffer.
+    if (!dec.inp_dflash_target_hidden) {
+        LLAMA_LOG_ERROR("%s: inp_dflash_target_hidden not set by graph builder\n", __func__);
+        return -1;
+    }
+    const size_t inp_bytes = ggml_nbytes(dec.inp_dflash_target_hidden);
+    ggml_backend_tensor_set(dec.inp_dflash_target_hidden,
+                            target_hidden_data, 0, inp_bytes);
+
+    // Compute.
+    llama_graph_compute(lctx, gf, (int) lctx.cparams.n_threads);
+
+    // Read output: result_output is the post-output_norm tensor, shape
+    // (n_embd, n_tokens) row-major (dim0 fastest = n_embd).
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "result_output");
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: no tensor named result_output in graph\n", __func__);
+        return -1;
+    }
+    const size_t out_bytes = ggml_nbytes(out);
+    if (out_capacity_floats * sizeof(float) < out_bytes) {
+        LLAMA_LOG_ERROR("%s: out capacity %zu floats < required %zu bytes\n",
+                        __func__, out_capacity_floats, out_bytes);
+        return -1;
+    }
+    // Resolve the backend that owns the output tensor (might be CUDA),
+    // then issue an async-get + sync. Using bare ggml_backend_tensor_get
+    // can return stale buffer contents if the tensor's owning backend
+    // hasn't flushed yet — surfaced in T1.5 testing as inp_pos data
+    // bleeding through into the readback.
+    ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(
+        lctx.default_decoder.sched, out);
+    if (!out_backend) {
+        LLAMA_LOG_ERROR("%s: no backend resolved for result_output tensor\n", __func__);
+        return -1;
+    }
+    ggml_backend_tensor_get_async(out_backend, out, out_hidden_data, 0, out_bytes);
+    ggml_backend_synchronize(out_backend);
+
+    GGML_UNUSED(n_embd);
+    return 0;
 }
 
 struct ggml_tensor * llama_main_graph_h_pre_norm(struct llama_context * ctx) {
