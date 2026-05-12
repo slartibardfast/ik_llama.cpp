@@ -216,6 +216,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen35();
 
+    ggml_cgraph * build_dflash_drafter();
+
     ggml_cgraph * build_phi2();
 
     ggml_cgraph * build_phi3();

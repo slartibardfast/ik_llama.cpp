@@ -146,6 +146,20 @@ struct llama_hparams {
     std::array<float, LLAMA_MAX_LAYERS> swiglu_limits;
     std::array<float, LLAMA_MAX_LAYERS> swiglu_limits_shared;
 
+    // LLM_ARCH_DFLASH_DRAFTER specifics — see PHASE46.md S1.T1.2.
+    // (oversized array to keep llama_hparams trivially-copyable; the
+    // active prefix is the first `num_target_pickoffs` entries.
+    // Types are uint32_t to match the existing get_key / get_arr
+    // template instantiations used by other arch-specific KV in this
+    // struct; cast to llama_token at point of use as needed.)
+    struct {
+        uint32_t block_size            = 0;   // diffusion block size
+        uint32_t mask_token_id         = 0;   // mask token in target vocab
+        uint32_t num_target_layers     = 0;   // target's full n_layer
+        uint32_t num_target_pickoffs   = 0;   // length of target_layer_ids prefix
+        std::array<uint32_t, LLAMA_MAX_LAYERS> target_layer_ids;
+    } dflash;
+
     bool operator!=(const llama_hparams & other) const {
         if (this->vocab_only    != other.vocab_only)    return true;
         if (this->n_vocab       != other.n_vocab)       return true;

@@ -2281,6 +2281,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_qwen35();
             } break;
+        case LLM_ARCH_DFLASH_DRAFTER:
+            {
+                result = llm.build_dflash_drafter();
+            } break;
         case LLM_ARCH_QWEN3VL:
             {
                 result = llm.build_qwen3vl();

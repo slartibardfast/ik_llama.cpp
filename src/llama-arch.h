@@ -77,6 +77,7 @@ enum llm_arch {
     LLM_ARCH_GLM_DSA,
     LLM_ARCH_MISTRAL4,
     LLM_ARCH_GEMMA4,
+    LLM_ARCH_DFLASH_DRAFTER,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -230,6 +231,12 @@ enum llm_kv {
 
     LLM_KV_ADAPTER_TYPE,
     LLM_KV_ADAPTER_LORA_ALPHA,
+
+    // DFlash drafter (LLM_ARCH_DFLASH_DRAFTER) — see PHASE46.md S1.T1.2.
+    LLM_KV_DFLASH_BLOCK_SIZE,         // diffusion block size (default 16)
+    LLM_KV_DFLASH_MASK_TOKEN_ID,      // mask token id in the target's vocab
+    LLM_KV_DFLASH_TARGET_LAYER_IDS,   // uint32 array, target layer indices to pick off
+    LLM_KV_DFLASH_NUM_TARGET_LAYERS,  // target's total n_layer (sanity check)
 };
 
 struct LLM_KV {
@@ -357,6 +364,16 @@ enum llm_tensor {
     LLM_TENSOR_FFN_PRE_NORM_2,             // 105
     LLM_TENSOR_FFN_POST_NORM_1,
     LLM_TENSOR_FFN_POST_NORM_2,
+
+    // DFlash drafter: trunk-level surfaces (NOT per-block).
+    // dflash.fc.weight        (hidden, num_target_pickoffs * hidden)
+    //   Fuses concatenated target hidden states (5 layers × hidden_size)
+    //   back down to a single hidden_size vector before the drafter
+    //   trunk. See PHASE46.md S1.T1.4.
+    // dflash.hidden_norm.weight (hidden,)
+    //   RMSNorm applied to the post-fc fused input, before block 0.
+    LLM_TENSOR_DFLASH_FC,
+    LLM_TENSOR_DFLASH_HIDDEN_NORM,
 
     LLM_TENSOR_UNKNOWN,
 };

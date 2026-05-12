@@ -79,6 +79,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_qwen35_tensors(const LLM_TN & tn);
 
+    bool create_dflash_drafter_tensors(const LLM_TN & tn);
+
     bool create_phi2_tensors(const LLM_TN & tn);
 
     bool create_phi3_tensors(const LLM_TN & tn);
@@ -1349,6 +1351,54 @@ bool create_tensors_helper::create_qwen3_tensors(const LLM_TN & tn) {
     for (int i = 0; i < n_layer; ++i) {
         ggml_context * ctx_split = ctx_for_layer_split(i);
 
+        auto & layer = model.layers[i];
+
+        layer.attn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+
+        use_mmap_buffer &= !merge_qkv(tn, i, 0);
+
+        layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd});
+
+        layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k});
+        layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k});
+
+        layer.ffn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+        create_std_ffn(i, tn, layer, n_ff, n_embd, ctx_split);
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_dflash_drafter_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+    // The drafter has NO token_embd and NO output (lm_head): both are
+    // delegated to the paired target model at runtime. See PHASE46.md
+    // S1.T1.3 (loader-pair contract) and scripts/dflash_drafter_to_gguf.py
+    // for the load-time enforcement.
+
+    // Trunk surfaces.
+    //
+    // dflash.fc is the multi-layer hidden-state fusion: it takes the
+    // concatenation of the target model's hidden states at
+    // `target_layer_ids` (default 5 layers × n_embd) and projects back
+    // down to a single n_embd vector. Sourced from
+    // `hparams.dflash.num_target_pickoffs` parsed at hparams load time
+    // (PHASE46.md S1.T1.2).
+    const int64_t n_target_pickoffs = hparams.dflash.num_target_pickoffs;
+    GGML_ASSERT(n_target_pickoffs > 0 &&
+                "DFlash drafter: num_target_pickoffs must be >0 (check KV "
+                "dflash_drafter.target_layer_ids in GGUF)");
+    const int64_t n_fc_in = n_target_pickoffs * n_embd;
+
+    model.dflash_fc = create_tensor(
+        ctx_output, tn(LLM_TENSOR_DFLASH_FC, "weight"), {n_fc_in, n_embd});
+    model.dflash_hidden_norm = create_tensor(
+        ctx_output, tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd});
+    model.output_norm = create_tensor(
+        ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+
+    // Per-layer surfaces (Qwen3 layout: GQA + per-head q/k_norm + SwiGLU MLP).
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_split = ctx_for_layer_split(i);
         auto & layer = model.layers[i];
 
         layer.attn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
@@ -4051,6 +4101,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_qwen35moe_tensors(tn); break;
         case LLM_ARCH_QWEN35:
             use_mmap_buffer = create_qwen35_tensors(tn); break;
+        case LLM_ARCH_DFLASH_DRAFTER:
+            use_mmap_buffer = create_dflash_drafter_tensors(tn); break;
         case LLM_ARCH_PHI2:
             use_mmap_buffer = create_phi2_tensors(tn); break;
         case LLM_ARCH_PHI3:

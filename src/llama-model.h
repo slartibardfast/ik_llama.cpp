@@ -411,6 +411,13 @@ struct llama_model {
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
 
+    // LLM_ARCH_DFLASH_DRAFTER trunk surfaces. See PHASE46.md S1.T1.4.
+    // - dflash_fc:          (n_target_pickoffs * n_embd, n_embd) — concat → fuse
+    // - dflash_hidden_norm: (n_embd,)                            — post-fc RMSNorm
+    // Set non-null only for drafter loads; NULL for target / non-DFlash archs.
+    struct ggml_tensor * dflash_fc = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+
     llama_split_tensor split_output;
     llama_split_tensor split_output_norm;
 

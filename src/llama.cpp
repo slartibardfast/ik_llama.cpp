@@ -3922,6 +3922,28 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
         }
+
+        // PHASE46 S1.T1.3 — loader-pair contract for DFlash drafter.
+        //
+        // The DFlash drafter GGUF is NOT a standalone model. It carries no
+        // tokenizer, no embed_tokens, and no lm_head — all three are
+        // delegated to a paired target model that MUST be loaded alongside.
+        //
+        // T1.3 enforces this by refusing standalone load. Later phases that
+        // wire up the spec-loop dispatch (S3.T3.1+) will introduce an
+        // explicit "loaded as drafter" path that bypasses this check.
+        //
+        // Error message MUST match scripts/dflash_drafter_to_gguf.py
+        // docstring's documented loader-contract text.
+        if (model.arch == LLM_ARCH_DFLASH_DRAFTER) {
+            throw std::runtime_error(
+                "dflash_drafter GGUF requires a paired target model. "
+                "The drafter has no tokenizer / embed_tokens / lm_head "
+                "of its own — these are delegated to the target. "
+                "Pass --target-model <path/to/qwen3.6-27b.gguf> alongside."
+            );
+        }
+
         try {
             llm_load_hparams(ml, model);
         } catch(const std::exception & e) {
@@ -7645,6 +7667,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_DFLASH_DRAFTER:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

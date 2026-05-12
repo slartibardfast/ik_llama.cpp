@@ -1384,6 +1384,35 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_full);
                 }
             } break;
+        case LLM_ARCH_DFLASH_DRAFTER:
+            {
+                // Standard Qwen3-shape hparams (rms-norm eps, pooling, etc.)
+                ml.get_key(LLM_KV_POOLING_TYPE, hparams.pooling_type, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // Sliding window: scalar + per-layer pattern (True=SWA, False=full).
+                // Matches the convention emitted by scripts/dflash_drafter_to_gguf.py
+                // via gguf-py add_sliding_window + add_sliding_window_pattern(bool[]).
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
+                                  hparams.swa_layers, hparams.n_layer);
+
+                // DFlash-specific KV.
+                ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,        hparams.dflash.block_size);
+                ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID,     hparams.dflash.mask_token_id);
+                ml.get_key(LLM_KV_DFLASH_NUM_TARGET_LAYERS, hparams.dflash.num_target_layers);
+
+                // target_layer_ids is a uint32 array; read length first via
+                // get_arr_n, then values via get_key_or_arr (these template
+                // instantiations are pre-emitted in llama-model-loader.cpp;
+                // raw `get_arr<std::array<uint32_t,N>>` is not).
+                ml.get_arr_n(LLM_KV_DFLASH_TARGET_LAYER_IDS, hparams.dflash.num_target_pickoffs);
+                ml.get_key_or_arr(LLM_KV_DFLASH_TARGET_LAYER_IDS,
+                                  hparams.dflash.target_layer_ids,
+                                  hparams.dflash.num_target_pickoffs);
+
+                model.type = e_model::MODEL_UNKNOWN; // size class — drafter is sui generis
+            } break;
         default: (void)0;
     }
 
