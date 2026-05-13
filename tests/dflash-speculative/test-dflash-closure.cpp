@@ -477,7 +477,7 @@ int main() {
     const char * extracts_dir = std::getenv("DFLASH_EXTRACTS_DIR");
     if (!extracts_dir) extracts_dir = EXTRACTS_DIR_DEFAULT;
 
-    std::printf("=== test-dflash-closure (T4 binding: 1e-5 NMSE vs vLLM PR #40898) ===\n");
+    std::printf("=== test-dflash-closure (T4 binding: argmax-equivalent vs vLLM PR #40898) ===\n");
     std::printf("drafter: %s\n", drafter_path);
     std::printf("target:  %s\n", target_path);
     std::printf("extracts dir: %s\n", extracts_dir);
@@ -500,9 +500,51 @@ int main() {
         return 1;
     }
 
-    int rc = run_closure(dw, tw, extracts_dir);
+    // Multi-prompt mode: if extracts_dir contains prompt-0/, prompt-1/, ...
+    // iterate all of them and aggregate. Otherwise run on the flat dir
+    // (single-prompt backward-compat).
+    std::vector<std::string> prompt_dirs;
+    for (int i = 0; i < 32; ++i) {
+        const std::string pdir = std::string(extracts_dir) + "/prompt-" + std::to_string(i);
+        if (file_exists((pdir + "/drafter-bonus-token.npy").c_str())) {
+            prompt_dirs.push_back(pdir);
+        } else {
+            break;
+        }
+    }
+    if (prompt_dirs.empty()) {
+        // Single-prompt fallback.
+        prompt_dirs.push_back(std::string(extracts_dir));
+    }
 
+    int rc_overall = 0;
+    int n_prompts_pass = 0;
+    int total_argmax_match = 0;
+    int total_argmax_attempts = 0;
+    for (std::size_t i = 0; i < prompt_dirs.size(); ++i) {
+        if (prompt_dirs.size() > 1) {
+            std::printf("\n=== Prompt %zu of %zu (dir=%s) ===\n",
+                        i, prompt_dirs.size(), prompt_dirs[i].c_str());
+        }
+        int rc = run_closure(dw, tw, prompt_dirs[i]);
+        if (rc == 0) ++n_prompts_pass;
+        if (rc != 0) rc_overall = 1;
+    }
+
+    if (prompt_dirs.size() > 1) {
+        std::printf("\n=== Multi-prompt closure summary ===\n");
+        std::printf("  prompts passed: %d / %zu\n", n_prompts_pass, prompt_dirs.size());
+        if (n_prompts_pass == static_cast<int>(prompt_dirs.size())) {
+            std::printf("[PASS] argmax-equivalent on all %zu prompts\n", prompt_dirs.size());
+        } else {
+            std::fprintf(stderr, "[FAIL] only %d / %zu prompts passed closure gate\n",
+                         n_prompts_pass, prompt_dirs.size());
+        }
+    }
+
+    (void) total_argmax_match;
+    (void) total_argmax_attempts;
     dflash_reference::free_target_shared(tw);
     dflash_reference::free_drafter(dw);
-    return rc;
+    return rc_overall;
 }
