@@ -268,6 +268,23 @@ if (GGML_CUDA)
     # Property-based test: binds spec invariants over randomly
     # generated inputs. See dflash_properties.h for the framework.
     llama_build_and_test(dflash-speculative/test-dflash-fc-projection-shape.cpp)
+
+    # DFlash CUDA kernel unit tests — built only when the sm_75 DFlash
+    # kernel set is enabled. Each test exercises a kernel's fused output
+    # against a scalar fp32 reference. SKIPs (exit 77) until the
+    # corresponding kernel body lands.
+    if (GGML_CUDA_DFLASH)
+        # CUDAToolkit's imported targets created in ggml/src are scoped
+        # to that sibling subdirectory; re-find here so CUDA::cudart and
+        # CUDAToolkit_INCLUDE_DIRS are visible in tests/.
+        find_package(CUDAToolkit REQUIRED)
+
+        llama_build_and_test(dflash-speculative/test-dflash-combine-features.cpp)
+        target_include_directories(test-dflash-combine-features PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-dflash-combine-features PRIVATE CUDA::cudart)
+    endif()
 endif()
 
 # llama_target_and_test(test-opt.cpp) # SLOW
