@@ -117,6 +117,178 @@ LayerWeights gen_layer_weights(const TinyShape & s, std::mt19937 & rng) {
     return L;
 }
 
+// Compare kernel output against reference output at the tiny shape.
+// PASS criterion: max_ulp ≤ 2 AND >2-ULP rate ≤ 1 %.
+int kernel_vs_reference_test() {
+    TinyShape s;
+    std::printf("[kvr] tiny shape: L_d=%d N_slots=%d BLOCK_SIZE=%d D_emb=%d H_q=%d D_h=%d intermediate=%d SeqLen=%d\n",
+                s.L_d, s.N_slots, s.BLOCK_SIZE, s.D_emb, s.H_q, s.D_h, s.intermediate, s.SeqLen);
+
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> d_w(-0.1f, 0.1f);
+    std::uniform_real_distribution<float> d_n(0.5f, 1.5f);
+
+    const int Q = 1 + s.BLOCK_SIZE;
+    const int n_rows = s.N_slots * Q;
+    std::vector<__half> input_tokens_emb(static_cast<std::size_t>(n_rows) * s.D_emb);
+    for (auto & h : input_tokens_emb) h = __float2half(d_w(rng) * 2.0f);
+
+    std::vector<__half> k_cache(
+        static_cast<std::size_t>(s.L_d) * s.N_slots * s.SeqLen * s.H_kv * s.D_h);
+    std::vector<__half> v_cache(
+        static_cast<std::size_t>(s.L_d) * s.N_slots * s.SeqLen * s.H_kv * s.D_h);
+    for (auto & h : k_cache) h = __float2half(d_w(rng));
+    for (auto & h : v_cache) h = __float2half(d_w(rng));
+
+    std::vector<int> slot_positions(s.N_slots);
+    for (int i = 0; i < s.N_slots; ++i) slot_positions[i] = 8 + i;
+
+    std::vector<LayerWeights> layers;
+    layers.reserve(s.L_d);
+    for (int l = 0; l < s.L_d; ++l) {
+        // Same RNG sequence as smoke_test would use — but we restart rng
+        // here so the two tests don't share state. Use fresh seeds.
+        std::mt19937 lrng(1000 + l);
+        layers.push_back(gen_layer_weights(s, lrng));
+    }
+
+    std::vector<const __half *> p_attn_norm(s.L_d);
+    std::vector<const __half *> p_q_w(s.L_d);
+    std::vector<const __half *> p_q_norm(s.L_d);
+    std::vector<const __half *> p_o_w(s.L_d);
+    std::vector<const __half *> p_ffn_norm(s.L_d);
+    std::vector<const __half *> p_gate(s.L_d);
+    std::vector<const __half *> p_up(s.L_d);
+    std::vector<const __half *> p_down(s.L_d);
+    for (int l = 0; l < s.L_d; ++l) {
+        p_attn_norm[l] = layers[l].attn_norm.data();
+        p_q_w[l]       = layers[l].q_w.data();
+        p_q_norm[l]    = layers[l].q_norm.data();
+        p_o_w[l]       = layers[l].o_w.data();
+        p_ffn_norm[l]  = layers[l].ffn_norm.data();
+        p_gate[l]      = layers[l].gate_w.data();
+        p_up[l]        = layers[l].up_w.data();
+        p_down[l]      = layers[l].down_w.data();
+    }
+    std::vector<int> layer_types(s.L_d, 0);
+    layer_types[s.L_d - 1] = 1;
+
+    const std::size_t n_out =
+        static_cast<std::size_t>(s.N_slots) * s.BLOCK_SIZE * s.D_emb;
+
+    // Reference output (CPU)
+    std::vector<__half> ref_h(n_out);
+    dflash_reference::drafter_forward_reference(
+        input_tokens_emb.data(), k_cache.data(), v_cache.data(),
+        slot_positions.data(),
+        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(), p_o_w.data(),
+        p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
+        layer_types.data(),
+        s.swa_window, s.rope_base, s.norm_eps,
+        s.BLOCK_SIZE, s.N_slots, s.SeqLen, s.L_d,
+        s.D_emb, s.H_q, s.H_kv, s.D_h, s.intermediate,
+        ref_h.data());
+
+    // Now drive the kernel: move all inputs to GPU.
+    __half *d_input_emb = nullptr, *d_k_cache = nullptr, *d_v_cache = nullptr;
+    __half *d_out = nullptr;
+    int    *d_slot_positions = nullptr, *d_layer_types = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_input_emb, input_tokens_emb.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_k_cache,   k_cache.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_v_cache,   v_cache.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_out,       n_out * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_slot_positions, s.N_slots * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_layer_types,    s.L_d * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_input_emb, input_tokens_emb.data(), input_tokens_emb.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k_cache,   k_cache.data(),          k_cache.size() * sizeof(__half),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_cache,   v_cache.data(),          v_cache.size() * sizeof(__half),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_slot_positions, slot_positions.data(), s.N_slots * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_layer_types,    layer_types.data(),    s.L_d * sizeof(int),      cudaMemcpyHostToDevice));
+
+    // Per-layer weights: copy each layer's tensors to device, build a host array of device ptrs.
+    std::vector<__half *> d_attn_norm(s.L_d), d_q_w(s.L_d), d_q_norm(s.L_d), d_o_w(s.L_d);
+    std::vector<__half *> d_ffn_norm(s.L_d), d_gate(s.L_d), d_up(s.L_d), d_down(s.L_d);
+    for (int l = 0; l < s.L_d; ++l) {
+        auto copy_to_dev = [&](const std::vector<__half> & host, __half ** dev) {
+            CUDA_CHECK(cudaMalloc(dev, host.size() * sizeof(__half)));
+            CUDA_CHECK(cudaMemcpy(*dev, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+            return 0;
+        };
+        copy_to_dev(layers[l].attn_norm, &d_attn_norm[l]);
+        copy_to_dev(layers[l].q_w,       &d_q_w[l]);
+        copy_to_dev(layers[l].q_norm,    &d_q_norm[l]);
+        copy_to_dev(layers[l].o_w,       &d_o_w[l]);
+        copy_to_dev(layers[l].ffn_norm,  &d_ffn_norm[l]);
+        copy_to_dev(layers[l].gate_w,    &d_gate[l]);
+        copy_to_dev(layers[l].up_w,      &d_up[l]);
+        copy_to_dev(layers[l].down_w,    &d_down[l]);
+    }
+    std::vector<const __half *> p_d_attn_norm(s.L_d), p_d_q_w(s.L_d), p_d_q_norm(s.L_d), p_d_o_w(s.L_d);
+    std::vector<const __half *> p_d_ffn_norm(s.L_d), p_d_gate(s.L_d), p_d_up(s.L_d), p_d_down(s.L_d);
+    for (int l = 0; l < s.L_d; ++l) {
+        p_d_attn_norm[l] = d_attn_norm[l];
+        p_d_q_w[l]       = d_q_w[l];
+        p_d_q_norm[l]    = d_q_norm[l];
+        p_d_o_w[l]       = d_o_w[l];
+        p_d_ffn_norm[l]  = d_ffn_norm[l];
+        p_d_gate[l]      = d_gate[l];
+        p_d_up[l]        = d_up[l];
+        p_d_down[l]      = d_down[l];
+    }
+
+    dflash_drafter_forward_launch(
+        d_input_emb, d_k_cache, d_v_cache, d_slot_positions,
+        p_d_attn_norm.data(), p_d_q_w.data(), p_d_q_norm.data(), p_d_o_w.data(),
+        p_d_ffn_norm.data(), p_d_gate.data(), p_d_up.data(), p_d_down.data(),
+        d_layer_types,
+        s.swa_window, s.rope_base, s.norm_eps,
+        s.BLOCK_SIZE, s.N_slots, s.SeqLen, s.L_d,
+        s.D_emb, s.H_q, s.H_kv, s.D_h, s.intermediate,
+        d_out, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<__half> dev_h(n_out);
+    CUDA_CHECK(cudaMemcpy(dev_h.data(), d_out, n_out * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    // Compare ULP-wise.
+    int max_ulp = 0, n_ulp_eq_1 = 0, n_ulp_gt_1 = 0, n_ulp_gt_2 = 0;
+    int worst_idx = -1;
+    for (std::size_t i = 0; i < n_out; ++i) {
+        const int ulp = dflash_reference::fp16_ulp_delta(ref_h[i], dev_h[i]);
+        if (ulp > max_ulp) { max_ulp = ulp; worst_idx = static_cast<int>(i); }
+        if (ulp == 1) ++n_ulp_eq_1;
+        if (ulp > 1)  ++n_ulp_gt_1;
+        if (ulp > 2)  ++n_ulp_gt_2;
+    }
+    const double rate1   = static_cast<double>(n_ulp_eq_1) / n_out;
+    const double rateGT1 = static_cast<double>(n_ulp_gt_1) / n_out;
+    const double rateGT2 = static_cast<double>(n_ulp_gt_2) / n_out;
+    std::printf("[kvr] kernel vs reference: max_ulp=%d  1-ULP rate=%.3f%%  >1-ULP rate=%.3f%%  >2-ULP rate=%.3f%%\n",
+                max_ulp, rate1 * 100.0, rateGT1 * 100.0, rateGT2 * 100.0);
+    if (worst_idx >= 0 && max_ulp > 2) {
+        std::printf("[kvr]   worst idx=%d  ref=%.6e  kernel=%.6e\n",
+                    worst_idx,
+                    __half2float(ref_h[worst_idx]),
+                    __half2float(dev_h[worst_idx]));
+    }
+
+    // Cleanup
+    cudaFree(d_input_emb); cudaFree(d_k_cache); cudaFree(d_v_cache);
+    cudaFree(d_out); cudaFree(d_slot_positions); cudaFree(d_layer_types);
+    for (int l = 0; l < s.L_d; ++l) {
+        cudaFree(d_attn_norm[l]); cudaFree(d_q_w[l]); cudaFree(d_q_norm[l]); cudaFree(d_o_w[l]);
+        cudaFree(d_ffn_norm[l]); cudaFree(d_gate[l]); cudaFree(d_up[l]); cudaFree(d_down[l]);
+    }
+
+    if (max_ulp <= 2 && rateGT2 < 0.01) {
+        std::printf("[kvr] PASS — kernel matches reference (max_ulp ≤ 2 with > 2-ULP rate < 1%%)\n");
+        return 0;
+    }
+    std::fprintf(stderr, "[kvr] FAIL — kernel diverges from reference: max_ulp=%d  >2-ULP rate=%.3f%%\n",
+                 max_ulp, rateGT2 * 100.0);
+    return 1;
+}
+
 int reference_smoke_test() {
     TinyShape s;
     std::printf("[smoke] tiny shape: L_d=%d N_slots=%d BLOCK_SIZE=%d D_emb=%d H_q=%d D_h=%d intermediate=%d SeqLen=%d\n",
@@ -200,7 +372,7 @@ int reference_smoke_test() {
     return 0;
 }
 
-constexpr bool STUB_KERNEL = true;
+constexpr bool STUB_KERNEL = false;
 
 int run_stub_kernel_check(int N_slots, int BLOCK_SIZE, int SeqLen) {
     std::printf("  [stub-check] N_slots=%d BLOCK_SIZE=%d SeqLen=%d\n",
@@ -287,8 +459,7 @@ int main() {
         return 77;
     }
 
-    // Phase 2 (active): kernel-vs-real-reference byte-identity sweep.
-    // Wired once the kernel body lands. See plan in plan file.
-    std::fprintf(stderr, "[ERROR] active sweep path not yet implemented — flip STUB_KERNEL=false once kernel + plumbing land\n");
-    return 1;
+    // Phase 2 (active): kernel-vs-reference at tiny shape.
+    const int rc = kernel_vs_reference_test();
+    return rc;
 }
