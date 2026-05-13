@@ -418,7 +418,7 @@ int run_stub_kernel_check(int N_slots, int BLOCK_SIZE, int SeqLen) {
                 N_slots, BLOCK_SIZE, SeqLen);
     constexpr int D_emb = 5120;
     constexpr int L_d   = 5;
-    constexpr int H_q   = 40;
+    constexpr int H_q   = 32;  // matches drafter config (num_attention_heads)
     constexpr int H_kv  = 8;
     constexpr int D_h   = 128;
     constexpr int intermediate = 17408;

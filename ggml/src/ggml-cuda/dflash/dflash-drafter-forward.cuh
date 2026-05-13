@@ -47,7 +47,7 @@ extern "C" {
 //   - 4 SWA layers (0..3) with window = 2048
 //   - 1 full-attention layer (layer 4)
 //   - D_emb = 5120 hidden size
-//   - H_q = 40 query heads, H_kv = 8 KV heads (GQA 5:1)
+//   - H_q = 32 query heads, H_kv = 8 KV heads (GQA factor 4)
 //   - D_h = 128 per-head dimension
 //   - intermediate = 17408 MLP dim
 //   - V = 248320 vocab
