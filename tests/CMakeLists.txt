@@ -290,6 +290,13 @@ if (GGML_CUDA)
             ${CMAKE_SOURCE_DIR}/ggml/src
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-inject-fused PRIVATE CUDA::cudart)
+
+        # WMMA-mimicking scalar oracle self-test — validates the oracle
+        # itself before any kernel binds against it. CPU-only test; needs
+        # CUDA fp16 header for __half and conversion intrinsics.
+        llama_build_and_test(dflash-speculative/test-wmma-mimicking-oracle.cpp)
+        target_include_directories(test-wmma-mimicking-oracle PRIVATE
+            ${CUDAToolkit_INCLUDE_DIRS})
     endif()
 endif()
 
