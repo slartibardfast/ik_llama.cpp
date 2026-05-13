@@ -64,12 +64,15 @@ extern "C" {
 // BLOCK_SIZE must be one of {4, 5, 6, 8}.
 void dflash_drafter_forward_launch(
     const __half * d_input_tokens_emb,      // [N_slots, 1+BLOCK_SIZE, D_emb]
-    const __half * d_k_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h]
-    const __half * d_v_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h]
+    __half       * d_k_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h] (drafter writes K/V at query positions)
+    __half       * d_v_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h]
     const int    * d_slot_positions,        // [N_slots] — anchor_pos for each slot
     const __half * const * d_layer_attn_norm_w,   // [L_d] pointers to [D_emb]
     const __half * const * d_layer_q_w,           // [L_d] pointers to [H_q*D_h, D_emb]
     const __half * const * d_layer_q_norm_w,      // [L_d] pointers to [D_h]
+    const __half * const * d_layer_k_w,           // [L_d] pointers to [H_kv*D_h, D_emb]
+    const __half * const * d_layer_k_norm_w,      // [L_d] pointers to [D_h]
+    const __half * const * d_layer_v_w,           // [L_d] pointers to [H_kv*D_h, D_emb]
     const __half * const * d_layer_o_w,           // [L_d] pointers to [D_emb, H_q*D_h]
     const __half * const * d_layer_ffn_norm_w,    // [L_d] pointers to [D_emb]
     const __half * const * d_layer_gate_w,        // [L_d] pointers to [intermediate, D_emb]

@@ -208,6 +208,107 @@ __global__ void q_norm_rope_kernel(
 }
 
 // ===========================================================================
+// Sub-kernel 3b: per-head K norm + NeoX RoPE.
+//
+// Same structure as q_norm_rope_kernel but operates on K with H_kv heads
+// (vs Q's H_q heads). Writes back in-place.
+// ===========================================================================
+__global__ void k_norm_rope_kernel(
+    __half       * __restrict__ k_buf,       // [n_rows, H_kv * D_h] in-place
+    const __half * __restrict__ k_norm_w,    // [D_h]
+    const int    * __restrict__ slot_positions, // [N_slots]
+    float          rope_base,
+    float          norm_eps,
+    int            Q,            // 1 + BLOCK_SIZE
+    int            H_kv,
+    int            D_h)
+{
+    const int row    = blockIdx.x;
+    const int slot   = row / Q;
+    const int q_off  = row % Q;
+    const int qpos   = slot_positions[slot] + q_off;
+    const int tid    = threadIdx.x;
+    __shared__ float reduce_smem[8];
+
+    __half * row_k = k_buf + static_cast<std::size_t>(row) * H_kv * D_h;
+    const int D_half = D_h / 2;
+
+    for (int h = 0; h < H_kv; ++h) {
+        __half * kh = row_k + h * D_h;
+
+        // k_norm: RMSNorm over D_h elements of this head.
+        float sum_sq = 0.0f;
+        for (int i = tid; i < D_h; i += blockDim.x) {
+            const float v = __half2float(kh[i]);
+            sum_sq += v * v;
+        }
+        const float total_sq = block_sum_f32(sum_sq, reduce_smem);
+        const float rsq = rsqrtf(total_sq / static_cast<float>(D_h) + norm_eps);
+        for (int i = tid; i < D_h; i += blockDim.x) {
+            const float v = __half2float(kh[i]);
+            const float w = __half2float(k_norm_w[i]);
+            kh[i] = __float2half((v * rsq) * w);
+        }
+        __syncthreads();
+
+        // RoPE: NeoX-pair rotation at qpos. fp64 transcendentals to match
+        // the inject kernel + scalar reference (sm_75 libdevice fp32 trig
+        // diverges from CPU libm by up to 6 ULP; fp64 bridges the gap).
+        for (int i = tid; i < D_half; i += blockDim.x) {
+            const double exp_val_d  = static_cast<double>(2 * i) / static_cast<double>(D_h);
+            const double inv_freq_d = pow(static_cast<double>(rope_base), -exp_val_d);
+            const double theta_d    = static_cast<double>(qpos) * inv_freq_d;
+            const float  c          = static_cast<float>(cos(theta_d));
+            const float  s          = static_cast<float>(sin(theta_d));
+            const float  lo         = __half2float(kh[i]);
+            const float  hi         = __half2float(kh[i + D_half]);
+            kh[i]            = __float2half(lo * c - hi * s);
+            kh[i + D_half]   = __float2half(lo * s + hi * c);
+        }
+        __syncthreads();
+    }
+}
+
+// ===========================================================================
+// Sub-kernel 3c: cache_write_kv — write per-row K, V to KV cache at the
+// query positions (slot_positions[slot] + q_off for q_off in [0, Q)).
+//
+// One CTA per (slot, q_off) row. Each thread strides across H_kv*D_h cells.
+// Writes from k_buf, v_buf into k_cache_layer[slot, qpos, h, d] and
+// v_cache_layer[slot, qpos, h, d]. The cache layout matches
+// dflash_inject_kv_fused's writes — the same cache buffer is shared
+// between the inject step (context positions) and this step (query
+// positions).
+// ===========================================================================
+__global__ void cache_write_kv_kernel(
+    const __half * __restrict__ k_buf,           // [n_rows, H_kv * D_h]
+    const __half * __restrict__ v_buf,           // [n_rows, H_kv * D_h]
+    __half       * __restrict__ k_cache_layer,   // [N_slots, SeqLen, H_kv, D_h]
+    __half       * __restrict__ v_cache_layer,   // [N_slots, SeqLen, H_kv, D_h]
+    const int    * __restrict__ slot_positions,  // [N_slots]
+    int            Q,
+    int            SeqLen,
+    int            H_kv,
+    int            D_h)
+{
+    const int row    = blockIdx.x;
+    const int slot   = row / Q;
+    const int q_off  = row % Q;
+    const int qpos   = slot_positions[slot] + q_off;
+    const int tid    = threadIdx.x;
+    const int hd     = H_kv * D_h;
+
+    const __half * row_k = k_buf + static_cast<std::size_t>(row) * hd;
+    const __half * row_v = v_buf + static_cast<std::size_t>(row) * hd;
+    const std::size_t cache_off =
+        ((static_cast<std::size_t>(slot) * SeqLen + qpos) * H_kv) * D_h;
+    for (int i = tid; i < hd; i += blockDim.x) {
+        k_cache_layer[cache_off + i] = row_k[i];
+        v_cache_layer[cache_off + i] = row_v[i];
+    }
+}
+
+// ===========================================================================
 // Sub-kernel 4: scalar fp32 SWA/full-attention.
 //
 // One CTA per (slot, query_position) row. One warp per attention head
@@ -406,12 +507,15 @@ __global__ void select_output_kernel(
 
 extern "C" void dflash_drafter_forward_launch(
     const __half * d_input_tokens_emb,
-    const __half * d_k_cache,
-    const __half * d_v_cache,
+    __half       * d_k_cache,
+    __half       * d_v_cache,
     const int    * d_slot_positions,
     const __half * const * d_layer_attn_norm_w,
     const __half * const * d_layer_q_w,
     const __half * const * d_layer_q_norm_w,
+    const __half * const * d_layer_k_w,
+    const __half * const * d_layer_k_norm_w,
+    const __half * const * d_layer_v_w,
     const __half * const * d_layer_o_w,
     const __half * const * d_layer_ffn_norm_w,
     const __half * const * d_layer_gate_w,
@@ -439,6 +543,8 @@ extern "C" void dflash_drafter_forward_launch(
     // not the production code path.
     if (d_input_tokens_emb == nullptr || d_layer_attn_norm_w == nullptr ||
         d_layer_q_w == nullptr || d_layer_q_norm_w == nullptr ||
+        d_layer_k_w == nullptr || d_layer_k_norm_w == nullptr ||
+        d_layer_v_w == nullptr ||
         d_layer_o_w == nullptr || d_layer_ffn_norm_w == nullptr ||
         d_layer_gate_w == nullptr || d_layer_up_w == nullptr ||
         d_layer_down_w == nullptr || d_layer_types == nullptr ||
@@ -460,6 +566,8 @@ extern "C" void dflash_drafter_forward_launch(
     __half * hidden     = nullptr;  // [n_rows, D_emb]
     __half * hidden_n   = nullptr;
     __half * q_buf      = nullptr;  // [n_rows, H_q*D_h]
+    __half * k_buf      = nullptr;  // [n_rows, H_kv*D_h]
+    __half * v_buf      = nullptr;  // [n_rows, H_kv*D_h]
     __half * attn_out   = nullptr;
     __half * o_proj     = nullptr;  // [n_rows, D_emb]
     __half * gate_buf   = nullptr;  // [n_rows, intermediate]
@@ -467,13 +575,17 @@ extern "C" void dflash_drafter_forward_launch(
     __half * act_buf    = nullptr;
     __half * down_buf   = nullptr;
 
+    const int H_kvDh = H_kv * D_h;
     const std::size_t hidden_bytes = static_cast<std::size_t>(n_rows) * D_emb * sizeof(__half);
     const std::size_t q_bytes      = static_cast<std::size_t>(n_rows) * H_qDh * sizeof(__half);
+    const std::size_t kv_bytes     = static_cast<std::size_t>(n_rows) * H_kvDh * sizeof(__half);
     const std::size_t imd_bytes    = static_cast<std::size_t>(n_rows) * intermediate * sizeof(__half);
 
     cudaMallocAsync(&hidden,   hidden_bytes, stream);
     cudaMallocAsync(&hidden_n, hidden_bytes, stream);
     cudaMallocAsync(&q_buf,    q_bytes,      stream);
+    cudaMallocAsync(&k_buf,    kv_bytes,     stream);
+    cudaMallocAsync(&v_buf,    kv_bytes,     stream);
     cudaMallocAsync(&attn_out, q_bytes,      stream);
     cudaMallocAsync(&o_proj,   hidden_bytes, stream);
     cudaMallocAsync(&gate_buf, imd_bytes,    stream);
@@ -508,6 +620,9 @@ extern "C" void dflash_drafter_forward_launch(
         const __half * attn_norm_w = d_layer_attn_norm_w[layer];
         const __half * q_w         = d_layer_q_w[layer];
         const __half * q_norm_w    = d_layer_q_norm_w[layer];
+        const __half * k_w         = d_layer_k_w[layer];
+        const __half * k_norm_w    = d_layer_k_norm_w[layer];
+        const __half * v_w         = d_layer_v_w[layer];
         const __half * o_w         = d_layer_o_w[layer];
         const __half * ffn_norm_w  = d_layer_ffn_norm_w[layer];
         const __half * gate_w      = d_layer_gate_w[layer];
@@ -537,6 +652,32 @@ extern "C" void dflash_drafter_forward_launch(
         q_norm_rope_kernel<<<grid_rows, block, 0, stream>>>(
             q_buf, q_norm_w, d_slot_positions, rope_base, norm_eps,
             Q, H_q, D_h);
+
+        // Step 3a: K projection (drafter's own K at query positions)
+        gemm_row_x_col_kernel<<<grid_rows, block, 0, stream>>>(
+            hidden_n, k_w, k_buf, D_emb, H_kvDh);
+
+        // Step 3b: V projection
+        gemm_row_x_col_kernel<<<grid_rows, block, 0, stream>>>(
+            hidden_n, v_w, v_buf, D_emb, H_kvDh);
+
+        // Step 3c: k_norm + RoPE on K (V is not normed or RoPE'd per
+        // @KAsymmetricallyNormedVNot — same as inject_kv_fused).
+        k_norm_rope_kernel<<<grid_rows, block, 0, stream>>>(
+            k_buf, k_norm_w, d_slot_positions, rope_base, norm_eps,
+            Q, H_kv, D_h);
+
+        // Step 3d: write K, V to cache at the query positions. The cache
+        // is shared with dflash_inject_kv_fused which populated K, V at
+        // context positions; together they populate the full range
+        // [0, anchor_pos + BLOCK_SIZE] that attention reads from.
+        cache_write_kv_kernel<<<grid_rows, block, 0, stream>>>(
+            k_buf, v_buf,
+            d_k_cache + static_cast<std::size_t>(layer) *
+                static_cast<std::size_t>(N_slots) * SeqLen * H_kv * D_h,
+            d_v_cache + static_cast<std::size_t>(layer) *
+                static_cast<std::size_t>(N_slots) * SeqLen * H_kv * D_h,
+            d_slot_positions, Q, SeqLen, H_kv, D_h);
 
         // Step 4: attention
         attention_kernel<<<grid_rows, block, attn_smem_bytes, stream>>>(
@@ -585,6 +726,8 @@ extern "C" void dflash_drafter_forward_launch(
     cudaFreeAsync(hidden,   stream);
     cudaFreeAsync(hidden_n, stream);
     cudaFreeAsync(q_buf,    stream);
+    cudaFreeAsync(k_buf,    stream);
+    cudaFreeAsync(v_buf,    stream);
     cudaFreeAsync(attn_out, stream);
     cudaFreeAsync(o_proj,   stream);
     cudaFreeAsync(gate_buf, stream);

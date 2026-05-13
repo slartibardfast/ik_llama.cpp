@@ -131,8 +131,14 @@ int run_closure(
     }
 
     // ---- Pipeline shape ----
+    // The drafter's KV cache is populated by inject_kv_fused at ALL
+    // n_prompt context positions (not just one anchor) — matching
+    // vLLM's precompute_and_store_context_kv path which writes K, V
+    // at every context_position. The drafter forward then writes K, V
+    // at the BLOCK_SIZE+1 query positions using its own attn_k, attn_v
+    // projections (cache_write_kv_kernel inside dflash_drafter_forward).
     const int N_slots     = 1;
-    const int MAL_anchors = 1;
+    const int MAL_anchors = static_cast<int>(prompt_tokens.size());  // 1 per context position
     const int D_emb       = dw.hidden_size;
     const int L_d         = dw.n_layers;
     const int H_q         = dw.n_q_heads;
@@ -154,26 +160,31 @@ int run_closure(
                 D_emb, L_d, H_q, H_kv, D_h, intermediate, V);
     std::printf("[closure] anchor_pos=%d SeqLen=%d Q=%d (1+BS)\n", anchor_pos, SeqLen, Q);
 
-    // ---- Compose target_hiddens [N=1, MAL=1, L_src=5, D_emb] ----
-    // Each source-layer dump has shape [n_prompt, D_emb] (squeezed).
-    // We take the LAST prompt-token row as the anchor's hidden state.
-    std::vector<__half> src_h(L_src * D_emb);
-    for (int i = 0; i < L_src; ++i) {
-        const auto & arr = target_hiddens_full[i];
-        const auto & shp = target_hiddens_shape[i];
-        if (shp.size() < 2 || shp[shp.size() - 1] != D_emb) {
-            std::fprintf(stderr, "[FAIL] target hidden %d shape mismatch\n", target_layer_ids[i]);
-            return 1;
-        }
-        const int n_rows = shp[shp.size() - 2];
-        if (n_rows < n_prompt) {
-            std::fprintf(stderr, "[FAIL] target hidden %d has %d rows, need %d\n",
-                         target_layer_ids[i], n_rows, n_prompt);
-            return 1;
-        }
-        const float * last_row = arr.data() + static_cast<std::size_t>(n_prompt - 1) * D_emb;
-        for (int d = 0; d < D_emb; ++d) {
-            src_h[i * D_emb + d] = __float2half(last_row[d]);
+    // ---- Compose target_hiddens [N=1, MAL=n_prompt, L_src=5, D_emb] ----
+    // For each (anchor=context_position, src_layer): take the row at
+    // that position from the vLLM dump. Layout: [N, MAL, L_src, D_emb]
+    // row-major.
+    std::vector<__half> src_h(
+        static_cast<std::size_t>(MAL_anchors) * L_src * D_emb);
+    for (int a = 0; a < MAL_anchors; ++a) {
+        for (int i = 0; i < L_src; ++i) {
+            const auto & arr = target_hiddens_full[i];
+            const auto & shp = target_hiddens_shape[i];
+            if (shp.size() < 2 || shp[shp.size() - 1] != D_emb) {
+                std::fprintf(stderr, "[FAIL] target hidden %d shape mismatch\n", target_layer_ids[i]);
+                return 1;
+            }
+            const int n_rows = shp[shp.size() - 2];
+            if (n_rows < n_prompt) {
+                std::fprintf(stderr, "[FAIL] target hidden %d has %d rows, need %d\n",
+                             target_layer_ids[i], n_rows, n_prompt);
+                return 1;
+            }
+            const float * a_row = arr.data() + static_cast<std::size_t>(a) * D_emb;
+            for (int d = 0; d < D_emb; ++d) {
+                src_h[(static_cast<std::size_t>(a) * L_src + i) * D_emb + d] =
+                    __float2half(a_row[d]);
+            }
         }
     }
 
@@ -181,14 +192,15 @@ int run_closure(
     CUDA_CHECK(cudaMalloc(&d_src, src_h.size() * sizeof(__half)));
     CUDA_CHECK(cudaMemcpy(d_src, src_h.data(), src_h.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
-    // ---- combine_features ----
+    // ---- combine_features (n_prompt anchors) ----
     __half * d_ctx = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_ctx, D_emb * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_ctx,
+        static_cast<std::size_t>(MAL_anchors) * D_emb * sizeof(__half)));
     dflash_combine_features_launch(
         d_src, dw.dflash_fc, dw.dflash_hidden_norm, norm_eps,
         d_ctx, N_slots, MAL_anchors, L_src, D_emb, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::printf("[closure] combine_features done\n");
+    std::printf("[closure] combine_features done (%d anchors)\n", MAL_anchors);
 
     // ---- Allocate KV cache and populate via inject_kv_fused × L_d ----
     const std::size_t n_kv_layer = static_cast<std::size_t>(N_slots) * SeqLen * H_kv * D_h;
@@ -199,7 +211,9 @@ int run_closure(
     CUDA_CHECK(cudaMemset(d_k_cache, 0, static_cast<std::size_t>(L_d) * n_kv_layer * sizeof(__half)));
     CUDA_CHECK(cudaMemset(d_v_cache, 0, static_cast<std::size_t>(L_d) * n_kv_layer * sizeof(__half)));
 
-    const std::vector<int> anchor_positions(MAL_anchors, anchor_pos);
+    // anchor_positions[a] = a  (one inject write per context token at its seq_pos)
+    std::vector<int> anchor_positions(MAL_anchors);
+    for (int a = 0; a < MAL_anchors; ++a) anchor_positions[a] = a;
     int * d_anchor_pos = nullptr;
     CUDA_CHECK(cudaMalloc(&d_anchor_pos, anchor_positions.size() * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(d_anchor_pos, anchor_positions.data(),
@@ -254,12 +268,16 @@ int run_closure(
     CUDA_CHECK(cudaMemcpy(d_layer_types, dw.layer_types.data(),
                           dw.layer_types.size() * sizeof(int), cudaMemcpyHostToDevice));
 
-    std::vector<const __half *> p_attn_norm(L_d), p_q_w(L_d), p_q_norm(L_d), p_o_w(L_d);
+    std::vector<const __half *> p_attn_norm(L_d), p_q_w(L_d), p_q_norm(L_d);
+    std::vector<const __half *> p_k_w(L_d), p_k_norm(L_d), p_v_w(L_d), p_o_w(L_d);
     std::vector<const __half *> p_ffn_norm(L_d), p_gate(L_d), p_up(L_d), p_down(L_d);
     for (int l = 0; l < L_d; ++l) {
         p_attn_norm[l] = dw.attn_norm[l];
         p_q_w[l]       = dw.attn_q[l];
         p_q_norm[l]    = dw.attn_q_norm[l];
+        p_k_w[l]       = dw.attn_k[l];
+        p_k_norm[l]    = dw.attn_k_norm[l];
+        p_v_w[l]       = dw.attn_v[l];
         p_o_w[l]       = dw.attn_output[l];
         p_ffn_norm[l]  = dw.ffn_norm[l];
         p_gate[l]      = dw.ffn_gate[l];
@@ -273,7 +291,9 @@ int run_closure(
 
     dflash_drafter_forward_launch(
         d_input_emb, d_k_cache, d_v_cache, d_slot_positions,
-        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(), p_o_w.data(),
+        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(),
+        p_k_w.data(), p_k_norm.data(), p_v_w.data(),
+        p_o_w.data(),
         p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
         d_layer_types,
         swa_window, rope_base, norm_eps,

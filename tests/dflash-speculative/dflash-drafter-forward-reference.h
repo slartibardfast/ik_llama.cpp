@@ -266,6 +266,9 @@ inline void drafter_forward_reference(
     const __half * const * layer_attn_norm_w,  // [L_d] -> [D_emb]
     const __half * const * layer_q_w,          // [L_d] -> [H_q*D_h, D_emb]
     const __half * const * layer_q_norm_w,     // [L_d] -> [D_h]
+    const __half * const * /*layer_k_w*/,      // unused — reference reads from cache
+    const __half * const * /*layer_k_norm_w*/, // unused
+    const __half * const * /*layer_v_w*/,      // unused
     const __half * const * layer_o_w,          // [L_d] -> [D_emb, H_q*D_h]
     const __half * const * layer_ffn_norm_w,   // [L_d] -> [D_emb]
     const __half * const * layer_gate_w,       // [L_d] -> [intermediate, D_emb]

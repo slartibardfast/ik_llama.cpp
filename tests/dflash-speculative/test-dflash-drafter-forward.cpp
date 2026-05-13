@@ -87,6 +87,9 @@ struct LayerWeights {
     std::vector<__half> attn_norm;
     std::vector<__half> q_w;
     std::vector<__half> q_norm;
+    std::vector<__half> k_w;
+    std::vector<__half> k_norm;
+    std::vector<__half> v_w;
     std::vector<__half> o_w;
     std::vector<__half> ffn_norm;
     std::vector<__half> gate_w;
@@ -104,6 +107,12 @@ LayerWeights gen_layer_weights(const TinyShape & s, std::mt19937 & rng) {
     for (auto & h : L.q_w) h = __float2half(d_w(rng));
     L.q_norm.resize(s.D_h);
     for (auto & h : L.q_norm) h = __float2half(d_n(rng));
+    L.k_w.resize(static_cast<std::size_t>(s.H_kv * s.D_h) * s.D_emb);
+    for (auto & h : L.k_w) h = __float2half(d_w(rng));
+    L.k_norm.resize(s.D_h);
+    for (auto & h : L.k_norm) h = __float2half(d_n(rng));
+    L.v_w.resize(static_cast<std::size_t>(s.H_kv * s.D_h) * s.D_emb);
+    for (auto & h : L.v_w) h = __float2half(d_w(rng));
     L.o_w.resize(static_cast<std::size_t>(s.D_emb) * s.H_q * s.D_h);
     for (auto & h : L.o_w) h = __float2half(d_w(rng));
     L.ffn_norm.resize(s.D_emb);
@@ -155,6 +164,9 @@ int kernel_vs_reference_test() {
     std::vector<const __half *> p_attn_norm(s.L_d);
     std::vector<const __half *> p_q_w(s.L_d);
     std::vector<const __half *> p_q_norm(s.L_d);
+    std::vector<const __half *> p_k_w(s.L_d);
+    std::vector<const __half *> p_k_norm(s.L_d);
+    std::vector<const __half *> p_v_w(s.L_d);
     std::vector<const __half *> p_o_w(s.L_d);
     std::vector<const __half *> p_ffn_norm(s.L_d);
     std::vector<const __half *> p_gate(s.L_d);
@@ -164,6 +176,9 @@ int kernel_vs_reference_test() {
         p_attn_norm[l] = layers[l].attn_norm.data();
         p_q_w[l]       = layers[l].q_w.data();
         p_q_norm[l]    = layers[l].q_norm.data();
+        p_k_w[l]       = layers[l].k_w.data();
+        p_k_norm[l]    = layers[l].k_norm.data();
+        p_v_w[l]       = layers[l].v_w.data();
         p_o_w[l]       = layers[l].o_w.data();
         p_ffn_norm[l]  = layers[l].ffn_norm.data();
         p_gate[l]      = layers[l].gate_w.data();
@@ -181,7 +196,9 @@ int kernel_vs_reference_test() {
     dflash_reference::drafter_forward_reference(
         input_tokens_emb.data(), k_cache.data(), v_cache.data(),
         slot_positions.data(),
-        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(), p_o_w.data(),
+        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(),
+        p_k_w.data(), p_k_norm.data(), p_v_w.data(),
+        p_o_w.data(),
         p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
         layer_types.data(),
         s.swa_window, s.rope_base, s.norm_eps,
@@ -206,7 +223,8 @@ int kernel_vs_reference_test() {
     CUDA_CHECK(cudaMemcpy(d_layer_types,    layer_types.data(),    s.L_d * sizeof(int),      cudaMemcpyHostToDevice));
 
     // Per-layer weights: copy each layer's tensors to device, build a host array of device ptrs.
-    std::vector<__half *> d_attn_norm(s.L_d), d_q_w(s.L_d), d_q_norm(s.L_d), d_o_w(s.L_d);
+    std::vector<__half *> d_attn_norm(s.L_d), d_q_w(s.L_d), d_q_norm(s.L_d);
+    std::vector<__half *> d_k_w(s.L_d), d_k_norm(s.L_d), d_v_w(s.L_d), d_o_w(s.L_d);
     std::vector<__half *> d_ffn_norm(s.L_d), d_gate(s.L_d), d_up(s.L_d), d_down(s.L_d);
     for (int l = 0; l < s.L_d; ++l) {
         auto copy_to_dev = [&](const std::vector<__half> & host, __half ** dev) {
@@ -217,18 +235,25 @@ int kernel_vs_reference_test() {
         copy_to_dev(layers[l].attn_norm, &d_attn_norm[l]);
         copy_to_dev(layers[l].q_w,       &d_q_w[l]);
         copy_to_dev(layers[l].q_norm,    &d_q_norm[l]);
+        copy_to_dev(layers[l].k_w,       &d_k_w[l]);
+        copy_to_dev(layers[l].k_norm,    &d_k_norm[l]);
+        copy_to_dev(layers[l].v_w,       &d_v_w[l]);
         copy_to_dev(layers[l].o_w,       &d_o_w[l]);
         copy_to_dev(layers[l].ffn_norm,  &d_ffn_norm[l]);
         copy_to_dev(layers[l].gate_w,    &d_gate[l]);
         copy_to_dev(layers[l].up_w,      &d_up[l]);
         copy_to_dev(layers[l].down_w,    &d_down[l]);
     }
-    std::vector<const __half *> p_d_attn_norm(s.L_d), p_d_q_w(s.L_d), p_d_q_norm(s.L_d), p_d_o_w(s.L_d);
+    std::vector<const __half *> p_d_attn_norm(s.L_d), p_d_q_w(s.L_d), p_d_q_norm(s.L_d);
+    std::vector<const __half *> p_d_k_w(s.L_d), p_d_k_norm(s.L_d), p_d_v_w(s.L_d), p_d_o_w(s.L_d);
     std::vector<const __half *> p_d_ffn_norm(s.L_d), p_d_gate(s.L_d), p_d_up(s.L_d), p_d_down(s.L_d);
     for (int l = 0; l < s.L_d; ++l) {
         p_d_attn_norm[l] = d_attn_norm[l];
         p_d_q_w[l]       = d_q_w[l];
         p_d_q_norm[l]    = d_q_norm[l];
+        p_d_k_w[l]       = d_k_w[l];
+        p_d_k_norm[l]    = d_k_norm[l];
+        p_d_v_w[l]       = d_v_w[l];
         p_d_o_w[l]       = d_o_w[l];
         p_d_ffn_norm[l]  = d_ffn_norm[l];
         p_d_gate[l]      = d_gate[l];
@@ -238,7 +263,9 @@ int kernel_vs_reference_test() {
 
     dflash_drafter_forward_launch(
         d_input_emb, d_k_cache, d_v_cache, d_slot_positions,
-        p_d_attn_norm.data(), p_d_q_w.data(), p_d_q_norm.data(), p_d_o_w.data(),
+        p_d_attn_norm.data(), p_d_q_w.data(), p_d_q_norm.data(),
+        p_d_k_w.data(), p_d_k_norm.data(), p_d_v_w.data(),
+        p_d_o_w.data(),
         p_d_ffn_norm.data(), p_d_gate.data(), p_d_up.data(), p_d_down.data(),
         d_layer_types,
         s.swa_window, s.rope_base, s.norm_eps,
@@ -307,7 +334,9 @@ int kernel_vs_reference_test() {
     cudaFree(d_input_emb); cudaFree(d_k_cache); cudaFree(d_v_cache);
     cudaFree(d_out); cudaFree(d_slot_positions); cudaFree(d_layer_types);
     for (int l = 0; l < s.L_d; ++l) {
-        cudaFree(d_attn_norm[l]); cudaFree(d_q_w[l]); cudaFree(d_q_norm[l]); cudaFree(d_o_w[l]);
+        cudaFree(d_attn_norm[l]); cudaFree(d_q_w[l]); cudaFree(d_q_norm[l]);
+        cudaFree(d_k_w[l]); cudaFree(d_k_norm[l]); cudaFree(d_v_w[l]);
+        cudaFree(d_o_w[l]);
         cudaFree(d_ffn_norm[l]); cudaFree(d_gate[l]); cudaFree(d_up[l]); cudaFree(d_down[l]);
     }
 
@@ -358,6 +387,9 @@ int reference_smoke_test() {
     std::vector<const __half *> p_attn_norm(s.L_d);
     std::vector<const __half *> p_q_w(s.L_d);
     std::vector<const __half *> p_q_norm(s.L_d);
+    std::vector<const __half *> p_k_w(s.L_d);
+    std::vector<const __half *> p_k_norm(s.L_d);
+    std::vector<const __half *> p_v_w(s.L_d);
     std::vector<const __half *> p_o_w(s.L_d);
     std::vector<const __half *> p_ffn_norm(s.L_d);
     std::vector<const __half *> p_gate(s.L_d);
@@ -367,6 +399,9 @@ int reference_smoke_test() {
         p_attn_norm[l] = layers[l].attn_norm.data();
         p_q_w[l]       = layers[l].q_w.data();
         p_q_norm[l]    = layers[l].q_norm.data();
+        p_k_w[l]       = layers[l].k_w.data();
+        p_k_norm[l]    = layers[l].k_norm.data();
+        p_v_w[l]       = layers[l].v_w.data();
         p_o_w[l]       = layers[l].o_w.data();
         p_ffn_norm[l]  = layers[l].ffn_norm.data();
         p_gate[l]      = layers[l].gate_w.data();
@@ -381,7 +416,9 @@ int reference_smoke_test() {
     dflash_reference::drafter_forward_reference(
         input_tokens_emb.data(), k_cache.data(), v_cache.data(),
         slot_positions.data(),
-        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(), p_o_w.data(),
+        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(),
+        p_k_w.data(), p_k_norm.data(), p_v_w.data(),
+        p_o_w.data(),
         p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
         layer_types.data(),
         s.swa_window, s.rope_base, s.norm_eps,
