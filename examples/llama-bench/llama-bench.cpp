@@ -2951,6 +2951,14 @@ int main(int argc, char ** argv) {
 
         for (int i = 0; i < params.reps; i++) {
             llama_kv_cache_clear(ctx);
+            // For DFlash: the cb_eval hook accumulates per-position
+            // hidden-state rows into ctx's dflash_extract_buf. Clear it
+            // between reps (and after the PPL second pass, below) so the
+            // first cycle's anchor count lines up with the freshly cleared
+            // KV.
+            if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_dflash_trim_extract(ctx, 0, -1);
+            }
 
             // Prefill: real prompt (if --prompt-file) or random (legacy).
             // PP/PG include prefill in the timer; TG/GP exclude it.
