@@ -162,11 +162,19 @@ __global__ void dflash_inject_kv_fused_kernel(
     // Pair partner position. tid in [0, D) since N_THREADS == D.
     const int partner_pos = (tid < D_HALF) ? (tid + D_HALF) : (tid - D_HALF);
     const int dim_idx     = tid % D_HALF;        // 0..63 (same for both pair members)
-    const float exp_val   = static_cast<float>(2 * dim_idx) / static_cast<float>(D_LOCKED);
-    const float inv_freq  = powf(rope_base, -exp_val);
-    const float theta     = static_cast<float>(position) * inv_freq;
-    const float c         = cosf(theta);
-    const float s         = sinf(theta);
+    // fp64 evaluation of pow/cos/sin keeps the kernel byte-aligned with
+    // the CPU-side scalar reference: CUDA libdevice and glibc both
+    // target ≤ 1 fp64 ULP for these functions, so the fp32 cast at use
+    // absorbs the residual delta to identical fp32 bits in nearly all
+    // cases. fp32 versions of these (powf, cosf, sinf) diverge enough
+    // (≤ 6 ULP for powf, ≤ 2 ULP for cosf/sinf per CUDA docs) to push
+    // the final fp16 output past the ≤ 2-ULP test gate at multi-anchor
+    // configurations where larger positions stress the trig path.
+    const double exp_val_d  = static_cast<double>(2 * dim_idx) / static_cast<double>(D_LOCKED);
+    const double inv_freq_d = pow(static_cast<double>(rope_base), -exp_val_d);
+    const double theta_d    = static_cast<double>(position) * inv_freq_d;
+    const float c           = static_cast<float>(cos(theta_d));
+    const float s           = static_cast<float>(sin(theta_d));
 
     #pragma unroll
     for (int h = 0; h < H_KV_LOCKED; ++h) {

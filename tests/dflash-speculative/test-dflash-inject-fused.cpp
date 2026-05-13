@@ -1,7 +1,9 @@
 // test-dflash-inject-fused.cpp
 //
 // Byte-identity unit test: fused CUDA inject_kv_fused kernel vs the
-// fp32 scalar reference, exercised across all 5 drafter layers.
+// fp32 scalar reference, exercised across all 5 drafter layers AND
+// a (N_slots × MAL_anchors × seed) sweep. This is the T3 closure
+// binding for inject_kv_fused per kernel-design.md §10 step 3.
 //
 // @witnesses: PerLayerArity
 // @witnesses: HeadShapeMatchesDraft
@@ -9,32 +11,13 @@
 // @witnesses: InjectedAnchorAlignment
 // @witnesses: InjectPerLayerLaunches
 //
-// Each @witnesses line above cites an Allium @invariant this test binds
-// on (per specs/dflash/allium-tla-binding.json bindings_external).
-//
-//   PerLayerArity              — host driver loops L_d=5 times, one
-//                                launch per drafter layer.
-//   HeadShapeMatchesDraft       — test uses drafter's declared
-//                                H_kv=8, D=128 shape.
-//   KAsymmetricallyNormedVNot   — scalar oracle applies k_norm + RoPE
-//                                to K only; fused must agree byte-
-//                                identically. V untouched after V_proj.
-//   InjectedAnchorAlignment     — test sets anchor_positions explicitly;
-//                                verifies cache writes land at exactly
-//                                those positions (and ONLY there).
-//   InjectPerLayerLaunches      — driver is a for-loop over L_d=5 with
-//                                grid (N_slots, MAL_anchors) per launch;
-//                                no batched 3D launch alternative.
-//
-// Spec:
-//   - specs/dflash/kernel-design.md §6.2
-//   - specs/dflash/dflash.allium ProjectAndFuse contract
-//
-// Exit codes:
-//   0  — fused kernel output matches scalar reference (byte-identical
-//        or every disagreement ≤ 1 ULP at fp16 AND rate ≤ 1 %)
-//   1  — fused kernel disagrees materially (FAIL)
-//  77  — CTest SKIP: kernel stub leaves caches all-zero, or no CUDA device
+// PASS criterion per sub-run:
+//   K: byte-identical OR every disagreement ≤ 2 ULP at fp16 AND rate ≤ 1 %.
+//      (≤ 2 ULP because cosf/sinf diverges up to 2 ULP between CUDA
+//      libdevice and CPU libm; > 2 ULP would indicate a precision bug.)
+//   V: byte-identical OR every disagreement ≤ 1 ULP AND rate ≤ 1 %.
+//      (No trig in V's path; tightened bound. Empirically V is always
+//      perfectly byte-identical, validating @KAsymmetricallyNormedVNot.)
 
 #include "dflash-inject-kv-reference.h"
 #include "ggml-cuda/dflash/dflash-inject-kv.cuh"
@@ -59,49 +42,52 @@
         }                                                                  \
     } while (0)
 
-int main() {
-    // Production drafter shape (Qwen3.6-27B-DFlash) — locked.
-    constexpr int   N_slots     = 1;
-    constexpr int   MAL_anchors = 1;
-    constexpr int   L_d         = 5;     // drafter layer count
-    constexpr int   H_kv        = 8;
-    constexpr int   D           = 128;
-    constexpr int   D_d         = 5120;
-    constexpr int   SeqLen      = 16;    // test cache capacity per slot
-    constexpr float rope_base   = 1.0e7f;
-    constexpr float norm_eps    = 1.0e-6f;
+namespace {
 
-    int dev_count = 0;
-    cudaError_t derr = cudaGetDeviceCount(&dev_count);
-    if (derr != cudaSuccess || dev_count == 0) {
-        std::printf("SKIP: no CUDA device available (%s)\n",
-                    derr == cudaSuccess ? "count=0" : cudaGetErrorString(derr));
-        return 77;
+constexpr int   L_d       = 5;
+constexpr int   H_kv      = 8;
+constexpr int   D         = 128;
+constexpr int   D_d       = 5120;
+constexpr float rope_base = 1.0e7f;
+constexpr float norm_eps  = 1.0e-6f;
+
+// Counts mismatch bins for byte / 1ULP / >2ULP buckets in fp16.
+void count_diffs(const __half* a, const __half* b, std::size_t n,
+                 int& n_diff, int& n_1ulp, int& max_ulp) {
+    n_diff = n_1ulp = max_ulp = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        uint16_t ab, bb;
+        std::memcpy(&ab, &a[i], sizeof(uint16_t));
+        std::memcpy(&bb, &b[i], sizeof(uint16_t));
+        if (ab == bb) continue;
+        ++n_diff;
+        int d = std::abs(static_cast<int>(ab) - static_cast<int>(bb));
+        if (d == 1) ++n_1ulp;
+        if (d > max_ulp) max_ulp = d;
+    }
+}
+
+int run_one(int N_slots, int MAL_anchors, int SeqLen, uint32_t seed) {
+    const int D_kv = H_kv * D;
+    const std::size_t n_ctx     = (std::size_t) N_slots * MAL_anchors * D_d;
+    const std::size_t n_w       = (std::size_t) D_kv * D_d;
+    const std::size_t n_kn      = D;
+    const std::size_t n_pos     = (std::size_t) N_slots * MAL_anchors;
+    const std::size_t n_cache_1 = (std::size_t) N_slots * SeqLen * H_kv * D;
+    const std::size_t n_cache   = (std::size_t) L_d * n_cache_1;
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> small(-0.5f, 0.5f);
+
+    // Anchor positions: distinct per (slot, anchor) within [1, SeqLen-1].
+    // Avoid pos=0 to make RoPE non-trivial (cos≠1, sin≠0).
+    std::vector<int> pos_h(n_pos);
+    for (int s = 0; s < N_slots; ++s) {
+        for (int a = 0; a < MAL_anchors; ++a) {
+            pos_h[s * MAL_anchors + a] = 1 + ((s * MAL_anchors + a) % (SeqLen - 1));
+        }
     }
 
-    const int D_kv = H_kv * D;  // 1024
-    std::printf("test-dflash-inject-fused: N=%d MAL=%d L_d=%d  H_kv=%d D=%d D_d=%d SeqLen=%d\n",
-                N_slots, MAL_anchors, L_d, H_kv, D, D_d, SeqLen);
-
-    const std::size_t n_ctx  = (std::size_t) N_slots * MAL_anchors * D_d;
-    const std::size_t n_w    = (std::size_t) D_kv * D_d;            // per-layer
-    const std::size_t n_kn   = D;                                   // per-layer
-    const std::size_t n_pos  = (std::size_t) N_slots * MAL_anchors;
-    const std::size_t n_cache = (std::size_t) N_slots * SeqLen * H_kv * D;
-
-    std::printf("  per-layer k_weight bytes:  %zu MiB\n", (n_w * sizeof(__half)) >> 20);
-    std::printf("  cache bytes per layer:     %zu KiB (each of K/V)\n",
-                (n_cache * sizeof(__half)) >> 10);
-
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> small(-0.5f, 0.5f);
-    // Anchor positions: choose a position within SeqLen.  Single slot,
-    // single anchor — keep simple for the first RED-first commit; future
-    // expanded sweep (closure binding step) will randomize across slots.
-    std::vector<int> pos_h(n_pos);
-    pos_h[0] = 3;
-
-    // Context states (shared across all drafter layers).
     std::vector<__half> ctx_h(n_ctx);
     std::vector<float>  ctx_f(n_ctx);
     for (std::size_t i = 0; i < n_ctx; ++i) {
@@ -110,10 +96,6 @@ int main() {
         ctx_f[i] = __half2float(ctx_h[i]);
     }
 
-    // Per-layer weight buffers (each layer gets its own random seed band so
-    // the test exercises 5 distinct configurations).  fc scale down to keep
-    // post-GEMV magnitudes bounded (sum of D_d random uniform terms has
-    // sd ~ sqrt(D_d/12) ~ 21; scale by 0.03 keeps K, V around |1|).
     std::vector<std::vector<__half>> kw_h(L_d, std::vector<__half>(n_w));
     std::vector<std::vector<__half>> vw_h(L_d, std::vector<__half>(n_w));
     std::vector<std::vector<__half>> kn_h(L_d, std::vector<__half>(n_kn));
@@ -123,21 +105,18 @@ int main() {
     for (int il = 0; il < L_d; ++il) {
         for (auto & h : kw_h[il]) h = __float2half(small(rng) * 0.03f);
         for (auto & h : vw_h[il]) h = __float2half(small(rng) * 0.03f);
-        for (auto & h : kn_h[il]) h = __float2half(0.5f + small(rng));  // non-identity
+        for (auto & h : kn_h[il]) h = __float2half(0.5f + small(rng));
         for (std::size_t i = 0; i < n_w;  ++i) kw_f[il][i] = __half2float(kw_h[il][i]);
         for (std::size_t i = 0; i < n_w;  ++i) vw_f[il][i] = __half2float(vw_h[il][i]);
         for (std::size_t i = 0; i < n_kn; ++i) kn_f[il][i] = __half2float(kn_h[il][i]);
     }
 
-    // Scalar reference: run all L_d layers serially, accumulate per-layer
-    // cache writes into one big fp32 buffer per (K, V).  Cache is
-    // [L_d, N_slots, SeqLen, H_kv, D] for the test (one slab per layer).
-    const std::size_t n_cache_all = (std::size_t) L_d * n_cache;
-    std::vector<float> ref_k_cache(n_cache_all, 0.0f);
-    std::vector<float> ref_v_cache(n_cache_all, 0.0f);
+    // Scalar reference across all 5 layers
+    std::vector<float> ref_k_cache(n_cache, 0.0f);
+    std::vector<float> ref_v_cache(n_cache, 0.0f);
     for (int il = 0; il < L_d; ++il) {
-        float * k_layer = ref_k_cache.data() + (std::size_t) il * n_cache;
-        float * v_layer = ref_v_cache.data() + (std::size_t) il * n_cache;
+        float * k_layer = ref_k_cache.data() + (std::size_t) il * n_cache_1;
+        float * v_layer = ref_v_cache.data() + (std::size_t) il * n_cache_1;
         dflash_reference::inject_kv_fused_scalar_ref_f32(
             ctx_f.data(),
             kw_f[il].data(), vw_f[il].data(), kn_f[il].data(),
@@ -145,15 +124,11 @@ int main() {
             k_layer, v_layer, pos_h.data(),
             N_slots, MAL_anchors, H_kv, D, D_d, SeqLen);
     }
-    // Cast fp32 scalar reference to fp16 for comparison.
-    std::vector<__half> ref_k_h(n_cache_all);
-    std::vector<__half> ref_v_h(n_cache_all);
-    for (std::size_t i = 0; i < n_cache_all; ++i) ref_k_h[i] = __float2half(ref_k_cache[i]);
-    for (std::size_t i = 0; i < n_cache_all; ++i) ref_v_h[i] = __float2half(ref_v_cache[i]);
+    std::vector<__half> ref_k_h(n_cache), ref_v_h(n_cache);
+    for (std::size_t i = 0; i < n_cache; ++i) ref_k_h[i] = __float2half(ref_k_cache[i]);
+    for (std::size_t i = 0; i < n_cache; ++i) ref_v_h[i] = __float2half(ref_v_cache[i]);
 
-    // Kernel path: allocate device buffers, copy in, launch per-layer L_d
-    // times (this IS the @InjectPerLayerLaunches binding — code shape is
-    // the witness).
+    // Kernel path
     __half *d_ctx = nullptr, *d_kn = nullptr;
     __half *d_kw_buf = nullptr, *d_vw_buf = nullptr;
     __half *d_kcache_all = nullptr, *d_vcache_all = nullptr;
@@ -163,12 +138,12 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_kw_buf, (std::size_t) L_d * n_w * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_vw_buf, (std::size_t) L_d * n_w * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_kn,     (std::size_t) L_d * n_kn * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_kcache_all, n_cache_all * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_vcache_all, n_cache_all * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_kcache_all, n_cache * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_vcache_all, n_cache * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_pos, n_pos * sizeof(int)));
 
-    CUDA_CHECK(cudaMemset(d_kcache_all, 0, n_cache_all * sizeof(__half)));
-    CUDA_CHECK(cudaMemset(d_vcache_all, 0, n_cache_all * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(d_kcache_all, 0, n_cache * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(d_vcache_all, 0, n_cache * sizeof(__half)));
     CUDA_CHECK(cudaMemcpy(d_ctx, ctx_h.data(), n_ctx * sizeof(__half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_pos, pos_h.data(), n_pos * sizeof(int),    cudaMemcpyHostToDevice));
     for (int il = 0; il < L_d; ++il) {
@@ -183,7 +158,7 @@ int main() {
                               cudaMemcpyHostToDevice));
     }
 
-    // Per-layer launches — this is the @InjectPerLayerLaunches witness.
+    // Per-layer launches — the @InjectPerLayerLaunches witness.
     for (int il = 0; il < L_d; ++il) {
         dflash_inject_kv_fused_launch(
             d_ctx,
@@ -191,124 +166,132 @@ int main() {
             d_vw_buf  + (std::size_t) il * n_w,
             d_kn      + (std::size_t) il * n_kn,
             rope_base, norm_eps,
-            d_kcache_all + (std::size_t) il * n_cache,
-            d_vcache_all + (std::size_t) il * n_cache,
+            d_kcache_all + (std::size_t) il * n_cache_1,
+            d_vcache_all + (std::size_t) il * n_cache_1,
             d_pos,
             N_slots, MAL_anchors, H_kv, D, D_d, SeqLen,
             /*stream=*/0);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<__half> kern_k_h(n_cache_all);
-    std::vector<__half> kern_v_h(n_cache_all);
-    CUDA_CHECK(cudaMemcpy(kern_k_h.data(), d_kcache_all, n_cache_all * sizeof(__half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(kern_v_h.data(), d_vcache_all, n_cache_all * sizeof(__half), cudaMemcpyDeviceToHost));
+    std::vector<__half> kern_k_h(n_cache), kern_v_h(n_cache);
+    CUDA_CHECK(cudaMemcpy(kern_k_h.data(), d_kcache_all, n_cache * sizeof(__half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(kern_v_h.data(), d_vcache_all, n_cache * sizeof(__half), cudaMemcpyDeviceToHost));
 
-    cudaFree(d_ctx);
-    cudaFree(d_kw_buf);
-    cudaFree(d_vw_buf);
-    cudaFree(d_kn);
-    cudaFree(d_kcache_all);
-    cudaFree(d_vcache_all);
-    cudaFree(d_pos);
+    cudaFree(d_ctx); cudaFree(d_kw_buf); cudaFree(d_vw_buf); cudaFree(d_kn);
+    cudaFree(d_kcache_all); cudaFree(d_vcache_all); cudaFree(d_pos);
 
-    // Detect RED-first stub state: kernel zeros the full cache slab, while
-    // the scalar reference writes non-zero values at the anchor positions.
-    // We check the (layer 0, slot 0, position=3, head 0) row: if all zero,
-    // kernel is stubbed → SKIP.  This is a deterministic SKIP signal.
+    // Stub detection: check (layer 0, slot 0, anchor 0)'s K row.
     const int pos0 = pos_h[0];
-    const std::size_t check_base =
-        ((((std::size_t) 0 /*layer*/ * N_slots + 0 /*slot*/) * SeqLen + pos0)
-          * H_kv + 0 /*head*/) * D;
-    bool stub_all_zero = true;
+    const std::size_t check_base = ((((std::size_t) 0) + 0) * SeqLen + pos0) * H_kv * D;
+    bool all_zero = true;
     for (int d = 0; d < D; ++d) {
         uint16_t bits;
         std::memcpy(&bits, &kern_k_h[check_base + d], sizeof(uint16_t));
-        if (bits != 0) { stub_all_zero = false; break; }
+        if (bits != 0) { all_zero = false; break; }
     }
-    if (stub_all_zero) {
-        std::printf("SKIP: kernel K cache at (layer 0, slot 0, pos %d, head 0) is all-zero "
-                    "(stub; inject kernel not yet implemented)\n", pos0);
+    if (all_zero) {
+        std::printf("  [N=%d MAL=%d seed=%u]  SKIP: kernel K cache is all-zero (stub)\n",
+                    N_slots, MAL_anchors, seed);
         return 77;
     }
 
-    // Compare cache slabs.  Mismatches in cells the kernel/ref didn't write
-    // (both should be zero) count too — they catch a kernel that writes
-    // outside its anchor position.
-    auto count_diffs = [&](const __half* a, const __half* b, std::size_t n,
-                           int& n_diff, int& n_1ulp, int& max_ulp) {
-        n_diff = n_1ulp = max_ulp = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            uint16_t ab, bb;
-            std::memcpy(&ab, &a[i], sizeof(uint16_t));
-            std::memcpy(&bb, &b[i], sizeof(uint16_t));
-            if (ab == bb) continue;
-            ++n_diff;
-            int d = std::abs(static_cast<int>(ab) - static_cast<int>(bb));
-            if (d == 1) ++n_1ulp;
-            if (d > max_ulp) max_ulp = d;
-        }
-    };
-
     int k_diff, k_1ulp, k_max;
     int v_diff, v_1ulp, v_max;
-    count_diffs(kern_k_h.data(), ref_k_h.data(), n_cache_all, k_diff, k_1ulp, k_max);
-    count_diffs(kern_v_h.data(), ref_v_h.data(), n_cache_all, v_diff, v_1ulp, v_max);
+    count_diffs(kern_k_h.data(), ref_k_h.data(), n_cache, k_diff, k_1ulp, k_max);
+    count_diffs(kern_v_h.data(), ref_v_h.data(), n_cache, v_diff, v_1ulp, v_max);
 
-    // Mismatch rates are computed against the count of cells the reference
-    // actually wrote (= L_d * N_slots * MAL_anchors * H_kv * D); positions
-    // outside the anchor cells should be zero on both sides.  But the test
-    // also accepts mismatches in zero positions (kernel bug that writes
-    // outside anchor) as a failure — those would show up as non-1-ULP
-    // differences from zero, captured in the max_ulp gate.
-    const std::size_t n_written_cells =
-        (std::size_t) L_d * N_slots * MAL_anchors * H_kv * D;
-    std::printf("  K mismatches: %d / %zu  (1-ULP: %d, max ULP: %d)\n",
-                k_diff, n_cache_all, k_1ulp, k_max);
-    std::printf("  V mismatches: %d / %zu  (1-ULP: %d, max ULP: %d)\n",
-                v_diff, n_cache_all, v_1ulp, v_max);
-    std::printf("  reference-written cell count (denom for rate): %zu\n", n_written_cells);
-
-    // PASS criterion: byte-identical, OR every disagreement ≤ 2 ULP at
-    // fp16 AND rate ≤ 1 % of reference-written cells. Looser than the
-    // combine_features test (which gates at ≤ 1 ULP) because:
-    //   - V output goes through K_proj + V_proj GEMV + fp16 cast only;
-    //     no transcendental functions are involved. Empirically V
-    //     matches byte-identically (max ULP = 0).
-    //   - K output additionally goes through cos/sin in the RoPE step.
-    //     CUDA libdevice cosf/sinf is documented to be accurate within
-    //     ≤ 2 ULP at fp32 (vs CPU libm typically ≤ 1 ULP). A 2-ULP fp32
-    //     difference propagates through the (k_lo * cos - k_hi * sin)
-    //     combination to occasionally a 2-ULP fp16 difference at binade-
-    //     boundary positions. > 2 ULP would indicate a real bug.
-    // V is held to a TIGHTER bound (≤ 1 ULP) because its accumulation
-    // path is identical to combine_features' FC and exhibits the same
-    // fp32-reduction-order noise but never trig.
-    auto judge = [&](int diff, int max_ulp, int allowed_ulp) -> int {
-        if (diff == 0) return 0;
-        if (max_ulp <= allowed_ulp && diff * 100 <= (int) n_written_cells) {
-            return 0;
+    // Diagnostic: if any K cell exceeds the 2-ULP gate, surface the WORST
+    // cell's (layer, slot, position, head, dim) coords + the kernel/ref
+    // fp16 bits + fp32 values so the test output drives debugging.
+    if (k_max > 2) {
+        std::size_t worst_idx = 0;
+        int worst_d = 0;
+        for (std::size_t i = 0; i < n_cache; ++i) {
+            uint16_t a, b;
+            std::memcpy(&a, &kern_k_h[i], sizeof(uint16_t));
+            std::memcpy(&b, &ref_k_h[i],  sizeof(uint16_t));
+            int d = std::abs(static_cast<int>(a) - static_cast<int>(b));
+            if (d > worst_d) { worst_d = d; worst_idx = i; }
         }
-        if (max_ulp > allowed_ulp) return 2;   // precision bug
-        return 3;                                // systematic mismatch rate
+        // Decompose worst_idx → (layer, slot, position, head, dim) per the
+        // cache layout [L_d, N_slots, SeqLen, H_kv, D].
+        const std::size_t per_layer = (std::size_t) N_slots * SeqLen * H_kv * D;
+        const std::size_t per_slot  = (std::size_t) SeqLen * H_kv * D;
+        const std::size_t per_pos   = (std::size_t) H_kv * D;
+        const int wl = worst_idx / per_layer;
+        std::size_t r = worst_idx - (std::size_t) wl * per_layer;
+        const int ws = r / per_slot;            r %= per_slot;
+        const int wp = r / per_pos;             r %= per_pos;
+        const int wh = r / D;                   const int wd = r % D;
+        std::printf("    WORST K cell @ [L=%d slot=%d pos=%d head=%d dim=%d]: "
+                    "kern=%.6g ref=%.6g diff=%d ULP\n",
+                    wl, ws, wp, wh, wd,
+                    __half2float(kern_k_h[worst_idx]),
+                    __half2float(ref_k_h[worst_idx]), worst_d);
+    }
+
+    const std::size_t n_written =
+        (std::size_t) L_d * N_slots * MAL_anchors * H_kv * D;
+
+    auto judge = [&](int diff, int max_ulp, int allowed_ulp) -> bool {
+        if (diff == 0) return true;
+        return max_ulp <= allowed_ulp && diff * 100 <= (int) n_written;
     };
+    const bool k_pass = judge(k_diff, k_max, /*K allowed*/ 2);
+    const bool v_pass = judge(v_diff, v_max, /*V allowed*/ 1);
+    const bool pass = k_pass && v_pass;
 
-    // K: ≤ 2 ULP allowed (cosf/sinf precision divergence between CUDA libdevice
-    // and CPU libm). V: ≤ 1 ULP (no trig, same expectation as combine_features).
-    const int kj = judge(k_diff, k_max, /*allowed_ulp=*/2);
-    const int vj = judge(v_diff, v_max, /*allowed_ulp=*/1);
+    std::printf("  [N=%d MAL=%d seed=%u]  K=%d/%zu (max %d)  V=%d/%zu (max %d)  %s\n",
+                N_slots, MAL_anchors, seed,
+                k_diff, n_cache, k_max,
+                v_diff, n_cache, v_max,
+                pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
 
-    if (kj == 0 && vj == 0) {
-        std::printf("PASS: K=%d diffs (≤2 ULP, ≤1%% rate)  V=%d diffs (≤1 ULP, ≤1%% rate)\n",
-                    k_diff, v_diff);
-        return 0;
+} // namespace
+
+int main() {
+    int dev_count = 0;
+    cudaError_t derr = cudaGetDeviceCount(&dev_count);
+    if (derr != cudaSuccess || dev_count == 0) {
+        std::printf("SKIP: no CUDA device available\n");
+        return 77;
     }
-    if (kj == 2 || vj == 2) {
-        std::printf("FAIL: K max ULP=%d (limit 2), V max ULP=%d (limit 1); precision bug\n",
-                    k_max, v_max);
-    } else {
-        std::printf("FAIL: mismatch rate exceeds 1%% (K=%d, V=%d); systematic precision loss\n",
-                    k_diff, v_diff);
+
+    std::printf("test-dflash-inject-fused sweep:  L_d=%d  H_kv=%d  D=%d  D_d=%d\n",
+                L_d, H_kv, D, D_d);
+
+    // SeqLen sized to accommodate the max anchor position generated across
+    // configs (need pos < SeqLen). With (N=8, MAL=4) and distinct positions,
+    // we need ≥ 33 slots; use 64 for headroom.
+    constexpr int SeqLen = 64;
+
+    // (N_slots, MAL_anchors) × seeds.
+    struct Config { int N; int MAL; uint32_t seed; };
+    const Config cfgs[] = {
+        {1, 1, 42}, {1, 1, 137},
+        {2, 2, 42}, {2, 2, 137},
+        {4, 3, 42}, {4, 3, 137},
+        {8, 4, 42}, {8, 4, 137},
+    };
+    const int n_cfgs = sizeof(cfgs) / sizeof(cfgs[0]);
+
+    int passes = 0, skips = 0, fails = 0;
+    for (int i = 0; i < n_cfgs; ++i) {
+        const int rc = run_one(cfgs[i].N, cfgs[i].MAL, SeqLen, cfgs[i].seed);
+        if      (rc == 0)  ++passes;
+        else if (rc == 77) ++skips;
+        else               ++fails;
+        if (rc == 77) {
+            std::printf("aborting sweep — kernel is stub state\n");
+            return 77;
+        }
     }
-    return 1;
+
+    std::printf("---\n");
+    std::printf("sweep summary: %d/%d configs PASSed (fails=%d skips=%d)\n",
+                passes, n_cfgs, fails, skips);
+    return (fails == 0) ? 0 : 1;
 }

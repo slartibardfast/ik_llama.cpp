@@ -135,15 +135,23 @@ inline void inject_kv_fused_scalar_ref_f32(
             //   k_hi  = K[h, i + D/2]
             //   K[h, i]          = k_lo * cos - k_hi * sin
             //   K[h, i + D/2]    = k_lo * sin + k_hi * cos
+            //
+            // pow/cos/sin computed in fp64, cast to fp32 at use. This
+            // keeps the scalar reference byte-aligned with the CUDA
+            // kernel's transcendental path — both call libm/libdevice
+            // pow/cos/sin at fp64 (each ≤ 1 fp64 ULP), and the fp32
+            // cast absorbs the residual delta. fp32 versions diverge
+            // enough (≤ 6 ULP powf, ≤ 2 ULP cosf/sinf) to push final
+            // fp16 outputs past the ≤ 2 ULP test gate.
             for (int h = 0; h < H_kv; ++h) {
                 float * Kh = K + h * D;
                 for (int i = 0; i < D_half; ++i) {
-                    const float exp_val =
-                        static_cast<float>(2 * i) / static_cast<float>(D);
-                    const float inv_freq = std::pow(rope_base, -exp_val);
-                    const float theta = static_cast<float>(position) * inv_freq;
-                    const float c = std::cos(theta);
-                    const float s = std::sin(theta);
+                    const double exp_val_d  =
+                        static_cast<double>(2 * i) / static_cast<double>(D);
+                    const double inv_freq_d = std::pow(static_cast<double>(rope_base), -exp_val_d);
+                    const double theta_d    = static_cast<double>(position) * inv_freq_d;
+                    const float c = static_cast<float>(std::cos(theta_d));
+                    const float s = static_cast<float>(std::sin(theta_d));
                     const float k_lo = Kh[i];
                     const float k_hi = Kh[i + D_half];
                     Kh[i]            = k_lo * c - k_hi * s;
