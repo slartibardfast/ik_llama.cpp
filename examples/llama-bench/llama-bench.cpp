@@ -2455,8 +2455,11 @@ static bool bench_prefill_with_mtp_warmup(llama_context * ctx,
         n_processed += n_tokens;
     }
 
-    // Flip embeddings off — verify decodes that follow want logits.
-    llama_set_embeddings(ctx, false);
+    // Leave embeddings ON: Qwen 3.6 MTP build emits BOTH logits AND
+    // embeddings when nextn_predict_layers > 0 (src/llama.cpp:5411,5427).
+    // Subsequent verify decodes still receive logits — and the MTP draft
+    // path inside common_speculative_draft can read embeddings for the
+    // recurrent input seed each cycle.
     llama_synchronize(ctx);
     return true;
 }
@@ -2572,10 +2575,6 @@ static void test_gen_spec(
         for (size_t k = 0; k < draft.size(); k++) {
             common_batch_add(batch, draft[k], P + 1 + (llama_pos) k, {0}, true);
         }
-        // Verify must return logits, not embeddings. Prefill leaves the
-        // ctx in embeddings=false state (set on exit), but MTP draft may
-        // have flipped it on for its own forward; re-disable here.
-        llama_set_embeddings(ctx, false);
         if (llama_decode(ctx, batch) != 0) {
             llama_batch_free(batch);
             break;
@@ -2605,6 +2604,18 @@ static void test_gen_spec(
             // Roll back rejected positions from target KV. The verify batch
             // wrote [P .. P+BS]; we keep [P .. P+n_acc] (id_last + n_acc drafts).
             llama_kv_cache_seq_rm(ctx, 0, P + n_acc + 1, -1);
+
+            // MTP: seed next cycle's draft with the LAST accepted position's
+            // embedding. Verify wrote rows [0..BS]; row n_acc is the
+            // embedding at position P + n_acc — i.e., the position where the
+            // bonus token will be decoded next cycle. This mirrors
+            // server-context.cpp:4019-4030 (post-restore re-seed).
+            if (spec_params.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                const float * emb_acc = llama_get_embeddings_ith(ctx, n_acc);
+                if (emb_acc) {
+                    llama_set_draft_input_hidden_state(ctx, emb_acc);
+                }
+            }
         }
 
         for (int k = 0; k < n_acc; k++) emitted.push_back(draft[k]);
@@ -2666,14 +2677,13 @@ static double compute_ppl_of_output(
             llama_batch_free(batch);
             return 0.0;
         }
-        // Gather logits in batch order. With logits-mask only on `need`
-        // positions, llama_get_logits_ith(i) returns row for the i-th
-        // `need` slot in the batch.
-        int need_slot = 0;
+        // Gather logits. llama_get_logits_ith takes a BATCH POSITION (not
+        // a slot counter) and uses output_ids[i] to find the contiguous
+        // logits slot. Pass the batch index `i` directly.
         for (int i = 0; i < n_tokens; i++) {
             int pos = n_processed + i;
             if (pos >= n_prompt - 1 && pos < n_prompt + n_gen - 1) {
-                float * row = llama_get_logits_ith(ctx, need_slot++);
+                float * row = llama_get_logits_ith(ctx, i);
                 if (!row) {
                     llama_batch_free(batch);
                     return 0.0;
@@ -2685,7 +2695,12 @@ static double compute_ppl_of_output(
         n_processed += n_tokens;
     }
 
-    if ((int) logits.size() != n_gen * n_vocab) return 0.0;
+    if ((int) logits.size() != n_gen * n_vocab) {
+        fprintf(stderr, "[bench-ppl diag] logits.size=%zu expected=%lld (n_gen=%d, n_vocab=%d, n_prompt=%d, n_total=%d)\n",
+                logits.size(), (long long)((long long)n_gen * (long long)n_vocab),
+                n_gen, n_vocab, n_prompt, n_total);
+        return 0.0;
+    }
 
     // process_logits scores tokens[1..n_token] under logits[0..n_token-1].
     // tokens[0] is unused by the loop; place the prompt's last token there
