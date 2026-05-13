@@ -262,6 +262,10 @@ if (GGML_CUDA)
     # behavioural tests skip (exit 77) until implementation lands.
     llama_build_and_test(dflash-speculative/test-dflash-symbols.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-vocab-identity.cpp)
+    # Smoke test for bench's spec init paths (none / mtp / dflash). Skips
+    # (exit 77) when LLAMA_TEST_TARGET unset. See PHASE_DFLASH.md Phase 1
+    # closure binding #7.
+    llama_build_and_test(dflash-speculative/test-llama-bench-spec-init.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
