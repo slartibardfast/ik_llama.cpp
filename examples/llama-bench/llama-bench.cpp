@@ -1105,6 +1105,11 @@ struct cmd_params_instance {
         if (!devices.empty()) {
             mparams.devices = devices.c_str();
         }
+        // T8: MTP needs has_mtp propagated to BOTH mparams (load NextN
+        // layers from GGUF) and cparams (enable MTP routing in build).
+        if (spec_type == COMMON_SPECULATIVE_TYPE_MTP) {
+            mparams.mtp = true;
+        }
         mparams.split_mode = split_mode;
         mparams.main_gpu = main_gpu;
         mparams.tensor_split = tensor_split.data();
@@ -1167,6 +1172,15 @@ struct cmd_params_instance {
         cparams.embeddings = embeddings;
         cparams.cuda_params = (void *)cuda_params.data();
         cparams.scheduler_async = sas;
+        // T8: MTP routing on target context. Pooling must be NONE because
+        // MTP consumes per-position embeddings from the target's residual
+        // stream (not a pooled vector). Mirrors server-context.cpp:294-331
+        // gpt_params.pooling_type = NONE → cparams via the standard wiring.
+        if (spec_type == COMMON_SPECULATIVE_TYPE_MTP) {
+            cparams.mtp = true;
+            cparams.mtp_op_type = MTP_OP_NONE;
+            cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        }
 
         return cparams;
     }
@@ -2387,6 +2401,100 @@ static bool bench_prefill_real(llama_context * ctx, const std::vector<llama_toke
     return true;
 }
 
+// MTP-aware prefill: in addition to a standard prefill, this captures
+// per-token embeddings during prompt decode and seeds the MTP heads via
+// llama_set_draft_input_hidden_state + mtp_update_kv_cache. Mirrors
+// server-context.cpp:4606-4744 — without this, MTP draft returns 0
+// tokens (no recurrent input to the heads).
+static bool bench_prefill_with_mtp_warmup(llama_context * ctx,
+                                          const std::vector<llama_token> & tokens,
+                                          int n_batch, int n_threads) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+    const llama_model * model = llama_get_model(ctx);
+    const int n_embd = llama_model_n_embd(model);
+    const int n_total = (int) tokens.size();
+
+    // Enable embeddings so target's forward emits per-token hidden states.
+    llama_set_embeddings(ctx, true);
+
+    int n_processed = 0;
+    while (n_processed < n_total) {
+        int n_tokens = std::min(n_batch, n_total - n_processed);
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            // logits=true on every token so embeddings emit at each position.
+            common_batch_add(batch, tokens[n_processed + i],
+                             n_processed + i, {0}, true);
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            llama_set_embeddings(ctx, false);
+            return false;
+        }
+        // Gather per-token embeddings. mtp_update_kv_cache short-circuits
+        // when LLAMA_MTP_INLINE_KV is set (the per-ubatch hook already
+        // wrote MTP KV during the prefill forward); call it anyway to
+        // keep the API contract identical to server. The LAST embedding
+        // seeds MTP's recurrent input for the first draft step
+        // (matches server-context.cpp:3325 — slot.mtp_hidden_state +
+        // (n_hidden - 1) * n_embd).
+        std::vector<float> emb_batch((size_t) n_tokens * (size_t) n_embd, 0.0f);
+        for (int i = 0; i < n_tokens; i++) {
+            const float * emb_i = llama_get_embeddings_ith(ctx, i);
+            if (emb_i) {
+                memcpy(emb_batch.data() + (size_t) i * (size_t) n_embd,
+                       emb_i, (size_t) n_embd * sizeof(float));
+            }
+        }
+        // Seed with the LAST position's embedding — that's what predicts the first gen token.
+        llama_set_draft_input_hidden_state(
+            ctx, emb_batch.data() + (size_t) (n_tokens - 1) * (size_t) n_embd);
+        mtp_update_kv_cache(ctx, batch, /*is_prompt_warmup=*/true);
+
+        llama_batch_free(batch);
+        n_processed += n_tokens;
+    }
+
+    // Flip embeddings off — verify decodes that follow want logits.
+    llama_set_embeddings(ctx, false);
+    llama_synchronize(ctx);
+    return true;
+}
+
+// Greedy-decode token generation (no spec). Produces coherent output by
+// argmaxing target logits at each step; required when --ppl-of-output is
+// set without a spec method, since vanilla `test_gen` emits random tokens.
+static void test_gen_greedy(
+        llama_context * ctx,
+        int n_gen,
+        int n_past,
+        int n_threads,
+        const llama_model * model,
+        std::vector<llama_token> * out_generated)
+{
+    llama_set_n_threads(ctx, n_threads, n_threads);
+    const int n_vocab = llama_n_vocab(model);
+
+    llama_token tok;
+    {
+        float * logits = llama_get_logits_ith(ctx, -1);
+        if (!logits) return;
+        tok = bench_greedy_argmax(logits, n_vocab);
+    }
+    if (out_generated) out_generated->push_back(tok);
+
+    for (int i = 1; i < n_gen; i++) {
+        llama_pos pos = (llama_pos)(n_past + i - 1);
+        llama_decode(ctx, llama_batch_get_one(&tok, 1, pos, 0));
+        llama_synchronize(ctx);
+        float * logits = llama_get_logits_ith(ctx, 0);
+        if (!logits) break;
+        tok = bench_greedy_argmax(logits, n_vocab);
+        if (out_generated) out_generated->push_back(tok);
+        // Do not exit on EOG: bench measures throughput, not output truncation.
+    }
+}
+
 // Spec-aware token generation. Drives `common_speculative_draft` + verify
 // batch + accept-prefix loop, mirroring examples/dflash-speculative-simple
 // and the production server's MTP path.
@@ -2464,6 +2572,10 @@ static void test_gen_spec(
         for (size_t k = 0; k < draft.size(); k++) {
             common_batch_add(batch, draft[k], P + 1 + (llama_pos) k, {0}, true);
         }
+        // Verify must return logits, not embeddings. Prefill leaves the
+        // ctx in embeddings=false state (set on exit), but MTP draft may
+        // have flipped it on for its own forward; re-disable here.
+        llama_set_embeddings(ctx, false);
         if (llama_decode(ctx, batch) != 0) {
             llama_batch_free(batch);
             break;
@@ -2499,7 +2611,10 @@ static void test_gen_spec(
         emitted.push_back(bonus);
         id_last = bonus;
 
-        if (llama_token_is_eog(model, bonus)) break;
+        // Bench: do NOT exit on EOG. Pad to n_gen for a fair t/s measurement
+        // — production server-side semantics are about token throughput,
+        // not output coherence beyond a sentinel. PPL-of-output is bounded
+        // separately and provides the quality signal.
     }
 
     if (out_generated) {
@@ -2747,6 +2862,9 @@ int main(int argc, char ** argv) {
                 nd = (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) ? 4 : 3;
             }
             spec_params.n_max = nd;
+            spec_params.n_min = 0;
+            spec_params.p_min = 0.0f;
+            spec_params.p_split = 0.0f;
 
             if (inst.spec_type == COMMON_SPECULATIVE_TYPE_MTP) {
                 if (llama_model_n_nextn_layer(lmodel) <= 0) {
@@ -2754,11 +2872,14 @@ int main(int argc, char ** argv) {
                     spec_init_failed = true;
                 } else {
                     // Mirror server-context.cpp:294-331 MTP init recipe.
+                    // cparams_dft is unused by the MTP impl (the server's
+                    // decoder wrapper applies these flags per-call); we still
+                    // populate them for ABI symmetry. Embeddings flag is
+                    // managed dynamically around verify (see test_gen_spec).
                     spec_params.cparams_dft = inst.to_llama_cparams();
                     spec_params.cparams_dft.mtp = true;
                     spec_params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
                     spec_params.cparams_dft.embeddings = true;
-                    llama_set_embeddings(ctx, true);
                 }
             } else if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 if (inst.spec_model.empty()) {
@@ -2826,7 +2947,15 @@ int main(int argc, char ** argv) {
                 t_start = get_time_ns();
             }
             if (use_real_prompt) {
-                if (!bench_prefill_real(ctx, prompt_tokens, t.n_batch, t.n_threads.second)) {
+                bool prefill_ok = false;
+                if (spec && inst.spec_type == COMMON_SPECULATIVE_TYPE_MTP) {
+                    prefill_ok = bench_prefill_with_mtp_warmup(
+                        ctx, prompt_tokens, t.n_batch, t.n_threads.second);
+                } else {
+                    prefill_ok = bench_prefill_real(
+                        ctx, prompt_tokens, t.n_batch, t.n_threads.second);
+                }
+                if (!prefill_ok) {
                     fprintf(stderr, "error: prefill decode failed\n");
                     break;
                 }
@@ -2838,8 +2967,12 @@ int main(int argc, char ** argv) {
             }
 
             std::vector<llama_token> generated;
+            const int n_past_after_prefill = use_real_prompt
+                ? (int) prompt_tokens.size()
+                : t.n_prompt;
             if (t.n_gen > 0) {
                 if (spec) {
+                    common_speculative_begin(spec, prompt_tokens);
                     int rep_n_drafts = 0;
                     int rep_n_accept = 0;
                     int rep_n_draft_total = 0;
@@ -2850,10 +2983,11 @@ int main(int argc, char ** argv) {
                     t.n_drafts      += rep_n_drafts;
                     t.n_accepted    += rep_n_accept;
                     t.n_draft_total += rep_n_draft_total;
+                } else if (inst.ppl_of_output && use_real_prompt) {
+                    // Greedy decode produces coherent output for PPL comparison.
+                    test_gen_greedy(ctx, t.n_gen, n_past_after_prefill,
+                                    t.n_threads.first, lmodel, &generated);
                 } else {
-                    const int n_past_after_prefill = use_real_prompt
-                        ? (int) prompt_tokens.size()
-                        : t.n_prompt;
                     test_gen(ctx, t.n_gen, n_past_after_prefill, t.n_threads.first);
                 }
             }
@@ -2862,8 +2996,8 @@ int main(int argc, char ** argv) {
             t.samples_ns.push_back(t_ns);
 
             // Optional second pass: corpus PPL of generated output under target.
-            // Only meaningful when we have a real prompt + spec-driven coherent output.
-            if (inst.ppl_of_output && spec && use_real_prompt && !generated.empty()) {
+            // Requires real prompt + captured generated tokens (spec or greedy).
+            if (inst.ppl_of_output && use_real_prompt && !generated.empty()) {
                 double ppl = compute_ppl_of_output(ctx, prompt_tokens, generated);
                 if (std::isfinite(ppl) && ppl > 0.0) {
                     ppl_sum += ppl;
