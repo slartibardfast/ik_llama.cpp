@@ -41,7 +41,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
-    COMMON_SPECULATIVE_TYPE_SUFFIX
+    COMMON_SPECULATIVE_TYPE_SUFFIX,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -54,7 +55,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
-    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
+    {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -958,6 +960,97 @@ struct common_speculative_state_suffix : public common_speculative_state {
     }
 };
 
+// DFlash sidecar drafter state. Wraps llama_dflash_drafter (owned) and
+// dispatches into llama_dflash_draft per draft call. The C API in
+// include/llama.h handles all kernel orchestration; this state subclass
+// is just a thin adapter onto the common_speculative_state contract.
+//
+// Spec: specs/dflash/dflash.allium
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context             * ctx_tgt = nullptr;
+    llama_dflash_drafter      * drafter = nullptr;
+    int32_t                     block_size = 0;
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context              * ctx_tgt_,
+            const std::string          & drafter_path)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt_)
+    {
+        drafter = llama_dflash_drafter_load(drafter_path.c_str());
+        if (!drafter) {
+            LOG_ERR("%s: failed to load DFlash drafter from '%s'\n",
+                    __func__, drafter_path.c_str());
+            return;
+        }
+        block_size = llama_dflash_block_size(drafter);
+        int32_t rc = llama_set_dflash(ctx_tgt, drafter);
+        if (rc != LLAMA_DFLASH_OK) {
+            LOG_ERR("%s: llama_set_dflash failed: rc=%d\n", __func__, rc);
+            llama_dflash_drafter_free(drafter);
+            drafter = nullptr;
+            return;
+        }
+        LOG_INF("%s: DFlash sidecar drafter bound to ctx_tgt (block_size=%d)\n",
+                __func__, block_size);
+    }
+
+    ~common_speculative_state_dflash() override {
+        // ctx_tgt's destructor releases the per-context DFlash state
+        // (llama_dflash_release_ctx_state). We free only the drafter
+        // we loaded here.
+        if (drafter) llama_dflash_drafter_free(drafter);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        // Target prefill drives the cb_eval extract hook installed by
+        // llama_set_dflash; nothing extra to do here.
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        if (!drafter) {
+            result.clear();
+            return;
+        }
+        const int32_t n_max = std::min<int32_t>(params.n_max, block_size);
+        if (n_max <= 0) {
+            result.clear();
+            return;
+        }
+
+        result.assign(block_size, 0);
+        // anchor_pos = prompt_tgt.size() — the seq position where id_last
+        // sits when fed into the target verify decode for this cycle.
+        const int32_t rc = llama_dflash_draft(
+                ctx_tgt, id_last, (int32_t) prompt_tgt.size(),
+                result.data(), (int32_t) result.size());
+        if (rc < 0) {
+            LOG_WRN("%s: llama_dflash_draft failed: rc=%d (giving up this cycle)\n", __func__, rc);
+            result.clear();
+            return;
+        }
+        // Caller's n_max may be less than block_size; truncate the
+        // returned candidate list rather than over-drafting.
+        if ((int32_t) result.size() > n_max) {
+            result.resize(n_max);
+        }
+        n_gen_drafts += 1;
+        n_gen_tokens += result.size();
+    }
+
+    void accept(uint16_t n_accepted) override {
+        n_call_accept += 1;
+        n_acc_drafts  += (n_accepted > 0) ? 1 : 0;
+        n_acc_tokens  += n_accepted;
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
@@ -1012,6 +1105,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
         case COMMON_SPECULATIVE_TYPE_SUFFIX:        return "suffix";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -1075,7 +1169,7 @@ common_speculative * common_speculative_init(
     {
         bool has_draft = !params.mparams_dft.path.empty();
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
-        bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP); 
+        bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP);
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -1083,6 +1177,17 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         bool has_suffix        = (params.type == COMMON_SPECULATIVE_TYPE_SUFFIX);
+        bool has_dflash        = (params.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+        if (has_dflash) {
+            // Prefer mparams_dft.path; fall back to legacy params.model string.
+            if (params.mparams_dft.path.empty() && params.model.empty()) {
+                LOG_ERR("%s: DFlash requires a drafter GGUF path (--model-draft or speculative.model)\n", __func__);
+                return nullptr;
+            }
+            // DFlash supersedes the generic "draft model" path — both flags
+            // are mutually exclusive at the loader level.
+            has_draft = false;
+        }
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -1121,6 +1226,9 @@ common_speculative * common_speculative_init(
         }
         if (has_mtp) {
              configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
+        }
+        if (has_dflash) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
         }
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
@@ -1163,6 +1271,19 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                const std::string & drafter_path = !params.mparams_dft.path.empty()
+                    ? params.mparams_dft.path
+                    : params.model;
+                auto state = std::make_unique<common_speculative_state_dflash>(
+                    config.type, ctx_tgt, drafter_path);
+                if (!state->drafter) {
+                    LOG_ERR("%s: failed to construct DFlash sidecar state\n", __func__);
+                    return nullptr;
+                }
+                impls.push_back(std::move(state));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

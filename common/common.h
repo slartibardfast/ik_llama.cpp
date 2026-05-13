@@ -148,6 +148,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_SUFFIX,        // self-speculative suffix-decoding (arXiv:2411.04975)
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash diffusion-style sidecar drafter (sm_75 only; specs/dflash/)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
