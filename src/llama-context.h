@@ -340,4 +340,9 @@ struct llama_context {
         struct llama_context & lctx);
     void set_mtp_op_type(llama_mtp_op_type value);
 
+    // DFlash drafter binding. Set by llama_set_dflash, cleared by
+    // llama_free. Type is opaque from this header (forward-declared in
+    // llama-dflash.cpp).
+    // Spec: specs/dflash/dflash.allium.
+    struct llama_dflash_ctx_state * dflash_state = nullptr;
 };

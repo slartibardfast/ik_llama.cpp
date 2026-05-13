@@ -1,48 +1,714 @@
 // llama-dflash.cpp
 //
-// DFlash speculative decoding stub implementation.
+// DFlash speculative decoding orchestration (sm_75).
 //
-// RED-first scaffold: every entry point returns
-// LLAMA_DFLASH_NOT_IMPLEMENTED (or a corresponding -1 / -2 sentinel)
-// until the real implementation lands. The behavioural tests under
-// tests/dflash-speculative/ bind on the eventual correct return
-// values; today they assert RED.
+// The drafter is a sidecar weight bundle loaded via
+// llama_dflash_drafter_load (gguf_init_from_file + per-tensor cudaMalloc
+// upload, mirroring tests/dflash-speculative/dflash-drafter-loader.h),
+// bound to a target context via llama_set_dflash, and driven by
+// llama_dflash_draft which runs the fused kernel pipeline:
 //
-// Spec: specs/dflash/dflash.allium
-// Design: specs/dflash/DESIGN.md
+//   combine_features -> inject_kv_fused x L_d -> drafter_forward
+//                    -> drafter_lm_head -> per-row argmax
+//
+// Target hiddens at the 5 source-layer indices are captured by the T2
+// cb_eval hook into ctx->default_decoder.dflash_extract_buf[il] and
+// uploaded per cycle.
+//
+// Shared embed / lm_head: drafter does NOT carry token_embd or
+// output.weight in its GGUF; we point at the target model's tensors
+// via llama_get_model_tensor. Satisfies @SharedEmbedAndLMHead.
+//
+// When GGML_CUDA_DFLASH is OFF every entry returns
+// LLAMA_DFLASH_NOT_IMPLEMENTED.
 
 #include "llama.h"
 
+// Internal helper: called from llama_context's destructor in llama.cpp to
+// release per-context DFlash scratch (KV cache + scratch buffers). The
+// drafter itself is caller-owned and freed via llama_dflash_drafter_free.
+extern void llama_dflash_release_ctx_state(struct llama_context * ctx);
+
+#ifdef GGML_CUDA_DFLASH
+
+#include "llama-context.h"
+#include "llama-model.h"
+
+#include "ggml.h"
+
+#include "ggml-cuda/dflash/dflash-combine-features.cuh"
+#include "ggml-cuda/dflash/dflash-inject-kv.cuh"
+#include "ggml-cuda/dflash/dflash-drafter-forward.cuh"
+#include "ggml-cuda/dflash/dflash-drafter-lm-head.cuh"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+const char * MODULE = "dflash";
+
+inline bool cuda_ok(cudaError_t e, const char * what) {
+    if (e == cudaSuccess) return true;
+    std::fprintf(stderr, "[%s] CUDA error in %s: %s\n", MODULE, what, cudaGetErrorString(e));
+    return false;
+}
+
+} // namespace
+
+// ─────────────────────────────────────────────────────────────────────
+// Opaque types
+// ─────────────────────────────────────────────────────────────────────
+
+struct llama_dflash_drafter {
+    // ── Dimensions / metadata (from drafter GGUF) ──
+    int n_layers          = 0;
+    int hidden_size       = 0;
+    int intermediate_size = 0;
+    int n_q_heads         = 0;
+    int n_kv_heads        = 0;
+    int head_dim          = 0;
+    int sliding_window    = 0;
+    int block_size        = 0;
+    int mask_token_id     = 0;
+    float rope_theta      = 0.0f;
+    float rms_norm_eps    = 0.0f;
+    std::vector<int> target_layer_ids;   // [1, 16, 31, 46, 61]
+    std::vector<int> layer_types;        // 0 = SWA, 1 = full
+
+    // ── Per-layer device pointers ──
+    std::vector<const __half *> attn_norm, attn_q, attn_q_norm;
+    std::vector<const __half *> attn_k,    attn_k_norm;
+    std::vector<const __half *> attn_v,    attn_output;
+    std::vector<const __half *> ffn_norm,  ffn_gate, ffn_up, ffn_down;
+
+    // ── Non-layer device pointers ──
+    const __half * dflash_fc          = nullptr;
+    const __half * dflash_hidden_norm = nullptr;
+    const __half * output_norm        = nullptr;
+
+    // ── Backing storage ──
+    std::vector<void *> gpu_buffers;
+    struct gguf_context * gguf_ctx = nullptr;
+    struct ggml_context * ggml_ctx = nullptr;
+};
+
+struct llama_dflash_ctx_state {
+    // Drafter reference (caller owns; do not free here).
+    struct llama_dflash_drafter * drafter = nullptr;
+
+    // Shared tensor pointers (target-owned; do not free).
+    const __half        * target_token_embd = nullptr;   // F16
+    const __nv_bfloat16 * target_lm_head    = nullptr;   // BF16
+    int                   target_vocab_size = 0;
+
+    // Drafter KV cache: L_d * SeqLen * H_kv * D_h * 2 (K and V).
+    __half * d_k_cache = nullptr;
+    __half * d_v_cache = nullptr;
+    int seq_len_cap = 0;
+
+    // Scratch buffers, sized at allocate-once time.
+    __half * d_ctx_states     = nullptr;     // [MAL_anchors, D_emb]
+    __half * d_target_hiddens = nullptr;     // [MAL_anchors, L_src, D_emb]
+    __half * d_input_emb      = nullptr;     // [(1+BS), D_emb]
+    __half * d_drafter_hidden = nullptr;     // [BS, D_emb]
+    float  * d_drafter_logits = nullptr;     // [BS, V]
+    int    * d_anchor_pos     = nullptr;     // [MAL_anchors]
+    int    * d_slot_positions = nullptr;     // [1]
+    int    * d_layer_types    = nullptr;     // [L_d]
+    int      mal_cap          = 0;           // largest MAL allocated for so far
+
+    // Host scratch for logit readback + argmax (since we do CPU argmax for T5).
+    std::vector<float> h_logits;
+
+    // Cycle counter for diagnostics.
+    int n_cycles = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Helpers — modelled after tests/dflash-speculative/dflash-drafter-loader.h
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+inline void * upload(llama_dflash_drafter & w, const void * src, std::size_t n_bytes) {
+    void * dev = nullptr;
+    if (!cuda_ok(cudaMalloc(&dev, n_bytes), "cudaMalloc(drafter weight)")) return nullptr;
+    if (!cuda_ok(cudaMemcpy(dev, src, n_bytes, cudaMemcpyHostToDevice), "cudaMemcpy(drafter weight)")) {
+        cudaFree(dev);
+        return nullptr;
+    }
+    w.gpu_buffers.push_back(dev);
+    return dev;
+}
+
+inline float kv_f32(struct gguf_context * g, const char * key) {
+    int idx = gguf_find_key(g, key);
+    return idx < 0 ? 0.0f : gguf_get_val_f32(g, idx);
+}
+inline uint32_t kv_u32(struct gguf_context * g, const char * key) {
+    int idx = gguf_find_key(g, key);
+    return idx < 0 ? 0u : gguf_get_val_u32(g, idx);
+}
+inline std::vector<int> kv_array_i32(struct gguf_context * g, const char * key) {
+    std::vector<int> out;
+    int idx = gguf_find_key(g, key);
+    if (idx < 0) return out;
+    int n = gguf_get_arr_n(g, idx);
+    const int32_t * data = static_cast<const int32_t *>(gguf_get_arr_data(g, idx));
+    out.assign(data, data + n);
+    return out;
+}
+inline std::vector<int> kv_layer_types_enum(struct gguf_context * g, const char * key) {
+    std::vector<int> out;
+    int idx = gguf_find_key(g, key);
+    if (idx < 0) return out;
+    int n = gguf_get_arr_n(g, idx);
+    out.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const char * s = gguf_get_arr_str(g, idx, i);
+        if (!s) { out.push_back(-1); continue; }
+        if (std::strcmp(s, "sliding_attention") == 0)   out.push_back(0);
+        else if (std::strcmp(s, "full_attention") == 0) out.push_back(1);
+        else                                            out.push_back(-1);
+    }
+    return out;
+}
+
+// F32 norm weights live in the drafter GGUF as F32; the kernels read
+// them as __half *. Cast at upload time per
+// feedback_validate_gguf_dtype_at_load.md. Non-F32 tensors uploaded raw.
+const __half * upload_f32_as_f16(llama_dflash_drafter & w, const char * name) {
+    struct ggml_tensor * tn = ggml_get_tensor(w.ggml_ctx, name);
+    if (!tn) {
+        std::fprintf(stderr, "[%s] tensor not found: %s\n", MODULE, name);
+        return nullptr;
+    }
+    if (tn->type != GGML_TYPE_F32) {
+        return static_cast<const __half *>(upload(w, tn->data, ggml_nbytes(tn)));
+    }
+    const std::size_t n_elems = ggml_nelements(tn);
+    std::vector<__half> tmp(n_elems);
+    const float * src = static_cast<const float *>(tn->data);
+    for (std::size_t i = 0; i < n_elems; ++i) tmp[i] = __float2half(src[i]);
+    return static_cast<const __half *>(upload(w, tmp.data(), n_elems * sizeof(__half)));
+}
+
+const __half * upload_raw_f16(llama_dflash_drafter & w, const char * name) {
+    struct ggml_tensor * tn = ggml_get_tensor(w.ggml_ctx, name);
+    if (!tn) {
+        std::fprintf(stderr, "[%s] tensor not found: %s\n", MODULE, name);
+        return nullptr;
+    }
+    return static_cast<const __half *>(upload(w, tn->data, ggml_nbytes(tn)));
+}
+
+} // namespace
+
+// ─────────────────────────────────────────────────────────────────────
+// Drafter load / free
+// ─────────────────────────────────────────────────────────────────────
+
+struct llama_dflash_drafter * llama_dflash_drafter_load(const char * path) {
+    if (!path) return nullptr;
+    auto * w = new llama_dflash_drafter();
+
+    struct gguf_init_params gparams{};
+    gparams.no_alloc = false;
+    gparams.ctx      = &w->ggml_ctx;
+    w->gguf_ctx = gguf_init_from_file(path, gparams);
+    if (!w->gguf_ctx) {
+        std::fprintf(stderr, "[%s] gguf_init_from_file failed: %s\n", MODULE, path);
+        delete w;
+        return nullptr;
+    }
+
+    w->n_layers          = (int) kv_u32(w->gguf_ctx, "dflash.block_count");
+    w->hidden_size       = (int) kv_u32(w->gguf_ctx, "dflash.embedding_length");
+    w->intermediate_size = (int) kv_u32(w->gguf_ctx, "dflash.feed_forward_length");
+    w->n_q_heads         = (int) kv_u32(w->gguf_ctx, "dflash.attention.head_count");
+    w->n_kv_heads        = (int) kv_u32(w->gguf_ctx, "dflash.attention.head_count_kv");
+    w->sliding_window    = (int) kv_u32(w->gguf_ctx, "dflash.attention.sliding_window");
+    w->block_size        = (int) kv_u32(w->gguf_ctx, "dflash.block_size");
+    w->mask_token_id     = (int) kv_u32(w->gguf_ctx, "dflash.mask_token_id");
+    w->rope_theta        =       kv_f32(w->gguf_ctx, "dflash.rope.freq_base");
+    w->rms_norm_eps      =       kv_f32(w->gguf_ctx, "dflash.attention.layer_norm_rms_epsilon");
+    w->head_dim          = (int) kv_u32(w->gguf_ctx, "dflash.attention.key_length");
+    if (w->head_dim == 0 && w->n_q_heads > 0 && w->hidden_size > 0) {
+        w->head_dim = w->hidden_size / w->n_q_heads;
+    }
+    w->target_layer_ids = kv_array_i32(w->gguf_ctx, "dflash.target_layer_ids");
+    w->layer_types      = kv_layer_types_enum(w->gguf_ctx, "dflash.layer_types");
+
+    if (w->n_layers <= 0 || w->hidden_size <= 0 || w->intermediate_size <= 0) {
+        std::fprintf(stderr, "[%s] drafter metadata incomplete: n_layers=%d hidden=%d ffn=%d\n",
+                     MODULE, w->n_layers, w->hidden_size, w->intermediate_size);
+        llama_dflash_drafter_free(w);
+        return nullptr;
+    }
+
+    w->attn_norm.resize(w->n_layers);
+    w->attn_q.resize(w->n_layers);
+    w->attn_q_norm.resize(w->n_layers);
+    w->attn_k.resize(w->n_layers);
+    w->attn_k_norm.resize(w->n_layers);
+    w->attn_v.resize(w->n_layers);
+    w->attn_output.resize(w->n_layers);
+    w->ffn_norm.resize(w->n_layers);
+    w->ffn_gate.resize(w->n_layers);
+    w->ffn_up.resize(w->n_layers);
+    w->ffn_down.resize(w->n_layers);
+
+    char nb[64];
+    for (int l = 0; l < w->n_layers; ++l) {
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_norm.weight",   l); w->attn_norm[l]   = upload_f32_as_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_q.weight",      l); w->attn_q[l]      = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_q_norm.weight", l); w->attn_q_norm[l] = upload_f32_as_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_k.weight",      l); w->attn_k[l]      = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_k_norm.weight", l); w->attn_k_norm[l] = upload_f32_as_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_v.weight",      l); w->attn_v[l]      = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.attn_output.weight", l); w->attn_output[l] = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.ffn_norm.weight",    l); w->ffn_norm[l]    = upload_f32_as_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.ffn_gate.weight",    l); w->ffn_gate[l]    = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.ffn_up.weight",      l); w->ffn_up[l]      = upload_raw_f16(*w, nb);
+        std::snprintf(nb, sizeof(nb), "blk.%d.ffn_down.weight",    l); w->ffn_down[l]    = upload_raw_f16(*w, nb);
+
+        if (!w->attn_norm[l] || !w->attn_q[l] || !w->attn_q_norm[l] || !w->attn_k[l] ||
+            !w->attn_k_norm[l] || !w->attn_v[l] || !w->attn_output[l] || !w->ffn_norm[l] ||
+            !w->ffn_gate[l] || !w->ffn_up[l] || !w->ffn_down[l]) {
+            std::fprintf(stderr, "[%s] missing tensor at layer %d\n", MODULE, l);
+            llama_dflash_drafter_free(w);
+            return nullptr;
+        }
+    }
+
+    w->dflash_fc          = upload_raw_f16(*w, "dflash_fc.weight");
+    w->dflash_hidden_norm = upload_f32_as_f16(*w, "dflash_hidden_norm.weight");
+    w->output_norm        = upload_f32_as_f16(*w, "output_norm.weight");
+    if (!w->dflash_fc || !w->dflash_hidden_norm || !w->output_norm) {
+        llama_dflash_drafter_free(w);
+        return nullptr;
+    }
+
+    std::fprintf(stderr, "[%s] drafter loaded: %d layers, hidden=%d, ffn=%d, vocab(target)=?, BS=%d, swa=%d, mask=%d\n",
+                 MODULE, w->n_layers, w->hidden_size, w->intermediate_size,
+                 w->block_size, w->sliding_window, w->mask_token_id);
+    return w;
+}
+
+void llama_dflash_drafter_free(struct llama_dflash_drafter * drafter) {
+    if (!drafter) return;
+    for (void * p : drafter->gpu_buffers) if (p) cudaFree(p);
+    if (drafter->gguf_ctx) gguf_free(drafter->gguf_ctx);
+    if (drafter->ggml_ctx) ggml_free(drafter->ggml_ctx);
+    delete drafter;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-context bind
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Find a target tensor by name, return its data pointer (must be on GPU
+// after the CUDA backend has uploaded it).
+const void * find_target_tensor_data(struct llama_model * model, const char * name) {
+    struct ggml_tensor * t = llama_get_model_tensor(model, name);
+    if (!t || !t->data) {
+        std::fprintf(stderr, "[%s] target tensor missing: %s\n", MODULE, name);
+        return nullptr;
+    }
+    return t->data;
+}
+
+// Allocate per-context DFlash scratch + drafter KV cache.
+// seq_len_cap = sequence-length budget for the drafter cache.
+// mal_cap     = maximum MAL_anchors (= context positions to combine over).
+bool allocate_ctx_scratch(llama_dflash_ctx_state & st, const llama_dflash_drafter & dw,
+                          int seq_len_cap, int mal_cap) {
+    const int L_d   = dw.n_layers;
+    const int H_kv  = dw.n_kv_heads;
+    const int D_h   = dw.head_dim;
+    const int D_emb = dw.hidden_size;
+    const int BS    = dw.block_size;
+    const int Q     = 1 + BS;
+    const int V     = st.target_vocab_size;
+    const int L_src = (int) dw.target_layer_ids.size();
+
+    const std::size_t n_kv_per_layer = (std::size_t) seq_len_cap * H_kv * D_h;
+    const std::size_t kv_bytes = (std::size_t) L_d * n_kv_per_layer * sizeof(__half);
+
+    if (!cuda_ok(cudaMalloc(&st.d_k_cache, kv_bytes), "alloc K cache")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_v_cache, kv_bytes), "alloc V cache")) return false;
+    cudaMemset(st.d_k_cache, 0, kv_bytes);
+    cudaMemset(st.d_v_cache, 0, kv_bytes);
+
+    if (!cuda_ok(cudaMalloc(&st.d_ctx_states, (std::size_t) mal_cap * D_emb * sizeof(__half)),
+                 "alloc ctx_states")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_target_hiddens, (std::size_t) mal_cap * L_src * D_emb * sizeof(__half)),
+                 "alloc target_hiddens stage")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_input_emb, (std::size_t) Q * D_emb * sizeof(__half)),
+                 "alloc input_emb")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_drafter_hidden, (std::size_t) BS * D_emb * sizeof(__half)),
+                 "alloc drafter_hidden")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_drafter_logits, (std::size_t) BS * V * sizeof(float)),
+                 "alloc drafter_logits")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_anchor_pos, (std::size_t) mal_cap * sizeof(int)),
+                 "alloc anchor_pos")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_slot_positions, sizeof(int)),
+                 "alloc slot_positions")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_layer_types, (std::size_t) L_d * sizeof(int)),
+                 "alloc layer_types")) return false;
+    cudaMemcpy(st.d_layer_types, dw.layer_types.data(),
+               (std::size_t) L_d * sizeof(int), cudaMemcpyHostToDevice);
+
+    st.h_logits.assign((std::size_t) BS * V, 0.0f);
+
+    st.seq_len_cap = seq_len_cap;
+    st.mal_cap     = mal_cap;
+    return true;
+}
+
+void free_ctx_scratch(llama_dflash_ctx_state & st) {
+    auto F = [](void *& p){ if (p) { cudaFree(p); p = nullptr; } };
+    F((void *&) st.d_k_cache);
+    F((void *&) st.d_v_cache);
+    F((void *&) st.d_ctx_states);
+    F((void *&) st.d_target_hiddens);
+    F((void *&) st.d_input_emb);
+    F((void *&) st.d_drafter_hidden);
+    F((void *&) st.d_drafter_logits);
+    F((void *&) st.d_anchor_pos);
+    F((void *&) st.d_slot_positions);
+    F((void *&) st.d_layer_types);
+}
+
+} // namespace
+
 int32_t llama_set_dflash(
-        struct llama_context * /*ctx_tgt*/,
-        struct llama_model   * /*model_dft*/) {
+        struct llama_context        * ctx_tgt,
+        struct llama_dflash_drafter * drafter) {
+    if (!ctx_tgt || !drafter) return LLAMA_DFLASH_INVALID_DRAFTER;
+
+    if (ctx_tgt->dflash_state) {
+        std::fprintf(stderr, "[%s] llama_set_dflash called twice on same context — freeing previous binding\n", MODULE);
+        free_ctx_scratch(*ctx_tgt->dflash_state);
+        delete ctx_tgt->dflash_state;
+        ctx_tgt->dflash_state = nullptr;
+    }
+
+    struct llama_model * model = const_cast<struct llama_model *>(&ctx_tgt->model);
+
+    auto * st = new llama_dflash_ctx_state();
+    st->drafter = drafter;
+
+    // Resolve shared embed + lm_head from target.
+    st->target_token_embd = static_cast<const __half *>(
+        find_target_tensor_data(model, "token_embd.weight"));
+    st->target_lm_head = static_cast<const __nv_bfloat16 *>(
+        find_target_tensor_data(model, "output.weight"));
+    if (!st->target_token_embd || !st->target_lm_head) {
+        delete st;
+        return LLAMA_DFLASH_INVALID_DRAFTER;
+    }
+
+    // Read target vocab size from model.
+    {
+        struct ggml_tensor * te = llama_get_model_tensor(model, "token_embd.weight");
+        if (!te) { delete st; return LLAMA_DFLASH_INVALID_DRAFTER; }
+        st->target_vocab_size = (int) te->ne[1];
+    }
+
+    // Allocate scratch. seq_len_cap = ctx size; mal_cap = same (we may
+    // combine over the entire seen context).
+    const int seq_len_cap = (int) ctx_tgt->cparams.n_ctx;
+    const int mal_cap     = seq_len_cap;
+    if (!allocate_ctx_scratch(*st, *drafter, seq_len_cap, mal_cap)) {
+        free_ctx_scratch(*st);
+        delete st;
+        return LLAMA_DFLASH_LOAD_FAILED;
+    }
+
+    // Arrange the extract hook on target's 5 source layers automatically.
+    std::vector<int32_t> ids(drafter->target_layer_ids.begin(),
+                              drafter->target_layer_ids.end());
+    llama_set_dflash_extract_layers(ctx_tgt, ids.data(), (int32_t) ids.size());
+
+    ctx_tgt->dflash_state = st;
+
+    std::fprintf(stderr, "[%s] bound: seq_len_cap=%d mal_cap=%d V=%d  source_layers=[",
+                 MODULE, seq_len_cap, mal_cap, st->target_vocab_size);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        std::fprintf(stderr, "%s%d", i?",":"", ids[i]);
+    }
+    std::fprintf(stderr, "]\n");
+    return LLAMA_DFLASH_OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Query API
+// ─────────────────────────────────────────────────────────────────────
+
+int32_t llama_dflash_n_source_layers(const struct llama_dflash_drafter * drafter) {
+    return drafter ? (int32_t) drafter->target_layer_ids.size() : -1;
+}
+int32_t llama_dflash_block_size(const struct llama_dflash_drafter * drafter) {
+    return drafter ? drafter->block_size : -1;
+}
+llama_token llama_dflash_mask_token_id(const struct llama_dflash_drafter * drafter) {
+    return drafter ? (llama_token) drafter->mask_token_id : -1;
+}
+int32_t llama_dflash_swa_window(const struct llama_dflash_drafter * drafter, int32_t layer_idx) {
+    if (!drafter) return -2;
+    if (layer_idx < 0 || layer_idx >= drafter->n_layers) return -2;
+    if (drafter->layer_types.empty()) return drafter->sliding_window;
+    return drafter->layer_types[layer_idx] == 0 ? drafter->sliding_window : 0;
+}
+enum llama_dflash_layer_type llama_dflash_layer_type_at(
+        const struct llama_dflash_drafter * drafter, int32_t layer_idx) {
+    if (!drafter || layer_idx < 0 || layer_idx >= drafter->n_layers || drafter->layer_types.empty())
+        return LLAMA_DFLASH_LAYER_FULL_ATTENTION;
+    return drafter->layer_types[layer_idx] == 0
+        ? LLAMA_DFLASH_LAYER_SLIDING_ATTENTION
+        : LLAMA_DFLASH_LAYER_FULL_ATTENTION;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Cycle: produce BLOCK_SIZE candidate tokens
+// ─────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Stage target hiddens from the cb_eval host buffer to the per-cycle
+// GPU staging buffer at shape [MAL_anchors, L_src, D_emb] row-major.
+bool stage_target_hiddens(llama_dflash_ctx_state & st,
+                          const llama_dflash_drafter & dw,
+                          struct llama_context * ctx,
+                          int mal_anchors) {
+    const int D_emb = dw.hidden_size;
+    const int L_src = (int) dw.target_layer_ids.size();
+
+    std::vector<__half> h_stage((std::size_t) mal_anchors * L_src * D_emb);
+
+    for (int i = 0; i < L_src; ++i) {
+        const int il = dw.target_layer_ids[i];
+        if (il < 0 || il >= 16) return false;
+        // T2 hook writes float per layer into default_decoder.dflash_extract_buf[il].
+        const std::vector<float> & buf = ctx->default_decoder.dflash_extract_buf[il];
+        if ((int) (buf.size() / D_emb) < mal_anchors) {
+            std::fprintf(stderr, "[%s] extract buffer too short for layer %d: have %zu, need %d\n",
+                         MODULE, il, buf.size() / (std::size_t) D_emb, mal_anchors);
+            return false;
+        }
+        for (int a = 0; a < mal_anchors; ++a) {
+            const float * row = buf.data() + (std::size_t) a * D_emb;
+            for (int d = 0; d < D_emb; ++d) {
+                h_stage[((std::size_t) a * L_src + i) * D_emb + d] = __float2half(row[d]);
+            }
+        }
+    }
+
+    return cuda_ok(cudaMemcpy(st.d_target_hiddens, h_stage.data(),
+                              h_stage.size() * sizeof(__half), cudaMemcpyHostToDevice),
+                   "upload staged target_hiddens");
+}
+
+} // namespace
+
+int32_t llama_dflash_draft(
+        struct llama_context * ctx_tgt,
+        llama_token            anchor_token_id,
+        int32_t                anchor_pos,
+        llama_token          * out_candidates,
+        int32_t                max_candidates) {
+    if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
+    auto & st = *ctx_tgt->dflash_state;
+    if (!st.drafter) return LLAMA_DFLASH_INVALID_DRAFTER;
+    auto & dw = *st.drafter;
+
+    const int BS = dw.block_size;
+    if (max_candidates < BS) {
+        std::fprintf(stderr, "[%s] out_candidates size %d < BLOCK_SIZE %d\n", MODULE, max_candidates, BS);
+        return LLAMA_DFLASH_INVALID_DRAFTER;
+    }
+
+    if (anchor_pos < 0 || anchor_pos >= st.seq_len_cap) {
+        std::fprintf(stderr, "[%s] anchor_pos %d out of range [0, %d)\n", MODULE, anchor_pos, st.seq_len_cap);
+        return LLAMA_DFLASH_INVALID_DRAFTER;
+    }
+
+    const int D_emb       = dw.hidden_size;
+    const int L_d         = dw.n_layers;
+    const int H_kv        = dw.n_kv_heads;
+    const int D_h         = dw.head_dim;
+    const int H_q         = dw.n_q_heads;
+    const int intermediate = dw.intermediate_size;
+    const int swa_window  = dw.sliding_window;
+    const float rope_base = dw.rope_theta;
+    const float norm_eps  = dw.rms_norm_eps;
+    const int L_src       = (int) dw.target_layer_ids.size();
+    const int N_slots     = 1;
+    const int Q           = 1 + BS;
+    const int SeqLen      = st.seq_len_cap;
+    const int V           = st.target_vocab_size;
+    const int MAL         = anchor_pos;   // combine over all positions [0, anchor_pos)
+    if (MAL <= 0) {
+        std::fprintf(stderr, "[%s] draft called at anchor_pos=0 (no context to combine)\n", MODULE);
+        return LLAMA_DFLASH_INVALID_DRAFTER;
+    }
+    if (MAL > st.mal_cap) {
+        std::fprintf(stderr, "[%s] MAL %d exceeds capacity %d\n", MODULE, MAL, st.mal_cap);
+        return LLAMA_DFLASH_INVALID_DRAFTER;
+    }
+
+    // ── 1. Stage target hiddens from cb_eval buffer ──
+    if (!stage_target_hiddens(st, dw, ctx_tgt, MAL)) return LLAMA_DFLASH_MISSING_METADATA;
+
+    // anchor_positions[a] = a  (each context token at its seq_pos)
+    {
+        std::vector<int> ap(MAL);
+        for (int a = 0; a < MAL; ++a) ap[a] = a;
+        cudaMemcpy(st.d_anchor_pos, ap.data(), (std::size_t) MAL * sizeof(int),
+                   cudaMemcpyHostToDevice);
+    }
+
+    // ── 2. combine_features ──
+    dflash_combine_features_launch(
+        st.d_target_hiddens, dw.dflash_fc, dw.dflash_hidden_norm, norm_eps,
+        st.d_ctx_states, N_slots, MAL, L_src, D_emb, 0);
+
+    // ── 3. inject_kv_fused × L_d (writes K, V at the MAL context positions) ──
+    const std::size_t n_kv_per_layer = (std::size_t) SeqLen * H_kv * D_h;
+    for (int l = 0; l < L_d; ++l) {
+        dflash_inject_kv_fused_launch(
+            st.d_ctx_states, dw.attn_k[l], dw.attn_v[l], dw.attn_k_norm[l],
+            rope_base, norm_eps,
+            st.d_k_cache + (std::size_t) l * n_kv_per_layer,
+            st.d_v_cache + (std::size_t) l * n_kv_per_layer,
+            st.d_anchor_pos, N_slots, MAL, H_kv, D_h, D_emb, SeqLen, 0);
+    }
+
+    // ── 4. Compose input embeddings: anchor + BS×MASK ──
+    if (!cuda_ok(cudaMemcpy(
+            st.d_input_emb + (std::size_t) 0 * D_emb,
+            st.target_token_embd + (std::size_t) anchor_token_id * D_emb,
+            (std::size_t) D_emb * sizeof(__half), cudaMemcpyDeviceToDevice),
+            "copy anchor emb")) return LLAMA_DFLASH_LOAD_FAILED;
+
+    for (int i = 1; i < Q; ++i) {
+        if (!cuda_ok(cudaMemcpy(
+                st.d_input_emb + (std::size_t) i * D_emb,
+                st.target_token_embd + (std::size_t) dw.mask_token_id * D_emb,
+                (std::size_t) D_emb * sizeof(__half), cudaMemcpyDeviceToDevice),
+                "copy mask emb")) return LLAMA_DFLASH_LOAD_FAILED;
+    }
+
+    // slot_positions = anchor_pos
+    {
+        int sp = anchor_pos;
+        cudaMemcpy(st.d_slot_positions, &sp, sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+    // ── 5. drafter_forward ──
+    std::vector<const __half *> p_attn_norm(L_d), p_q_w(L_d), p_q_norm(L_d);
+    std::vector<const __half *> p_k_w(L_d), p_k_norm(L_d), p_v_w(L_d), p_o_w(L_d);
+    std::vector<const __half *> p_ffn_norm(L_d), p_gate(L_d), p_up(L_d), p_down(L_d);
+    for (int l = 0; l < L_d; ++l) {
+        p_attn_norm[l] = dw.attn_norm[l];
+        p_q_w[l]       = dw.attn_q[l];
+        p_q_norm[l]    = dw.attn_q_norm[l];
+        p_k_w[l]       = dw.attn_k[l];
+        p_k_norm[l]    = dw.attn_k_norm[l];
+        p_v_w[l]       = dw.attn_v[l];
+        p_o_w[l]       = dw.attn_output[l];
+        p_ffn_norm[l]  = dw.ffn_norm[l];
+        p_gate[l]      = dw.ffn_gate[l];
+        p_up[l]        = dw.ffn_up[l];
+        p_down[l]      = dw.ffn_down[l];
+    }
+
+    dflash_drafter_forward_launch(
+        st.d_input_emb, st.d_k_cache, st.d_v_cache, st.d_slot_positions,
+        p_attn_norm.data(), p_q_w.data(), p_q_norm.data(),
+        p_k_w.data(), p_k_norm.data(), p_v_w.data(), p_o_w.data(),
+        p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
+        dw.output_norm,
+        st.d_layer_types,
+        swa_window, rope_base, norm_eps,
+        BS, N_slots, SeqLen, L_d,
+        D_emb, H_q, H_kv, D_h, intermediate,
+        st.d_drafter_hidden, 0);
+
+    // ── 6. drafter_lm_head ──
+    dflash_drafter_lm_head_launch(
+        st.d_drafter_hidden, st.target_lm_head, st.d_drafter_logits,
+        N_slots * BS, D_emb, V, 0);
+
+    cudaDeviceSynchronize();
+
+    // ── 7. Per-row argmax on CPU (BS small, V=248320; fp32 logits) ──
+    cudaMemcpy(st.h_logits.data(), st.d_drafter_logits,
+               (std::size_t) BS * V * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int row = 0; row < BS; ++row) {
+        const float * r = st.h_logits.data() + (std::size_t) row * V;
+        int argmax = 0;
+        float maxv = r[0];
+        for (int v = 1; v < V; ++v) {
+            if (r[v] > maxv) { maxv = r[v]; argmax = v; }
+        }
+        out_candidates[row] = (llama_token) argmax;
+    }
+
+    st.n_cycles += 1;
+    return BS;
+}
+
+// Internal helper called from llama.cpp's llama_context destructor.
+// Releases per-context DFlash scratch (KV cache + scratch buffers)
+// but NOT the drafter — drafter is caller-owned, freed by
+// llama_dflash_drafter_free.
+void llama_dflash_release_ctx_state(struct llama_context * ctx) {
+    if (!ctx || !ctx->dflash_state) return;
+    free_ctx_scratch(*ctx->dflash_state);
+    delete ctx->dflash_state;
+    ctx->dflash_state = nullptr;
+}
+
+#else // GGML_CUDA_DFLASH not defined — stubs
+
+void llama_dflash_release_ctx_state(struct llama_context * /*ctx*/) {
+    // Field doesn't exist when DFlash compile-disabled.
+}
+
+
+struct llama_dflash_drafter * llama_dflash_drafter_load(const char * /*path*/) {
+    return nullptr;
+}
+void llama_dflash_drafter_free(struct llama_dflash_drafter * /*drafter*/) {
+}
+int32_t llama_set_dflash(struct llama_context * /*ctx*/, struct llama_dflash_drafter * /*drafter*/) {
+    return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+int32_t llama_dflash_n_source_layers(const struct llama_dflash_drafter * /*drafter*/) { return -1; }
+int32_t llama_dflash_block_size     (const struct llama_dflash_drafter * /*drafter*/) { return -1; }
+llama_token llama_dflash_mask_token_id(const struct llama_dflash_drafter * /*drafter*/) { return -1; }
+int32_t llama_dflash_swa_window     (const struct llama_dflash_drafter * /*drafter*/, int32_t /*layer*/) { return -2; }
+enum llama_dflash_layer_type llama_dflash_layer_type_at(
+        const struct llama_dflash_drafter * /*drafter*/, int32_t /*layer*/) {
+    return LLAMA_DFLASH_LAYER_FULL_ATTENTION;
+}
+int32_t llama_dflash_draft(struct llama_context * /*ctx*/, llama_token /*anchor*/, int32_t /*pos*/,
+                            llama_token * /*out*/, int32_t /*max*/) {
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
 }
 
-int32_t llama_dflash_n_source_layers(const struct llama_model * /*model_dft*/) {
-    return -1;
-}
-
-int32_t llama_dflash_block_size(const struct llama_model * /*model_dft*/) {
-    return -1;
-}
-
-llama_token llama_dflash_mask_token_id(const struct llama_model * /*model_dft*/) {
-    return -1;
-}
-
-int32_t llama_dflash_swa_window(
-        const struct llama_model * /*model_dft*/,
-        int32_t                    /*layer_idx*/) {
-    return -2;
-}
-
-enum llama_dflash_layer_type llama_dflash_layer_type_at(
-        const struct llama_model * /*model_dft*/,
-        int32_t                    /*layer_idx*/) {
-    // Stub returns full_attention so symbol-surface tests can
-    // bind on the enum value. Behavioural tests assert the
-    // drafter's actual layer composition; they fail RED until
-    // the implementation reads from GGUF metadata.
-    return LLAMA_DFLASH_LAYER_FULL_ATTENTION;
-}
+#endif // GGML_CUDA_DFLASH

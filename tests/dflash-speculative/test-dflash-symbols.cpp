@@ -34,47 +34,64 @@ int main() {
     static_assert(LLAMA_DFLASH_LAYER_FULL_ATTENTION    != LLAMA_DFLASH_LAYER_SLIDING_ATTENTION,
                   "DFlash layer-type variants must be distinct");
 
-    // 2. Status enum: all seven sentinels must exist and be distinct.
-    static_assert(LLAMA_DFLASH_OK                != LLAMA_DFLASH_NOT_IMPLEMENTED, "");
-    static_assert(LLAMA_DFLASH_NOT_IMPLEMENTED   != LLAMA_DFLASH_INVALID_DRAFTER, "");
-    static_assert(LLAMA_DFLASH_INVALID_DRAFTER   != LLAMA_DFLASH_VOCAB_MISMATCH,  "");
-    static_assert(LLAMA_DFLASH_VOCAB_MISMATCH    != LLAMA_DFLASH_HYBRID_DRAFTER,  "");
-    static_assert(LLAMA_DFLASH_HYBRID_DRAFTER    != LLAMA_DFLASH_MISSING_METADATA, "");
-    static_assert(LLAMA_DFLASH_MISSING_METADATA  != LLAMA_DFLASH_MULTIMODAL_PROMPT, "");
+    // 2. Status enum: all nine sentinels must exist and be distinct.
+    //    LLAMA_DFLASH_NP_GT_1 + LLAMA_DFLASH_LOAD_FAILED added in T5
+    //    when the sidecar drafter API replaced the llama_model-typed stub.
+    static_assert(LLAMA_DFLASH_OK                != LLAMA_DFLASH_NOT_IMPLEMENTED,    "");
+    static_assert(LLAMA_DFLASH_NOT_IMPLEMENTED   != LLAMA_DFLASH_INVALID_DRAFTER,    "");
+    static_assert(LLAMA_DFLASH_INVALID_DRAFTER   != LLAMA_DFLASH_VOCAB_MISMATCH,     "");
+    static_assert(LLAMA_DFLASH_VOCAB_MISMATCH    != LLAMA_DFLASH_HYBRID_DRAFTER,     "");
+    static_assert(LLAMA_DFLASH_HYBRID_DRAFTER    != LLAMA_DFLASH_MISSING_METADATA,   "");
+    static_assert(LLAMA_DFLASH_MISSING_METADATA  != LLAMA_DFLASH_MULTIMODAL_PROMPT,  "");
+    static_assert(LLAMA_DFLASH_MULTIMODAL_PROMPT != LLAMA_DFLASH_NP_GT_1,            "");
+    static_assert(LLAMA_DFLASH_NP_GT_1           != LLAMA_DFLASH_LOAD_FAILED,        "");
 
     // 3. Function symbols: take addresses to force link-time binding.
     //    Per spec contracts ExtractFeatures, ProjectAndFuse,
     //    DraftBlockEmit, and AdvanceState — all surface through this
-    //    API at the C boundary.
-    typedef int32_t (*set_dflash_fn)(struct llama_context *, struct llama_model *);
-    typedef int32_t (*n_source_layers_fn)(const struct llama_model *);
-    typedef int32_t (*block_size_fn)(const struct llama_model *);
-    typedef llama_token (*mask_token_fn)(const struct llama_model *);
-    typedef int32_t (*swa_window_fn)(const struct llama_model *, int32_t);
-    typedef enum llama_dflash_layer_type (*layer_type_at_fn)(const struct llama_model *, int32_t);
+    //    API at the C boundary. T5: drafter is a sidecar
+    //    (llama_dflash_drafter), not a llama_model — per the locked
+    //    Q&A decision recorded in PHASE_DFLASH.md.
+    typedef struct llama_dflash_drafter * (*drafter_load_fn)(const char *);
+    typedef void (*drafter_free_fn)(struct llama_dflash_drafter *);
+    typedef int32_t (*set_dflash_fn)(struct llama_context *, struct llama_dflash_drafter *);
+    typedef int32_t (*n_source_layers_fn)(const struct llama_dflash_drafter *);
+    typedef int32_t (*block_size_fn)(const struct llama_dflash_drafter *);
+    typedef llama_token (*mask_token_fn)(const struct llama_dflash_drafter *);
+    typedef int32_t (*swa_window_fn)(const struct llama_dflash_drafter *, int32_t);
+    typedef enum llama_dflash_layer_type (*layer_type_at_fn)(const struct llama_dflash_drafter *, int32_t);
+    typedef int32_t (*draft_fn)(struct llama_context *, llama_token, int32_t, llama_token *, int32_t);
 
-    set_dflash_fn       p1 = &llama_set_dflash;
-    n_source_layers_fn  p2 = &llama_dflash_n_source_layers;
-    block_size_fn       p3 = &llama_dflash_block_size;
-    mask_token_fn       p4 = &llama_dflash_mask_token_id;
-    swa_window_fn       p5 = &llama_dflash_swa_window;
-    layer_type_at_fn    p6 = &llama_dflash_layer_type_at;
+    drafter_load_fn     p0a = &llama_dflash_drafter_load;
+    drafter_free_fn     p0b = &llama_dflash_drafter_free;
+    set_dflash_fn       p1  = &llama_set_dflash;
+    n_source_layers_fn  p2  = &llama_dflash_n_source_layers;
+    block_size_fn       p3  = &llama_dflash_block_size;
+    mask_token_fn       p4  = &llama_dflash_mask_token_id;
+    swa_window_fn       p5  = &llama_dflash_swa_window;
+    layer_type_at_fn    p6  = &llama_dflash_layer_type_at;
+    draft_fn            p7  = &llama_dflash_draft;
 
-    if (p1 == nullptr || p2 == nullptr || p3 == nullptr ||
-        p4 == nullptr || p5 == nullptr || p6 == nullptr) {
+    if (p0a == nullptr || p0b == nullptr || p1 == nullptr || p2 == nullptr ||
+        p3  == nullptr || p4  == nullptr || p5 == nullptr || p6 == nullptr ||
+        p7  == nullptr) {
         fprintf(stderr, "FAIL: one or more DFlash symbols null after &-take\n");
         return 1;
     }
 
     printf("=== test-dflash-symbols ===\n");
-    printf("  llama_dflash_layer_type   enum present (2 variants)\n");
-    printf("  llama_dflash_status       enum present (7 sentinels)\n");
-    printf("  llama_set_dflash          linkable\n");
-    printf("  llama_dflash_n_source_layers linkable\n");
-    printf("  llama_dflash_block_size   linkable\n");
-    printf("  llama_dflash_mask_token_id linkable\n");
-    printf("  llama_dflash_swa_window   linkable\n");
-    printf("  llama_dflash_layer_type_at linkable\n");
+    printf("  llama_dflash_layer_type        enum present (2 variants)\n");
+    printf("  llama_dflash_status            enum present (9 sentinels)\n");
+    printf("  llama_dflash_drafter           opaque type present\n");
+    printf("  llama_dflash_drafter_load      linkable\n");
+    printf("  llama_dflash_drafter_free      linkable\n");
+    printf("  llama_set_dflash               linkable\n");
+    printf("  llama_dflash_n_source_layers   linkable\n");
+    printf("  llama_dflash_block_size        linkable\n");
+    printf("  llama_dflash_mask_token_id     linkable\n");
+    printf("  llama_dflash_swa_window        linkable\n");
+    printf("  llama_dflash_layer_type_at     linkable\n");
+    printf("  llama_dflash_draft             linkable\n");
     printf("  GREEN — symbol surface exists\n");
     return 0;
 }

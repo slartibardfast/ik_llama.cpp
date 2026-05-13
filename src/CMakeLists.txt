@@ -138,6 +138,16 @@ target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
 
+# DFlash drafter (sm_75): when GGML_CUDA_DFLASH is on, src/llama-dflash.cpp
+# calls into ggml-cuda/dflash kernel launchers, so libllama needs CUDA
+# headers and CUDA::cudart at link time.
+if (GGML_CUDA_DFLASH)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(llama PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries     (llama PRIVATE CUDA::cudart)
+    target_compile_definitions(llama PRIVATE GGML_CUDA_DFLASH)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_SHARED LLAMA_BUILD)

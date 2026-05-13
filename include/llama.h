@@ -1728,12 +1728,16 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_mtp_fused_last_compute_count(struct llama_context * ctx);
 
     // -----------------------------------------------------------------
-    // DFlash speculative decoding API surface (RED-first scaffold).
+    // DFlash speculative decoding API surface.
     //
     // Spec: specs/dflash/dflash.allium
     // Design: specs/dflash/DESIGN.md
-    // Stubs in src/llama-dflash.cpp return LLAMA_DFLASH_NOT_IMPLEMENTED
-    // until the implementation lands.
+    //
+    // The DFlash drafter is a sidecar weight bundle (NOT a llama_model
+    // you can call llama_decode on). It is loaded via
+    // llama_dflash_drafter_load(path), bound to a target context via
+    // llama_set_dflash(ctx_tgt, drafter), and produces candidate token
+    // blocks via llama_dflash_draft(ctx_tgt, anchor_token_id, ...).
     // -----------------------------------------------------------------
 
     enum llama_dflash_layer_type {
@@ -1749,23 +1753,55 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
         LLAMA_DFLASH_HYBRID_DRAFTER      = -4,
         LLAMA_DFLASH_MISSING_METADATA    = -5,
         LLAMA_DFLASH_MULTIMODAL_PROMPT   = -6,
+        LLAMA_DFLASH_NP_GT_1             = -7,
+        LLAMA_DFLASH_LOAD_FAILED         = -8,
     };
 
+    // Opaque drafter handle. Internally wraps the drafter GGUF weights
+    // uploaded to GPU memory and the dflash.* metadata.
+    struct llama_dflash_drafter;
+
+    // Load a DFlash drafter GGUF from disk. Returns nullptr on failure
+    // (missing file, malformed GGUF, missing metadata, GPU OOM).
+    LLAMA_API struct llama_dflash_drafter * llama_dflash_drafter_load(const char * path);
+
+    // Free a drafter and its GPU buffers.
+    LLAMA_API void llama_dflash_drafter_free(struct llama_dflash_drafter * drafter);
+
+    // Bind a loaded drafter to a target context. Allocates per-context
+    // DFlash state (KV cache, scratch buffers). Returns LLAMA_DFLASH_OK
+    // on success or a negative llama_dflash_status code on failure.
     LLAMA_API int32_t llama_set_dflash(
-            struct llama_context * ctx_tgt,
-            struct llama_model   * model_dft);
+            struct llama_context        * ctx_tgt,
+            struct llama_dflash_drafter * drafter);
 
-    LLAMA_API int32_t llama_dflash_n_source_layers(const struct llama_model * model_dft);
-
-    LLAMA_API int32_t llama_dflash_block_size(const struct llama_model * model_dft);
-
-    LLAMA_API llama_token llama_dflash_mask_token_id(const struct llama_model * model_dft);
-
-    LLAMA_API int32_t llama_dflash_swa_window(const struct llama_model * model_dft, int32_t layer_idx);
+    // Drafter property queries (all read from drafter metadata; cheap).
+    LLAMA_API int32_t      llama_dflash_n_source_layers(const struct llama_dflash_drafter * drafter);
+    LLAMA_API int32_t      llama_dflash_block_size     (const struct llama_dflash_drafter * drafter);
+    LLAMA_API llama_token  llama_dflash_mask_token_id  (const struct llama_dflash_drafter * drafter);
+    LLAMA_API int32_t      llama_dflash_swa_window     (const struct llama_dflash_drafter * drafter, int32_t layer_idx);
 
     LLAMA_API enum llama_dflash_layer_type llama_dflash_layer_type_at(
-            const struct llama_model * model_dft,
-            int32_t                    layer_idx);
+            const struct llama_dflash_drafter * drafter,
+            int32_t                             layer_idx);
+
+    // Run one DFlash drafter cycle and emit BLOCK_SIZE candidate tokens.
+    // - ctx_tgt: target context that has already prefilled the prompt and
+    //   has DFlash bound via llama_set_dflash.
+    // - anchor_token_id: token the target sampled at the current position
+    //   (becomes the drafter's anchor input embedding).
+    // - anchor_pos: target seq_pos where the anchor sits.
+    // - out_candidates: caller-provided buffer of size >= max_candidates;
+    //   filled with BLOCK_SIZE drafted token ids.
+    // - max_candidates: must be >= drafter's BLOCK_SIZE.
+    // Returns the number of candidates written (= BLOCK_SIZE) on success
+    // or a negative llama_dflash_status code on failure.
+    LLAMA_API int32_t llama_dflash_draft(
+            struct llama_context * ctx_tgt,
+            llama_token            anchor_token_id,
+            int32_t                anchor_pos,
+            llama_token          * out_candidates,
+            int32_t                max_candidates);
 
 #ifdef __cplusplus
 }

@@ -707,9 +707,16 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
     cparams.mtp_op_type = value;
 }
 
+// DFlash drafter-side cleanup. Defined in src/llama-dflash.cpp.
+extern void llama_dflash_release_ctx_state(struct llama_context * ctx);
+
 llama_context::~llama_context() {
     // PHASE45 D9.6e: sched is freed by default_decoder's destructor
     // (held by-value; runs after this function body completes).
+
+    // Release DFlash per-context scratch before backends tear down
+    // CUDA state. Drafter itself is caller-owned.
+    llama_dflash_release_ctx_state(this);
 
     // PHASE45 D9.6h: backends are architecturally session-owned. Today
     // ctx still owns the storage; freeing is here so the legacy

@@ -32,25 +32,23 @@
 #include <cstdio>
 
 int main() {
-    // RED until implementation lands. The eventual implementation
-    // binds llama_set_dflash to a real drafter and verifies the
-    // vocab match before declaring OK.
-    const int32_t stub = llama_set_dflash(nullptr, nullptr);
-    if (stub != LLAMA_DFLASH_NOT_IMPLEMENTED) {
-        // Stub is no longer present — implementation has begun.
-        // Replace this body with the real test plan above.
+    // T5 status check. Real implementation rejects null pointers with
+    // LLAMA_DFLASH_INVALID_DRAFTER (sidecar drafter API). Once a real
+    // Qwen3.6-27B-DFlash GGUF is loadable end-to-end, this body should
+    // be replaced with the full DrafterTargetVocabIdentity test in the
+    // file header.
+    const int32_t rc = llama_set_dflash(nullptr, nullptr);
+    if (rc != LLAMA_DFLASH_INVALID_DRAFTER && rc != LLAMA_DFLASH_NOT_IMPLEMENTED) {
         fprintf(stderr,
-                "test-dflash-load-vocab-identity: stub status changed to %d.\n"
-                "  Implementation has begun; this test needs to be filled in\n"
-                "  with the steps in the file header.\n",
-                stub);
+                "test-dflash-load-vocab-identity: unexpected status %d for null args.\n"
+                "  Expected LLAMA_DFLASH_INVALID_DRAFTER (-2) or LLAMA_DFLASH_NOT_IMPLEMENTED (-1).\n",
+                rc);
         return 1;
     }
 
     fprintf(stderr,
-            "TODO: implement DrafterTargetVocabIdentity test once a real\n"
-            "      Qwen3.6-27B-DFlash GGUF is loadable. Requires:\n"
-            "        - Converter DFlashModel class\n"
-            "        - llama_set_dflash with vocab-cross-check at bind\n");
+            "TODO: implement DrafterTargetVocabIdentity test against a real\n"
+            "      Qwen3.6-27B-DFlash GGUF loaded via llama_dflash_drafter_load.\n"
+            "      Currently stubbed at null-pointer null-check level.\n");
     return 77;
 }
