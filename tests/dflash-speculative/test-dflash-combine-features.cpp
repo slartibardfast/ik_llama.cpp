@@ -163,17 +163,50 @@ int main() {
     std::printf("  mismatches: %d / %zu (%.3f%%)\n",
                 n_diff, n_out, 100.0 * n_diff / (double) n_out);
 
+    // Magnitude diagnostic: bin mismatches by absolute fp16-bit difference.
+    // 1-ULP differences are expected from fp32-reduction-order LSB noise;
+    // anything larger suggests a kernel bug.
+    int n_diff_1ulp = 0, n_diff_2ulp = 0, n_diff_more = 0;
+    int max_ulp_diff = 0;
+    for (std::size_t i = 0; i < n_out; ++i) {
+        uint16_t ab, bb;
+        std::memcpy(&ab, &kern_out_h[i], sizeof(uint16_t));
+        std::memcpy(&bb, &ref_out_h[i],  sizeof(uint16_t));
+        if (ab == bb) continue;
+        int d = std::abs(static_cast<int>(ab) - static_cast<int>(bb));
+        if      (d == 1) ++n_diff_1ulp;
+        else if (d == 2) ++n_diff_2ulp;
+        else             ++n_diff_more;
+        if (d > max_ulp_diff) max_ulp_diff = d;
+    }
+    std::printf("  ULP-bin: 1=%d  2=%d  >2=%d  max=%d\n",
+                n_diff_1ulp, n_diff_2ulp, n_diff_more, max_ulp_diff);
+
     if (n_diff == 0) {
         std::printf("PASS: byte-identical kernel vs scalar reference\n");
         return 0;
     }
-    // Allow up to 0.1 %% LSB drift for fp32-vs-fp16-WMMA reduction-order
-    // differences. T3 closure binding (final task) re-tightens; if this
-    // tolerance proves insufficient or excessive, document there.
-    if (n_diff * 1000 < (int) n_out) {
-        std::printf("CLOSE: < 0.1%% mismatch; treating as PASS (LSB drift expected)\n");
+    // PASS criterion when mismatches exist: every disagreeing position
+    // must differ by exactly 1 fp16 ULP, AND total disagreement rate
+    // must be ≤ 1 %.  Rationale: byte-identity is unachievable when one
+    // side does serial-order fp32 reduction (scalar ref) and the other
+    // does parallel-tree fp32 reduction (kernel's warp-shuffle + SMEM
+    // tree).  fp32 add is non-associative; reduction-order LSB noise
+    // propagates through rsqrt to a 1-ULP fp16 output difference at a
+    // small fraction of positions.  >1 ULP at any position is a real
+    // kernel bug; rate > 1 % suggests a systematic precision loss
+    // (e.g., fp16 accumulator slipped in somewhere).
+    if (max_ulp_diff <= 1 && n_diff * 100 <= (int) n_out) {
+        std::printf("PASS: %d/%zu 1-ULP differences (fp32 reduction-order LSB noise; ≤1%% rate, ≤1 ULP)\n",
+                    n_diff, n_out);
         return 0;
     }
-    std::printf("FAIL: kernel output disagrees materially with scalar reference\n");
+    if (max_ulp_diff > 1) {
+        std::printf("FAIL: max ULP difference = %d (> 1); kernel has precision bug, not just reduction-order noise\n",
+                    max_ulp_diff);
+    } else {
+        std::printf("FAIL: mismatch rate %d/%zu > 1%%; systematic precision loss suspected\n",
+                    n_diff, n_out);
+    }
     return 1;
 }
