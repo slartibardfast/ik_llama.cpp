@@ -297,6 +297,12 @@ if (GGML_CUDA)
         llama_build_and_test(dflash-speculative/test-wmma-mimicking-oracle.cpp)
         target_include_directories(test-wmma-mimicking-oracle PRIVATE
             ${CUDAToolkit_INCLUDE_DIRS})
+
+        llama_build_and_test(dflash-speculative/test-dflash-drafter-forward.cpp)
+        target_include_directories(test-dflash-drafter-forward PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-dflash-drafter-forward PRIVATE CUDA::cudart)
     endif()
 endif()
 
