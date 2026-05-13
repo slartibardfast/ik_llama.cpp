@@ -255,6 +255,8 @@ struct cmd_params {
     std::vector<int> n_draft;
     std::vector<std::string> spec_model;
     std::vector<std::string> prompt_files;
+    int  ctx_size = 0;        // explicit n_ctx override; 0 = use n_prompt + n_gen
+    std::string devices;      // explicit device CSV (e.g., "CUDA0,CUDA1")
     bool ppl_of_output = false;
     std::vector<ggml_type> type_k;
     std::vector<ggml_type> type_v;
@@ -309,6 +311,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_draft              */ {0},     // 0 = method-specific default applied later
     /* spec_model           */ {""},
     /* prompt_files         */ {""},    // empty path = synthetic n_prompt prefix
+    /* ctx_size             */ 0,
+    /* devices              */ "",
     /* ppl_of_output        */ false,
     /* type_k               */ {GGML_TYPE_F16},
     /* type_v               */ {GGML_TYPE_F16},
@@ -404,6 +408,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --fit-margin N                      (default: %d)\n", cmd_params_defaults.fit_margin);
     printf("  --max-gpu <N>                       (default: %d)\n", cmd_params_defaults.max_gpu);
     printf("        --print-overrides <0|1>       (default: %s)\n", cmd_params_defaults.print_overrides ? "1" : "0");
+    printf("\n");
+    printf("  -c, --ctx-size <N>                  context size override (default: n_prompt+n_gen)\n");
+    printf("  -dev, --device <CSV>                explicit device list, e.g. CUDA0,CUDA1\n");
     printf("\n");
     printf("speculative decoding (T8):\n");
     printf("  --spec <name[,name,...]>            spec method(s): none, mtp, dflash, draft, ngram-simple,\n");
@@ -973,6 +980,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             params.prompt_files.push_back(argv[i]);
         } else if (arg == "--ppl-of-output") {
             params.ppl_of_output = true;
+        } else if (arg == "-c" || arg == "--ctx-size") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.ctx_size = std::stoi(argv[i]);
+        } else if (arg == "-dev" || arg == "--device") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.devices = argv[i];
         } else {
             invalid_param = true;
             break;
@@ -1072,6 +1091,8 @@ struct cmd_params_instance {
     int         n_draft = 0;
     std::string spec_model;
     std::string prompt_file;
+    int         ctx_size = 0;
+    std::string devices;
     bool        ppl_of_output = false;
 
     llama_model_params to_llama_mparams() const {
@@ -1080,6 +1101,9 @@ struct cmd_params_instance {
         mparams.n_gpu_layers = n_gpu_layers;
         if (!rpc_servers.empty()) {
             mparams.rpc_servers = rpc_servers.c_str();
+        }
+        if (!devices.empty()) {
+            mparams.devices = devices.c_str();
         }
         mparams.split_mode = split_mode;
         mparams.main_gpu = main_gpu;
@@ -1123,7 +1147,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx = n_prompt + n_gen;
+        cparams.n_ctx = ctx_size > 0 ? ctx_size : (n_prompt + n_gen);
         cparams.n_batch = n_batch;
         cparams.n_ubatch = n_ubatch;
         cparams.type_k = type_k;
@@ -1228,6 +1252,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_draft      = */ nd,
                 /* .spec_model   = */ sm_path,
                 /* .prompt_file  = */ prompt_file,
+                /* .ctx_size     = */ params.ctx_size,
+                /* .devices      = */ params.devices,
                 /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
@@ -1280,6 +1306,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_draft      = */ nd,
                 /* .spec_model   = */ sm_path,
                 /* .prompt_file  = */ prompt_file,
+                /* .ctx_size     = */ params.ctx_size,
+                /* .devices      = */ params.devices,
                 /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
@@ -1332,6 +1360,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_draft      = */ nd,
                 /* .spec_model   = */ sm_path,
                 /* .prompt_file  = */ prompt_file,
+                /* .ctx_size     = */ params.ctx_size,
+                /* .devices      = */ params.devices,
                 /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
@@ -1384,6 +1414,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_draft      = */ nd,
                 /* .spec_model   = */ sm_path,
                 /* .prompt_file  = */ prompt_file,
+                /* .ctx_size     = */ params.ctx_size,
+                /* .devices      = */ params.devices,
                 /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
@@ -1681,7 +1713,7 @@ struct test {
             std::to_string(n_draft_total),
             buf_ar,
             buf_ma,
-            has_ppl ? std::string(buf_ppl) : std::string("-")
+            std::string(buf_ppl)
         };
         return values;
     }
