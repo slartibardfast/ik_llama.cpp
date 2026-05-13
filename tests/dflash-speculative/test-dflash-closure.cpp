@@ -231,12 +231,30 @@ int run_closure(
     std::printf("[closure] inject_kv_fused ×%d done\n", L_d);
 
     // ---- Compose input embeddings: anchor + BLOCK_SIZE mask tokens ----
-    // anchor = token_embd[last_prompt_token_id]
-    // mask   = token_embd[MASK_TOKEN_ID] (broadcast to all BLOCK_SIZE mask positions)
+    // anchor = token_embd[bonus_token]   (the token the target sampled at
+    //          seq_pos = anchor_pos — NOT the last prompt token. vLLM's
+    //          copy_and_expand_dflash_inputs_kernel writes this as the
+    //          drafter's query[0] input.)
+    // mask   = token_embd[MASK_TOKEN_ID] (broadcast to BLOCK_SIZE positions)
     //
-    // Gather from device-side token_embd. We do this via cudaMemcpy of
-    // individual rows (small data) rather than a custom gather kernel.
-    const int last_tok_id = static_cast<int>(prompt_tokens.back());
+    // Read bonus_token from the vLLM dump if present; fall back to
+    // last_prompt_token only if missing (incorrect but lets the test
+    // run end-to-end pre-bonus-dump).
+    const std::string bonus_path = path_for("drafter-bonus-token.npy");
+    int anchor_token_id = -1;
+    if (file_exists(bonus_path.c_str())) {
+        std::vector<int64_t> bonus_vec = dflash_reference::load_npy_i64(bonus_path.c_str());
+        if (!bonus_vec.empty()) {
+            anchor_token_id = static_cast<int>(bonus_vec[0]);
+            std::printf("[closure] bonus token id (= drafter anchor) = %d\n", anchor_token_id);
+        }
+    }
+    if (anchor_token_id < 0) {
+        anchor_token_id = static_cast<int>(prompt_tokens.back());
+        std::printf("[closure] WARN: no bonus dump, using last_prompt_token=%d as anchor (incorrect)\n",
+                    anchor_token_id);
+    }
+    const int last_tok_id = anchor_token_id;
     const std::size_t n_input_emb = static_cast<std::size_t>(Q) * D_emb;
     __half * d_input_emb = nullptr;
     CUDA_CHECK(cudaMalloc(&d_input_emb, n_input_emb * sizeof(__half)));
@@ -295,6 +313,7 @@ int run_closure(
         p_k_w.data(), p_k_norm.data(), p_v_w.data(),
         p_o_w.data(),
         p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
+        dw.output_norm,
         d_layer_types,
         swa_window, rope_base, norm_eps,
         BLOCK_SIZE, N_slots, SeqLen, L_d,

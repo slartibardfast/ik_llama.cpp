@@ -68,8 +68,8 @@ struct DrafterWeights {
 
     // DFlash-specific tensors.
     const __half * dflash_fc          = nullptr;  // F16 [n_layers*hidden_size, hidden_size]
-    const __half * dflash_hidden_norm = nullptr;  // F32 [hidden_size]
-    const float  * output_norm        = nullptr;  // F32 [hidden_size] — used by lm_head pre-step
+    const __half * dflash_hidden_norm = nullptr;  // F32 in GGUF, cast to F16 at load
+    const __half * output_norm        = nullptr;  // F32 in GGUF, cast to F16 at load — used by lm_head pre-step
 
     // Backing allocations to free on destroy.
     std::vector<void *> gpu_buffers;
@@ -201,6 +201,29 @@ inline bool load_drafter(const char * gguf_path, DrafterWeights & w) {
         return static_cast<const __half *>(_upload(w, src, nb));
     };
 
+    // Cast F32 → F16 then upload. For norm-weight tensors which the
+    // drafter GGUF stores as F32 but the kernels consume as __half*.
+    // Norm weights are in [~0.5, ~2.0] range — fp16 has plenty of
+    // precision; F32→F16 cast is essentially lossless here.
+    auto upload_f32_as_f16 = [&](const char * name) -> const __half * {
+        struct ggml_tensor * tn = ggml_get_tensor(w.ggml_ctx, name);
+        if (tn == nullptr) {
+            std::fprintf(stderr, "load_drafter: tensor not found: %s\n", name);
+            return nullptr;
+        }
+        if (tn->type != GGML_TYPE_F32) {
+            // Already not F32 — fall through to raw upload.
+            return static_cast<const __half *>(_upload(w, tn->data, ggml_nbytes(tn)));
+        }
+        const std::size_t n_elems = ggml_nelements(tn);
+        std::vector<__half> tmp(n_elems);
+        const float * src = static_cast<const float *>(tn->data);
+        for (std::size_t i = 0; i < n_elems; ++i) {
+            tmp[i] = __float2half(src[i]);
+        }
+        return static_cast<const __half *>(_upload(w, tmp.data(), n_elems * sizeof(__half)));
+    };
+
     w.attn_norm.resize(w.n_layers);
     w.attn_q.resize(w.n_layers);
     w.attn_q_norm.resize(w.n_layers);
@@ -215,14 +238,17 @@ inline bool load_drafter(const char * gguf_path, DrafterWeights & w) {
 
     char namebuf[64];
     for (int l = 0; l < w.n_layers; ++l) {
-        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_norm.weight",      l); w.attn_norm[l]    = upload_tensor(namebuf);
+        // Norm weights are F32 in the drafter GGUF — must cast to F16
+        // before the kernels consume them as __half*. The other weights
+        // (q/k/v/o/gate/up/down) are F16 already.
+        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_norm.weight",      l); w.attn_norm[l]    = upload_f32_as_f16(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_q.weight",         l); w.attn_q[l]       = upload_tensor(namebuf);
-        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_q_norm.weight",    l); w.attn_q_norm[l]  = upload_tensor(namebuf);
+        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_q_norm.weight",    l); w.attn_q_norm[l]  = upload_f32_as_f16(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_k.weight",         l); w.attn_k[l]       = upload_tensor(namebuf);
-        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_k_norm.weight",    l); w.attn_k_norm[l]  = upload_tensor(namebuf);
+        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_k_norm.weight",    l); w.attn_k_norm[l]  = upload_f32_as_f16(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_v.weight",         l); w.attn_v[l]       = upload_tensor(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.attn_output.weight",    l); w.attn_output[l]  = upload_tensor(namebuf);
-        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.ffn_norm.weight",       l); w.ffn_norm[l]     = upload_tensor(namebuf);
+        std::snprintf(namebuf, sizeof(namebuf), "blk.%d.ffn_norm.weight",       l); w.ffn_norm[l]     = upload_f32_as_f16(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.ffn_gate.weight",       l); w.ffn_gate[l]     = upload_tensor(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.ffn_up.weight",         l); w.ffn_up[l]       = upload_tensor(namebuf);
         std::snprintf(namebuf, sizeof(namebuf), "blk.%d.ffn_down.weight",       l); w.ffn_down[l]     = upload_tensor(namebuf);
@@ -235,12 +261,10 @@ inline bool load_drafter(const char * gguf_path, DrafterWeights & w) {
         }
     }
     w.dflash_fc          = upload_tensor("dflash_fc.weight");
-    w.dflash_hidden_norm = upload_tensor("dflash_hidden_norm.weight");
-    {
-        std::size_t nb = 0;
-        const void * src = _find_tensor(w.ggml_ctx, "output_norm.weight", &nb);
-        if (src) w.output_norm = static_cast<const float *>(_upload(w, src, nb));
-    }
+    // dflash_hidden_norm is F32 in the GGUF; cast to F16 for the
+    // combine_features kernel which expects __half * weight.
+    w.dflash_hidden_norm = upload_f32_as_f16("dflash_hidden_norm.weight");
+    w.output_norm = upload_f32_as_f16("output_norm.weight");
     return true;
 }
 

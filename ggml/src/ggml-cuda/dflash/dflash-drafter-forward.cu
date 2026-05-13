@@ -344,7 +344,11 @@ __global__ void attention_kernel(
     const bool is_full = (layer_type == 1);
 
     const int k_lo = is_full ? 0 : max(0, qpos - swa_window + 1);
-    const int k_hi = qpos;
+    // Full attention is bidirectional within the block — query at any
+    // position attends to ALL block positions [anchor_pos, anchor_pos+Q-1]
+    // plus the entire past context. SWA is causal: K-loop stops at qpos.
+    const int anchor_pos = slot_positions[slot];
+    const int k_hi = is_full ? (anchor_pos + Q - 1) : qpos;
     const int n_keys = k_hi - k_lo + 1;
     if (n_keys <= 0) return;
 
@@ -521,6 +525,7 @@ extern "C" void dflash_drafter_forward_launch(
     const __half * const * d_layer_gate_w,
     const __half * const * d_layer_up_w,
     const __half * const * d_layer_down_w,
+    const __half * d_output_norm_w,
     const int    * d_layer_types,
     int            swa_window,
     float          rope_base,
@@ -718,10 +723,21 @@ extern "C" void dflash_drafter_forward_launch(
             hidden, down_buf, hidden, D_emb);
     }
 
-    // Step 13: select BLOCK_SIZE mask-token output positions.
+    // Step 13: final output RMSNorm before lm_head (per vLLM's
+    // DFlashQwen3Model.forward line 526: self.norm(hidden_states, residual)).
+    // Optional: if d_output_norm_w is null, skip — caller test may not
+    // have an output_norm. Production path always passes it.
+    const __half * select_input = hidden;
+    if (d_output_norm_w != nullptr) {
+        rmsnorm_kernel<<<grid_rows, block, 0, stream>>>(
+            hidden, d_output_norm_w, hidden_n, norm_eps, D_emb);
+        select_input = hidden_n;
+    }
+
+    // Step 14: select BLOCK_SIZE mask-token output positions.
     const dim3 grid_out(BLOCK_SIZE, N_slots);
     select_output_kernel<<<grid_out, block, 0, stream>>>(
-        hidden, d_out_hidden, Q, BLOCK_SIZE, D_emb);
+        select_input, d_out_hidden, Q, BLOCK_SIZE, D_emb);
 
     cudaFreeAsync(hidden,   stream);
     cudaFreeAsync(hidden_n, stream);

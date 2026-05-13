@@ -78,6 +78,7 @@ void dflash_drafter_forward_launch(
     const __half * const * d_layer_gate_w,        // [L_d] pointers to [intermediate, D_emb]
     const __half * const * d_layer_up_w,          // [L_d] pointers to [intermediate, D_emb]
     const __half * const * d_layer_down_w,        // [L_d] pointers to [D_emb, intermediate]
+    const __half * d_output_norm_w,                // [D_emb] — final RMSNorm before lm_head
     const int    * d_layer_types,                  // [L_d] — 0 = SWA, 1 = full
     int            swa_window,                     // = 2048 for Qwen3.6-27B-DFlash
     float          rope_base,                      // = 10000000.0
