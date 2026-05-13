@@ -1810,6 +1810,19 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_dflash_state_snapshot(struct llama_context * ctx_tgt, int32_t slot);
     LLAMA_API int32_t llama_dflash_state_restore (struct llama_context * ctx_tgt, int32_t slot);
 
+    // T6.C: trim the cb_eval extract buffer to match a seq_rm
+    // rollback. Mirrors llama_kv_cache_seq_rm semantics:
+    //   - p_end == -1 (or p_end > seq length): truncate to first
+    //     p_start rows per source-layer slot.
+    //   - p_end > p_start: remove slice [p_start, p_end) per slot.
+    // Caller is responsible for calling this immediately after the
+    // matching llama_kv_cache_seq_rm so target's KV and the extract
+    // buffer stay coherent. Spec: kernel-design.md §6.8.
+    LLAMA_API int32_t llama_dflash_trim_extract(
+            struct llama_context * ctx_tgt,
+            int32_t                p_start,
+            int32_t                p_end);
+
     // T6.B: cycle stats for tests. Each output pointer may be NULL.
     LLAMA_API void llama_dflash_get_cycle_stats(
             const struct llama_context * ctx_tgt,

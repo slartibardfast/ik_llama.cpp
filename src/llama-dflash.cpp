@@ -826,6 +826,57 @@ int32_t llama_dflash_state_restore(struct llama_context * ctx_tgt, int32_t slot)
     return dn_state_restore(*ctx_tgt->dflash_state, slot) ? LLAMA_DFLASH_OK : LLAMA_DFLASH_LOAD_FAILED;
 }
 
+// T6.C: trim the cb_eval extract buffer per slot to match a seq_rm
+// rollback. Walks the source-layer slots configured at
+// llama_set_dflash time; for each, resizes the float buffer.
+//
+// Semantics match llama_kv_cache_seq_rm: p_end == -1 means "remove
+// to end"; p_end > p_start means "remove the slice [p_start, p_end)".
+//
+// Spec: kernel-design.md §6.8.
+int32_t llama_dflash_trim_extract(
+        struct llama_context * ctx_tgt,
+        int32_t                p_start,
+        int32_t                p_end) {
+    if (!ctx_tgt) return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (p_start < 0) return LLAMA_DFLASH_INVALID_DRAFTER;
+
+    const int n_slots = ctx_tgt->cparams.dflash_extract_count;
+    if (n_slots <= 0) return LLAMA_DFLASH_OK;  // hook not armed; no-op
+
+    // Determine D_emb from the drafter binding so we can convert
+    // position counts to float-element counts.
+    int D_emb = 0;
+    if (ctx_tgt->dflash_state && ctx_tgt->dflash_state->drafter) {
+        D_emb = ctx_tgt->dflash_state->drafter->hidden_size;
+    }
+    if (D_emb <= 0) {
+        // Fall back to the model's n_embd if drafter not bound.
+        D_emb = ctx_tgt->model.hparams.n_embd;
+    }
+    if (D_emb <= 0) return LLAMA_DFLASH_MISSING_METADATA;
+
+    for (int i = 0; i < n_slots; ++i) {
+        std::vector<float> & buf = ctx_tgt->default_decoder.dflash_extract_buf[i];
+        const std::size_t row = (std::size_t) D_emb;
+        const std::size_t n_rows_have = buf.size() / row;
+        if (p_end < 0 || (std::size_t) p_end >= n_rows_have) {
+            // Truncate to first p_start rows.
+            if ((std::size_t) p_start < n_rows_have) {
+                buf.resize((std::size_t) p_start * row);
+            }
+        } else {
+            // Remove slice [p_start, p_end).
+            if ((std::size_t) p_start >= n_rows_have) continue;
+            const std::size_t b_start = (std::size_t) p_start * row;
+            const std::size_t b_end   = (std::size_t) p_end   * row;
+            buf.erase(buf.begin() + b_start, buf.begin() + b_end);
+        }
+        ctx_tgt->default_decoder.dflash_extract_n[i] = buf.size();
+    }
+    return LLAMA_DFLASH_OK;
+}
+
 void llama_dflash_get_cycle_stats(
         const struct llama_context * ctx_tgt,
         int32_t * out_n_cycles,
@@ -871,6 +922,9 @@ int32_t llama_dflash_state_snapshot(struct llama_context * /*ctx*/, int32_t /*sl
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
 }
 int32_t llama_dflash_state_restore(struct llama_context * /*ctx*/, int32_t /*slot*/) {
+    return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+int32_t llama_dflash_trim_extract(struct llama_context * /*ctx*/, int32_t /*ps*/, int32_t /*pe*/) {
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
 }
 void llama_dflash_get_cycle_stats(

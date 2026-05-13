@@ -154,10 +154,19 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        // T6.A: snapshot DeltaNet state BEFORE the verify decode mutates
+        // it. We'll restore from this checkpoint after the partial-accept
+        // decision so the re-decode of the committed prefix sees the
+        // correct recurrent state at every position.
+        const llama_pos P = (llama_pos) prompt_tgt.size();
+        if (llama_dflash_state_snapshot(ctx, /*slot*/0) != LLAMA_DFLASH_OK) {
+            fprintf(stderr, "error: state_snapshot failed\n");
+            break;
+        }
+
         // Build verify batch: [id_last, c1, ..., cBS] at positions [P, P+BS]
         const int verify_bs = (int) draft.size() + 1;
         llama_batch batch = llama_batch_init(verify_bs, 0, 1);
-        const llama_pos P = (llama_pos) prompt_tgt.size();
         common_batch_add(batch, id_last, P, { 0 }, true);
         for (size_t i = 0; i < draft.size(); ++i) {
             common_batch_add(batch, draft[i], P + 1 + (llama_pos) i, { 0 }, true);
@@ -169,21 +178,13 @@ int main(int argc, char ** argv) {
         }
 
         // Per-position target argmax over the verify batch.
-        // sampled_at[k] = token target picks at verify position k.
         std::vector<llama_token> sampled_at(verify_bs);
         for (int k = 0; k < verify_bs; ++k) {
-            // common_sampler_sample expects logits at index k of the batch.
             sampled_at[k] = common_sampler_sample(smpl, ctx, k);
         }
         llama_batch_free(batch);
 
         // Accept-prefix: longest run where draft[k] == sampled_at[k].
-        // Batch index k has input token (k==0 ? id_last : draft[k-1]) at
-        // seq position P+k. logits[k] = target's prediction for the
-        // NEXT token after batch[k]. Drafter's draft[k] is its prediction
-        // for "the token AT position P+k+1" — i.e., the token target
-        // would put after the input at batch[k]. So accept condition is
-        // draft[k] == sampled_at[k] for k in [0, BS).
         int n_accepted = 0;
         for (size_t k = 0; k < draft.size(); ++k) {
             if (draft[k] == sampled_at[k]) {
@@ -195,27 +196,51 @@ int main(int argc, char ** argv) {
         common_speculative_accept(spec, (uint16_t) n_accepted);
         n_accept_tokens += n_accepted;
 
-        // Cycle emits: the n_accepted draft tokens (positions
-        // P+1..P+n_accepted) plus the bonus = sampled_at[n_accepted]
-        // (target's argmax at the first unaccepted slot OR the post-
-        // block extra row when n_accepted==BS). Total emitted = n_accepted+1.
+        // ── T6.B: bonus re-decode for late-stream coherence ──
+        // The verify batch decoded positions [P, P+BS] with inputs
+        // [id_last, c1, ..., cBS]. The slot at the bonus position
+        // (P + n_accepted + 1) has KV + hidden from input c_{n_accepted+1},
+        // which was REJECTED. To get the correct state for the next cycle:
+        //   1. seq_rm to position P  (remove ALL of this cycle's KV)
+        //   2. restore DeltaNet state to the pre-verify checkpoint
+        //   3. trim the cb_eval extract buffer to the pre-verify length
+        //   4. re-decode the committed sequence [id_last, accepted_drafts..., bonus]
+        const llama_token bonus = sampled_at[n_accepted];
+
+        llama_kv_cache_seq_rm(ctx, 0, P, -1);
+        if (llama_dflash_state_restore(ctx, /*slot*/0) != LLAMA_DFLASH_OK) {
+            fprintf(stderr, "error: state_restore failed\n");
+            break;
+        }
+        // T6.C: trim the extract buffer to the pre-verify length.
+        llama_dflash_trim_extract(ctx, (int32_t) P, -1);
+
+        // Build re-decode batch: [id_last, c1, ..., c_{n_accepted}, bonus]
+        // at positions [P, P+1, ..., P+n_accepted+1] (n_accepted+2 tokens).
+        const int re_n = n_accepted + 2;
+        llama_batch re_batch = llama_batch_init(re_n, 0, 1);
+        common_batch_add(re_batch, id_last, P, { 0 }, true);
+        for (int k = 0; k < n_accepted; ++k) {
+            common_batch_add(re_batch, draft[k], P + 1 + (llama_pos) k, { 0 }, true);
+        }
+        common_batch_add(re_batch, bonus, P + 1 + (llama_pos) n_accepted, { 0 }, true);
+        if (llama_decode(ctx, re_batch) != 0) {
+            fprintf(stderr, "error: bonus re-decode failed\n");
+            llama_batch_free(re_batch);
+            break;
+        }
+        llama_batch_free(re_batch);
+
+        // Emit the n_accepted draft tokens + bonus.
         for (int k = 0; k < n_accepted; ++k) {
             common_sampler_accept(smpl, ctx, draft[k], true);
             printf("%s", common_token_to_piece(ctx, draft[k]).c_str());
             emitted.push_back(draft[k]);
         }
-        const llama_token bonus = sampled_at[n_accepted];
         common_sampler_accept(smpl, ctx, bonus, true);
         printf("%s", common_token_to_piece(ctx, bonus).c_str());
         fflush(stdout);
         emitted.push_back(bonus);
-
-        // Roll back rejected positions in target's KV cache. Verify
-        // decoded positions [P, P+BS]. After accept we keep positions
-        // [P, P+n_accepted] (= id_last + n_accepted drafted tokens).
-        // The bonus token at position P+n_accepted+1 will be re-decoded
-        // by the NEXT cycle's verify batch with input = bonus.
-        llama_kv_cache_seq_rm(ctx, 0, P + n_accepted + 1, -1);
 
         id_last = bonus;
         if (llama_token_is_eog(model, bonus)) break;
