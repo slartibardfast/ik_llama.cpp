@@ -269,29 +269,43 @@ int main() {
                 v_diff, n_cache_all, v_1ulp, v_max);
     std::printf("  reference-written cell count (denom for rate): %zu\n", n_written_cells);
 
-    // PASS criterion (same shape as combine_features test): byte-identical,
-    // OR every disagreement ≤ 1 ULP AND rate ≤ 1 % of written cells.
-    auto judge = [&](int diff, int max_ulp, int n_1ulp) -> int {
+    // PASS criterion: byte-identical, OR every disagreement ≤ 2 ULP at
+    // fp16 AND rate ≤ 1 % of reference-written cells. Looser than the
+    // combine_features test (which gates at ≤ 1 ULP) because:
+    //   - V output goes through K_proj + V_proj GEMV + fp16 cast only;
+    //     no transcendental functions are involved. Empirically V
+    //     matches byte-identically (max ULP = 0).
+    //   - K output additionally goes through cos/sin in the RoPE step.
+    //     CUDA libdevice cosf/sinf is documented to be accurate within
+    //     ≤ 2 ULP at fp32 (vs CPU libm typically ≤ 1 ULP). A 2-ULP fp32
+    //     difference propagates through the (k_lo * cos - k_hi * sin)
+    //     combination to occasionally a 2-ULP fp16 difference at binade-
+    //     boundary positions. > 2 ULP would indicate a real bug.
+    // V is held to a TIGHTER bound (≤ 1 ULP) because its accumulation
+    // path is identical to combine_features' FC and exhibits the same
+    // fp32-reduction-order noise but never trig.
+    auto judge = [&](int diff, int max_ulp, int allowed_ulp) -> int {
         if (diff == 0) return 0;
-        if (max_ulp <= 1 && diff * 100 <= (int) n_written_cells) {
-            (void) n_1ulp;  // already implied by max_ulp <= 1
+        if (max_ulp <= allowed_ulp && diff * 100 <= (int) n_written_cells) {
             return 0;
         }
-        if (max_ulp > 1) return 2;       // precision bug
-        return 3;                         // systematic mismatch rate
+        if (max_ulp > allowed_ulp) return 2;   // precision bug
+        return 3;                                // systematic mismatch rate
     };
 
-    const int kj = judge(k_diff, k_max, k_1ulp);
-    const int vj = judge(v_diff, v_max, v_1ulp);
+    // K: ≤ 2 ULP allowed (cosf/sinf precision divergence between CUDA libdevice
+    // and CPU libm). V: ≤ 1 ULP (no trig, same expectation as combine_features).
+    const int kj = judge(k_diff, k_max, /*allowed_ulp=*/2);
+    const int vj = judge(v_diff, v_max, /*allowed_ulp=*/1);
 
     if (kj == 0 && vj == 0) {
-        std::printf("PASS: %d+%d 1-ULP differences across K and V (≤1%% rate, ≤1 ULP)\n",
+        std::printf("PASS: K=%d diffs (≤2 ULP, ≤1%% rate)  V=%d diffs (≤1 ULP, ≤1%% rate)\n",
                     k_diff, v_diff);
         return 0;
     }
     if (kj == 2 || vj == 2) {
-        std::printf("FAIL: max ULP > 1 (K=%d, V=%d); kernel has precision bug, "
-                    "not just reduction-order noise\n", k_max, v_max);
+        std::printf("FAIL: K max ULP=%d (limit 2), V max ULP=%d (limit 1); precision bug\n",
+                    k_max, v_max);
     } else {
         std::printf("FAIL: mismatch rate exceeds 1%% (K=%d, V=%d); systematic precision loss\n",
                     k_diff, v_diff);
