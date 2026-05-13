@@ -232,6 +232,18 @@ bool server_context::load_model(const gpt_params& params_) {
 }
 
 void server_context::init() {
+    // DFlash drafter is single-slot only at this gate. T5 ships np=1;
+    // np-invariance binding is T7. Refuse boot at n_parallel>1 rather
+    // than silently mis-route the cycle.
+    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+        params_base.n_parallel > 1) {
+        LOG_ERROR(
+            "DFlash speculative decoding requires n_parallel=1 at T5 "
+            "(np>1 binding is T7). Refusing to initialise with n_parallel=%d.",
+            { {"n_parallel", params_base.n_parallel} });
+        std::exit(1);
+    }
+
     const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
 
     LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel} });
