@@ -337,8 +337,11 @@ if (GGML_CUDA)
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-closure PRIVATE CUDA::cudart ggml)
 
-        # T6.A: DeltaNet state save/restore smoke test
-        llama_build_and_test(dflash-speculative/test-dflash-state-save-restore.cpp)
+        # T6: spec-ckpt flow witness for the 3 DeltaNet-rollback invariants
+        # (DraftKVRollbackOnRejection, InjectedKVEvictedOnAnchorAdvance,
+        # EffectiveSeqLensSubtractsRejected). Drives llama_spec_ckpt_*
+        # save → verify → restore.
+        llama_build_and_test(dflash-speculative/test-dflash-spec-ckpt-flow.cpp)
     endif()
 endif()
 

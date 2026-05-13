@@ -1803,13 +1803,6 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             llama_token          * out_candidates,
             int32_t                max_candidates);
 
-    // T6.A: snapshot / restore the target's DeltaNet recurrent state.
-    // - slot must be 0 or 1 (ping-pong scratch slot).
-    // Returns LLAMA_DFLASH_OK on success or a negative status code.
-    // No-op (returns OK) for dense (non-hybrid) target models.
-    LLAMA_API int32_t llama_dflash_state_snapshot(struct llama_context * ctx_tgt, int32_t slot);
-    LLAMA_API int32_t llama_dflash_state_restore (struct llama_context * ctx_tgt, int32_t slot);
-
     // T6.C: trim the cb_eval extract buffer to match a seq_rm
     // rollback. Mirrors llama_kv_cache_seq_rm semantics:
     //   - p_end == -1 (or p_end > seq length): truncate to first
@@ -1823,11 +1816,11 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             int32_t                p_start,
             int32_t                p_end);
 
-    // T6.B: cycle stats for tests. Each output pointer may be NULL.
+    // Per-context cycle counter for diagnostics / tests.
+    // out_n_cycles may be NULL.
     LLAMA_API void llama_dflash_get_cycle_stats(
             const struct llama_context * ctx_tgt,
-            int32_t * out_n_cycles,
-            int32_t * out_n_re_decodes);
+            int32_t * out_n_cycles);
 
 #ifdef __cplusplus
 }
