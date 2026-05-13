@@ -334,6 +334,18 @@ if (GGML_CUDA)
         endif()
         message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
+        if (GGML_CUDA_DFLASH)
+            if (NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+                message(FATAL_ERROR
+                    "GGML_CUDA_DFLASH=ON requires CMAKE_CUDA_ARCHITECTURES=75 only. "
+                    "Got: '${CMAKE_CUDA_ARCHITECTURES}'. "
+                    "DFlash kernels use WMMA m16n16k16 fp16 fragments and sm_75 PTX "
+                    "intrinsics that are not portable across Turing/Ampere/Ada/Hopper. "
+                    "Reconfigure with -DCMAKE_CUDA_ARCHITECTURES=75.")
+            endif()
+            message(STATUS "GGML_CUDA_DFLASH: enabled (sm_75 production build)")
+        endif()
+
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
         else()
@@ -353,6 +365,14 @@ if (GGML_CUDA)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/mmvq-instance*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+        if (GGML_CUDA_DFLASH)
+            file(GLOB   SRCS "ggml-cuda/dflash/*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   GGML_HEADERS_DFLASH "ggml-cuda/dflash/*.cuh")
+            list(APPEND GGML_HEADERS_CUDA  ${GGML_HEADERS_DFLASH})
+            add_compile_definitions(GGML_CUDA_DFLASH)
+        endif()
 
         if (GGML_CUDA_FA_ALL_QUANTS)
             file(GLOB   SRCS "ggml-cuda/template-instances/fattn-vec*.cu")
