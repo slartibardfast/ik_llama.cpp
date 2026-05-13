@@ -178,13 +178,15 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
 
         // Accept-prefix: longest run where draft[k] == sampled_at[k].
-        // sampled_at[0] = the token target picks AFTER id_last (anchor row),
-        // so it always becomes emitted regardless of drafter. Drafter
-        // produced draft[0..BS-1]; check draft[k] == sampled_at[k+1] for
-        // k in [0, draft.size()).
+        // Batch index k has input token (k==0 ? id_last : draft[k-1]) at
+        // seq position P+k. logits[k] = target's prediction for the
+        // NEXT token after batch[k]. Drafter's draft[k] is its prediction
+        // for "the token AT position P+k+1" — i.e., the token target
+        // would put after the input at batch[k]. So accept condition is
+        // draft[k] == sampled_at[k] for k in [0, BS).
         int n_accepted = 0;
         for (size_t k = 0; k < draft.size(); ++k) {
-            if (draft[k] == sampled_at[k + 1]) {
+            if (draft[k] == sampled_at[k]) {
                 n_accepted += 1;
             } else {
                 break;
@@ -193,36 +195,27 @@ int main(int argc, char ** argv) {
         common_speculative_accept(spec, (uint16_t) n_accepted);
         n_accept_tokens += n_accepted;
 
-        // Emit: sampled_at[0] (anchor's next, deterministic from id_last)
-        //   ... then accepted draft tokens [0..n_accepted)
-        //   ... plus the bonus = sampled_at[n_accepted+1] (the first
-        //       diverging or extra-row token)
-        // Actually the standard accept-emit pattern emits the accepted
-        // run + 1 bonus. Here sampled_at[0] is the token at anchor's row,
-        // which IS what we want to emit first (the deterministic
-        // "anchor's continuation"). Then bonus = sampled_at[n_accepted+1]
-        // (target's argmax at the first unaccepted position, or the
-        // post-block bonus row).
-        // For acceptance counting per the literature we count
-        // n_accepted from the drafter. Emit count = 1 + n_accepted.
-
+        // Cycle emits: the n_accepted draft tokens (positions
+        // P+1..P+n_accepted) plus the bonus = sampled_at[n_accepted]
+        // (target's argmax at the first unaccepted slot OR the post-
+        // block extra row when n_accepted==BS). Total emitted = n_accepted+1.
         for (int k = 0; k < n_accepted; ++k) {
             common_sampler_accept(smpl, ctx, draft[k], true);
             printf("%s", common_token_to_piece(ctx, draft[k]).c_str());
             emitted.push_back(draft[k]);
         }
-        // Bonus.
-        const llama_token bonus = sampled_at[n_accepted + 1];
+        const llama_token bonus = sampled_at[n_accepted];
         common_sampler_accept(smpl, ctx, bonus, true);
         printf("%s", common_token_to_piece(ctx, bonus).c_str());
         fflush(stdout);
         emitted.push_back(bonus);
 
-        // Remove rejected positions from target KV cache. We decoded
-        // [P, P+BS] but only positions [P, P+n_accepted+1] are kept.
-        if (n_accepted < (int) draft.size()) {
-            llama_kv_cache_seq_rm(ctx, 0, P + 1 + n_accepted + 1, -1);
-        }
+        // Roll back rejected positions in target's KV cache. Verify
+        // decoded positions [P, P+BS]. After accept we keep positions
+        // [P, P+n_accepted] (= id_last + n_accepted drafted tokens).
+        // The bonus token at position P+n_accepted+1 will be re-decoded
+        // by the NEXT cycle's verify batch with input = bonus.
+        llama_kv_cache_seq_rm(ctx, 0, P + n_accepted + 1, -1);
 
         id_last = bonus;
         if (llama_token_is_eog(model, bonus)) break;

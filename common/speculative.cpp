@@ -1024,6 +1024,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
+        // Sized to the drafter's max block size so llama_dflash_draft's
+        // bounds check passes; the kernel's operating BS is set in
+        // llama-dflash.cpp and may be less.
         result.assign(block_size, 0);
         // anchor_pos = prompt_tgt.size() — the seq position where id_last
         // sits when fed into the target verify decode for this cycle.
@@ -1035,8 +1038,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
             result.clear();
             return;
         }
-        // Caller's n_max may be less than block_size; truncate the
-        // returned candidate list rather than over-drafting.
+        // rc is the number of candidates actually written.
+        result.resize((size_t) rc);
+        // Caller's n_max may be less than the kernel's operating BS;
+        // truncate the returned candidate list rather than over-drafting.
         if ((int32_t) result.size() > n_max) {
             result.resize(n_max);
         }

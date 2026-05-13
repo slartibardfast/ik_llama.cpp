@@ -489,6 +489,18 @@ namespace {
 
 // Stage target hiddens from the cb_eval host buffer to the per-cycle
 // GPU staging buffer at shape [MAL_anchors, L_src, D_emb] row-major.
+// T2's cb_eval hook is append-only (one ubatch's hiddens per cb_eval
+// fire). After a verify decode in cycle N adds BS+1 rows, the buffer
+// grows to anchor_pos_prev + BS+1 rows. For cycle N+1, anchor_pos is
+// at most that — the slot at index n_accepted in the verify-added rows
+// was decoded with the REJECTED input rather than the bonus, but we
+// accept that one-row degradation rather than re-decoding (T6
+// state-save/restore would clean this up; out of T5 scope).
+//
+// After staging, we trim the buffer to anchor_pos rows so subsequent
+// verify decode appends extend a clean slate.
+//
+// Spec: specs/dflash/dflash.allium @ AtomicityPerCycle / NewAnchorIsBonus
 bool stage_target_hiddens(llama_dflash_ctx_state & st,
                           const llama_dflash_drafter & dw,
                           struct llama_context * ctx,
@@ -499,13 +511,15 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
     std::vector<__half> h_stage((std::size_t) mal_anchors * L_src * D_emb);
 
     for (int i = 0; i < L_src; ++i) {
+        // dflash_extract_buf is indexed by source-layer SLOT (0..L_src-1),
+        // NOT by target layer id. The cb_eval hook stores at the slot
+        // index it finds for the matched layer; this matches the order
+        // of llama_set_dflash_extract_layers' input array.
+        std::vector<float> & buf = ctx->default_decoder.dflash_extract_buf[i];
         const int il = dw.target_layer_ids[i];
-        if (il < 0 || il >= 16) return false;
-        // T2 hook writes float per layer into default_decoder.dflash_extract_buf[il].
-        const std::vector<float> & buf = ctx->default_decoder.dflash_extract_buf[il];
         if ((int) (buf.size() / D_emb) < mal_anchors) {
-            std::fprintf(stderr, "[%s] extract buffer too short for layer %d: have %zu, need %d\n",
-                         MODULE, il, buf.size() / (std::size_t) D_emb, mal_anchors);
+            std::fprintf(stderr, "[%s] extract buffer too short for slot %d (layer %d): have %zu rows, need %d\n",
+                         MODULE, i, il, buf.size() / (std::size_t) D_emb, mal_anchors);
             return false;
         }
         for (int a = 0; a < mal_anchors; ++a) {
@@ -514,6 +528,9 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
                 h_stage[((std::size_t) a * L_src + i) * D_emb + d] = __float2half(row[d]);
             }
         }
+        // Trim to mal_anchors rows for next cycle.
+        buf.resize((std::size_t) mal_anchors * D_emb);
+        ctx->default_decoder.dflash_extract_n[i] = buf.size();
     }
 
     return cuda_ok(cudaMemcpy(st.d_target_hiddens, h_stage.data(),
@@ -534,7 +551,11 @@ int32_t llama_dflash_draft(
     if (!st.drafter) return LLAMA_DFLASH_INVALID_DRAFTER;
     auto & dw = *st.drafter;
 
-    const int BS = dw.block_size;
+    // Operating block size: kernels validated for {4, 5, 6, 8}. The
+    // drafter GGUF carries the model's MAX block size (16); for T5 we
+    // run at the spec's documented production operating point of 4.
+    // T8 may sweep {4, 5, 6, 8} for perf tuning.
+    const int BS = 4;
     if (max_candidates < BS) {
         std::fprintf(stderr, "[%s] out_candidates size %d < BLOCK_SIZE %d\n", MODULE, max_candidates, BS);
         return LLAMA_DFLASH_INVALID_DRAFTER;

@@ -9638,8 +9638,15 @@ static bool llama_dflash_extract_cb_eval(struct ggml_tensor * t, bool ask, void 
     }
     const size_t nbytes = ggml_nbytes(t);
     auto & buf = ctx->default_decoder.dflash_extract_buf[slot];
-    buf.resize(nbytes / sizeof(float));
-    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+    // Append: cb_eval may fire multiple times per llama_decode when the
+    // batch is split into ubatches. The accumulated buffer ends up with
+    // one row per decoded position in seq order. Resetting on each
+    // ubatch would discard all but the last ubatch's rows. Callers that
+    // need to truncate after a partial-accept rollback do so explicitly
+    // via llama_dflash_trim_extract_buf (see include/llama.h).
+    const size_t old_n_floats = buf.size();
+    buf.resize(old_n_floats + nbytes / sizeof(float));
+    ggml_backend_tensor_get(t, buf.data() + old_n_floats, 0, nbytes);
     ctx->default_decoder.dflash_extract_n[slot] = buf.size();
     return true;
 }
