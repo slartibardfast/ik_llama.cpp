@@ -336,6 +336,9 @@ if (GGML_CUDA)
             ${CMAKE_SOURCE_DIR}/ggml/include
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-closure PRIVATE CUDA::cudart ggml)
+
+        # T6.A: DeltaNet state save/restore smoke test
+        llama_build_and_test(dflash-speculative/test-dflash-state-save-restore.cpp)
     endif()
 endif()
 

@@ -131,6 +131,21 @@ struct llama_dflash_ctx_state {
 
     // Cycle counter for diagnostics.
     int n_cycles = 0;
+    int n_re_decodes = 0;       // T6.B: bonus re-decodes performed
+
+    // ── T6.A: DeltaNet recurrent state save/restore ──
+    // Per-layer descriptor for each linear-attn layer in target.
+    struct dn_layer_info {
+        int          il;            // layer index
+        float      * live_data;     // device pointer to lctx.transformer_kv.s_l[il]->data
+        std::size_t  n_bytes;       // bytes of state at this layer
+        std::size_t  scratch_off;   // offset into the ping-pong scratch buffer
+    };
+    std::vector<dn_layer_info> dn_layers;
+    std::size_t   dn_scratch_bytes = 0;   // sum across all recurrent layers
+    float       * d_state_scratch_a = nullptr;
+    float       * d_state_scratch_b = nullptr;
+    int           active_ckpt_slot  = -1;   // 0 or 1 (which scratch holds the latest checkpoint); -1 = none
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -389,6 +404,88 @@ void free_ctx_scratch(llama_dflash_ctx_state & st) {
     F((void *&) st.d_anchor_pos);
     F((void *&) st.d_slot_positions);
     F((void *&) st.d_layer_types);
+    F((void *&) st.d_state_scratch_a);
+    F((void *&) st.d_state_scratch_b);
+    st.dn_layers.clear();
+    st.dn_scratch_bytes = 0;
+    st.active_ckpt_slot = -1;
+}
+
+// T6.A: discover target's linear-attn (DeltaNet) state layers, build a
+// per-layer descriptor list with device pointers + scratch offsets,
+// and allocate the ping-pong scratch (2 × total state bytes).
+//
+// Walks `lctx.transformer_kv.s_l[il]` for il in [0, n_layer). Non-null
+// entries are recurrent layers carrying DeltaNet state. Their type is
+// F32 per src/llama-delta-net.cpp:324.
+//
+// Allocation happens at llama_set_dflash bind time, before any cycles.
+bool init_dn_state_scratch(llama_dflash_ctx_state & st, struct llama_context * ctx) {
+    const auto & s_l = ctx->transformer_kv.s_l;
+    std::size_t total = 0;
+    st.dn_layers.clear();
+    for (int il = 0; il < (int) s_l.size(); ++il) {
+        struct ggml_tensor * t = s_l[il];
+        if (!t || !t->data) continue;
+        if (t->type != GGML_TYPE_F32) {
+            std::fprintf(stderr, "[%s] WARN linear-attn layer %d state type is %d, expected F32 (%d)\n",
+                         MODULE, il, (int) t->type, (int) GGML_TYPE_F32);
+            // Continue anyway — we treat the buffer as opaque bytes for memcpy.
+        }
+        const std::size_t nb = ggml_nbytes(t);
+        llama_dflash_ctx_state::dn_layer_info info{};
+        info.il          = il;
+        info.live_data   = static_cast<float *>(t->data);
+        info.n_bytes     = nb;
+        info.scratch_off = total;
+        st.dn_layers.push_back(info);
+        total += nb;
+    }
+    st.dn_scratch_bytes = total;
+
+    if (total == 0) {
+        // Dense target — no DeltaNet state. Save/restore is no-op.
+        std::fprintf(stderr, "[%s] no recurrent layers found in target — state save/restore disabled\n", MODULE);
+        return true;
+    }
+
+    if (!cuda_ok(cudaMalloc(&st.d_state_scratch_a, total), "alloc state scratch A")) return false;
+    if (!cuda_ok(cudaMalloc(&st.d_state_scratch_b, total), "alloc state scratch B")) return false;
+
+    std::fprintf(stderr, "[%s] DeltaNet state scratch: %zu recurrent layers, %.2f MiB ping-pong (2×%.2f MiB)\n",
+                 MODULE, st.dn_layers.size(),
+                 (double) (2 * total) / (1024.0 * 1024.0),
+                 (double) total       / (1024.0 * 1024.0));
+    return true;
+}
+
+// Snapshot live state to scratch slot {0, 1}. Caller should
+// cudaDeviceSynchronize before calling if a kernel writing to the
+// live state hasn't finished.
+bool dn_state_snapshot(llama_dflash_ctx_state & st, int slot) {
+    if (st.dn_scratch_bytes == 0) return true;
+    float * dst = (slot == 0) ? st.d_state_scratch_a : st.d_state_scratch_b;
+    for (const auto & info : st.dn_layers) {
+        char * dst_p = reinterpret_cast<char *>(dst) + info.scratch_off;
+        if (!cuda_ok(cudaMemcpyAsync(dst_p, info.live_data, info.n_bytes,
+                                     cudaMemcpyDeviceToDevice, 0),
+                     "state_snapshot memcpy")) return false;
+    }
+    st.active_ckpt_slot = slot;
+    return true;
+}
+
+// Restore from scratch slot {0, 1} back into live state.
+bool dn_state_restore(llama_dflash_ctx_state & st, int slot) {
+    if (st.dn_scratch_bytes == 0) return true;
+    const float * src = (slot == 0) ? st.d_state_scratch_a : st.d_state_scratch_b;
+    for (const auto & info : st.dn_layers) {
+        const char * src_p = reinterpret_cast<const char *>(src) + info.scratch_off;
+        if (!cuda_ok(cudaMemcpyAsync(info.live_data, src_p, info.n_bytes,
+                                     cudaMemcpyDeviceToDevice, 0),
+                     "state_restore memcpy")) return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -432,6 +529,14 @@ int32_t llama_set_dflash(
     const int seq_len_cap = (int) ctx_tgt->cparams.n_ctx;
     const int mal_cap     = seq_len_cap;
     if (!allocate_ctx_scratch(*st, *drafter, seq_len_cap, mal_cap)) {
+        free_ctx_scratch(*st);
+        delete st;
+        return LLAMA_DFLASH_LOAD_FAILED;
+    }
+
+    // T6.A: DeltaNet state ping-pong scratch — discover recurrent layers
+    // in target and allocate ping-pong scratch for snapshot/restore.
+    if (!init_dn_state_scratch(*st, ctx_tgt)) {
         free_ctx_scratch(*st);
         delete st;
         return LLAMA_DFLASH_LOAD_FAILED;
@@ -704,6 +809,37 @@ void llama_dflash_release_ctx_state(struct llama_context * ctx) {
     ctx->dflash_state = nullptr;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// T6.A: DeltaNet state save/restore (public C API)
+// ─────────────────────────────────────────────────────────────────────
+
+int32_t llama_dflash_state_snapshot(struct llama_context * ctx_tgt, int32_t slot) {
+    if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
+    if (slot != 0 && slot != 1) return LLAMA_DFLASH_INVALID_DRAFTER;
+    // Caller is responsible for ensuring prior decodes have completed.
+    return dn_state_snapshot(*ctx_tgt->dflash_state, slot) ? LLAMA_DFLASH_OK : LLAMA_DFLASH_LOAD_FAILED;
+}
+
+int32_t llama_dflash_state_restore(struct llama_context * ctx_tgt, int32_t slot) {
+    if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
+    if (slot != 0 && slot != 1) return LLAMA_DFLASH_INVALID_DRAFTER;
+    return dn_state_restore(*ctx_tgt->dflash_state, slot) ? LLAMA_DFLASH_OK : LLAMA_DFLASH_LOAD_FAILED;
+}
+
+void llama_dflash_get_cycle_stats(
+        const struct llama_context * ctx_tgt,
+        int32_t * out_n_cycles,
+        int32_t * out_n_re_decodes) {
+    if (!ctx_tgt || !ctx_tgt->dflash_state) {
+        if (out_n_cycles)     *out_n_cycles     = 0;
+        if (out_n_re_decodes) *out_n_re_decodes = 0;
+        return;
+    }
+    const auto & st = *ctx_tgt->dflash_state;
+    if (out_n_cycles)     *out_n_cycles     = st.n_cycles;
+    if (out_n_re_decodes) *out_n_re_decodes = st.n_re_decodes;
+}
+
 #else // GGML_CUDA_DFLASH not defined — stubs
 
 void llama_dflash_release_ctx_state(struct llama_context * /*ctx*/) {
@@ -730,6 +866,19 @@ enum llama_dflash_layer_type llama_dflash_layer_type_at(
 int32_t llama_dflash_draft(struct llama_context * /*ctx*/, llama_token /*anchor*/, int32_t /*pos*/,
                             llama_token * /*out*/, int32_t /*max*/) {
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+int32_t llama_dflash_state_snapshot(struct llama_context * /*ctx*/, int32_t /*slot*/) {
+    return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+int32_t llama_dflash_state_restore(struct llama_context * /*ctx*/, int32_t /*slot*/) {
+    return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+void llama_dflash_get_cycle_stats(
+        const struct llama_context * /*ctx*/,
+        int32_t * out_n_cycles,
+        int32_t * out_n_re_decodes) {
+    if (out_n_cycles)     *out_n_cycles     = 0;
+    if (out_n_re_decodes) *out_n_re_decodes = 0;
 }
 
 #endif // GGML_CUDA_DFLASH
