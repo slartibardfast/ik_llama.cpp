@@ -19,14 +19,18 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <fstream>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ggml.h"
 #include "llama.h"
 #include "common.h"
+#include "perplexity.h"
+#include "speculative.h"
 #include "ggml-cuda.h"
 #include "ggml-sycl.h"
 
@@ -231,6 +235,14 @@ static std::string pair_str(const std::pair<int, int> & p) {
 // Ser = Smart Expert Reduction
 using Ser = std::pair<int,float>;
 
+// Spec-aware bench fields (T8 Phase 1). See PHASE_DFLASH.md Phase 1.1/1.2.
+//
+//   spec_type       sweep over { none, mtp, dflash, draft, ngram-* } drivers
+//   n_draft         draft chain length / DFlash BLOCK_SIZE
+//   spec_model      drafter GGUF (DFlash/Draft only; MTP uses inline heads)
+//   prompt_files    real prompts (one row per file); needed for spec accept-rate
+//   ppl_of_output   re-decode generated output under target → corpus PPL
+//                   captures cumulative numerical drift across spec methods
 struct cmd_params {
     std::vector<std::string> model;
     std::vector<int> n_prompt;
@@ -239,6 +251,11 @@ struct cmd_params {
     std::vector<std::pair<int, int>> n_gp;
     std::vector<int> n_batch;
     std::vector<int> n_ubatch;
+    std::vector<common_speculative_type> spec_type;
+    std::vector<int> n_draft;
+    std::vector<std::string> spec_model;
+    std::vector<std::string> prompt_files;
+    bool ppl_of_output = false;
     std::vector<ggml_type> type_k;
     std::vector<ggml_type> type_v;
     std::vector<std::pair<int,int>> n_threads;
@@ -288,6 +305,11 @@ static const cmd_params cmd_params_defaults = {
     /* n_gp                 */ {},
     /* n_batch              */ {2048},
     /* n_ubatch             */ {512},
+    /* spec_type            */ {COMMON_SPECULATIVE_TYPE_NONE},
+    /* n_draft              */ {0},     // 0 = method-specific default applied later
+    /* spec_model           */ {""},
+    /* prompt_files         */ {""},    // empty path = synthetic n_prompt prefix
+    /* ppl_of_output        */ false,
     /* type_k               */ {GGML_TYPE_F16},
     /* type_v               */ {GGML_TYPE_F16},
     /* n_threads            */ {{cpu_get_num_math(), cpu_get_num_math()}},
@@ -382,6 +404,16 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --fit-margin N                      (default: %d)\n", cmd_params_defaults.fit_margin);
     printf("  --max-gpu <N>                       (default: %d)\n", cmd_params_defaults.max_gpu);
     printf("        --print-overrides <0|1>       (default: %s)\n", cmd_params_defaults.print_overrides ? "1" : "0");
+    printf("\n");
+    printf("speculative decoding (T8):\n");
+    printf("  --spec <name[,name,...]>            spec method(s): none, mtp, dflash, draft, ngram-simple,\n");
+    printf("                                      ngram-map-k, ngram-map-k4v, ngram-mod, ngram-cache, suffix, eagle3\n");
+    printf("                                      (default: none)\n");
+    printf("  -nd, --draft <N[,N,...]>            draft chain length or DFlash BLOCK_SIZE (0 = method default)\n");
+    printf("  --spec-model <path>                 drafter GGUF (DFlash/draft; MTP uses inline heads)\n");
+    printf("  --prompt-file <path>                real prompt for spec accept-rate; may be repeated\n");
+    printf("  --ppl-of-output                     after each tg row, re-decode generated output and report\n");
+    printf("                                      target PPL — quality bound for spec method comparison\n");
     printf("\n");
     printf("Multiple values can be given for each parameter by separating them with ',' or by specifying the parameter multiple times.\n");
 }
@@ -903,6 +935,44 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.print_overrides = std::stoi(argv[i]);
+        } else if (arg == "--spec") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto names = string_split<std::string>(argv[i], split_delim);
+            for (const auto & name : names) {
+                common_speculative_type st = common_speculative_type_from_name(name);
+                if (st == COMMON_SPECULATIVE_TYPE_COUNT) {
+                    fprintf(stderr, "error: unknown spec method '%s' (valid: %s)\n",
+                            name.c_str(), common_speculative_type_name_str().c_str());
+                    invalid_param = true;
+                    break;
+                }
+                params.spec_type.push_back(st);
+            }
+            if (invalid_param) break;
+        } else if (arg == "-nd" || arg == "--draft") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            auto p = string_split<int>(argv[i], split_delim);
+            params.n_draft.insert(params.n_draft.end(), p.begin(), p.end());
+        } else if (arg == "--spec-model") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.spec_model.push_back(argv[i]);
+        } else if (arg == "--prompt-file") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.prompt_files.push_back(argv[i]);
+        } else if (arg == "--ppl-of-output") {
+            params.ppl_of_output = true;
         } else {
             invalid_param = true;
             break;
@@ -938,6 +1008,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.use_mmap.empty())     { params.use_mmap = cmd_params_defaults.use_mmap; }
     if (params.embeddings.empty())   { params.embeddings = cmd_params_defaults.embeddings; }
     if (params.n_threads.empty())    { params.n_threads = cmd_params_defaults.n_threads; }
+    if (params.spec_type.empty())    { params.spec_type = cmd_params_defaults.spec_type; }
+    if (params.n_draft.empty())      { params.n_draft = cmd_params_defaults.n_draft; }
+    if (params.spec_model.empty())   { params.spec_model = cmd_params_defaults.spec_model; }
+    if (params.prompt_files.empty()) { params.prompt_files = cmd_params_defaults.prompt_files; }
     if (!params.buft_overrides.empty()) params.buft_overrides.emplace_back(llama_model_tensor_buft_override{nullptr, nullptr});
 
     return params;
@@ -993,6 +1067,12 @@ struct cmd_params_instance {
     bool fit = false;
     int  fit_margin = 0;
     const llama_model_tensor_buft_override* buft_overrides;
+    // T8 spec-aware bench
+    common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    int         n_draft = 0;
+    std::string spec_model;
+    std::string prompt_file;
+    bool        ppl_of_output = false;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1090,9 +1170,19 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & amb : params.attn_max_batch)
     for (const auto & reuse : params.reuse)
     for (const auto & ser : params.ser)
-    for (const auto & nt : params.n_threads) {
+    for (const auto & nt : params.n_threads)
+    for (const auto & st : params.spec_type)
+    for (const auto & nd : params.n_draft)
+    for (const auto & sm_path : params.spec_model)
+    for (const auto & prompt_file : params.prompt_files) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
+                continue;
+            }
+            // PP-only rows are spec-independent (prefill happens before spec init).
+            // When sweeping multiple --spec methods, only emit one PP row to avoid
+            // wasting compute on identical prefills.
+            if (st != params.spec_type.front()) {
                 continue;
             }
             cmd_params_instance instance = {
@@ -1134,6 +1224,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .spec_type    = */ st,
+                /* .n_draft      = */ nd,
+                /* .spec_model   = */ sm_path,
+                /* .prompt_file  = */ prompt_file,
+                /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
         }
@@ -1181,6 +1276,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .spec_type    = */ st,
+                /* .n_draft      = */ nd,
+                /* .spec_model   = */ sm_path,
+                /* .prompt_file  = */ prompt_file,
+                /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
         }
@@ -1228,6 +1328,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .spec_type    = */ st,
+                /* .n_draft      = */ nd,
+                /* .spec_model   = */ sm_path,
+                /* .prompt_file  = */ prompt_file,
+                /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
         }
@@ -1275,6 +1380,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit          = */ params.fit,
                 /* .git_margin   = */ params.fit_margin,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
+                /* .spec_type    = */ st,
+                /* .n_draft      = */ nd,
+                /* .spec_model   = */ sm_path,
+                /* .prompt_file  = */ prompt_file,
+                /* .ppl_of_output*/ params.ppl_of_output,
             };
             instances.push_back(instance);
         }
@@ -1339,6 +1449,17 @@ struct test {
     std::vector<uint64_t> samples_ns;
     test_kind_type  test_kind;
     std::string     test_label;
+    // T8 spec-aware bench result fields. Populated for TG-class kinds; left
+    // at defaults for PP. accept_rate / mean_accept are 0 for spec=none.
+    common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    int         n_draft       = 0;
+    std::string spec_model;
+    std::string prompt_file;
+    int         n_drafts      = 0;     // total draft cycles across reps
+    int         n_accepted    = 0;     // total accepted draft tokens across reps
+    int         n_draft_total = 0;     // total candidate draft tokens (= cycles * BS)
+    double      ppl_of_output = 0.0;   // avg corpus-PPL of generated output (target re-decode)
+    bool        has_ppl       = false;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) {
         model_filename = inst.model;
@@ -1396,6 +1517,10 @@ struct test {
         n_prompt = inst.n_prompt;
         n_gen = inst.n_gen;
         test_kind = inst.test_kind;
+        spec_type = inst.spec_type;
+        n_draft = inst.n_draft;
+        spec_model = inst.spec_model;
+        prompt_file = inst.prompt_file;
         // RFC 3339 date-time format
         time_t t = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
@@ -1481,7 +1606,8 @@ struct test {
             field == "model_size" || field == "model_n_params" ||
             field == "n_gpu_layers" || field == "main_gpu" ||
             field == "n_prompt" || field == "n_gen" || field == "mla_attn" || field == "attn_max_batch" ||
-            field == "avg_ns" || field == "stddev_ns" || field == "max_gpu") {
+            field == "avg_ns" || field == "stddev_ns" || field == "max_gpu" ||
+            field == "n_draft" || field == "n_drafts" || field == "n_accepted" || field == "n_draft_total") {
             return INT;
         }
         if (field == "cuda" || field == "vulkan" || field == "kompute" || field == "metal" ||
@@ -1491,7 +1617,8 @@ struct test {
             field == "rcache" || field == "reuse" || field == "muge" || field == "defer_experts" || field == "sas") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" ||
+            field == "accept_rate" || field == "mean_accept" || field == "target_ppl_of_output") {
             return FLOAT;
         }
         return STRING;
@@ -1519,6 +1646,12 @@ struct test {
             return str.str();
         };
         bool is_gen = n_gen > 0;
+        char buf_ar[32];
+        char buf_ma[32];
+        char buf_ppl[32];
+        snprintf(buf_ar,  sizeof(buf_ar),  "%.4f", accept_rate());
+        snprintf(buf_ma,  sizeof(buf_ma),  "%.3f", mean_accept());
+        snprintf(buf_ppl, sizeof(buf_ppl), "%.4f", ppl_of_output);
         std::vector<std::string> values = {
             build_commit, std::to_string(build_number),
             std::to_string(cuda), std::to_string(vulkan), std::to_string(kompute),
@@ -1538,9 +1671,27 @@ struct test {
             std::to_string(n_prompt), std::to_string(n_gen), test_time,
             std::to_string(avg_ns()), std::to_string(stdev_ns()),
             std::to_string(avg_ts()), std::to_string(stdev_ts()),
-            test_label
+            test_label,
+            common_speculative_type_to_str(spec_type),
+            std::to_string(n_draft),
+            spec_model,
+            prompt_file,
+            std::to_string(n_drafts),
+            std::to_string(n_accepted),
+            std::to_string(n_draft_total),
+            buf_ar,
+            buf_ma,
+            has_ppl ? std::string(buf_ppl) : std::string("-")
         };
         return values;
+    }
+
+    // T8: accept_rate = accepted / total_candidates, mean_accept = accepted / drafts
+    double accept_rate() const {
+        return n_draft_total > 0 ? double(n_accepted) / double(n_draft_total) : 0.0;
+    }
+    double mean_accept() const {
+        return n_drafts > 0 ? double(n_accepted) / double(n_drafts) : 0.0;
     }
 
     static const std::vector<std::string> & get_fields() {
@@ -1558,6 +1709,9 @@ struct test {
             "n_prompt", "n_gen", "test_time",
             "avg_ns", "stddev_ns",
             "avg_ts", "stddev_ts", "test",
+            "spec", "n_draft", "spec_model", "prompt_file",
+            "n_drafts", "n_accepted", "n_draft_total",
+            "accept_rate", "mean_accept", "target_ppl_of_output",
         };
         return fields;
     }
@@ -1771,6 +1925,21 @@ struct markdown_printer : public printer {
         if (field == "test") {
             return 13;
         }
+        if (field == "spec") {
+            return 12;
+        }
+        if (field == "n_draft") {
+            return 3;
+        }
+        if (field == "accept_rate" || field == "mean_accept") {
+            return 8;
+        }
+        if (field == "target_ppl_of_output") {
+            return 10;
+        }
+        if (field == "prompt_file") {
+            return -24;
+        }
 
         int width = std::max((int)field.length(), 10);
 
@@ -1858,6 +2027,24 @@ struct markdown_printer : public printer {
         }
         if (field == "override_tensor") {
             return "ot";
+        }
+        if (field == "spec") {
+            return "spec";
+        }
+        if (field == "n_draft") {
+            return "nd";
+        }
+        if (field == "accept_rate") {
+            return "acc%";
+        }
+        if (field == "mean_accept") {
+            return "ma";
+        }
+        if (field == "target_ppl_of_output") {
+            return "ppl_out";
+        }
+        if (field == "prompt_file") {
+            return "prompt";
         }
         return field;
     }
@@ -1966,6 +2153,23 @@ struct markdown_printer : public printer {
         if (params.no_ooae != cmd_params_defaults.no_ooae) {
             fields.emplace_back("no_ooae");
         }
+        // T8 spec columns: emit only when user opted in (any non-default value).
+        const bool any_spec = params.spec_type.size() > 1 ||
+            (params.spec_type.size() == 1 && params.spec_type.front() != COMMON_SPECULATIVE_TYPE_NONE);
+        if (any_spec) {
+            fields.emplace_back("spec");
+            fields.emplace_back("n_draft");
+            fields.emplace_back("accept_rate");
+            fields.emplace_back("mean_accept");
+        }
+        const bool any_prompt = params.prompt_files.size() > 1 ||
+            (params.prompt_files.size() == 1 && !params.prompt_files.front().empty());
+        if (any_prompt) {
+            fields.emplace_back("prompt_file");
+        }
+        if (params.ppl_of_output) {
+            fields.emplace_back("target_ppl_of_output");
+        }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
 
@@ -1992,7 +2196,24 @@ struct markdown_printer : public printer {
             }
             std::string value;
             char buf[128];
-            if (field == "model") {
+            if (field == "prompt_file") {
+                // Display basename only — full path crowds the row.
+                const std::string & pf = t.prompt_file;
+                auto slash = pf.find_last_of('/');
+                value = (slash == std::string::npos) ? pf : pf.substr(slash + 1);
+            } else if (field == "target_ppl_of_output") {
+                value = t.has_ppl ? vmap.at(field) : std::string("-");
+            } else if (field == "accept_rate") {
+                char buf2[32];
+                snprintf(buf2, sizeof(buf2), "%.3f", t.accept_rate());
+                value = buf2;
+            } else if (field == "mean_accept") {
+                char buf2[32];
+                snprintf(buf2, sizeof(buf2), "%.2f", t.mean_accept());
+                value = buf2;
+            } else if (field == "spec") {
+                value = common_speculative_type_to_str(t.spec_type);
+            } else if (field == "model") {
                 value = t.model_type;
             } else if (field == "size") {
                 if (t.model_size < 1024*1024*1024) {
@@ -2097,6 +2318,245 @@ struct sql_printer : public printer {
         fprintf(fout, ");\n");
     }
 };
+
+// Greedy argmax over a single logit row (n_vocab floats).
+static llama_token bench_greedy_argmax(const float * logits, int n_vocab) {
+    llama_token best = 0;
+    float bv = logits[0];
+    for (int i = 1; i < n_vocab; i++) {
+        if (logits[i] > bv) { bv = logits[i]; best = i; }
+    }
+    return best;
+}
+
+// Decode a real prompt as prefill (one batch per n_batch chunk; final logit only).
+// Returns true on success.
+static bool bench_prefill_real(llama_context * ctx, const std::vector<llama_token> & tokens,
+                               int n_batch, int n_threads) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+    const int n_total = (int) tokens.size();
+    int n_processed = 0;
+    while (n_processed < n_total) {
+        int n_tokens = std::min(n_batch, n_total - n_processed);
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = n_processed + i;
+            bool logits_here = (pos == n_total - 1);
+            common_batch_add(batch, tokens[pos], pos, {0}, logits_here);
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            return false;
+        }
+        llama_batch_free(batch);
+        n_processed += n_tokens;
+    }
+    llama_synchronize(ctx);
+    return true;
+}
+
+// Spec-aware token generation. Drives `common_speculative_draft` + verify
+// batch + accept-prefix loop, mirroring examples/dflash-speculative-simple
+// and the production server's MTP path.
+//
+// On entry: ctx must already have the prompt prefilled; the last logit row
+// holds the predictive distribution for the first generated token.
+//
+// Outputs: n_drafts (cycle count), n_accepted (sum of accepted prefix lengths),
+// n_draft_total (sum of candidate lengths). When out_generated != nullptr,
+// captures the emitted token sequence (for PPL-of-output).
+static void test_gen_spec(
+        llama_context * ctx,
+        int n_gen,
+        int n_threads,
+        common_speculative * spec,
+        common_params_speculative & spec_params,
+        const std::vector<llama_token> & prompt_tokens,
+        int & n_drafts,
+        int & n_accepted,
+        int & n_draft_total,
+        std::vector<llama_token> * out_generated)
+{
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab = llama_n_vocab(model);
+    const int n_prompt = (int) prompt_tokens.size();
+
+    // First token: greedy argmax over the last logit row from prefill.
+    llama_token id_last;
+    {
+        float * logits = llama_get_logits_ith(ctx, -1);
+        if (!logits) return;
+        id_last = bench_greedy_argmax(logits, n_vocab);
+    }
+
+    std::vector<llama_token> emitted;
+    emitted.reserve(n_gen);
+    emitted.push_back(id_last);
+
+    const bool is_dflash = (spec_params.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+    std::vector<llama_token> prompt_tgt;
+
+    while ((int) emitted.size() < n_gen) {
+        prompt_tgt.assign(prompt_tokens.begin(), prompt_tokens.end());
+        prompt_tgt.insert(prompt_tgt.end(), emitted.begin(), emitted.end() - 1);
+
+        const llama_tokens draft = common_speculative_draft(spec, spec_params, prompt_tgt, id_last);
+        n_drafts++;
+        n_draft_total += (int) draft.size();
+
+        if (draft.empty()) {
+            // Fall back: single-token decode at the anchor position.
+            llama_token tok = id_last;
+            llama_decode(ctx, llama_batch_get_one(&tok, 1, (llama_pos) prompt_tgt.size(), 0));
+            llama_synchronize(ctx);
+            float * logits = llama_get_logits_ith(ctx, 0);
+            if (!logits) break;
+            llama_token nxt = bench_greedy_argmax(logits, n_vocab);
+            emitted.push_back(nxt);
+            id_last = nxt;
+            if (llama_token_is_eog(model, nxt)) break;
+            continue;
+        }
+
+        const llama_pos P = (llama_pos) prompt_tgt.size();
+
+        if (is_dflash) {
+            if (!llama_spec_ckpt_save(ctx, 0)) break;
+        }
+
+        const int verify_bs = (int) draft.size() + 1;
+        llama_batch batch = llama_batch_init(verify_bs, 0, 1);
+        common_batch_add(batch, id_last, P, {0}, true);
+        for (size_t k = 0; k < draft.size(); k++) {
+            common_batch_add(batch, draft[k], P + 1 + (llama_pos) k, {0}, true);
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            break;
+        }
+        std::vector<llama_token> sampled(verify_bs);
+        for (int k = 0; k < verify_bs; k++) {
+            float * logits = llama_get_logits_ith(ctx, k);
+            if (!logits) { sampled[k] = -1; break; }
+            sampled[k] = bench_greedy_argmax(logits, n_vocab);
+        }
+        llama_batch_free(batch);
+
+        int n_acc = 0;
+        for (size_t k = 0; k < draft.size(); k++) {
+            if (draft[k] == sampled[k]) n_acc++;
+            else break;
+        }
+        common_speculative_accept(spec, (uint16_t) n_acc);
+        n_accepted += n_acc;
+
+        llama_token bonus = sampled[n_acc];
+
+        if (is_dflash) {
+            if (!llama_spec_ckpt_restore(ctx, 0, P, n_acc)) break;
+            llama_dflash_trim_extract(ctx, P + n_acc + 1, -1);
+        } else {
+            // Roll back rejected positions from target KV. The verify batch
+            // wrote [P .. P+BS]; we keep [P .. P+n_acc] (id_last + n_acc drafts).
+            llama_kv_cache_seq_rm(ctx, 0, P + n_acc + 1, -1);
+        }
+
+        for (int k = 0; k < n_acc; k++) emitted.push_back(draft[k]);
+        emitted.push_back(bonus);
+        id_last = bonus;
+
+        if (llama_token_is_eog(model, bonus)) break;
+    }
+
+    if (out_generated) {
+        *out_generated = emitted;
+    }
+    (void) n_prompt;
+}
+
+// Compute corpus PPL of [prompt + generated] under the target. Re-decodes
+// the full sequence in fresh KV cache state, captures per-position logits at
+// the positions that predict generated[0..n_gen-1], then runs the shared
+// NLL/PPL kernel from common/perplexity.h.
+//
+// Returns exp(mean_nll); 0.0 on failure.
+static double compute_ppl_of_output(
+        llama_context * ctx,
+        const std::vector<llama_token> & prompt_tokens,
+        const std::vector<llama_token> & generated)
+{
+    const int n_prompt = (int) prompt_tokens.size();
+    const int n_gen = (int) generated.size();
+    if (n_prompt < 1 || n_gen < 1) return 0.0;
+
+    const llama_model * model = llama_get_model(ctx);
+    const int n_vocab = llama_n_vocab(model);
+
+    llama_kv_cache_clear(ctx);
+
+    std::vector<llama_token> all_tokens = prompt_tokens;
+    all_tokens.insert(all_tokens.end(), generated.begin(), generated.end());
+    const int n_total = (int) all_tokens.size();
+
+    // Flatten per-position logits into [n_gen, n_vocab].
+    std::vector<float> logits;
+    logits.reserve((size_t) n_gen * (size_t) n_vocab);
+
+    const int n_batch_cap = (int) llama_n_batch(ctx);
+    int n_processed = 0;
+    while (n_processed < n_total) {
+        int n_tokens = std::min(n_batch_cap, n_total - n_processed);
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = n_processed + i;
+            // Need predictive logits at [n_prompt-1 .. n_prompt+n_gen-2].
+            bool need = (pos >= n_prompt - 1 && pos < n_prompt + n_gen - 1);
+            common_batch_add(batch, all_tokens[pos], pos, {0}, need);
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            llama_batch_free(batch);
+            return 0.0;
+        }
+        // Gather logits in batch order. With logits-mask only on `need`
+        // positions, llama_get_logits_ith(i) returns row for the i-th
+        // `need` slot in the batch.
+        int need_slot = 0;
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = n_processed + i;
+            if (pos >= n_prompt - 1 && pos < n_prompt + n_gen - 1) {
+                float * row = llama_get_logits_ith(ctx, need_slot++);
+                if (!row) {
+                    llama_batch_free(batch);
+                    return 0.0;
+                }
+                logits.insert(logits.end(), row, row + n_vocab);
+            }
+        }
+        llama_batch_free(batch);
+        n_processed += n_tokens;
+    }
+
+    if ((int) logits.size() != n_gen * n_vocab) return 0.0;
+
+    // process_logits scores tokens[1..n_token] under logits[0..n_token-1].
+    // tokens[0] is unused by the loop; place the prompt's last token there
+    // for clarity. tokens[1..n_gen] = generated[0..n_gen-1].
+    std::vector<llama_token> seq(n_gen + 1);
+    seq[0] = prompt_tokens.back();
+    for (int i = 0; i < n_gen; i++) seq[i + 1] = generated[i];
+
+    double nll = 0.0, nll2 = 0.0;
+    std::vector<float> logit_hist(n_gen), prob_hist(n_gen);
+
+    int n_workers = std::max(1, (int) std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> workers(n_workers);
+    process_logits(n_vocab, logits.data(), seq.data(), n_gen, workers, nll, nll2,
+                   logit_hist.data(), prob_hist.data());
+
+    return std::exp(nll / (double) n_gen);
+}
 
 static void test_prompt(llama_context * ctx, int n_prompt, int n_past, int n_batch, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
@@ -2226,6 +2686,83 @@ int main(int argc, char ** argv) {
 
         test t(inst, lmodel, ctx);
 
+        // ----- T8 spec init (once per instance, after ctx created) -----
+        common_speculative * spec = nullptr;
+        common_params_speculative spec_params;
+        std::vector<llama_token> prompt_tokens;
+        bool spec_init_failed = false;
+
+        if (!inst.prompt_file.empty()) {
+            std::ifstream f(inst.prompt_file);
+            if (!f) {
+                fprintf(stderr, "%s: error: failed to open prompt file '%s'\n", __func__, inst.prompt_file.c_str());
+                spec_init_failed = true;
+            } else {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                prompt_tokens = common_tokenize(ctx, ss.str(), /*add_special=*/true, /*parse_special=*/true);
+                if (prompt_tokens.empty()) {
+                    fprintf(stderr, "%s: error: empty prompt after tokenization (%s)\n", __func__, inst.prompt_file.c_str());
+                    spec_init_failed = true;
+                }
+            }
+        }
+
+        if (!spec_init_failed && inst.spec_type != COMMON_SPECULATIVE_TYPE_NONE) {
+            spec_params.type = inst.spec_type;
+            int nd = inst.n_draft;
+            if (nd <= 0) {
+                nd = (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) ? 4 : 3;
+            }
+            spec_params.n_max = nd;
+
+            if (inst.spec_type == COMMON_SPECULATIVE_TYPE_MTP) {
+                if (llama_model_n_nextn_layer(lmodel) <= 0) {
+                    fprintf(stderr, "warning: model has no MTP nextn layers; skipping --spec mtp row\n");
+                    spec_init_failed = true;
+                } else {
+                    // Mirror server-context.cpp:294-331 MTP init recipe.
+                    spec_params.cparams_dft = inst.to_llama_cparams();
+                    spec_params.cparams_dft.mtp = true;
+                    spec_params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
+                    spec_params.cparams_dft.embeddings = true;
+                    llama_set_embeddings(ctx, true);
+                }
+            } else if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                if (inst.spec_model.empty()) {
+                    fprintf(stderr, "error: --spec dflash requires --spec-model PATH\n");
+                    spec_init_failed = true;
+                } else {
+                    spec_params.mparams_dft.path = inst.spec_model;
+                }
+            } else if (!inst.spec_model.empty()) {
+                spec_params.mparams_dft.path = inst.spec_model;
+            }
+
+            if (!spec_init_failed) {
+                spec = common_speculative_init(spec_params, ctx, /*seq_id=*/0);
+                if (!spec) {
+                    fprintf(stderr, "error: failed to init spec for type=%s\n",
+                            common_speculative_type_to_str(inst.spec_type).c_str());
+                    spec_init_failed = true;
+                }
+            }
+
+            if (!spec_init_failed && inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                const int max_tokens = (int) spec_params.n_max + 1;
+                int rc = llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_AUTO, max_tokens);
+                if (rc < 0) {
+                    fprintf(stderr, "warning: llama_spec_ckpt_init returned %d\n", rc);
+                }
+            }
+        }
+
+        if (spec_init_failed) {
+            if (spec) common_speculative_free(spec);
+            llama_free(ctx);
+            continue;
+        }
+
         llama_kv_cache_clear(ctx);
 
         // warmup run
@@ -2239,21 +2776,73 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // ----- Per-rep measurement -----
+        const bool use_real_prompt = !prompt_tokens.empty();
+        double ppl_sum = 0.0;
+        int    ppl_n   = 0;
+
         for (int i = 0; i < params.reps; i++) {
             llama_kv_cache_clear(ctx);
 
-            uint64_t t_start = get_time_ns();
+            // Prefill: real prompt (if --prompt-file) or random (legacy).
+            // PP/PG include prefill in the timer; TG/GP exclude it.
+            const bool prefill_inside_timer =
+                (t.test_kind == TEST_KIND_PP || t.test_kind == TEST_KIND_PG);
 
-            if (t.n_prompt > 0) {
+            uint64_t t_start = 0;
+            if (prefill_inside_timer) {
+                t_start = get_time_ns();
+            }
+            if (use_real_prompt) {
+                if (!bench_prefill_real(ctx, prompt_tokens, t.n_batch, t.n_threads.second)) {
+                    fprintf(stderr, "error: prefill decode failed\n");
+                    break;
+                }
+            } else if (t.n_prompt > 0) {
                 test_prompt(ctx, t.n_prompt, 0, t.n_batch, t.n_threads.second);
             }
-            if (t.test_kind == TEST_KIND_GP) t_start = get_time_ns();
+            if (!prefill_inside_timer) {
+                t_start = get_time_ns();
+            }
+
+            std::vector<llama_token> generated;
             if (t.n_gen > 0) {
-                test_gen(ctx, t.n_gen, t.n_prompt, t.n_threads.first);
+                if (spec) {
+                    int rep_n_drafts = 0;
+                    int rep_n_accept = 0;
+                    int rep_n_draft_total = 0;
+                    test_gen_spec(ctx, t.n_gen, t.n_threads.first,
+                                  spec, spec_params, prompt_tokens,
+                                  rep_n_drafts, rep_n_accept, rep_n_draft_total,
+                                  &generated);
+                    t.n_drafts      += rep_n_drafts;
+                    t.n_accepted    += rep_n_accept;
+                    t.n_draft_total += rep_n_draft_total;
+                } else {
+                    const int n_past_after_prefill = use_real_prompt
+                        ? (int) prompt_tokens.size()
+                        : t.n_prompt;
+                    test_gen(ctx, t.n_gen, n_past_after_prefill, t.n_threads.first);
+                }
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
+
+            // Optional second pass: corpus PPL of generated output under target.
+            // Only meaningful when we have a real prompt + spec-driven coherent output.
+            if (inst.ppl_of_output && spec && use_real_prompt && !generated.empty()) {
+                double ppl = compute_ppl_of_output(ctx, prompt_tokens, generated);
+                if (std::isfinite(ppl) && ppl > 0.0) {
+                    ppl_sum += ppl;
+                    ppl_n   += 1;
+                }
+            }
+        }
+
+        if (ppl_n > 0) {
+            t.ppl_of_output = ppl_sum / (double) ppl_n;
+            t.has_ppl = true;
         }
 
         if (p) {
@@ -2268,6 +2857,7 @@ int main(int argc, char ** argv) {
 
         llama_print_timings(ctx);
 
+        if (spec) common_speculative_free(spec);
         llama_free(ctx);
     }
 
