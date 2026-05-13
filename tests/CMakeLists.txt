@@ -337,6 +337,15 @@ if (GGML_CUDA)
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-closure PRIVATE CUDA::cudart ggml)
 
+        # Empirical np-invariance probe — drafter_forward at N_slots ∈
+        # {1,2,4,8} with identical slot content; slot 0 output must be
+        # byte-identical across all N values.
+        llama_build_and_test(dflash-speculative/test-dflash-np-invariance.cpp)
+        target_include_directories(test-dflash-np-invariance PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-dflash-np-invariance PRIVATE CUDA::cudart)
+
         # T6: spec-ckpt flow witness for the 3 DeltaNet-rollback invariants
         # (DraftKVRollbackOnRejection, InjectedKVEvictedOnAnchorAdvance,
         # EffectiveSeqLensSubtractsRejected). Drives llama_spec_ckpt_*
