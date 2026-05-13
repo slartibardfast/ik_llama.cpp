@@ -315,6 +315,13 @@ if (GGML_CUDA)
             ${CMAKE_SOURCE_DIR}/ggml/src
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-argmax-match PRIVATE CUDA::cudart)
+
+        llama_build_and_test(dflash-speculative/test-dflash-drafter-load.cpp)
+        target_include_directories(test-dflash-drafter-load PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CMAKE_SOURCE_DIR}/ggml/include
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-dflash-drafter-load PRIVATE CUDA::cudart ggml)
     endif()
 endif()
 
