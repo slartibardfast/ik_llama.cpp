@@ -459,16 +459,19 @@ bool init_dn_state_scratch(llama_dflash_ctx_state & st, struct llama_context * c
     return true;
 }
 
-// Snapshot live state to scratch slot {0, 1}. Caller should
-// cudaDeviceSynchronize before calling if a kernel writing to the
-// live state hasn't finished.
+// Snapshot live state to scratch slot {0, 1}. We synchronise both
+// before and after the per-layer memcpys: before, to make sure any
+// kernel writing the live state on a backend stream has completed;
+// after, so the caller can immediately mutate live_state without
+// racing against our in-flight memcpy.
 bool dn_state_snapshot(llama_dflash_ctx_state & st, int slot) {
     if (st.dn_scratch_bytes == 0) return true;
+    cudaDeviceSynchronize();
     float * dst = (slot == 0) ? st.d_state_scratch_a : st.d_state_scratch_b;
     for (const auto & info : st.dn_layers) {
         char * dst_p = reinterpret_cast<char *>(dst) + info.scratch_off;
-        if (!cuda_ok(cudaMemcpyAsync(dst_p, info.live_data, info.n_bytes,
-                                     cudaMemcpyDeviceToDevice, 0),
+        if (!cuda_ok(cudaMemcpy(dst_p, info.live_data, info.n_bytes,
+                                cudaMemcpyDeviceToDevice),
                      "state_snapshot memcpy")) return false;
     }
     st.active_ckpt_slot = slot;
@@ -478,11 +481,12 @@ bool dn_state_snapshot(llama_dflash_ctx_state & st, int slot) {
 // Restore from scratch slot {0, 1} back into live state.
 bool dn_state_restore(llama_dflash_ctx_state & st, int slot) {
     if (st.dn_scratch_bytes == 0) return true;
+    cudaDeviceSynchronize();
     const float * src = (slot == 0) ? st.d_state_scratch_a : st.d_state_scratch_b;
     for (const auto & info : st.dn_layers) {
         const char * src_p = reinterpret_cast<const char *>(src) + info.scratch_off;
-        if (!cuda_ok(cudaMemcpyAsync(info.live_data, src_p, info.n_bytes,
-                                     cudaMemcpyDeviceToDevice, 0),
+        if (!cuda_ok(cudaMemcpy(info.live_data, src_p, info.n_bytes,
+                                cudaMemcpyDeviceToDevice),
                      "state_restore memcpy")) return false;
     }
     return true;
