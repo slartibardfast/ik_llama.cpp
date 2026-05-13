@@ -2951,13 +2951,25 @@ int main(int argc, char ** argv) {
 
         for (int i = 0; i < params.reps; i++) {
             llama_kv_cache_clear(ctx);
-            // For DFlash: the cb_eval hook accumulates per-position
-            // hidden-state rows into ctx's dflash_extract_buf. Clear it
-            // between reps (and after the PPL second pass, below) so the
-            // first cycle's anchor count lines up with the freshly cleared
-            // KV.
+            // For DFlash: between reps, two pieces of state must be
+            // reset so the next prefill decodes cleanly:
+            //   (1) dflash_extract_buf — cb_eval rows accumulate across
+            //       reps; clear via trim_extract(0,-1).
+            //   (2) save_per_step_ssm flag — left ON across cycles so
+            //       successive BS+1 verifies route into the 5-sized
+            //       per_step buffer (per dflash-speculative-simple
+            //       comment at L241-244). But the next *prefill* is
+            //       103+ tokens; with save_per_step on, prefill data
+            //       misroutes into the 5-sized buffer and tripsa
+            //       ggml view assertion. Discard between reps, then
+            //       re-init for the next cycle batch.
             if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 llama_dflash_trim_extract(ctx, 0, -1);
+                if (i > 0) {
+                    llama_spec_ckpt_discard(ctx);
+                    const int max_tokens = (int) spec_params.n_max + 1;
+                    llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_AUTO, max_tokens);
+                }
             }
 
             // Prefill: real prompt (if --prompt-file) or random (legacy).
@@ -3021,10 +3033,23 @@ int main(int argc, char ** argv) {
             // Optional second pass: corpus PPL of generated output under target.
             // Requires real prompt + captured generated tokens (spec or greedy).
             if (inst.ppl_of_output && use_real_prompt && !generated.empty()) {
+                // DFlash: same per_step state issue as between reps — the
+                // PPL re-decode is a long batch (prompt + generated), not a
+                // BS+1 verify. Discard so prefill-shape data doesn't
+                // misroute into the 5-sized buffer.
+                if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    llama_spec_ckpt_discard(ctx);
+                }
                 double ppl = compute_ppl_of_output(ctx, prompt_tokens, generated);
                 if (std::isfinite(ppl) && ppl > 0.0) {
                     ppl_sum += ppl;
                     ppl_n   += 1;
+                }
+                // Re-arm per_step for the next rep's spec loop. Without
+                // this, the next rep's first spec_ckpt_save returns false.
+                if (inst.spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    const int max_tokens = (int) spec_params.n_max + 1;
+                    llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_AUTO, max_tokens);
                 }
             }
         }

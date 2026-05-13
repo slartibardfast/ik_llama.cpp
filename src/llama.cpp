@@ -9638,15 +9638,39 @@ static bool llama_dflash_extract_cb_eval(struct ggml_tensor * t, bool ask, void 
     }
     const size_t nbytes = ggml_nbytes(t);
     auto & buf = ctx->default_decoder.dflash_extract_buf[slot];
+    if (std::getenv("DFLASH_DIAG") && slot == 0) {
+        std::fprintf(stderr, "[dflash-diag cb_eval] slot 0 layer %d: t->type=%s nbytes=%zu ne=[%lld,%lld,%lld,%lld]\n",
+                     il, ggml_type_name(t->type), nbytes,
+                     (long long)t->ne[0], (long long)t->ne[1],
+                     (long long)t->ne[2], (long long)t->ne[3]);
+    }
     // Append: cb_eval may fire multiple times per llama_decode when the
     // batch is split into ubatches. The accumulated buffer ends up with
     // one row per decoded position in seq order. Resetting on each
     // ubatch would discard all but the last ubatch's rows. Callers that
     // need to truncate after a partial-accept rollback do so explicitly
     // via llama_dflash_trim_extract_buf (see include/llama.h).
+    //
+    // Type handling: the `l_out-<il>` node lands as F32 for single-token
+    // decodes and F16 for multi-token prefill/verify ubatches (the build
+    // graph keeps the residual stream in F16 when the batch dim is > 1).
+    // Both shapes need to land in `buf` as F32 with stride = D_emb.
     const size_t old_n_floats = buf.size();
-    buf.resize(old_n_floats + nbytes / sizeof(float));
-    ggml_backend_tensor_get(t, buf.data() + old_n_floats, 0, nbytes);
+    const int64_t n_elements = (int64_t) ggml_nelements(t);
+    if (t->type == GGML_TYPE_F32) {
+        buf.resize(old_n_floats + (size_t) n_elements);
+        ggml_backend_tensor_get(t, buf.data() + old_n_floats, 0, nbytes);
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h_stage((size_t) n_elements);
+        ggml_backend_tensor_get(t, h_stage.data(), 0, nbytes);
+        buf.resize(old_n_floats + (size_t) n_elements);
+        ggml_fp16_to_fp32_row(h_stage.data(), buf.data() + old_n_floats, n_elements);
+    } else {
+        // Unknown type for cb_eval extract — skip rather than corrupt buf.
+        // (BF16 would need ggml_bf16_to_fp32_row; quant types don't apply
+        // to residual streams.)
+        return true;
+    }
     ctx->default_decoder.dflash_extract_n[slot] = buf.size();
     return true;
 }

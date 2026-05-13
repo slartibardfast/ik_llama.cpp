@@ -525,6 +525,10 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
         // of llama_set_dflash_extract_layers' input array.
         std::vector<float> & buf = ctx->default_decoder.dflash_extract_buf[i];
         const int il = dw.target_layer_ids[i];
+        if (i == 0 && std::getenv("DFLASH_DIAG")) {
+            std::fprintf(stderr, "[dflash-diag stage] slot 0 layer %d: buf_rows=%zu MAL=%d\n",
+                         il, buf.size() / (std::size_t) D_emb, mal_anchors);
+        }
         if ((int) (buf.size() / D_emb) < mal_anchors) {
             std::fprintf(stderr, "[%s] extract buffer too short for slot %d (layer %d): have %zu rows, need %d\n",
                          MODULE, i, il, buf.size() / (std::size_t) D_emb, mal_anchors);
@@ -749,6 +753,7 @@ int32_t llama_dflash_trim_extract(
         std::vector<float> & buf = ctx_tgt->default_decoder.dflash_extract_buf[i];
         const std::size_t row = (std::size_t) D_emb;
         const std::size_t n_rows_have = buf.size() / row;
+        const std::size_t n_rows_before = n_rows_have;
         if (p_end < 0 || (std::size_t) p_end >= n_rows_have) {
             // Truncate to first p_start rows.
             if ((std::size_t) p_start < n_rows_have) {
@@ -762,6 +767,10 @@ int32_t llama_dflash_trim_extract(
             buf.erase(buf.begin() + b_start, buf.begin() + b_end);
         }
         ctx_tgt->default_decoder.dflash_extract_n[i] = buf.size();
+        if (i == 0 && std::getenv("DFLASH_DIAG")) {
+            std::fprintf(stderr, "[dflash-diag trim] slot 0: before=%zu p_start=%d p_end=%d after=%zu\n",
+                         n_rows_before, p_start, p_end, buf.size() / row);
+        }
     }
     return LLAMA_DFLASH_OK;
 }
