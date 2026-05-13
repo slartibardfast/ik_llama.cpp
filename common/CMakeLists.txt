@@ -77,6 +77,8 @@ add_library(${TARGET} STATIC
     ngram-map.h
     peg-parser.cpp
     peg-parser.h
+    perplexity.cpp
+    perplexity.h
     speculative.cpp
     spec-tuner.cpp
     spec-tuner.h

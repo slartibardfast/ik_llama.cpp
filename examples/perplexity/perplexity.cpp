@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "perplexity.h"  // shared NLL / PPL kernel
 
 #include <cmath>
 #include <cstdio>
@@ -30,12 +31,6 @@ struct results_perplexity {
     double                   ppl_value;
     std::vector<float>       logits;
     std::vector<float>       probs;
-};
-
-struct results_log_softmax {
-    double log_softmax;
-    float  logit;
-    float  prob;
 };
 
 static void write_logfile(
@@ -107,17 +102,10 @@ static std::vector<float> softmax(const std::vector<float>& logits) {
     return probs;
 }
 
-static results_log_softmax log_softmax(int n_vocab, const float * logits, int tok) {
-    float max_logit = logits[0];
-    for (int i = 1; i < n_vocab; ++i) {
-        max_logit = std::max(max_logit, logits[i]);
-    }
-    double sum_exp = 0.0;
-    for (int i = 0; i < n_vocab; ++i) {
-        sum_exp += expf(logits[i] - max_logit);
-    }
-    return {logits[tok] - max_logit - log(sum_exp), logits[tok], expf(logits[tok] - max_logit) / (float) sum_exp};
-}
+// results_log_softmax / log_softmax (simple) / process_logits (simple)
+// moved to common/perplexity.{h,cpp} so llama-bench can share the kernel.
+// The uint16_t* log_softmax overload below and the ostream process_logits
+// overload further down stay here — they're perplexity-example-only.
 
 static inline int nearest_int(float fval) {
     //assert(fval <= 4194303.f);
@@ -156,40 +144,8 @@ static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob
     return max_logit + log_sum_exp - logits[tok];
 }
 
-static void process_logits(
-    int n_vocab, const float * logits, const int * tokens, int n_token, std::vector<std::thread> & workers,
-    double & nll, double & nll2, float * logit_history, float * prob_history
-) {
-    std::mutex mutex;
-    int counter = 0;
-    auto compute = [&mutex, &counter, &nll, &nll2, logit_history, prob_history, n_vocab, logits, tokens, n_token] () {
-        double local_nll  = 0;
-        double local_nll2 = 0;
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex);
-            int i = counter++;
-            if (i >= n_token) {
-                nll += local_nll; nll2 += local_nll2;
-                break;
-            }
-            lock.unlock();
-            const results_log_softmax results = log_softmax(n_vocab, logits + int64_t(i)*n_vocab, tokens[i+1]);
-            const double v = -results.log_softmax;
-            local_nll += v;
-            local_nll2 += v*v;
-
-            logit_history[i] = results.logit;
-            prob_history[i]  = results.prob;
-        }
-    };
-    for (auto & w : workers) {
-        w = std::thread(compute);
-    }
-    compute();
-    for (auto & w : workers) {
-        w.join();
-    }
-}
+// process_logits (simple overload) moved to common/perplexity.{h,cpp};
+// the ostream/log_probs overload below remains perplexity-example-only.
 
 static void process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2) {
