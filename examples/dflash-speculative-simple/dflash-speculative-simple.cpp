@@ -86,6 +86,17 @@ int main(int argc, char ** argv) {
     }
     common_speculative_begin(spec, prompt_tokens);
 
+    // T6.α: initialise the spec-checkpoint subsystem ONCE up front.
+    // PER_STEP mode is preferred when target has recurrent layers (Qwen
+    // 3.5/3.6 hybrid). Falls back to GPU_FALLBACK if mixed CPU/GPU
+    // recurrent layers or n_seq_max > 1. max_tokens = BS+1 = 5 sizes
+    // the per-step buffers for the verify batch.
+    constexpr int DFLASH_BS = 4;
+    const int ckpt_mode = llama_spec_ckpt_init(ctx, LLAMA_SPEC_CKPT_AUTO, /*max_tokens*/ DFLASH_BS + 1);
+    fprintf(stderr, "[dflash-spec] llama_spec_ckpt_init: mode=%d (AUTO=%d, PER_STEP=%d, GPU_FALLBACK=%d, CPU=%d)\n",
+            ckpt_mode, LLAMA_SPEC_CKPT_AUTO, LLAMA_SPEC_CKPT_PER_STEP,
+            LLAMA_SPEC_CKPT_GPU_FALLBACK, LLAMA_SPEC_CKPT_CPU);
+
     // Sampler for emitting tokens (target-side).
     common_sampler * smpl = common_sampler_init(model, params.sparams);
 
@@ -154,17 +165,29 @@ int main(int argc, char ** argv) {
             continue;
         }
 
+        // T6.α — spec-ckpt cycle protocol (replaces T6.B's commit re-decode):
+        //   1. spec_ckpt_save: shadow s_l + enable save_per_step_ssm
+        //   2. verify decode (BS+1=5 tokens) populates per_step_ssm[il] /
+        //      per_step_qkv[il] as it runs
+        //   3. accept-prefix from per-position target argmax
+        //   4. spec_ckpt_restore with accepted_step=n_accepted: per-step
+        //      stitch s_l[il] back to "after id_last + n_accepted drafts"
+        //      AND seq_rm to P + n_accepted + 1
+        //   5. trim_extract to keep [0, P+n_accepted+1) rows
+        //   6. single-token bonus decode at P + n_accepted + 1 (batch
+        //      shape 1, deterministic)
+        //   7. spec_ckpt_discard: clears save_per_step_ssm so next
+        //      cycle's prefill / verify isn't misrouted into per-step
+        //      buffers sized for BS+1.
+        const llama_pos P = (llama_pos) prompt_tgt.size();
+        if (!llama_spec_ckpt_save(ctx, /*seq_id*/0)) {
+            fprintf(stderr, "error: llama_spec_ckpt_save failed\n");
+            break;
+        }
+
         // Build verify batch: [id_last, c1, ..., cBS] at positions [P, P+BS]
-        // T6.A/B/C mechanisms (state save/restore + bonus re-decode + extract
-        // trim) are wired in libllama but NOT yet used here. Enabling them
-        // requires T6.D batch-invariant verify_attn — without it, the
-        // bonus re-decode introduces batch-shape variance in target's
-        // attention kernels and accept rate REGRESSES (1.667 vs T5's 2.256
-        // with faster late-stream loop emergence). Documented in
-        // data/gate5-T6abc-coherence{,-sync}.runlog.
         const int verify_bs = (int) draft.size() + 1;
         llama_batch batch = llama_batch_init(verify_bs, 0, 1);
-        const llama_pos P = (llama_pos) prompt_tgt.size();
         common_batch_add(batch, id_last, P, { 0 }, true);
         for (size_t i = 0; i < draft.size(); ++i) {
             common_batch_add(batch, draft[i], P + 1 + (llama_pos) i, { 0 }, true);
@@ -194,22 +217,42 @@ int main(int argc, char ** argv) {
         common_speculative_accept(spec, (uint16_t) n_accepted);
         n_accept_tokens += n_accepted;
 
-        // Cycle emits: n_accepted draft tokens + bonus = sampled_at[n_accepted].
+        const llama_token bonus = sampled_at[n_accepted];
+
+        // T6.α step 4: restore DeltaNet state to "after id_last + n_accepted
+        // drafts" AND seq_rm rejected positions in one call.
+        if (!llama_spec_ckpt_restore(ctx, /*seq_id*/0, /*n_past*/P, /*accepted_step*/n_accepted)) {
+            fprintf(stderr, "error: llama_spec_ckpt_restore failed\n");
+            break;
+        }
+
+        // T6.α step 5: trim cb_eval extract buffer to match the
+        // post-restore seq state. After restore: target seq_len =
+        // P + n_accepted + 1 (positions [0, P+n_accepted] kept).
+        // bonus has NOT been decoded yet — it becomes id_last for the
+        // next cycle and gets committed as batch[0] of that verify
+        // batch (same BS+1 shape every cycle → no batch-shape variance).
+        llama_dflash_trim_extract(ctx, P + n_accepted + 1, -1);
+
+        // No separate bonus decode. The bonus token will be batch[0] of
+        // the NEXT cycle's verify batch — consistent BS+1 batch shape
+        // across all cycles eliminates batch-shape K, V variance.
+
+        // Do NOT _discard between cycles: it would reset
+        // ckpt.selected_spec_mode to NONE, making the next _save
+        // return false. save_per_step_ssm stays on; the next verify
+        // is BS+1 tokens, matching the allocated per-step buffer.
+
+        // Emit the n_accepted draft tokens + bonus.
         for (int k = 0; k < n_accepted; ++k) {
             common_sampler_accept(smpl, ctx, draft[k], true);
             printf("%s", common_token_to_piece(ctx, draft[k]).c_str());
             emitted.push_back(draft[k]);
         }
-        const llama_token bonus = sampled_at[n_accepted];
         common_sampler_accept(smpl, ctx, bonus, true);
         printf("%s", common_token_to_piece(ctx, bonus).c_str());
         fflush(stdout);
         emitted.push_back(bonus);
-
-        // T5 behavior: roll back rejected positions; bonus KV at
-        // P+n_accepted+1 stays from input c_{n_accepted+1} (the
-        // T5-scope drift). T6.B re-decode disabled pending T6.D.
-        llama_kv_cache_seq_rm(ctx, 0, P + n_accepted + 1, -1);
 
         id_last = bonus;
         if (llama_token_is_eog(model, bonus)) break;
