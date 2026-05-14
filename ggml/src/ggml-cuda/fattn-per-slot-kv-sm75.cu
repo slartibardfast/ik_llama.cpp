@@ -822,12 +822,16 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
     // SMEM (per CTA):
     //   Q_smem[16][256]           = 8192 B for Q tile, loaded once per CTA
     //   K_smem[32][256]           = 16384 B for K block, loaded per K-iteration
+    //   V_smem[32][256]           = 16384 B for V block, loaded per K-iteration
     //   D_partials[NWARPS][16][8] = 2048 B for mma cross-warp sum
     //   KQ_smem[16][32]           = 2048 B for per-row KQ values
     //   scale_factor_smem[16]     = 64 B
-    //   Total: ~28.5 KiB (KVB=32) / ~20.5 KiB (KVB=16)
+    //   Total: ~44.8 KiB (KVB=32) / ~28.5 KiB (KVB=16)
+    //   At KVB=16, fits 2 blocks/SM at 32 KiB SMEM cap with margin.
+    //   At KVB=32, 1 block/SM (over 32 KiB target but under 64 KiB cap).
     __shared__ half  Q_smem[N_ROWS * 256];      // 8 KiB
-    __shared__ half  K_smem[32 * 256];           // 16 KiB, upper bound for KVB
+    __shared__ half  K_smem[32 * 256];           // 16 KiB
+    __shared__ half  V_smem[32 * 256];           // 16 KiB
     __shared__ float D_partials[NWARPS][N_ROWS][8];
     __shared__ float KQ_smem[N_ROWS][32];
     __shared__ float scale_factor_smem[N_ROWS];
@@ -857,9 +861,10 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
         const int kb_end = min(kb + KVB, n_kv);
         const int blk    = kb_end - kb;
 
-        // ----- Cooperative load K block into SMEM -----
-        // K_smem[i][d] = K_cache[slot][kv_head][kb + i][d] for i in [0, blk),
-        // zero for i in [blk, KVB_MAX) — but we only read indices < blk below.
+        // ----- Cooperative load K and V blocks into SMEM -----
+        // K_smem[i][d] = K_cache[slot][kv_head][kb + i][d] for i in [0, blk).
+        // V_smem[i][d] = V_cache[slot][kv_head][kb + i][d].
+        // (Dq == Dv == 256 at our production tuple; same loop structure.)
         {
             const int total = blk * Dq;
             const int per_thread = (total + 127) / 128;
@@ -870,6 +875,16 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
                 const int d_idx = idx % Dq;
                 const int k_global = kb + n_idx;
                 K_smem[n_idx * Dq + d_idx] = __ushort_as_half(K[K_off(d_idx, k_global)]);
+            }
+            const int total_v = blk * Dv;
+            const int per_thread_v = (total_v + 127) / 128;
+            for (int e = 0; e < per_thread_v; e++) {
+                const int idx = tid + e * 128;
+                if (idx >= total_v) break;
+                const int n_idx = idx / Dv;
+                const int d_idx = idx % Dv;
+                const int k_global = kb + n_idx;
+                V_smem[n_idx * Dv + d_idx] = __ushort_as_half(V[V_off(d_idx, k_global)]);
             }
         }
         __syncthreads();
@@ -1019,7 +1034,7 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
         }
         __syncthreads();
 
-        // ----- VKQ rescale + V accumulation (this warp's 4 rows) -----
+        // ----- VKQ rescale + V accumulation (this warp's 4 rows, V from SMEM) -----
         for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
             const int r = warp_id * ROWS_PER_WARP + r_in_warp;
             if (r >= H_packed) continue;
@@ -1037,18 +1052,17 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
 
             if (row_kqmax == -INFINITY) continue;
 
-            // Accumulate NEW V contributions for this K-block.
+            // Accumulate NEW V contributions for this K-block from V_smem.
             for (int i = 0; i < blk; i++) {
                 const float kq = KQ_smem[r][i];
                 const float sm = (kq == -INFINITY) ? 0.0f : __expf(kq - row_kqmax);
                 if (sm == 0.0f) continue;
-                const int k_global = kb + i;
                 #pragma unroll
                 for (int d_offset = 0; d_offset < 8; d_offset++) {
                     const int d = lane + d_offset * 32;
                     if (d < Dv) {
                         VKQ[r_in_warp * 8 + d_offset] +=
-                            sm * half_bits_to_float(V[V_off(d, k_global)]);
+                            sm * __half2float(V_smem[i * Dv + d]);
                     }
                 }
             }
