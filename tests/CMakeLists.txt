@@ -275,6 +275,12 @@ if (GGML_CUDA)
     # Drives D2 first-divergent-layer localization. Requires extract-layers
     # cap ≥ n_layer (cap is 80; Qwen 3.6 27B is 65 — fits).
     llama_build_and_test(dflash-speculative/test-deltanet-d1-capture.cpp)
+    # PLAN.md S2.3 — op-level intermediate capture at a specified target
+    # layer. Installs a custom cb_eval via llama_context_params.cb_eval
+    # that captures every named tensor whose suffix matches "-<L>" for L
+    # in the configured target layer set. Localizes WHICH op within a
+    # first-divergent layer (S2.1 named the layer; S2.3 names the op).
+    llama_build_and_test(dflash-speculative/test-deltanet-s23-op-capture.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
