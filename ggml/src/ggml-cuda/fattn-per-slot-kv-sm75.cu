@@ -705,6 +705,337 @@ __global__ void fattn_per_slot_kv_sm75_stage22a_kernel(
 }
 
 // ============================================================================
+// Stage 2.2b kernel — Approach C multi-head packing (decode case).
+// ============================================================================
+//
+// Per spec §1 / §4 (corrected). At n_tokens=1 (decode), pack H=gqa query
+// heads (one q_row each) into a single CTA's 16-row mma tile. Rows
+// 0..H-1 are real heads; rows H..15 are zero-padded.
+//
+// At gqa=6 (production target Qwen 3.6 27B): 6 real rows + 10 padded.
+// Useful mma work: 6/16 = 37.5% (vs Stage 2.2a's 1/16 = 6.25% at decode).
+// 6x effective mma-throughput improvement at decode shape.
+//
+// SCOPE: this kernel handles ONLY n_tokens=1 with H_packed <= 16 packed
+// heads (one CTA per (slot, kv_head)). For n_tokens > 1 or H_packed > 16,
+// the launcher falls through to Stage 2.2a (Approach A).
+//
+// GRID & BLOCK:
+//   grid (n_seqs, n_kv_heads, 1) — was (n_seqs, n_tokens, n_heads_q)
+//   block (32, 4, 1) — 4 warps = 128 threads
+//
+// PER-CTA WORK:
+//   1 (slot, kv_head) tuple. All H heads of the gqa group processed
+//   together. Single q_row = 0 (decode).
+//   K-cache and V-cache are SHARED across all H heads in this gqa group
+//   (one K head feeds all H Q heads) — no extra K/V loading vs Stage 2.2a.
+//
+// VKQ DISTRIBUTION:
+//   16 rows × Dv=256 dims = 4096 fp32 per CTA = 32 fp32/thread (128 threads).
+//   Layout: warp w owns rows [w*4, w*4+4); within a warp, 32 threads cover
+//   256 V dims via strided access (lane + d_offset*32 → coalesced loads).
+//   Per-thread VKQ: 4 rows × 8 dims = 32 fp32.
+//
+// SOFTMAX STATE: per-row (16 rows). Stored in SMEM (kqmax_smem,
+// kqrowsum_smem arrays of 16 fp32 each). All threads read; warp 0
+// (or any chosen warp) writes via a per-row reduce.
+
+__global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
+    const uint16_t * __restrict__ Q,
+    const uint16_t * __restrict__ K,
+    const uint16_t * __restrict__ V,
+    const uint16_t * __restrict__ mask,
+    const int32_t  * __restrict__ slot_seq_lens,
+    float          * __restrict__ out_final,
+    int Dq, int Dv, int KVB,
+    int n_heads_q, int n_kv_heads, int n_seqs, int n_kv_max,
+    int H_packed,                  // number of real query heads packed (<= 16)
+    float scale, float softcap, bool use_softcap)
+{
+    using namespace ggml_cuda_mma;
+
+    constexpr int NWARPS = 4;
+    constexpr int N_ROWS = 16;     // mma m-axis
+    constexpr int ROWS_PER_WARP = N_ROWS / NWARPS;  // 4
+    constexpr int VKQ_PER_THREAD = 32;  // ROWS_PER_WARP * (Dv / 32) = 4 * 8 = 32
+
+    const int slot    = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int lane    = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int tid     = warp_id * 32 + lane;
+
+    if (slot >= n_seqs || kv_head >= n_kv_heads) return;
+
+    const int gqa        = n_heads_q / n_kv_heads;
+    const int head_start = kv_head * gqa;        // first Q head in this gqa group
+    const int n_kv       = slot_seq_lens[slot];
+
+    // Q[head, q_row=0] offset per row r in the CTA's mma tile.
+    auto Q_off_row = [=] __device__ (int r, int d) -> size_t {
+        const int head_global = head_start + r;
+        // q_row = 0 always (decode case)
+        return (((size_t)slot * n_heads_q + head_global) * /*n_tokens=*/1 + 0) * Dq + d;
+    };
+    auto K_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dq + d;
+    };
+    auto V_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dv + d;
+    };
+    auto M_off = [=] __device__ (int k) -> size_t {
+        // mask[k, q_row=0]
+        return (size_t)0 * n_kv_max + k;
+    };
+    auto O_off = [=] __device__ (int r, int d) -> size_t {
+        const int head_global = head_start + r;
+        return (((size_t)slot * n_heads_q + head_global) * /*n_tokens=*/1 + 0) * Dv + d;
+    };
+
+    // Per-thread VKQ: 4 rows × 8 dims (Dv/32) = 32 fp32.
+    // Index: VKQ[r_in_warp * 8 + d_offset] where r_in_warp ∈ [0,4), d_offset ∈ [0,8).
+    float VKQ[VKQ_PER_THREAD] = {0};
+
+    // Per-row softmax state in SMEM (16 rows × 2 fp32 = 128 bytes).
+    __shared__ float kqmax_smem[N_ROWS];
+    __shared__ float kqrowsum_smem[N_ROWS];
+
+    // Init per-row state.
+    if (tid < N_ROWS) {
+        kqmax_smem[tid]    = -INFINITY;
+        kqrowsum_smem[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    if (n_kv <= 0) {
+        for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
+            const int r = warp_id * ROWS_PER_WARP + r_in_warp;
+            if (r >= H_packed) continue;
+            for (int d_offset = 0; d_offset < 8; d_offset++) {
+                const int d = lane + d_offset * 32;
+                if (d < Dv) out_final[O_off(r, d)] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // SMEM:
+    //   D_partials[NWARPS][16][8] = 2048 B for mma cross-warp sum
+    //   KQ_smem[16][32]          = 2048 B for per-row KQ values across K-block
+    //   scale_factor_smem[16]    = 64 B for per-row VKQ rescale factor
+    __shared__ float D_partials[NWARPS][N_ROWS][8];
+    __shared__ float KQ_smem[N_ROWS][32];  // upper bound for KVB=32
+    __shared__ float scale_factor_smem[N_ROWS];
+
+    for (int kb = 0; kb < n_kv; kb += KVB) {
+        const int kb_end = min(kb + KVB, n_kv);
+        const int blk    = kb_end - kb;
+
+        // ----- KQ computation via mma (Approach C: rows 0..H-1 real) -----
+        for (int n_tile = 0; n_tile * 8 < blk; n_tile++) {
+            const int n_start = n_tile * 8;
+            const int n_count = min(8, blk - n_start);
+
+            tile<16, 8, float> D;
+            #pragma unroll
+            for (int l = 0; l < D.ne; l++) D.x[l] = 0.0f;
+
+            const int k_chunks_per_warp = (Dq / 16) / NWARPS;
+            const int k_chunk_start = warp_id * k_chunks_per_warp;
+            const int k_chunk_end   = k_chunk_start + k_chunks_per_warp;
+
+            for (int k_chunk = k_chunk_start; k_chunk < k_chunk_end; k_chunk++) {
+                const int k_start = k_chunk * 16;
+
+                // Build A tile: rows 0..H-1 are real Q for each packed head.
+                tile<16, 8, half2> A;
+                #pragma unroll
+                for (int l = 0; l < A.ne; l++) {
+                    const int row       = A.get_i(l);
+                    const int half2_col = A.get_j(l);
+                    half a, b;
+                    if (row < H_packed) {
+                        const int d0 = k_start + 2 * half2_col;
+                        const int d1 = d0 + 1;
+                        a = __ushort_as_half(Q[Q_off_row(row, d0)]);
+                        b = __ushort_as_half(Q[Q_off_row(row, d1)]);
+                    } else {
+                        a = __float2half(0.0f);
+                        b = __float2half(0.0f);
+                    }
+                    A.x[l] = __halves2half2(a, b);
+                }
+
+                tile<8, 8, half2> B;
+                #pragma unroll
+                for (int l = 0; l < B.ne; l++) {
+                    const int n_idx     = B.get_i(l);
+                    const int half2_col = B.get_j(l);
+                    const int k_global  = kb + n_start + n_idx;
+                    half a, b;
+                    if (n_idx < n_count) {
+                        const int d0 = k_start + 2 * half2_col;
+                        const int d1 = d0 + 1;
+                        a = __ushort_as_half(K[K_off(d0, k_global)]);
+                        b = __ushort_as_half(K[K_off(d1, k_global)]);
+                    } else {
+                        a = __float2half(0.0f);
+                        b = __float2half(0.0f);
+                    }
+                    B.x[l] = __halves2half2(a, b);
+                }
+
+                mma(D, A, B);
+            }
+
+            // Write partial D to SMEM.
+            {
+                const int row_lo = lane / 4;
+                const int row_hi = 8 + row_lo;
+                const int col_lo = 2 * (lane % 4);
+                D_partials[warp_id][row_lo][col_lo    ] = D.x[0];
+                D_partials[warp_id][row_lo][col_lo + 1] = D.x[1];
+                D_partials[warp_id][row_hi][col_lo    ] = D.x[2];
+                D_partials[warp_id][row_hi][col_lo + 1] = D.x[3];
+            }
+            __syncthreads();
+
+            // Cross-warp sum + extract ALL 16 rows × 8 cols of D into KQ_smem.
+            // 16 rows × 8 cols = 128 outputs = 1 per thread (128 threads).
+            // Thread tid handles (row, col) = (tid / 8, tid % 8).
+            {
+                const int r_out = tid / 8;
+                const int c_out = tid % 8;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < NWARPS; w++) {
+                    sum += D_partials[w][r_out][c_out];
+                }
+                KQ_smem[r_out][n_start + c_out] = sum;
+            }
+            __syncthreads();
+        }
+
+        // ----- Apply scale + softcap + mask to KQ_smem (all 16 rows × blk cols) -----
+        // 128 threads × 1 element each = 128 elements covered if blk*16 ≤ 128.
+        // For blk ≤ 8 (KVB=8): 8*16 = 128 ✓. For blk=16: 256 elements → 2 per thread.
+        // For blk=32: 512 elements → 4 per thread.
+        {
+            const int total = N_ROWS * blk;
+            const int per_thread = (total + 127) / 128;
+            for (int i_thread = 0; i_thread < per_thread; i_thread++) {
+                const int idx = tid + i_thread * 128;
+                if (idx >= total) break;
+                const int r = idx / blk;
+                const int i = idx % blk;
+                float acc = KQ_smem[r][i] * scale;
+                if (use_softcap) {
+                    acc = softcap * tanhf(acc / softcap);
+                }
+                acc += half_bits_to_float(mask[M_off(kb + i)]);
+                // For padded rows (r >= H_packed), Q is zero so D was zero;
+                // KQ_smem[r][i] holds (0 * scale + softcap_or_not + mask) = mask
+                // value. Force these to -INF so they don't affect any other
+                // row's softmax (they shouldn't, but safety) and so their own
+                // sm = 0 → no spurious accumulation.
+                if (r >= H_packed) acc = -INFINITY;
+                KQ_smem[r][i] = acc;
+            }
+        }
+        __syncthreads();
+
+        // ----- Per-row online softmax state update -----
+        // Lane 0..3 of each warp processes one row each (warp w handles rows
+        // [w*4, w*4+4)). The scale_factor for VKQ rescale is published to
+        // scale_factor_smem; the new kqmax / kqrowsum are written back.
+        if (lane < ROWS_PER_WARP) {
+            const int r = warp_id * ROWS_PER_WARP + lane;
+            const float old_max     = kqmax_smem[r];
+            const float old_rowsum  = kqrowsum_smem[r];
+
+            float new_max = old_max;
+            if (r < H_packed) {
+                for (int i = 0; i < blk; i++) {
+                    if (KQ_smem[r][i] > new_max) new_max = KQ_smem[r][i];
+                }
+            }
+
+            if (new_max == -INFINITY) {
+                // All-masked or padded row — no change to softmax state, no
+                // VKQ contribution this block. scale_factor = 1 (no rescale).
+                scale_factor_smem[r] = 1.0f;
+            } else {
+                const float scale_factor =
+                    (old_max == -INFINITY) ? 0.0f : __expf(old_max - new_max);
+
+                // Update kqrowsum: rescale old contribution + add new ones.
+                float new_rowsum = old_rowsum * scale_factor;
+                for (int i = 0; i < blk; i++) {
+                    const float kq = KQ_smem[r][i];
+                    new_rowsum += (kq == -INFINITY) ? 0.0f : __expf(kq - new_max);
+                }
+
+                kqmax_smem[r]        = new_max;
+                kqrowsum_smem[r]     = new_rowsum;
+                scale_factor_smem[r] = scale_factor;
+            }
+        }
+        __syncthreads();
+
+        // ----- VKQ rescale + V accumulation (this warp's 4 rows) -----
+        for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
+            const int r = warp_id * ROWS_PER_WARP + r_in_warp;
+            if (r >= H_packed) continue;
+
+            const float scale_f   = scale_factor_smem[r];
+            const float row_kqmax = kqmax_smem[r];
+
+            // Rescale OLD VKQ accumulator.
+            if (scale_f != 1.0f) {
+                #pragma unroll
+                for (int d_offset = 0; d_offset < 8; d_offset++) {
+                    VKQ[r_in_warp * 8 + d_offset] *= scale_f;
+                }
+            }
+
+            if (row_kqmax == -INFINITY) continue;
+
+            // Accumulate NEW V contributions for this K-block.
+            for (int i = 0; i < blk; i++) {
+                const float kq = KQ_smem[r][i];
+                const float sm = (kq == -INFINITY) ? 0.0f : __expf(kq - row_kqmax);
+                if (sm == 0.0f) continue;
+                const int k_global = kb + i;
+                #pragma unroll
+                for (int d_offset = 0; d_offset < 8; d_offset++) {
+                    const int d = lane + d_offset * 32;
+                    if (d < Dv) {
+                        VKQ[r_in_warp * 8 + d_offset] +=
+                            sm * half_bits_to_float(V[V_off(d, k_global)]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ----- Normalize + write output (this warp's 4 rows) -----
+    for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
+        const int r = warp_id * ROWS_PER_WARP + r_in_warp;
+        if (r >= H_packed) continue;
+
+        const float den = kqrowsum_smem[r];
+        for (int d_offset = 0; d_offset < 8; d_offset++) {
+            const int d = lane + d_offset * 32;
+            if (d < Dv) {
+                const float val = (den > 0.0f) ? (VKQ[r_in_warp * 8 + d_offset] / den) : 0.0f;
+                out_final[O_off(r, d)] = val;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Host-side launcher (extern "C" symbol consumed by the unit test).
 // ============================================================================
 
@@ -774,17 +1105,19 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
     err = cudaMemset(O_d, 0,               n_O * sizeof(float));                            if (err != cudaSuccess) goto cleanup;
 
     // Launch. Variant selectable via env (debug):
-    //   FATTN_KERNEL_VARIANT=phase1  → 1-warp scalar (Phase 1)
-    //   FATTN_KERNEL_VARIANT=stage21 → 1-warp mma.sync (Stage 2.1)
-    //   default                       → 4-warp mma.sync (Stage 2.2a)
+    //   FATTN_KERNEL_VARIANT=phase1   → 1-warp scalar (Phase 1)
+    //   FATTN_KERNEL_VARIANT=stage21  → 1-warp mma.sync (Stage 2.1)
+    //   FATTN_KERNEL_VARIANT=stage22a → 4-warp Approach A (forced — all shapes)
+    //   default                        → Approach C decode pack (Stage 2.2b)
+    //                                     for n_tokens=1, else Stage 2.2a.
     {
-        const dim3 grid(n_seqs, n_tok, n_hq);
-
         const char * variant = std::getenv("FATTN_KERNEL_VARIANT");
-        const bool use_phase1  = (variant && std::strcmp(variant, "phase1") == 0);
-        const bool use_stage21 = (variant && std::strcmp(variant, "stage21") == 0);
+        const bool use_phase1   = (variant && std::strcmp(variant, "phase1")   == 0);
+        const bool use_stage21  = (variant && std::strcmp(variant, "stage21")  == 0);
+        const bool use_stage22a = (variant && std::strcmp(variant, "stage22a") == 0);
 
         if (use_phase1) {
+            const dim3 grid(n_seqs, n_tok, n_hq);
             const dim3 block(32, 1, 1);
             fattn_per_slot_kv_sm75_naive_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
@@ -793,6 +1126,7 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
         } else if (use_stage21) {
+            const dim3 grid(n_seqs, n_tok, n_hq);
             const dim3 block(32, 1, 1);
             fattn_per_slot_kv_sm75_stage21_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
@@ -800,14 +1134,41 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
-        } else {
-            const dim3 block(32, 4, 1);  // 4 warps = 128 threads
+        } else if (use_stage22a || n_tok > 1) {
+            // Stage 2.2a for prefill / multi-token paths (or forced via env).
+            const dim3 grid(n_seqs, n_tok, n_hq);
+            const dim3 block(32, 4, 1);
             fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
                 Dq, Dv, KVB,
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
+        } else {
+            // Stage 2.2b: Approach C decode-pack (n_tok == 1).
+            // H_packed = gqa_ratio (assumes gqa ≤ 16; safe for Qwen 3.6 27B at gqa=6).
+            const int gqa = n_hq / n_hkv;
+            if (gqa > 16) {
+                // Fall back to Stage 2.2a for unsupported gqa values.
+                const dim3 grid(n_seqs, n_tok, n_hq);
+                const dim3 block(32, 4, 1);
+                fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block>>>(
+                    Q_d, K_d, V_d, M_d, S_d, O_d,
+                    Dq, Dv, KVB,
+                    n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
+                    cfg.scale, cfg.softcap, cfg.use_softcap
+                );
+            } else {
+                const dim3 grid(n_seqs, n_hkv, 1);
+                const dim3 block(32, 4, 1);
+                fattn_per_slot_kv_sm75_stage22b_kernel<<<grid, block>>>(
+                    Q_d, K_d, V_d, M_d, S_d, O_d,
+                    Dq, Dv, KVB,
+                    n_hq, n_hkv, n_seqs, n_kvmax,
+                    /*H_packed=*/gqa,
+                    cfg.scale, cfg.softcap, cfg.use_softcap
+                );
+            }
         }
         err = cudaGetLastError();
         if (err != cudaSuccess) goto cleanup;
