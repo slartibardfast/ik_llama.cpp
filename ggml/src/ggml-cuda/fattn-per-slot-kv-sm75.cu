@@ -919,24 +919,18 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
                     A.x[l] = __halves2half2(a, b);
                 }
 
-                // B tile from K_smem.
+                // B tile from K_smem via ldmatrix.sync.aligned.m8n8.x2.b16
+                // (single warp-cooperative instruction → 4 half2/thread).
+                // K_smem layout is row-major [n_idx][d]; pass base pointer to
+                // (n_start, k_start) sub-block. Stride is Dq/2 in half2 units.
+                // Boundary safety: ldmatrix reads garbage for invalid
+                // n_in_blk ≥ blk; KQ_smem at those indices is then never
+                // read in the softmax / V-accum loops (i iterates [0, blk)).
                 tile<8, 8, half2> B;
-                #pragma unroll
-                for (int l = 0; l < B.ne; l++) {
-                    const int n_idx     = B.get_i(l);
-                    const int half2_col = B.get_j(l);
-                    const int n_in_blk  = n_start + n_idx;
-                    half a, b;
-                    if (n_in_blk < blk) {
-                        const int d0 = k_start + 2 * half2_col;
-                        const int d1 = d0 + 1;
-                        a = K_smem[n_in_blk * Dq + d0];
-                        b = K_smem[n_in_blk * Dq + d1];
-                    } else {
-                        a = __float2half(0.0f);
-                        b = __float2half(0.0f);
-                    }
-                    B.x[l] = __halves2half2(a, b);
+                {
+                    const half2 * K_h2 =
+                        (const half2 *)(K_smem + n_start * Dq) + (k_start / 2);
+                    load_ldmatrix(B, K_h2, Dq / 2);
                 }
 
                 mma(D, A, B);
