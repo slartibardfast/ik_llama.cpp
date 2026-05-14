@@ -819,13 +819,15 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
         return;
     }
 
-    // SMEM:
-    //   Q_smem[16][256]          = 8192 B for Q tile, loaded once per CTA
+    // SMEM (per CTA):
+    //   Q_smem[16][256]           = 8192 B for Q tile, loaded once per CTA
+    //   K_smem[32][256]           = 16384 B for K block, loaded per K-iteration
     //   D_partials[NWARPS][16][8] = 2048 B for mma cross-warp sum
-    //   KQ_smem[16][32]          = 2048 B for per-row KQ values across K-block
-    //   scale_factor_smem[16]    = 64 B for per-row VKQ rescale factor
-    //   Total: ~12.5 KiB per CTA — under the 32 KiB target for 2 blocks/SM
-    __shared__ half  Q_smem[N_ROWS * 256];  // hard-coded Dq upper bound
+    //   KQ_smem[16][32]           = 2048 B for per-row KQ values
+    //   scale_factor_smem[16]     = 64 B
+    //   Total: ~28.5 KiB (KVB=32) / ~20.5 KiB (KVB=16)
+    __shared__ half  Q_smem[N_ROWS * 256];      // 8 KiB
+    __shared__ half  K_smem[32 * 256];           // 16 KiB, upper bound for KVB
     __shared__ float D_partials[NWARPS][N_ROWS][8];
     __shared__ float KQ_smem[N_ROWS][32];
     __shared__ float scale_factor_smem[N_ROWS];
@@ -854,6 +856,23 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
     for (int kb = 0; kb < n_kv; kb += KVB) {
         const int kb_end = min(kb + KVB, n_kv);
         const int blk    = kb_end - kb;
+
+        // ----- Cooperative load K block into SMEM -----
+        // K_smem[i][d] = K_cache[slot][kv_head][kb + i][d] for i in [0, blk),
+        // zero for i in [blk, KVB_MAX) — but we only read indices < blk below.
+        {
+            const int total = blk * Dq;
+            const int per_thread = (total + 127) / 128;
+            for (int e = 0; e < per_thread; e++) {
+                const int idx = tid + e * 128;
+                if (idx >= total) break;
+                const int n_idx = idx / Dq;
+                const int d_idx = idx % Dq;
+                const int k_global = kb + n_idx;
+                K_smem[n_idx * Dq + d_idx] = __ushort_as_half(K[K_off(d_idx, k_global)]);
+            }
+        }
+        __syncthreads();
 
         // ----- KQ computation via mma (Approach C: rows 0..H-1 real) -----
         for (int n_tile = 0; n_tile * 8 < blk; n_tile++) {
@@ -885,18 +904,19 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
                     A.x[l] = __halves2half2(a, b);
                 }
 
+                // B tile from K_smem.
                 tile<8, 8, half2> B;
                 #pragma unroll
                 for (int l = 0; l < B.ne; l++) {
                     const int n_idx     = B.get_i(l);
                     const int half2_col = B.get_j(l);
-                    const int k_global  = kb + n_start + n_idx;
+                    const int n_in_blk  = n_start + n_idx;
                     half a, b;
-                    if (n_idx < n_count) {
+                    if (n_in_blk < blk) {
                         const int d0 = k_start + 2 * half2_col;
                         const int d1 = d0 + 1;
-                        a = __ushort_as_half(K[K_off(d0, k_global)]);
-                        b = __ushort_as_half(K[K_off(d1, k_global)]);
+                        a = K_smem[n_in_blk * Dq + d0];
+                        b = K_smem[n_in_blk * Dq + d1];
                     } else {
                         a = __float2half(0.0f);
                         b = __float2half(0.0f);
@@ -920,8 +940,6 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
             __syncthreads();
 
             // Cross-warp sum + extract ALL 16 rows × 8 cols of D into KQ_smem.
-            // 16 rows × 8 cols = 128 outputs = 1 per thread (128 threads).
-            // Thread tid handles (row, col) = (tid / 8, tid % 8).
             {
                 const int r_out = tid / 8;
                 const int c_out = tid % 8;
