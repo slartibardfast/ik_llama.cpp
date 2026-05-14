@@ -4106,6 +4106,25 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
     }
 
+    // Populate inp_slot_seq_lens for the deterministic FA path (sm_75 only).
+    // Per spec OQ-4: per-slot KV occupancy = llama_kv_cache_seq_pos_max + 1.
+    // For inactive seq_ids (no cached cells), pos_max returns 0 → n_kv=0,
+    // which the kernel handles as a zero-output slot (early-return path).
+    if (lctx.default_decoder.inp_slot_seq_lens) {
+        const int64_t n_seqs = lctx.default_decoder.inp_slot_seq_lens->ne[0];
+        std::vector<int32_t> slot_seq_lens(n_seqs, 0);
+        // batch.seq_id[i] is an array of seq_ids for token i. For the new FA
+        // op, n_seqs equals the batch's slot count and slot index = seq_id.
+        // Compute max n_kv per slot from kv_self.
+        for (int64_t s = 0; s < n_seqs; s++) {
+            const llama_pos pos_max = llama_kv_cache_seq_pos_max(lctx.transformer_kv, (llama_seq_id)s);
+            slot_seq_lens[s] = (pos_max < 0) ? 0 : (int32_t)(pos_max + 1);
+        }
+        ggml_backend_tensor_set(lctx.default_decoder.inp_slot_seq_lens,
+                                slot_seq_lens.data(), 0,
+                                slot_seq_lens.size() * sizeof(int32_t));
+    }
+
     if (lctx.default_decoder.inp_pos && lctx.default_decoder.inp_scale) {
 #if IK_PRINT_TIMING == 2
         auto tim1 = ggml_time_us();

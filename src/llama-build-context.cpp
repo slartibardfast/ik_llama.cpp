@@ -2693,16 +2693,42 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                              ggml_row_size(split_vl->type, n_embd_head_v), 0);
                 cb(v, "v", il_cb);
 
-                cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
-                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-                cb(cur, "flash_attn", il_cb);
-                if (model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra) {
-                    auto split = (ggml_split_tensor_t *)model.layers[il].attn_sinks->extra;
-                    GGML_ASSERT(split->n_device == wq->n_device);
-                    GGML_ASSERT(split->splits[id]);
-                    ggml_flash_attn_ext_add_sinks(cur, split->splits[id]);
+                // Phase 2 closure: route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV
+                // at the Qwen 3.5/3.6 production shape (Dq=Dv=256, gqa <= 16).
+                // The new op consumes a per-slot KV-occupancy tensor as src[5]
+                // and the CUDA kernel uses it to bound the per-slot K-loop,
+                // restoring np>1 determinism. CPU fallback ignores src[5].
+                // Sinks are not supported on the new op (src[4]=NULL by design).
+                const bool use_per_slot_kv =
+                    cparams.flash_attn
+                    && q->ne[0] == 256 && v->ne[0] == 256
+                    && (q->ne[2] / k->ne[2]) <= 16
+                    && !(model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra)
+                    && sinks == nullptr;
+
+                if (use_per_slot_kv) {
+                    if (!lctx.default_decoder.inp_slot_seq_lens) {
+                        lctx.default_decoder.inp_slot_seq_lens =
+                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q->ne[3]);
+                        ggml_set_input(lctx.default_decoder.inp_slot_seq_lens);
+                    }
+                    cur = ggml_flash_attn_ext_per_slot_kv(ctx0, q, k, v, KQ_mask,
+                            lctx.default_decoder.inp_slot_seq_lens,
+                            KQ_scale, hparams.f_max_alibi_bias,
+                            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                    cb(cur, "flash_attn_per_slot_kv", il_cb);
                 } else {
-                    ggml_flash_attn_ext_add_sinks(cur, sinks);
+                    cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
+                            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                    cb(cur, "flash_attn", il_cb);
+                    if (model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra) {
+                        auto split = (ggml_split_tensor_t *)model.layers[il].attn_sinks->extra;
+                        GGML_ASSERT(split->n_device == wq->n_device);
+                        GGML_ASSERT(split->splits[id]);
+                        ggml_flash_attn_ext_add_sinks(cur, split->splits[id]);
+                    } else {
+                        ggml_flash_attn_ext_add_sinks(cur, sinks);
+                    }
                 }
                 if (n_swa > 0) {
                     ((int32_t *)cur->op_params)[4] = n_swa;

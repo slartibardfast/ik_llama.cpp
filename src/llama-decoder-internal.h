@@ -107,6 +107,10 @@ struct llama_decoder {
     struct ggml_tensor * inp_KQ_mask_cross = nullptr; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale         = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states    = nullptr;
+    // Per-slot KV occupancy for the deterministic FA path (sm_75 only).
+    // Populated each decode step from kv_self->seq_pos_max per active seq.
+    // Consumed as src[5] of ggml_flash_attn_ext_per_slot_kv.
+    struct ggml_tensor * inp_slot_seq_lens = nullptr; // I32 [n_seqs]
 
     // PHASE45 D9.6f: per-seq slot allocator for the linear-attn recurrent
     // state buffer (s_l[il]); maps llama_seq_id -> slot index.
