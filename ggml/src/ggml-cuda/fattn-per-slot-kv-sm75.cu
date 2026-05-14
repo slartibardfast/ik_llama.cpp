@@ -460,6 +460,251 @@ __global__ void fattn_per_slot_kv_sm75_stage21_kernel(
 }
 
 // ============================================================================
+// Stage 2.2a kernel — 4-warp CTA (128 threads), same Approach A geometry.
+// ============================================================================
+//
+// Sub-stage of Stage 2.2 per Q&A decision (7b incremental). ONLY change from
+// Stage 2.1: scale from 1 warp to 4 warps per CTA. Approach C multi-head
+// packing remains deferred to 2.2b; Q/K/V SMEM-staging deferred to 2.2c/2.2d.
+//
+// WORK PARTITION (4 warps × 32 threads = 128 threads):
+//   Each warp handles 4 of the 16 k-chunks (Dq/16 = 16) per n-tile.
+//   Warp w computes mma over k-chunks {w*4, w*4+1, w*4+2, w*4+3}.
+//   Partial D per warp = 16×8 fp32. After all 4 warps finish, sum
+//   partial D's via SMEM to get full D.
+//
+//   KQ extraction: warp 0 reads summed D's top row from SMEM into the
+//   shared KQ array. All warps see the same KQ via SMEM.
+//
+//   Online softmax: all warps independently update kqmax / kqrowsum
+//   (identical state because identical inputs).
+//
+//   V accumulation: each warp owns 1/4 of V dims (Dv/4 = 64 dims).
+//   Within a warp, 32 threads × 2 fp32/thread = 64 dims.
+//   Each warp writes its slice of out_final directly (no cross-warp combine).
+//
+// COSINE BIND. Same numerical class as Stage 2.1 — all fp32 accumulators,
+// mma.sync internal reduction. Cross-warp SMEM sum introduces another
+// associative-add ordering, but cosine ≥ 0.9999 holds at fp32 precision.
+
+__global__ void fattn_per_slot_kv_sm75_stage22a_kernel(
+    const uint16_t * __restrict__ Q,
+    const uint16_t * __restrict__ K,
+    const uint16_t * __restrict__ V,
+    const uint16_t * __restrict__ mask,
+    const int32_t  * __restrict__ slot_seq_lens,
+    float          * __restrict__ out_final,
+    int Dq, int Dv, int KVB,
+    int n_tokens, int n_heads_q, int n_kv_heads, int n_seqs, int n_kv_max,
+    float scale, float softcap, bool use_softcap)
+{
+    using namespace ggml_cuda_mma;
+
+    constexpr int NWARPS = 4;
+
+    const int slot    = blockIdx.x;
+    const int q_row   = blockIdx.y;
+    const int head    = blockIdx.z;
+    const int lane    = threadIdx.x;       // 0..31 (within warp)
+    const int warp_id = threadIdx.y;       // 0..3
+    const int tid     = warp_id * 32 + lane;  // 0..127 (CTA-wide)
+
+    if (slot >= n_seqs || q_row >= n_tokens || head >= n_heads_q) return;
+
+    const int gqa     = n_heads_q / n_kv_heads;
+    const int kv_head = head / gqa;
+    const int n_kv    = slot_seq_lens[slot];
+
+    auto Q_off = [=] __device__ (int d) -> size_t {
+        return (((size_t)slot * n_heads_q + head) * n_tokens + q_row) * Dq + d;
+    };
+    auto K_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dq + d;
+    };
+    auto V_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dv + d;
+    };
+    auto M_off = [=] __device__ (int k) -> size_t {
+        return (size_t)q_row * n_kv_max + k;
+    };
+    auto O_off = [=] __device__ (int d) -> size_t {
+        return (((size_t)slot * n_heads_q + head) * n_tokens + q_row) * Dv + d;
+    };
+
+    // Each warp owns Dv/4 = 64 V dims. Within a warp, 32 threads × 2 fp32 = 64 dims.
+    // Dim index for thread tid: warp_id * (Dv/NWARPS) + lane * (Dv/(NWARPS*32))
+    constexpr int VKQ_PER_THREAD = 2;  // Dv=256 / 128 = 2
+    const int dv_base = warp_id * (Dv / NWARPS);  // 0, 64, 128, 192
+    float VKQ[VKQ_PER_THREAD] = {0};
+
+    float kqmax    = -INFINITY;
+    float kqrowsum = 0.0f;
+
+    if (n_kv <= 0) {
+        for (int i = 0; i < VKQ_PER_THREAD; i++) {
+            int d = dv_base + lane + i * 32;
+            if (d < Dv) out_final[O_off(d)] = 0.0f;
+        }
+        return;
+    }
+
+    // Shared memory:
+    //   D_partials[NWARPS][16][8] fp32 — partial D per warp. Sized at compile.
+    //   D_summed[16][8]                — summed D after cross-warp reduction.
+    //                                    Reuse D_partials[0] to save SMEM.
+    //   KQ_smem[32]                    — extracted top-row KQ values.
+    // Total: NWARPS * 16 * 8 * 4 + 32 * 4 = 2048 + 128 = 2176 bytes. Tiny.
+    __shared__ float D_partials[NWARPS][16][8];
+    __shared__ float KQ_smem[32];
+
+    for (int kb = 0; kb < n_kv; kb += KVB) {
+        const int kb_end = min(kb + KVB, n_kv);
+        const int blk    = kb_end - kb;
+
+        // ----- KQ computation via mma -----
+        // Each warp handles its k-chunks (4 of 16) per n-tile.
+        // n_tile iterates 0..(blk-1)/8 — at most 2 for KVB ≤ 16.
+        for (int n_tile = 0; n_tile * 8 < blk; n_tile++) {
+            const int n_start = n_tile * 8;
+            const int n_count = min(8, blk - n_start);
+
+            tile<16, 8, float> D;
+            #pragma unroll
+            for (int l = 0; l < D.ne; l++) D.x[l] = 0.0f;
+
+            // This warp handles k-chunks {warp_id*4, warp_id*4+1, ..., warp_id*4+3}.
+            // 4 k-chunks × 16 features = 64 features per warp. Total across warps:
+            // 4 × 64 = 256 = Dq. ✓
+            const int k_chunks_per_warp = (Dq / 16) / NWARPS;  // 16/4 = 4
+            const int k_chunk_start = warp_id * k_chunks_per_warp;
+            const int k_chunk_end   = k_chunk_start + k_chunks_per_warp;
+
+            for (int k_chunk = k_chunk_start; k_chunk < k_chunk_end; k_chunk++) {
+                const int k_start = k_chunk * 16;
+
+                tile<16, 8, half2> A;
+                #pragma unroll
+                for (int l = 0; l < A.ne; l++) {
+                    const int row       = A.get_i(l);
+                    const int half2_col = A.get_j(l);
+                    half a, b;
+                    if (row == 0) {
+                        const int d0 = k_start + 2 * half2_col;
+                        const int d1 = d0 + 1;
+                        a = __ushort_as_half(Q[Q_off(d0)]);
+                        b = __ushort_as_half(Q[Q_off(d1)]);
+                    } else {
+                        a = __float2half(0.0f);
+                        b = __float2half(0.0f);
+                    }
+                    A.x[l] = __halves2half2(a, b);
+                }
+
+                tile<8, 8, half2> B;
+                #pragma unroll
+                for (int l = 0; l < B.ne; l++) {
+                    const int n_idx     = B.get_i(l);
+                    const int half2_col = B.get_j(l);
+                    const int k_global  = kb + n_start + n_idx;
+                    half a, b;
+                    if (n_idx < n_count) {
+                        const int d0 = k_start + 2 * half2_col;
+                        const int d1 = d0 + 1;
+                        a = __ushort_as_half(K[K_off(d0, k_global)]);
+                        b = __ushort_as_half(K[K_off(d1, k_global)]);
+                    } else {
+                        a = __float2half(0.0f);
+                        b = __float2half(0.0f);
+                    }
+                    B.x[l] = __halves2half2(a, b);
+                }
+
+                mma(D, A, B);
+            }
+
+            // Write this warp's partial D to SMEM at known thread→(row,col) layout.
+            // For tile<16, 8, float>: thread tx holds
+            //   D.x[0] at D[tx/4][2*(tx%4)]
+            //   D.x[1] at D[tx/4][2*(tx%4)+1]
+            //   D.x[2] at D[8+tx/4][2*(tx%4)]
+            //   D.x[3] at D[8+tx/4][2*(tx%4)+1]
+            {
+                const int row_lo = lane / 4;
+                const int row_hi = 8 + row_lo;
+                const int col_lo = 2 * (lane % 4);
+                D_partials[warp_id][row_lo][col_lo    ] = D.x[0];
+                D_partials[warp_id][row_lo][col_lo + 1] = D.x[1];
+                D_partials[warp_id][row_hi][col_lo    ] = D.x[2];
+                D_partials[warp_id][row_hi][col_lo + 1] = D.x[3];
+            }
+            __syncthreads();
+
+            // Sum partials across warps + extract top row to KQ_smem.
+            // Top row of D = D[0][col] for col in 0..7. Map 8 cols to 8 threads.
+            if (tid < 8) {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < NWARPS; w++) {
+                    sum += D_partials[w][0][tid];
+                }
+                KQ_smem[n_start + tid] = sum;
+            }
+            __syncthreads();
+        }
+
+        // ----- Apply scale + softcap + mask -----
+        float KQ[64];
+        for (int i = 0; i < blk; i++) {
+            float acc = KQ_smem[i] * scale;
+            if (use_softcap) {
+                acc = softcap * tanhf(acc / softcap);
+            }
+            acc += half_bits_to_float(mask[M_off(kb + i)]);
+            KQ[i] = acc;
+        }
+
+        // ----- Update online softmax state (identical across warps) -----
+        float new_max = kqmax;
+        for (int i = 0; i < blk; i++) {
+            if (KQ[i] > new_max) new_max = KQ[i];
+        }
+        if (new_max == -INFINITY) continue;
+
+        const float scale_factor =
+            (kqmax == -INFINITY) ? 0.0f : __expf(kqmax - new_max);
+        kqrowsum *= scale_factor;
+        for (int i = 0; i < VKQ_PER_THREAD; i++) {
+            VKQ[i] *= scale_factor;
+        }
+        kqmax = new_max;
+
+        // ----- V accumulation (this warp's V-dim slice) -----
+        for (int i = 0; i < blk; i++) {
+            const int k    = kb + i;
+            const float sm = __expf(KQ[i] - new_max);
+            kqrowsum += sm;
+            if (sm == 0.0f) continue;
+            for (int j = 0; j < VKQ_PER_THREAD; j++) {
+                const int d = dv_base + lane + j * 32;
+                if (d < Dv) {
+                    VKQ[j] += sm * half_bits_to_float(V[V_off(d, k)]);
+                }
+            }
+        }
+    }
+
+    // ----- Normalize + write output (this warp's V-dim slice) -----
+    const float den = kqrowsum;
+    for (int j = 0; j < VKQ_PER_THREAD; j++) {
+        const int d = dv_base + lane + j * 32;
+        if (d < Dv) {
+            const float val = (den > 0.0f) ? (VKQ[j] / den) : 0.0f;
+            out_final[O_off(d)] = val;
+        }
+    }
+}
+
+// ============================================================================
 // Host-side launcher (extern "C" symbol consumed by the unit test).
 // ============================================================================
 
@@ -528,24 +773,36 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
     err = cudaMemcpy(S_d, slot_seq_lens_h, n_S * sizeof(int32_t),  cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
     err = cudaMemset(O_d, 0,               n_O * sizeof(float));                            if (err != cudaSuccess) goto cleanup;
 
-    // Launch. Variant selectable via env (debug): "phase1" → naïve scalar,
-    // default → stage21 (mma.sync.m16n8k8 inner dot product).
+    // Launch. Variant selectable via env (debug):
+    //   FATTN_KERNEL_VARIANT=phase1  → 1-warp scalar (Phase 1)
+    //   FATTN_KERNEL_VARIANT=stage21 → 1-warp mma.sync (Stage 2.1)
+    //   default                       → 4-warp mma.sync (Stage 2.2a)
     {
         const dim3 grid(n_seqs, n_tok, n_hq);
-        const dim3 block(32, 1, 1);
 
         const char * variant = std::getenv("FATTN_KERNEL_VARIANT");
-        const bool use_phase1 = (variant && std::strcmp(variant, "phase1") == 0);
+        const bool use_phase1  = (variant && std::strcmp(variant, "phase1") == 0);
+        const bool use_stage21 = (variant && std::strcmp(variant, "stage21") == 0);
 
         if (use_phase1) {
+            const dim3 block(32, 1, 1);
             fattn_per_slot_kv_sm75_naive_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
                 Dq, Dv, KVB,
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
-        } else {
+        } else if (use_stage21) {
+            const dim3 block(32, 1, 1);
             fattn_per_slot_kv_sm75_stage21_kernel<<<grid, block>>>(
+                Q_d, K_d, V_d, M_d, S_d, O_d,
+                Dq, Dv, KVB,
+                n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
+                cfg.scale, cfg.softcap, cfg.use_softcap
+            );
+        } else {
+            const dim3 block(32, 4, 1);  // 4 warps = 128 threads
+            fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
                 Dq, Dv, KVB,
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
