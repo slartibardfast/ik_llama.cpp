@@ -282,24 +282,20 @@ if (GGML_CUDA)
     # first-divergent layer (S2.1 named the layer; S2.3 names the op).
     llama_build_and_test(dflash-speculative/test-deltanet-s23-op-capture.cpp)
 
-    # PLAN.md S2.5.b — RED unit test for fattn_per_slot_kv_sm75
-    # (specs/deltanet/fattn-per-slot-kv-sm75.md). Currently links against
-    # the stub launcher (test fails with rc=-1 until the real kernel
-    # implementation lands). Two-file build: test driver + stub.
+    # PLAN.md S2.5.b — RED → GREEN unit test for fattn_per_slot_kv_sm75
+    # (specs/deltanet/fattn-per-slot-kv-sm75.md).
+    #
+    # The launcher `fattn_per_slot_kv_sm75_launch` is implemented in
+    # ggml/src/ggml-cuda/fattn-per-slot-kv-sm75.cu (Phase 1 = naïve scalar
+    # device kernel; Phase 2 = SoTA PTX path). The test links against ggml
+    # to pull in the launcher symbol from the compiled ggml-cuda library.
     set(TEST_TARGET test-fattn-per-slot-kv-sm75)
     add_executable(${TEST_TARGET}
-        dflash-speculative/test-fattn-per-slot-kv-sm75.cpp
-        dflash-speculative/fattn-per-slot-kv-sm75-stub.cpp)
-    target_link_libraries(${TEST_TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+        dflash-speculative/test-fattn-per-slot-kv-sm75.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
-    # NOTE: this test is EXPECTED TO FAIL until the kernel implementation
-    # lands. The stub returns -1 from fattn_per_slot_kv_sm75_launch; every
-    # config's "oracle_vs_kernel" scenario fails with that rc. When the
-    # real launcher is implemented in ggml/src/ggml-cuda/fattn-per-slot-kv-sm75.cu,
-    # remove fattn-per-slot-kv-sm75-stub.cpp from this add_executable
-    # and the test transitions to GREEN.
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
