@@ -4176,6 +4176,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
+            ggml_cuda_flash_attn_ext_per_slot_kv_sm75(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5322,6 +5325,15 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
 #else
             return ggml_cuda_fattn_is_supported(*cuda_ctx, op);
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+        case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
+            // sm_75 dispatch: requires HEAD_DIM_Q == HEAD_DIM_V == 256
+            // (Qwen 3.5/3.6 production tuple). gqa <= 16 for Approach C pack.
+            // Higher arches fall through to false (no other backend implements
+            // the new op yet); ggml then errors out at graph build time, which
+            // is the desired behavior — the new op is sm_75-only by design.
+            return op->src[0]->ne[0] == 256
+                && op->src[2]->ne[0] == 256
+                && (op->src[0]->ne[2] / op->src[1]->ne[2]) <= 16;
         default:
             return false;
     }
