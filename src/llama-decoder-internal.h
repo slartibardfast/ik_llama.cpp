@@ -151,8 +151,10 @@ struct llama_decoder {
     // installed when cparams.dflash_extract_count > 0; each slot matches
     // the index in cparams.dflash_extract_layers. n_elements is the
     // contiguous float count actually written for the last decode.
-    std::vector<float> dflash_extract_buf[16];
-    size_t             dflash_extract_n[16] = {};
+    // Cap mirrors dflash_extract_layers[80] in llama-cparams.h (Qwen 3.6 27B
+    // 65-layer capture + headroom).
+    std::vector<float> dflash_extract_buf[80];
+    size_t             dflash_extract_n[80] = {};
 
     // PHASE45 D9.6f: PHASE36 Step 1 fused multi-draft cgraph counters.
     int32_t mtp_fused_last_compute_count = 0;

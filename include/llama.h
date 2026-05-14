@@ -1091,7 +1091,9 @@ extern "C" {
 
     // DFlash: set the layer indices at which the qwen35 build graph will
     // snapshot the residual stream during the next decode. n must be in
-    // [0, 16]. Pass n=0 to disable.
+    // [0, 80] (cap raised from 16 to support full-stack capture for
+    // batch-invariance diagnosis on Qwen 3.6 27B's 65-layer target). Pass
+    // n=0 to disable.
     LLAMA_API void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n);
 
     // DFlash: copy the residual-stream snapshot for the `idx`-th configured

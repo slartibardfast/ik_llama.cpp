@@ -72,7 +72,11 @@ struct llama_cparams {
     // residual at each requested index, marks it ggml_set_output, and
     // stashes the handle on default_decoder.t_dflash_extract[idx].
     int      dflash_extract_count = 0;
-    int32_t  dflash_extract_layers[16] = {};
+    // Cap is 80 to cover full-stack capture on the largest production target
+    // (Qwen 3.6 27B has 65 layers). Mirrored as the array size on
+    // default_decoder.dflash_extract_buf/_n in llama-decoder-internal.h and
+    // as the upper bound in llama_set_dflash_extract_layers in llama.cpp.
+    int32_t  dflash_extract_layers[80] = {};
 
     enum ggml_type reduce_type;
     enum llama_pooling_type pooling_type;

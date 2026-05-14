@@ -9676,16 +9676,18 @@ static bool llama_dflash_extract_cb_eval(struct ggml_tensor * t, bool ask, void 
 }
 
 void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n) {
+    // Cap mirrors dflash_extract_layers[80] in llama-cparams.h.
+    constexpr int32_t LLAMA_DFLASH_MAX_EXTRACT_LAYERS = 80;
     if (n < 0) { n = 0; }
-    if (n > 16) { n = 16; }
+    if (n > LLAMA_DFLASH_MAX_EXTRACT_LAYERS) { n = LLAMA_DFLASH_MAX_EXTRACT_LAYERS; }
     ctx->cparams.dflash_extract_count = n;
     for (int32_t i = 0; i < n; ++i) {
         ctx->cparams.dflash_extract_layers[i] = layer_ids[i];
     }
-    for (int32_t i = n; i < 16; ++i) {
+    for (int32_t i = n; i < LLAMA_DFLASH_MAX_EXTRACT_LAYERS; ++i) {
         ctx->cparams.dflash_extract_layers[i] = 0;
     }
-    for (int32_t i = 0; i < 16; ++i) {
+    for (int32_t i = 0; i < LLAMA_DFLASH_MAX_EXTRACT_LAYERS; ++i) {
         ctx->default_decoder.dflash_extract_buf[i].clear();
         ctx->default_decoder.dflash_extract_n[i] = 0;
     }
