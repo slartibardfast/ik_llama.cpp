@@ -162,6 +162,8 @@ int main() {
     cparams.n_seq_max   = (uint32_t) N;
     cparams.type_k      = GGML_TYPE_Q4_0;
     cparams.type_v      = GGML_TYPE_Q4_0;
+    cparams.k_cache_hadamard = true;
+    cparams.v_cache_hadamard = true;
     cparams.flash_attn  = true;
     cparams.mla_attn    = 3;
     llama_context * ctx = llama_init_from_model(model, cparams);
