@@ -4298,6 +4298,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_2D_DW",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_PER_SLOT_KV",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -4337,7 +4338,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FUSED_RMS_RMS_ADD",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4418,6 +4419,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_2d_dw(x)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_per_slot_kv(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -4458,7 +4460,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10222,11 +10224,77 @@ struct ggml_tensor * ggml_flash_attn_ext(
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT ||
+                a->op == GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV);
 
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+// ggml_flash_attn_ext_per_slot_kv
+//
+// Same shape inference as ggml_flash_attn_ext, with an additional
+// src[5]=slot_seq_lens i32 tensor of length n_seqs. The CUDA dispatcher
+// uses slot_seq_lens to bound the per-slot K-loop iteration count (the
+// determinism fix); CPU eval falls through to ggml_compute_forward_flash_attn_ext
+// which ignores src[5].
+
+struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * slot_seq_lens,
+        float                 scale,
+        float                 max_bias,
+        float                 softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+
+    if (mask) {
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[2] == 1);
+        GGML_ASSERT(mask->ne[3] == 1);
+        GGML_ASSERT(mask->ne[1] >= GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) &&
+                "the Flash-Attention kernel requires the mask to be padded to GGML_KQ_MASK_PAD and at least n_queries big");
+    }
+
+    if (max_bias > 0.0f) {
+        GGML_ASSERT(mask);
+    }
+
+    GGML_ASSERT(slot_seq_lens);
+    GGML_ASSERT(slot_seq_lens->type == GGML_TYPE_I32);
+    // slot_seq_lens is a 1-D tensor of length n_seqs (== q->ne[3]).
+    GGML_ASSERT(slot_seq_lens->ne[0] == q->ne[3]);
+    GGML_ASSERT(slot_seq_lens->ne[1] == 1);
+    GGML_ASSERT(slot_seq_lens->ne[2] == 1);
+    GGML_ASSERT(slot_seq_lens->ne[3] == 1);
+
+    bool is_node = false;
+
+    if (q->grad || k->grad || v->grad) {
+        is_node = true;
+    }
+
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, max_bias, softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, 0);
+
+    result->op   = GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = NULL;          // sinks slot (unused for per-slot-kv variant)
+    result->src[5] = slot_seq_lens; // per-slot KV occupancy (i32, length n_seqs)
+
+    return result;
 }
 
 void ggml_flash_attn_ext_add_sinks(
@@ -24505,7 +24573,13 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                 ggml_compute_forward_leaky_relu(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
             {
+                // CPU fallback for both ops uses the same forward kernel.
+                // PER_SLOT_KV's src[5]=slot_seq_lens is ignored on CPU (CPU
+                // path uses K->ne[1] for all slots, matching the existing
+                // non-deterministic behavior). The new op is CUDA-only for
+                // determinism semantics; CPU eval is a correctness-only path.
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
@@ -25594,6 +25668,11 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
+        case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
+            {
+                // Inference-only op; backward not supported.
+                GGML_ABORT("FLASH_ATTN_EXT_PER_SLOT_KV: backward not implemented");
+            }
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 struct ggml_tensor * flash_grad = NULL;
@@ -26390,6 +26469,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT_THRESH:
         case GGML_OP_GROUPED_TOPK:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -26620,6 +26700,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = 16 * 1024 * 1024; //GGML_IM2COL_WORK_SIZE;
                 } break;
             case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
                 {
                     const int64_t Dk = node->src[0]->ne[0];
                     const int64_t Dv = node->src[2]->ne[0];
