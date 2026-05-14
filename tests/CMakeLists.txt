@@ -270,6 +270,11 @@ if (GGML_CUDA)
     # multi-slot API extension; if vanilla fails validity, DFlash multi-slot
     # work is moot. See PHASE_DFLASH.md T9.
     llama_build_and_test(dflash-speculative/test-np-validity-vanilla.cpp)
+    # PLAN.md D1 — per-layer per-slot residual capture at np ∈ {1,2,4,8}.
+    # Single-decode capture writes n_embd floats per (layer × slot) to disk.
+    # Drives D2 first-divergent-layer localization. Requires extract-layers
+    # cap ≥ n_layer (cap is 80; Qwen 3.6 27B is 65 — fits).
+    llama_build_and_test(dflash-speculative/test-deltanet-d1-capture.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
