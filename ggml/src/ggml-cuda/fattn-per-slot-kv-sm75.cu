@@ -1081,6 +1081,409 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
 }
 
 // ============================================================================
+// Stage 2.3 kernel — Approach C decode pack + parallel_blocks split-K.
+// ============================================================================
+//
+// Per spec §4 parallel_blocks. Each (slot, kv_head, ip) CTA processes a
+// per-slot K-range slice [k_start, k_end) where:
+//   k_chunk_size = ⌈n_kv_slot / pb_for_slot⌉
+//   k_start = ip * k_chunk_size
+//   k_end = min((ip+1) * k_chunk_size, n_kv_slot)
+//
+// Output: dst_partial[n_seqs][n_heads_q][max_pb][Dv] and
+//         dst_meta[n_seqs][n_heads_q][max_pb] (float2 = max, rowsum).
+//
+// Companion `fattn_per_slot_kv_sm75_combine_kernel` reduces across ip per
+// (slot, head_global) to produce the final output.
+//
+// Grid: (n_seqs, n_kv_heads, max_pb)
+// Block: (32, 4, 1) — same 4-warp layout as stage22b
+//
+// Per-slot pb is read from `pb_per_slot[slot]` input. CTAs with ip >=
+// pb_for_slot return early after writing (-INF, 0) to their dst_meta entry
+// so combine treats them as no-contribution. dst_partial entries for those
+// CTAs are left undefined (combine multiplies by 0 weight).
+//
+// All other aspects (Q SMEM, K SMEM, V SMEM, ldmatrix B-fragment, fp32
+// accumulator, online softmax with per-row state, VKQ rescale) are
+// identical to stage22b.
+
+__global__ void fattn_per_slot_kv_sm75_stage23_kernel(
+    const uint16_t * __restrict__ Q,
+    const uint16_t * __restrict__ K,
+    const uint16_t * __restrict__ V,
+    const uint16_t * __restrict__ mask,
+    const int32_t  * __restrict__ slot_seq_lens,
+    const int32_t  * __restrict__ pb_per_slot,
+    float          * __restrict__ dst_partial,    // [n_seqs][n_heads_q][max_pb][Dv]
+    float2         * __restrict__ dst_meta,       // [n_seqs][n_heads_q][max_pb]
+    int Dq, int Dv, int KVB,
+    int n_heads_q, int n_kv_heads, int n_seqs, int n_kv_max,
+    int H_packed, int max_pb,
+    float scale, float softcap, bool use_softcap)
+{
+    using namespace ggml_cuda_mma;
+
+    constexpr int NWARPS = 4;
+    constexpr int N_ROWS = 16;
+    constexpr int ROWS_PER_WARP = N_ROWS / NWARPS;
+    constexpr int VKQ_PER_THREAD = 32;
+
+    const int slot    = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int ip      = blockIdx.z;
+    const int lane    = threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int tid     = warp_id * 32 + lane;
+
+    if (slot >= n_seqs || kv_head >= n_kv_heads || ip >= max_pb) return;
+
+    const int gqa        = n_heads_q / n_kv_heads;
+    const int head_start = kv_head * gqa;
+    const int n_kv       = slot_seq_lens[slot];
+    const int pb_for_slot = pb_per_slot[slot];
+
+    // CTAs with ip >= pb_for_slot or empty slot: write sentinel meta and return.
+    if (ip >= pb_for_slot || n_kv <= 0) {
+        if (tid < H_packed) {
+            const int r = tid;
+            const int head_global = head_start + r;
+            const size_t meta_idx = ((size_t)slot * n_heads_q + head_global) * max_pb + ip;
+            dst_meta[meta_idx] = make_float2(-INFINITY, 0.0f);
+        }
+        return;
+    }
+
+    // Per-slot K range for this ip.
+    const int k_chunk_size = (n_kv + pb_for_slot - 1) / pb_for_slot;
+    const int k_start_global = ip * k_chunk_size;
+    const int k_end_global   = min((ip + 1) * k_chunk_size, n_kv);
+
+    if (k_start_global >= n_kv) {
+        if (tid < H_packed) {
+            const int r = tid;
+            const int head_global = head_start + r;
+            const size_t meta_idx = ((size_t)slot * n_heads_q + head_global) * max_pb + ip;
+            dst_meta[meta_idx] = make_float2(-INFINITY, 0.0f);
+        }
+        return;
+    }
+
+    auto Q_off_row = [=] __device__ (int r, int d) -> size_t {
+        const int head_global = head_start + r;
+        return (((size_t)slot * n_heads_q + head_global) * /*n_tokens=*/1 + 0) * Dq + d;
+    };
+    auto K_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dq + d;
+    };
+    auto V_off = [=] __device__ (int d, int k) -> size_t {
+        return (((size_t)slot * n_kv_heads + kv_head) * n_kv_max + k) * Dv + d;
+    };
+    auto M_off = [=] __device__ (int k) -> size_t {
+        return (size_t)0 * n_kv_max + k;
+    };
+
+    float VKQ[VKQ_PER_THREAD] = {0};
+
+    __shared__ half  Q_smem[N_ROWS * 256];
+    __shared__ half  K_smem[32 * 256];
+    __shared__ half  V_smem[32 * 256];
+    __shared__ float D_partials[NWARPS][N_ROWS][8];
+    __shared__ float KQ_smem[N_ROWS][32];
+    __shared__ float scale_factor_smem[N_ROWS];
+    __shared__ float kqmax_smem[N_ROWS];
+    __shared__ float kqrowsum_smem[N_ROWS];
+
+    // Load Q.
+    {
+        const int total = N_ROWS * Dq;
+        const int per_thread = (total + 127) / 128;
+        for (int e = 0; e < per_thread; e++) {
+            const int idx = tid + e * 128;
+            if (idx >= total) break;
+            const int r = idx / Dq;
+            const int c = idx % Dq;
+            half val;
+            if (r < H_packed) {
+                val = __ushort_as_half(Q[Q_off_row(r, c)]);
+            } else {
+                val = __float2half(0.0f);
+            }
+            Q_smem[r * Dq + c] = val;
+        }
+    }
+
+    if (tid < N_ROWS) {
+        kqmax_smem[tid]    = -INFINITY;
+        kqrowsum_smem[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int kb = k_start_global; kb < k_end_global; kb += KVB) {
+        const int kb_end = min(kb + KVB, k_end_global);
+        const int blk    = kb_end - kb;
+
+        // Cooperative load K and V blocks into SMEM.
+        {
+            const int total = blk * Dq;
+            const int per_thread = (total + 127) / 128;
+            for (int e = 0; e < per_thread; e++) {
+                const int idx = tid + e * 128;
+                if (idx >= total) break;
+                const int n_idx = idx / Dq;
+                const int d_idx = idx % Dq;
+                const int k_global = kb + n_idx;
+                K_smem[n_idx * Dq + d_idx] = __ushort_as_half(K[K_off(d_idx, k_global)]);
+            }
+            const int total_v = blk * Dv;
+            const int per_thread_v = (total_v + 127) / 128;
+            for (int e = 0; e < per_thread_v; e++) {
+                const int idx = tid + e * 128;
+                if (idx >= total_v) break;
+                const int n_idx = idx / Dv;
+                const int d_idx = idx % Dv;
+                const int k_global = kb + n_idx;
+                V_smem[n_idx * Dv + d_idx] = __ushort_as_half(V[V_off(d_idx, k_global)]);
+            }
+        }
+        __syncthreads();
+
+        for (int n_tile = 0; n_tile * 8 < blk; n_tile++) {
+            const int n_start = n_tile * 8;
+
+            tile<16, 8, float> D;
+            #pragma unroll
+            for (int l = 0; l < D.ne; l++) D.x[l] = 0.0f;
+
+            const int k_chunks_per_warp = (Dq / 16) / NWARPS;
+            const int k_chunk_start = warp_id * k_chunks_per_warp;
+            const int k_chunk_end   = k_chunk_start + k_chunks_per_warp;
+
+            for (int k_chunk = k_chunk_start; k_chunk < k_chunk_end; k_chunk++) {
+                const int k_start = k_chunk * 16;
+
+                tile<16, 8, half2> A;
+                #pragma unroll
+                for (int l = 0; l < A.ne; l++) {
+                    const int row       = A.get_i(l);
+                    const int half2_col = A.get_j(l);
+                    const int d0 = k_start + 2 * half2_col;
+                    const int d1 = d0 + 1;
+                    half a = Q_smem[row * Dq + d0];
+                    half b = Q_smem[row * Dq + d1];
+                    A.x[l] = __halves2half2(a, b);
+                }
+
+                tile<8, 8, half2> B;
+                {
+                    const half2 * K_h2 =
+                        (const half2 *)(K_smem + n_start * Dq) + (k_start / 2);
+                    load_ldmatrix(B, K_h2, Dq / 2);
+                }
+
+                mma(D, A, B);
+            }
+
+            {
+                const int row_lo = lane / 4;
+                const int row_hi = 8 + row_lo;
+                const int col_lo = 2 * (lane % 4);
+                D_partials[warp_id][row_lo][col_lo    ] = D.x[0];
+                D_partials[warp_id][row_lo][col_lo + 1] = D.x[1];
+                D_partials[warp_id][row_hi][col_lo    ] = D.x[2];
+                D_partials[warp_id][row_hi][col_lo + 1] = D.x[3];
+            }
+            __syncthreads();
+
+            {
+                const int r_out = tid / 8;
+                const int c_out = tid % 8;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < NWARPS; w++) {
+                    sum += D_partials[w][r_out][c_out];
+                }
+                KQ_smem[r_out][n_start + c_out] = sum;
+            }
+            __syncthreads();
+        }
+
+        // Scale + softcap + mask.
+        {
+            const int total = N_ROWS * blk;
+            const int per_thread = (total + 127) / 128;
+            for (int i_thread = 0; i_thread < per_thread; i_thread++) {
+                const int idx = tid + i_thread * 128;
+                if (idx >= total) break;
+                const int r = idx / blk;
+                const int i = idx % blk;
+                float acc = KQ_smem[r][i] * scale;
+                if (use_softcap) {
+                    acc = softcap * tanhf(acc / softcap);
+                }
+                acc += half_bits_to_float(mask[M_off(kb + i)]);
+                if (r >= H_packed) acc = -INFINITY;
+                KQ_smem[r][i] = acc;
+            }
+        }
+        __syncthreads();
+
+        // Per-row online softmax state update.
+        if (lane < ROWS_PER_WARP) {
+            const int r = warp_id * ROWS_PER_WARP + lane;
+            const float old_max     = kqmax_smem[r];
+            const float old_rowsum  = kqrowsum_smem[r];
+
+            float new_max = old_max;
+            if (r < H_packed) {
+                for (int i = 0; i < blk; i++) {
+                    if (KQ_smem[r][i] > new_max) new_max = KQ_smem[r][i];
+                }
+            }
+
+            if (new_max == -INFINITY) {
+                scale_factor_smem[r] = 1.0f;
+            } else {
+                const float scale_factor =
+                    (old_max == -INFINITY) ? 0.0f : __expf(old_max - new_max);
+
+                float new_rowsum = old_rowsum * scale_factor;
+                for (int i = 0; i < blk; i++) {
+                    const float kq = KQ_smem[r][i];
+                    new_rowsum += (kq == -INFINITY) ? 0.0f : __expf(kq - new_max);
+                }
+
+                kqmax_smem[r]        = new_max;
+                kqrowsum_smem[r]     = new_rowsum;
+                scale_factor_smem[r] = scale_factor;
+            }
+        }
+        __syncthreads();
+
+        // VKQ rescale + V accumulation.
+        for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
+            const int r = warp_id * ROWS_PER_WARP + r_in_warp;
+            if (r >= H_packed) continue;
+
+            const float scale_f   = scale_factor_smem[r];
+            const float row_kqmax = kqmax_smem[r];
+
+            if (scale_f != 1.0f) {
+                #pragma unroll
+                for (int d_offset = 0; d_offset < 8; d_offset++) {
+                    VKQ[r_in_warp * 8 + d_offset] *= scale_f;
+                }
+            }
+
+            if (row_kqmax == -INFINITY) continue;
+
+            for (int i = 0; i < blk; i++) {
+                const float kq = KQ_smem[r][i];
+                const float sm = (kq == -INFINITY) ? 0.0f : __expf(kq - row_kqmax);
+                if (sm == 0.0f) continue;
+                #pragma unroll
+                for (int d_offset = 0; d_offset < 8; d_offset++) {
+                    const int d = lane + d_offset * 32;
+                    if (d < Dv) {
+                        VKQ[r_in_warp * 8 + d_offset] +=
+                            sm * __half2float(V_smem[i * Dv + d]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ----- Write partial output to dst_partial and dst_meta -----
+    // This CTA's (slot, kv_head, ip) writes H_packed (head_global, ip) entries.
+    // Per-thread per-row: 8 VKQ dims (strided lane + d_offset*32).
+    for (int r_in_warp = 0; r_in_warp < ROWS_PER_WARP; r_in_warp++) {
+        const int r = warp_id * ROWS_PER_WARP + r_in_warp;
+        if (r >= H_packed) continue;
+        const int head_global = head_start + r;
+
+        #pragma unroll
+        for (int d_offset = 0; d_offset < 8; d_offset++) {
+            const int d = lane + d_offset * 32;
+            if (d < Dv) {
+                const size_t part_idx =
+                    (((size_t)slot * n_heads_q + head_global) * max_pb + ip) * Dv + d;
+                dst_partial[part_idx] = VKQ[r_in_warp * 8 + d_offset];
+            }
+        }
+        // Thread 0 of this row's owning warp writes the meta.
+        if (lane == 0) {
+            const size_t meta_idx =
+                ((size_t)slot * n_heads_q + head_global) * max_pb + ip;
+            dst_meta[meta_idx] = make_float2(kqmax_smem[r], kqrowsum_smem[r]);
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2.3 combine kernel — reduce across ip per (slot, head_global).
+// ============================================================================
+//
+// Grid: (n_seqs, n_heads_q, 1)
+// Block: (Dv, 1, 1)
+//
+// Each CTA reads up to max_pb partials for its (slot, head_global), finds
+// the combined max, applies exp(ip_max - combined_max) weights, and writes
+// the final output to out_final[n_seqs][n_heads_q][n_tokens=1][Dv].
+
+__global__ void fattn_per_slot_kv_sm75_combine_kernel(
+    const float  * __restrict__ dst_partial,   // [n_seqs][n_heads_q][max_pb][Dv]
+    const float2 * __restrict__ dst_meta,      // [n_seqs][n_heads_q][max_pb]
+    const int32_t * __restrict__ pb_per_slot,  // [n_seqs]
+    float * __restrict__ out_final,            // [n_seqs][n_heads_q][Dv]
+    int Dv, int n_heads_q, int n_seqs, int max_pb)
+{
+    const int slot = blockIdx.x;
+    const int head = blockIdx.y;
+    const int tid  = threadIdx.x;
+
+    if (slot >= n_seqs || head >= n_heads_q || tid >= Dv) return;
+
+    const int pb = pb_per_slot[slot];
+
+    // Phase 1: combined max across all valid ip's max.
+    __shared__ float kqmax_shared;
+    if (tid == 0) {
+        float m = -INFINITY;
+        for (int ip = 0; ip < pb; ip++) {
+            const size_t meta_idx = ((size_t)slot * n_heads_q + head) * max_pb + ip;
+            const float ip_max = dst_meta[meta_idx].x;
+            if (ip_max > m) m = ip_max;
+        }
+        kqmax_shared = m;
+    }
+    __syncthreads();
+
+    const float kqmax = kqmax_shared;
+    if (kqmax == -INFINITY) {
+        out_final[((size_t)slot * n_heads_q + head) * Dv + tid] = 0.0f;
+        return;
+    }
+
+    // Phase 2: weighted combine.
+    float num = 0.0f, den = 0.0f;
+    for (int ip = 0; ip < pb; ip++) {
+        const size_t meta_idx = ((size_t)slot * n_heads_q + head) * max_pb + ip;
+        const float ip_max = dst_meta[meta_idx].x;
+        const float ip_sum = dst_meta[meta_idx].y;
+        if (ip_max == -INFINITY) continue;
+        const float w = __expf(ip_max - kqmax);
+        const size_t part_idx =
+            (((size_t)slot * n_heads_q + head) * max_pb + ip) * Dv + tid;
+        num += w * dst_partial[part_idx];
+        den += w * ip_sum;
+    }
+
+    const float val = (den > 0.0f) ? num / den : 0.0f;
+    out_final[((size_t)slot * n_heads_q + head) * Dv + tid] = val;
+}
+
+// ============================================================================
 // Host-side launcher (extern "C" symbol consumed by the unit test).
 // ============================================================================
 
@@ -1190,8 +1593,12 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
         } else {
-            // Stage 2.2b: Approach C decode-pack (n_tok == 1).
-            // H_packed = gqa_ratio (assumes gqa ≤ 16; safe for Qwen 3.6 27B at gqa=6).
+            // Default decode path. Stage 2.3 (split-K) is opt-in via env
+            // FATTN_KERNEL_VARIANT=stage23; default remains Stage 2.2b
+            // (single-pass Approach C decode pack) until split-K is validated
+            // at production shape.
+            const bool use_stage23 =
+                (variant && std::strcmp(variant, "stage23") == 0);
             const int gqa = n_hq / n_hkv;
             if (gqa > 16) {
                 // Fall back to Stage 2.2a for unsupported gqa values.
@@ -1203,7 +1610,7 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                     n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
                     cfg.scale, cfg.softcap, cfg.use_softcap
                 );
-            } else {
+            } else if (!use_stage23) {
                 const dim3 grid(n_seqs, n_hkv, 1);
                 const dim3 block(32, 4, 1);
                 fattn_per_slot_kv_sm75_stage22b_kernel<<<grid, block>>>(
@@ -1213,6 +1620,76 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                     /*H_packed=*/gqa,
                     cfg.scale, cfg.softcap, cfg.use_softcap
                 );
+            } else {
+                // Stage 2.3: parallel_blocks split-K + combine kernel.
+                // Compute pb_per_slot matching the oracle's formula
+                // (max(1, (slot_seq_lens[s] + 255) / 256)).
+                std::vector<int32_t> pb_per_slot_h(n_seqs);
+                int max_pb = 1;
+                for (int s = 0; s < n_seqs; s++) {
+                    const int pb = std::max(1, (slot_seq_lens_h[s] + 255) / 256);
+                    pb_per_slot_h[s] = pb;
+                    if (pb > max_pb) max_pb = pb;
+                }
+
+                int32_t * pb_d = nullptr;
+                float * dst_partial_d = nullptr;
+                float2 * dst_meta_d = nullptr;
+                err = cudaMalloc(&pb_d, n_seqs * sizeof(int32_t));
+                if (err != cudaSuccess) goto cleanup_stage23;
+                err = cudaMemcpy(pb_d, pb_per_slot_h.data(),
+                                 n_seqs * sizeof(int32_t), cudaMemcpyHostToDevice);
+                if (err != cudaSuccess) goto cleanup_stage23;
+
+                {
+                    const size_t n_part = (size_t)n_seqs * n_hq * max_pb * Dv;
+                    const size_t n_meta = (size_t)n_seqs * n_hq * max_pb;
+                    err = cudaMalloc(&dst_partial_d, n_part * sizeof(float));
+                    if (err != cudaSuccess) goto cleanup_stage23;
+                    err = cudaMalloc(&dst_meta_d, n_meta * sizeof(float2));
+                    if (err != cudaSuccess) goto cleanup_stage23;
+                    // Init dst_meta to (-INF, 0). Easier from device side, but
+                    // a cudaMemset to a bit pattern isn't trivial for fp32 -INF.
+                    // Host-init + H2D for the small meta array.
+                    std::vector<float2> meta_init(n_meta, make_float2(-INFINITY, 0.0f));
+                    err = cudaMemcpy(dst_meta_d, meta_init.data(),
+                                     n_meta * sizeof(float2), cudaMemcpyHostToDevice);
+                    if (err != cudaSuccess) goto cleanup_stage23;
+                }
+
+                {
+                    const dim3 grid(n_seqs, n_hkv, max_pb);
+                    const dim3 block(32, 4, 1);
+                    fattn_per_slot_kv_sm75_stage23_kernel<<<grid, block>>>(
+                        Q_d, K_d, V_d, M_d, S_d, pb_d,
+                        dst_partial_d, dst_meta_d,
+                        Dq, Dv, KVB,
+                        n_hq, n_hkv, n_seqs, n_kvmax,
+                        /*H_packed=*/gqa, max_pb,
+                        cfg.scale, cfg.softcap, cfg.use_softcap
+                    );
+                    err = cudaGetLastError();
+                    if (err != cudaSuccess) goto cleanup_stage23;
+                }
+
+                {
+                    const dim3 grid_combine(n_seqs, n_hq, 1);
+                    const dim3 block_combine(Dv, 1, 1);
+                    fattn_per_slot_kv_sm75_combine_kernel<<<grid_combine, block_combine>>>(
+                        dst_partial_d, dst_meta_d, pb_d, O_d,
+                        Dv, n_hq, n_seqs, max_pb
+                    );
+                    err = cudaGetLastError();
+                    if (err != cudaSuccess) goto cleanup_stage23;
+                }
+
+                err = cudaDeviceSynchronize();
+
+            cleanup_stage23:
+                if (pb_d) cudaFree(pb_d);
+                if (dst_partial_d) cudaFree(dst_partial_d);
+                if (dst_meta_d) cudaFree(dst_meta_d);
+                if (err != cudaSuccess) goto cleanup;
             }
         }
         err = cudaGetLastError();
