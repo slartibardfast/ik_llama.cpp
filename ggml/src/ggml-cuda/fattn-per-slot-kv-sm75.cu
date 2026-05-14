@@ -820,12 +820,36 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
     }
 
     // SMEM:
+    //   Q_smem[16][256]          = 8192 B for Q tile, loaded once per CTA
     //   D_partials[NWARPS][16][8] = 2048 B for mma cross-warp sum
     //   KQ_smem[16][32]          = 2048 B for per-row KQ values across K-block
     //   scale_factor_smem[16]    = 64 B for per-row VKQ rescale factor
+    //   Total: ~12.5 KiB per CTA — under the 32 KiB target for 2 blocks/SM
+    __shared__ half  Q_smem[N_ROWS * 256];  // hard-coded Dq upper bound
     __shared__ float D_partials[NWARPS][N_ROWS][8];
-    __shared__ float KQ_smem[N_ROWS][32];  // upper bound for KVB=32
+    __shared__ float KQ_smem[N_ROWS][32];
     __shared__ float scale_factor_smem[N_ROWS];
+
+    // ----- Cooperative load Q into SMEM (rows 0..H_packed-1 real, rest zero) -----
+    // 16 rows × Dq elements, 128 threads → ⌈16 * Dq / 128⌉ elements/thread.
+    {
+        const int total = N_ROWS * Dq;
+        const int per_thread = (total + 127) / 128;
+        for (int e = 0; e < per_thread; e++) {
+            const int idx = tid + e * 128;
+            if (idx >= total) break;
+            const int r = idx / Dq;
+            const int c = idx % Dq;
+            half val;
+            if (r < H_packed) {
+                val = __ushort_as_half(Q[Q_off_row(r, c)]);
+            } else {
+                val = __float2half(0.0f);
+            }
+            Q_smem[r * Dq + c] = val;
+        }
+    }
+    __syncthreads();
 
     for (int kb = 0; kb < n_kv; kb += KVB) {
         const int kb_end = min(kb + KVB, n_kv);
@@ -847,22 +871,17 @@ __global__ void fattn_per_slot_kv_sm75_stage22b_kernel(
             for (int k_chunk = k_chunk_start; k_chunk < k_chunk_end; k_chunk++) {
                 const int k_start = k_chunk * 16;
 
-                // Build A tile: rows 0..H-1 are real Q for each packed head.
+                // Build A tile from Q_smem (already populated with real Q for
+                // rows 0..H_packed-1 and zeros for padded rows).
                 tile<16, 8, half2> A;
                 #pragma unroll
                 for (int l = 0; l < A.ne; l++) {
                     const int row       = A.get_i(l);
                     const int half2_col = A.get_j(l);
-                    half a, b;
-                    if (row < H_packed) {
-                        const int d0 = k_start + 2 * half2_col;
-                        const int d1 = d0 + 1;
-                        a = __ushort_as_half(Q[Q_off_row(row, d0)]);
-                        b = __ushort_as_half(Q[Q_off_row(row, d1)]);
-                    } else {
-                        a = __float2half(0.0f);
-                        b = __float2half(0.0f);
-                    }
+                    const int d0 = k_start + 2 * half2_col;
+                    const int d1 = d0 + 1;
+                    half a = Q_smem[row * Dq + d0];
+                    half b = Q_smem[row * Dq + d1];
                     A.x[l] = __halves2half2(a, b);
                 }
 
