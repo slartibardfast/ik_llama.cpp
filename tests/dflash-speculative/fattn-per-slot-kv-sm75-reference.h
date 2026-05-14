@@ -126,12 +126,14 @@ static inline Half float_to_half(float f) {
 //   dst_meta:        [2, parallel_blocks, n_tokens, n_heads_q, n_seqs]   (float2 = max, rowsum)
 //
 // HEAD_DIM_Q and HEAD_DIM_V are compile-time constants for the production
-// (256, 128) tuple per OQ-4. Other tuples are not implemented in this oracle.
+// (256, 256) tuple (corrected 2026-05-14 from prior wrong (256, 128) — GGUF
+// metadata qwen35.attention.value_length=256 confirms V head dim = 256).
+// Other tuples are not implemented in this oracle.
 
 struct AttnConfig {
     int head_dim_q;          // 256
-    int head_dim_v;          // 128
-    int kv_block_size;       // 32 or 64
+    int head_dim_v;          // 256 (production target Qwen 3.6 27B)
+    int kv_block_size;       // 16 primary, 32 alt
     int n_tokens;
     int n_heads_q;
     int n_kv_heads;          // gqa: n_heads_q / n_kv_heads gives gqa_ratio

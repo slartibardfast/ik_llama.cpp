@@ -84,13 +84,19 @@ struct TestConfig {
 static std::vector<TestConfig> build_sweep(bool quick) {
     std::vector<TestConfig> configs;
 
-    // Locked production tuple (OQ-4 LOCKED).
+    // Production tuple (corrected 2026-05-14 from prior wrong (256, 128) per
+    // GGUF metadata qwen35.attention.value_length=256 + nsys trace
+    // flash_attn_ext_f16<256, 256, ...>):
+    //   HEAD_DIM_Q = HEAD_DIM_V = 256
+    //   n_heads_q = 24, n_kv_heads = 4 (gqa_ratio = 6)
     constexpr int Dq = 256;
-    constexpr int Dv = 128;
-    constexpr int n_heads_q = 12;
-    constexpr int n_kv_heads = 2;
+    constexpr int Dv = 256;
+    constexpr int n_heads_q = 24;
+    constexpr int n_kv_heads = 4;
 
-    const std::vector<int> kv_block_sizes = quick ? std::vector<int>{32} : std::vector<int>{32, 64};
+    // KV_BLOCK_SIZE=64 eliminated at Dv=256 (over 64 KiB SMEM cap; see spec §9).
+    // Primary {16}, alt {32}.
+    const std::vector<int> kv_block_sizes = quick ? std::vector<int>{16} : std::vector<int>{16, 32};
     const std::vector<int> nps            = quick ? std::vector<int>{2, 4} : std::vector<int>{1, 2, 4, 8};
     const std::vector<int> n_tokens_set   = quick ? std::vector<int>{1, 16} : std::vector<int>{1, 4, 16, 64, 256};
     const std::vector<int> n_kv_set       = quick ? std::vector<int>{128, 1024} : std::vector<int>{32, 128, 512, 4096};
