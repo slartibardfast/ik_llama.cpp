@@ -143,7 +143,7 @@ int main() {
     const int N = std::atoi(np_env);
     const int n_gen = std::getenv("LLAMA_TEST_N_GEN") ? std::atoi(std::getenv("LLAMA_TEST_N_GEN")) : 64;
     const char * json_out = std::getenv("LLAMA_TEST_JSON");
-    if (N < 2 || N > 16) { fprintf(stderr, "LLAMA_TEST_NP must be in [2,16]\n"); return 1; }
+    if (N < 1 || N > 16) { fprintf(stderr, "LLAMA_TEST_NP must be in [1,16]\n"); return 1; }
 
     llama_backend_init();
 
@@ -169,12 +169,15 @@ int main() {
 
     const int n_vocab = llama_n_vocab(model);
 
-    // Tokenise prompts.
+    // Tokenise prompts. PROMPT_OFFSET lets the NP=1 reference run iterate
+    // p0.txt..p7.txt by re-invoking the binary 8× with OFFSET=0..7.
+    const int prompt_offset = std::getenv("LLAMA_TEST_PROMPT_OFFSET")
+                            ? std::atoi(std::getenv("LLAMA_TEST_PROMPT_OFFSET")) : 0;
     std::vector<slot_state> slots(N);
     for (int s = 0; s < N; s++) {
         slots[s].id = s;
         char path[512];
-        snprintf(path, sizeof(path), "%s/p%d.txt", pd, s);
+        snprintf(path, sizeof(path), "%s/p%d.txt", pd, s + prompt_offset);
         slots[s].prompt_path = path;
         std::ifstream f(path); std::stringstream ss; ss << f.rdbuf();
         slots[s].prompt_tokens = common_tokenize(ctx, ss.str(), true, true);
@@ -279,7 +282,7 @@ int main() {
                     "\"terminated\": %s, \"decode_ok\": %s, \"no_nan_inf\": %s, "
                     "\"in_vocab\": %d, \"n_gen\": %zu, \"in_vocab_ok\": %s, "
                     "\"ppl\": %.6f, \"ppl_ok\": %s, "
-                    "\"first_tokens\": [%d, %d, %d, %d, %d]}%s\n",
+                    "\"n_prompt_tokens\": %zu, \"generated_tokens\": [",
                     sl.id, sl.prompt_path.c_str(),
                     sl.terminated ? "true" : "false",
                     sl.decode_ok  ? "true" : "false",
@@ -287,12 +290,11 @@ int main() {
                     sl.in_vocab_count, sl.generated.size(),
                     sl.in_vocab_ok ? "true" : "false",
                     sl.ppl_of_output, sl.ppl_ok ? "true" : "false",
-                    sl.generated.size() > 0 ? (int) sl.generated[0] : -1,
-                    sl.generated.size() > 1 ? (int) sl.generated[1] : -1,
-                    sl.generated.size() > 2 ? (int) sl.generated[2] : -1,
-                    sl.generated.size() > 3 ? (int) sl.generated[3] : -1,
-                    sl.generated.size() > 4 ? (int) sl.generated[4] : -1,
-                    s + 1 < N ? "," : "");
+                    sl.prompt_tokens.size());
+                for (size_t k = 0; k < sl.generated.size(); k++) {
+                    fprintf(f, "%s%d", k ? "," : "", (int) sl.generated[k]);
+                }
+                fprintf(f, "]}%s\n", s + 1 < N ? "," : "");
             }
             fprintf(f, "  ],\n  \"n_fail\": %d\n}\n", n_fail);
             std::fclose(f);
