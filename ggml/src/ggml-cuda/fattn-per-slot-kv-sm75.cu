@@ -1716,3 +1716,159 @@ cleanup:
     }
     return 0;
 }
+
+// ============================================================================
+// Production-side dispatch entry — called from fattn.cu when the new ggml op
+// GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV is encountered.
+// ============================================================================
+//
+// Takes device pointers (from ggml_tensor->data) + ggml_backend_cuda_context
+// for pool allocation + stream. Uses Stage 2.3 split-K + combine path.
+//
+// Caller responsibility:
+//   - dst->src[0]=Q, [1]=K, [2]=V, [3]=mask, [5]=slot_seq_lens (i32, n_seqs)
+//   - All tensors fp16 (Q/K/V/mask); slot_seq_lens i32
+//   - dst is fp32 output [Dv, n_heads_q, n_tokens, n_seqs]
+//
+// Phase 1 wiring scope: gqa <= 16 (Approach C decode pack supports up to 16
+// rows). For n_tokens > 1, route to Stage 2.2a (prefill path). For n_tokens=1
+// and gqa <= 16, route to Stage 2.3 (split-K + combine).
+
+#include "ggml-cuda/common.cuh"
+#include "ggml-cuda/convert.cuh"
+
+void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+{
+    const ggml_tensor * Q             = dst->src[0];
+    const ggml_tensor * K             = dst->src[1];
+    const ggml_tensor * V             = dst->src[2];
+    const ggml_tensor * mask          = dst->src[3];
+    const ggml_tensor * slot_seq_lens = dst->src[5];
+
+    GGML_ASSERT(Q && K && V && mask && slot_seq_lens);
+    GGML_ASSERT(Q->type == GGML_TYPE_F32);   // ggml FA convention: Q is fp32
+    GGML_ASSERT(K->type == GGML_TYPE_F16);
+    GGML_ASSERT(V->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(slot_seq_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int Dq      = (int) Q->ne[0];
+    const int Dv      = (int) V->ne[0];
+    const int n_tok   = (int) Q->ne[1];
+    const int n_hq    = (int) Q->ne[2];
+    const int n_seqs  = (int) Q->ne[3];
+    const int n_kvmax = (int) K->ne[1];
+    const int n_hkv   = (int) K->ne[2];
+    const int KVB     = 16;  // primary at Dv=256 per spec §9
+
+    GGML_ASSERT(Dq == 256 && Dv == 256);
+    GGML_ASSERT(n_hq % n_hkv == 0);
+    const int gqa = n_hq / n_hkv;
+    GGML_ASSERT(gqa <= 16);
+
+    // Op_params: scale, max_bias, softcap, prec, swa_window (same as FA_EXT).
+    float scale = 1.0f, max_bias = 0.0f, softcap = 0.0f;
+    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    if (softcap != 0.0f) {
+        scale /= softcap;
+    }
+    const bool use_softcap = (softcap != 0.0f);
+
+    // Convert Q from fp32 to fp16 (FA kernels consume fp16 Q).
+    ggml_cuda_pool_alloc<uint16_t> Q_h_buf(ctx.pool(),
+        (size_t)Dq * n_tok * n_hq * n_seqs);
+    GGML_ASSERT(Q_h_buf.get() != nullptr);
+    {
+        auto to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        to_fp16(Q->data, (half *) Q_h_buf.get(),
+                1, (int64_t)Dq * n_tok * n_hq * n_seqs, ctx.stream());
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const uint16_t * Q_d = Q_h_buf.get();
+    const uint16_t * K_d = (const uint16_t *) K->data;
+    const uint16_t * V_d = (const uint16_t *) V->data;
+    const uint16_t * M_d = (const uint16_t *) mask->data;
+    const int32_t  * S_d = (const int32_t  *) slot_seq_lens->data;
+    float          * O_d = (float          *) dst->data;
+
+    if (n_tok > 1) {
+        // Prefill path: Stage 2.2a (Approach A, no split-K).
+        const dim3 grid(n_seqs, n_tok, n_hq);
+        const dim3 block(32, 4, 1);
+        fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block, 0, stream>>>(
+            Q_d, K_d, V_d, M_d, S_d, O_d,
+            Dq, Dv, KVB,
+            n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
+            scale, softcap, use_softcap
+        );
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // Decode path: Stage 2.3 split-K + combine. Pool-allocate partials.
+    // pb_per_slot must come from the device-side slot_seq_lens. We need it
+    // on host to compute max_pb (grid.z). Tiny array (~n_seqs ints): copy
+    // back to host transiently.
+    std::vector<int32_t> slot_seq_lens_h(n_seqs);
+    CUDA_CHECK(cudaMemcpyAsync(slot_seq_lens_h.data(), S_d,
+        n_seqs * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> pb_per_slot_h(n_seqs);
+    int max_pb = 1;
+    for (int s = 0; s < n_seqs; s++) {
+        const int pb = std::max(1, (slot_seq_lens_h[s] + 255) / 256);
+        pb_per_slot_h[s] = pb;
+        if (pb > max_pb) max_pb = pb;
+    }
+
+    ggml_cuda_pool_alloc<int32_t> pb_buf(ctx.pool(), n_seqs);
+    ggml_cuda_pool_alloc<float>   dst_partial_buf(ctx.pool(),
+        (size_t)n_seqs * n_hq * max_pb * Dv);
+    ggml_cuda_pool_alloc<float2>  dst_meta_buf(ctx.pool(),
+        (size_t)n_seqs * n_hq * max_pb);
+    GGML_ASSERT(pb_buf.get() != nullptr);
+    GGML_ASSERT(dst_partial_buf.get() != nullptr);
+    GGML_ASSERT(dst_meta_buf.get() != nullptr);
+
+    CUDA_CHECK(cudaMemcpyAsync(pb_buf.get(), pb_per_slot_h.data(),
+        n_seqs * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    // Init dst_meta to (-INF, 0). Use a small kernel since cudaMemset can't
+    // write -INF directly.
+    {
+        std::vector<float2> meta_init((size_t)n_seqs * n_hq * max_pb,
+            make_float2(-INFINITY, 0.0f));
+        CUDA_CHECK(cudaMemcpyAsync(dst_meta_buf.get(), meta_init.data(),
+            meta_init.size() * sizeof(float2), cudaMemcpyHostToDevice, stream));
+    }
+
+    {
+        const dim3 grid(n_seqs, n_hkv, max_pb);
+        const dim3 block(32, 4, 1);
+        fattn_per_slot_kv_sm75_stage23_kernel<<<grid, block, 0, stream>>>(
+            Q_d, K_d, V_d, M_d, S_d, pb_buf.get(),
+            dst_partial_buf.get(), dst_meta_buf.get(),
+            Dq, Dv, KVB,
+            n_hq, n_hkv, n_seqs, n_kvmax,
+            /*H_packed=*/gqa, max_pb,
+            scale, softcap, use_softcap
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    {
+        const dim3 grid(n_seqs, n_hq, 1);
+        const dim3 block(Dv, 1, 1);
+        fattn_per_slot_kv_sm75_combine_kernel<<<grid, block, 0, stream>>>(
+            dst_partial_buf.get(), dst_meta_buf.get(), pb_buf.get(), O_d,
+            Dv, n_hq, n_seqs, max_pb
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
