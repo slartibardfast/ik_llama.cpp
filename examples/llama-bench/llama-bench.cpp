@@ -2541,11 +2541,32 @@ static void test_gen_spec(
     const bool is_dflash = (spec_params.type == COMMON_SPECULATIVE_TYPE_DFLASH);
     std::vector<llama_token> prompt_tgt;
 
+    // Phase 2 timing instrumentation. Gated on DFLASH_TIMING=1.
+    // Buckets accumulate per cycle and total ns; print per-cycle line +
+    // a final ledger row.
+    const bool timing_on = std::getenv("DFLASH_TIMING") != nullptr;
+    struct cycle_ns {
+        uint64_t draft = 0, save = 0, verify_decode = 0, argmax_loop = 0;
+        uint64_t accept = 0, restore = 0, trim = 0, reseed = 0, bookkeep = 0;
+    };
+    cycle_ns total_ns;
+    auto tnow = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
     while ((int) emitted.size() < n_gen) {
+        cycle_ns t_ns;
+        uint64_t t0_bk = tnow();
         prompt_tgt.assign(prompt_tokens.begin(), prompt_tokens.end());
         prompt_tgt.insert(prompt_tgt.end(), emitted.begin(), emitted.end() - 1);
 
+        uint64_t t0_draft = tnow();
         const llama_tokens draft = common_speculative_draft(spec, spec_params, prompt_tgt, id_last);
+        if (timing_on) {
+            llama_synchronize(ctx);
+        }
+        t_ns.draft = tnow() - t0_draft;
         n_drafts++;
         n_draft_total += (int) draft.size();
 
@@ -2566,7 +2587,10 @@ static void test_gen_spec(
         const llama_pos P = (llama_pos) prompt_tgt.size();
 
         if (is_dflash) {
+            uint64_t t0_save = tnow();
             if (!llama_spec_ckpt_save(ctx, 0)) break;
+            if (timing_on) llama_synchronize(ctx);
+            t_ns.save = tnow() - t0_save;
         }
 
         const int verify_bs = (int) draft.size() + 1;
@@ -2575,18 +2599,25 @@ static void test_gen_spec(
         for (size_t k = 0; k < draft.size(); k++) {
             common_batch_add(batch, draft[k], P + 1 + (llama_pos) k, {0}, true);
         }
+        uint64_t t0_vd = tnow();
         if (llama_decode(ctx, batch) != 0) {
             llama_batch_free(batch);
             break;
         }
+        if (timing_on) llama_synchronize(ctx);
+        t_ns.verify_decode = tnow() - t0_vd;
+
+        uint64_t t0_am = tnow();
         std::vector<llama_token> sampled(verify_bs);
         for (int k = 0; k < verify_bs; k++) {
             float * logits = llama_get_logits_ith(ctx, k);
             if (!logits) { sampled[k] = -1; break; }
             sampled[k] = bench_greedy_argmax(logits, n_vocab);
         }
+        t_ns.argmax_loop = tnow() - t0_am;
         llama_batch_free(batch);
 
+        uint64_t t0_acc = tnow();
         int n_acc = 0;
         for (size_t k = 0; k < draft.size(); k++) {
             if (draft[k] == sampled[k]) n_acc++;
@@ -2594,16 +2625,24 @@ static void test_gen_spec(
         }
         common_speculative_accept(spec, (uint16_t) n_acc);
         n_accepted += n_acc;
-
         llama_token bonus = sampled[n_acc];
+        t_ns.accept = tnow() - t0_acc;
 
         if (is_dflash) {
+            uint64_t t0_rs = tnow();
             if (!llama_spec_ckpt_restore(ctx, 0, P, n_acc)) break;
+            if (timing_on) llama_synchronize(ctx);
+            t_ns.restore = tnow() - t0_rs;
+
+            uint64_t t0_tr = tnow();
             llama_dflash_trim_extract(ctx, P + n_acc + 1, -1);
+            t_ns.trim = tnow() - t0_tr;
         } else {
+            uint64_t t0_rs = tnow();
             // Roll back rejected positions from target KV. The verify batch
             // wrote [P .. P+BS]; we keep [P .. P+n_acc] (id_last + n_acc drafts).
             llama_kv_cache_seq_rm(ctx, 0, P + n_acc + 1, -1);
+            t_ns.restore = tnow() - t0_rs;
 
             // MTP: seed next cycle's draft with the LAST accepted position's
             // embedding. Verify wrote rows [0..BS]; row n_acc is the
@@ -2611,21 +2650,75 @@ static void test_gen_spec(
             // bonus token will be decoded next cycle. This mirrors
             // server-context.cpp:4019-4030 (post-restore re-seed).
             if (spec_params.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                uint64_t t0_rd = tnow();
                 const float * emb_acc = llama_get_embeddings_ith(ctx, n_acc);
                 if (emb_acc) {
                     llama_set_draft_input_hidden_state(ctx, emb_acc);
                 }
+                t_ns.reseed = tnow() - t0_rd;
             }
         }
 
         for (int k = 0; k < n_acc; k++) emitted.push_back(draft[k]);
         emitted.push_back(bonus);
         id_last = bonus;
+        t_ns.bookkeep = tnow() - t0_bk - t_ns.draft - t_ns.save - t_ns.verify_decode
+                        - t_ns.argmax_loop - t_ns.accept - t_ns.restore - t_ns.trim - t_ns.reseed;
+
+        if (timing_on) {
+            const uint64_t total = t_ns.draft + t_ns.save + t_ns.verify_decode + t_ns.argmax_loop
+                                 + t_ns.accept + t_ns.restore + t_ns.trim + t_ns.reseed + t_ns.bookkeep;
+            fprintf(stderr,
+                "[dflash-timing cycle %d] P=%d n_acc=%d total=%.2fms | "
+                "draft=%.2f save=%.2f verify=%.2f argmax=%.2f accept=%.2f "
+                "restore=%.2f trim=%.2f reseed=%.2f bk=%.2f\n",
+                n_drafts, (int) P, n_acc, total/1e6,
+                t_ns.draft/1e6, t_ns.save/1e6, t_ns.verify_decode/1e6,
+                t_ns.argmax_loop/1e6, t_ns.accept/1e6, t_ns.restore/1e6,
+                t_ns.trim/1e6, t_ns.reseed/1e6, t_ns.bookkeep/1e6);
+        }
+        total_ns.draft         += t_ns.draft;
+        total_ns.save          += t_ns.save;
+        total_ns.verify_decode += t_ns.verify_decode;
+        total_ns.argmax_loop   += t_ns.argmax_loop;
+        total_ns.accept        += t_ns.accept;
+        total_ns.restore       += t_ns.restore;
+        total_ns.trim          += t_ns.trim;
+        total_ns.reseed        += t_ns.reseed;
+        total_ns.bookkeep      += t_ns.bookkeep;
 
         // Bench: do NOT exit on EOG. Pad to n_gen for a fair t/s measurement
         // — production server-side semantics are about token throughput,
         // not output coherence beyond a sentinel. PPL-of-output is bounded
         // separately and provides the quality signal.
+    }
+
+    if (timing_on) {
+        const uint64_t total = total_ns.draft + total_ns.save + total_ns.verify_decode
+                             + total_ns.argmax_loop + total_ns.accept + total_ns.restore
+                             + total_ns.trim + total_ns.reseed + total_ns.bookkeep;
+        auto pct = [&](uint64_t x) { return total > 0 ? 100.0 * x / total : 0.0; };
+        fprintf(stderr,
+            "[dflash-timing TOTAL n_cycles=%d emit=%zu] total=%.2fms\n"
+            "  draft   = %8.2f ms (%5.1f%%)\n"
+            "  save    = %8.2f ms (%5.1f%%)\n"
+            "  verify  = %8.2f ms (%5.1f%%)\n"
+            "  argmax  = %8.2f ms (%5.1f%%)\n"
+            "  accept  = %8.2f ms (%5.1f%%)\n"
+            "  restore = %8.2f ms (%5.1f%%)\n"
+            "  trim    = %8.2f ms (%5.1f%%)\n"
+            "  reseed  = %8.2f ms (%5.1f%%)\n"
+            "  bookkep = %8.2f ms (%5.1f%%)\n",
+            n_drafts, emitted.size(), total/1e6,
+            total_ns.draft/1e6,         pct(total_ns.draft),
+            total_ns.save/1e6,          pct(total_ns.save),
+            total_ns.verify_decode/1e6, pct(total_ns.verify_decode),
+            total_ns.argmax_loop/1e6,   pct(total_ns.argmax_loop),
+            total_ns.accept/1e6,        pct(total_ns.accept),
+            total_ns.restore/1e6,       pct(total_ns.restore),
+            total_ns.trim/1e6,          pct(total_ns.trim),
+            total_ns.reseed/1e6,        pct(total_ns.reseed),
+            total_ns.bookkeep/1e6,      pct(total_ns.bookkeep));
     }
 
     if (out_generated) {
