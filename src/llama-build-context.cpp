@@ -112,6 +112,7 @@ void llm_build_context::init() {
     lctx.default_decoder.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
     lctx.default_decoder.inp_KQ_mask_cross = nullptr;
+    lctx.default_decoder.inp_slot_seq_lens = nullptr;
 }
 
 void llm_build_context::free() {

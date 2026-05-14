@@ -1748,8 +1748,8 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
 
     GGML_ASSERT(Q && K && V && mask && slot_seq_lens);
     GGML_ASSERT(Q->type == GGML_TYPE_F32);   // ggml FA convention: Q is fp32
-    GGML_ASSERT(K->type == GGML_TYPE_F16);
-    GGML_ASSERT(V->type == GGML_TYPE_F16);
+    // K/V may be quantized (Q4_0 + Hadamard in production); kernel takes fp16,
+    // so we inline-dequant below (mirrors fattn-mma-f16.cu:102-125 pattern).
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
     GGML_ASSERT(slot_seq_lens->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -1790,14 +1790,43 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
 
     cudaStream_t stream = ctx.stream();
     const uint16_t * Q_d = Q_h_buf.get();
-    const uint16_t * K_d = (const uint16_t *) K->data;
-    const uint16_t * V_d = (const uint16_t *) V->data;
     const uint16_t * M_d = (const uint16_t *) mask->data;
     const int32_t  * S_d = (const int32_t  *) slot_seq_lens->data;
     float          * O_d = (float          *) dst->data;
 
+    // Inline K/V dequant to fp16 if needed (Q4_0 in production).
+    // Buffers allocated from pool; lifetime tied to this function scope.
+    ggml_cuda_pool_alloc<uint16_t> K_dq_buf(ctx.pool());
+    ggml_cuda_pool_alloc<uint16_t> V_dq_buf(ctx.pool());
+    const uint16_t * K_d;
+    const uint16_t * V_d;
+    if (K->type == GGML_TYPE_F16) {
+        K_d = (const uint16_t *) K->data;
+    } else {
+        const int64_t n_K = ggml_nelements(K);
+        K_dq_buf.alloc(n_K);
+        GGML_ASSERT(K_dq_buf.get() != nullptr);
+        auto to_fp16 = ggml_get_to_fp16_cuda(K->type);
+        to_fp16(K->data, (half *) K_dq_buf.get(), 1, n_K, stream);
+        K_d = K_dq_buf.get();
+    }
+    if (V->type == GGML_TYPE_F16) {
+        V_d = (const uint16_t *) V->data;
+    } else {
+        const int64_t n_V = ggml_nelements(V);
+        V_dq_buf.alloc(n_V);
+        GGML_ASSERT(V_dq_buf.get() != nullptr);
+        auto to_fp16 = ggml_get_to_fp16_cuda(V->type);
+        to_fp16(V->data, (half *) V_dq_buf.get(), 1, n_V, stream);
+        V_d = V_dq_buf.get();
+    }
+
+    // Production wiring uses Stage 2.2b (single-pass Approach C decode pack)
+    // for n_tok == 1 and Stage 2.2a for prefill. Stage 2.3 split-K is deferred
+    // — it requires a host sync on max_pb which is incompatible with CUDA
+    // graph capture (graph_reuse is set in production cparams). Follow-up
+    // will reintroduce split-K with on-device pb computation.
     if (n_tok > 1) {
-        // Prefill path: Stage 2.2a (Approach A, no split-K).
         const dim3 grid(n_seqs, n_tok, n_hq);
         const dim3 block(32, 4, 1);
         fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block, 0, stream>>>(
@@ -1806,69 +1835,16 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
             n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
             scale, softcap, use_softcap
         );
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    // Decode path: Stage 2.3 split-K + combine. Pool-allocate partials.
-    // pb_per_slot must come from the device-side slot_seq_lens. We need it
-    // on host to compute max_pb (grid.z). Tiny array (~n_seqs ints): copy
-    // back to host transiently.
-    std::vector<int32_t> slot_seq_lens_h(n_seqs);
-    CUDA_CHECK(cudaMemcpyAsync(slot_seq_lens_h.data(), S_d,
-        n_seqs * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<int32_t> pb_per_slot_h(n_seqs);
-    int max_pb = 1;
-    for (int s = 0; s < n_seqs; s++) {
-        const int pb = std::max(1, (slot_seq_lens_h[s] + 255) / 256);
-        pb_per_slot_h[s] = pb;
-        if (pb > max_pb) max_pb = pb;
-    }
-
-    ggml_cuda_pool_alloc<int32_t> pb_buf(ctx.pool(), n_seqs);
-    ggml_cuda_pool_alloc<float>   dst_partial_buf(ctx.pool(),
-        (size_t)n_seqs * n_hq * max_pb * Dv);
-    ggml_cuda_pool_alloc<float2>  dst_meta_buf(ctx.pool(),
-        (size_t)n_seqs * n_hq * max_pb);
-    GGML_ASSERT(pb_buf.get() != nullptr);
-    GGML_ASSERT(dst_partial_buf.get() != nullptr);
-    GGML_ASSERT(dst_meta_buf.get() != nullptr);
-
-    CUDA_CHECK(cudaMemcpyAsync(pb_buf.get(), pb_per_slot_h.data(),
-        n_seqs * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-
-    // Init dst_meta to (-INF, 0). Use a small kernel since cudaMemset can't
-    // write -INF directly.
-    {
-        std::vector<float2> meta_init((size_t)n_seqs * n_hq * max_pb,
-            make_float2(-INFINITY, 0.0f));
-        CUDA_CHECK(cudaMemcpyAsync(dst_meta_buf.get(), meta_init.data(),
-            meta_init.size() * sizeof(float2), cudaMemcpyHostToDevice, stream));
-    }
-
-    {
-        const dim3 grid(n_seqs, n_hkv, max_pb);
+    } else {
+        const dim3 grid(n_seqs, n_hkv, 1);
         const dim3 block(32, 4, 1);
-        fattn_per_slot_kv_sm75_stage23_kernel<<<grid, block, 0, stream>>>(
-            Q_d, K_d, V_d, M_d, S_d, pb_buf.get(),
-            dst_partial_buf.get(), dst_meta_buf.get(),
+        fattn_per_slot_kv_sm75_stage22b_kernel<<<grid, block, 0, stream>>>(
+            Q_d, K_d, V_d, M_d, S_d, O_d,
             Dq, Dv, KVB,
             n_hq, n_hkv, n_seqs, n_kvmax,
-            /*H_packed=*/gqa, max_pb,
+            /*H_packed=*/gqa,
             scale, softcap, use_softcap
         );
-        CUDA_CHECK(cudaGetLastError());
     }
-
-    {
-        const dim3 grid(n_seqs, n_hq, 1);
-        const dim3 block(Dv, 1, 1);
-        fattn_per_slot_kv_sm75_combine_kernel<<<grid, block, 0, stream>>>(
-            dst_partial_buf.get(), dst_meta_buf.get(), pb_buf.get(), O_d,
-            Dv, n_hq, n_seqs, max_pb
-        );
-        CUDA_CHECK(cudaGetLastError());
-    }
+    CUDA_CHECK(cudaGetLastError());
 }
