@@ -788,9 +788,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
-            for (auto ts : string_split<std::string>(argv[i], split_delim)) {
-                // split string by ; and /
-                const std::regex regex{R"([;/]+)"};
+            // Outer delimiter for tensor-split is ';' (separates multiple
+            // configs to sweep across); inner uses ',' or '/' to separate
+            // per-device values WITHIN a config. This matches the
+            // common.cpp (server / cli) convention where `-ts 1,1` means
+            // one config with even split across two devices. Using ',' as
+            // the outer delimiter (the global llama-bench split_delim)
+            // would mis-parse `1,1` as TWO configs of one value each, sending
+            // all weight to GPU 0 — which on DeltaNet/hybrid models trips
+            // the load-tensors assert "single GPU participating in the
+            // delta-net tensor split".
+            for (auto ts : string_split<std::string>(argv[i], ';')) {
+                const std::regex regex{R"([,/]+)"};
                 std::sregex_token_iterator it{ts.begin(), ts.end(), regex, -1};
                 std::vector<std::string> split_arg{it, {}};
                 GGML_ASSERT(split_arg.size() <= llama_max_devices());
