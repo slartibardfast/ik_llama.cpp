@@ -2407,7 +2407,9 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
 
     GGML_ASSERT(Q && V && mask && per_row_k_bound);
     GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
-    GGML_ASSERT(Q->ne[1] <= 8);  // production target NP <= 8
 
+    // cols_per_block=8 covers any ne[1] via multi-CTA tiling
+    // (blocks_num.x = ceil(ne[1]/8)). parallel_blocks=1 pins the K-loop
+    // partitioning. Both are compile-time constants — NP-independent.
     ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, half>(ctx, dst);
 }

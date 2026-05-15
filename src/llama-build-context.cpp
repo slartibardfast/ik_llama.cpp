@@ -2708,6 +2708,14 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_ENABLE");
                     return e && std::strcmp(e, "1") == 0;
                 }();
+                // The per-row-K-bound dispatch routes ALL FA calls (decode
+                // and prefill alike) to wmma_f16_case_pb1<256, 256, 8, half>.
+                // cols_per_block=8 + parallel_blocks=1 are NP-independent
+                // compile-time constants; for prefill ne[1]>8 the kernel
+                // launches ceil(ne[1]/8) CTAs in x-dim, covering all rows.
+                // Restricting the route to decode (ne[1]<=8) leaked shape
+                // dependence through prefill's heuristic into the KV cache
+                // state, breaking the NP-cross determinism contract.
                 const bool use_per_slot_kv =
                     fa_per_slot_enabled
                     && cparams.flash_attn
