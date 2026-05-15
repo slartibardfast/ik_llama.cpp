@@ -404,6 +404,31 @@ if (GGML_CUDA)
         # EffectiveSeqLensSubtractsRejected). Drives llama_spec_ckpt_*
         # save → verify → restore.
         llama_build_and_test(dflash-speculative/test-dflash-spec-ckpt-flow.cpp)
+
+        # PHASE_MMQ_Q4_0_AR16 A.3: load_tiles_q4_0_ar16 SMEM dump vs CPU
+        # dequant oracle. Single CUDA source (.cu), self-contained main().
+        # Needs CUDA language enabled at tests/ scope.
+        enable_language(CUDA)
+        set(TEST_TARGET test-mmq-q4-0-ar16-load-tiles)
+        add_executable(${TEST_TARGET}
+            dflash-speculative/test-mmq-q4-0-ar16-load-tiles.cu)
+        target_include_directories(${TEST_TARGET} PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CMAKE_SOURCE_DIR}/ggml/include
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(${TEST_TARGET} PRIVATE CUDA::cudart ggml)
+        target_compile_definitions(${TEST_TARGET} PRIVATE
+            GGML_USE_CUDA
+            GGML_CUDA_FUSION=1
+            GGML_CUDA_MIN_BATCH_OFFLOAD=32
+            GGML_CUDA_DMMV_X=32
+            GGML_CUDA_MMV_Y=1
+            GGML_CUDA_PEER_MAX_BATCH_SIZE=128
+            K_QUANTS_PER_ITERATION=2)
+        set_target_properties(${TEST_TARGET} PROPERTIES CUDA_ARCHITECTURES 75)
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+        set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
     endif()
 endif()
 
