@@ -460,6 +460,29 @@ static_assert(get_VKQ_stride( 80, 1, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 2, 16) ==  16, "Test failed.");
 static_assert(get_VKQ_stride( 80, 4, 16) ==  16, "Test failed.");
 
+// Force parallel_blocks=1 entry point (bypasses the heuristic in
+// ggml_cuda_flash_attn_ext_wmma_f16_case). Used by the per-row K-bound
+// dispatch path to eliminate the NP-dependent split-K geometry that
+// makes the heuristic-selected variant non-deterministic across NP.
+// Per spec §15.7, cols_per_block + parallel_blocks fixed at compile
+// time is the determinism primitive; the existing mask already covers
+// per-row K-bound semantics bit-identically. See fattn-wmma-f16.cuh
+// (heuristic) and specs/deltanet/fattn-per-slot-kv-sm75.md §15.7.
+template <int Dk, int Dv, int cols_per_block, typename KQ_acc_t>
+void ggml_cuda_flash_attn_ext_wmma_f16_case_pb1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int nwarps = 4;
+    constexpr int frag_m = cols_per_block == 8 && Dk % 32 == 0 ? 32 : 16;
+    constexpr int parallel_blocks = 1;
+
+    float softcap;
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    fattn_kernel_t fattn_kernel = softcap == 0.0f ?
+        flash_attn_ext_f16<Dk, Dv, cols_per_block, nwarps, get_VKQ_stride(Dv, nwarps, frag_m), parallel_blocks, KQ_acc_t, false> :
+        flash_attn_ext_f16<Dk, Dv, cols_per_block, nwarps, get_VKQ_stride(Dv, nwarps, frag_m), parallel_blocks, KQ_acc_t, true>;
+    launch_fattn<Dk, Dv, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
+}
+
 template <int Dk, int Dv, int cols_per_block, typename KQ_acc_t>
 void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];

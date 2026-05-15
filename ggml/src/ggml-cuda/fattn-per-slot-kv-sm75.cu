@@ -1,6 +1,27 @@
 // fattn-per-slot-kv-sm75.cu
 //
-// SoTA sm_75 batch-invariant flash-attention replacement for
+// ============================================================================
+// DEPRECATED FROM PRODUCTION DISPATCH (spec §15.6, §15.7).
+// ============================================================================
+// The bespoke per-slot kernels below (naive, multi_row, decode_split_k,
+// single_head_split_k, combine, compute_pb, init_meta, stage21, stage22b,
+// stage23) are RETAINED COMPILED to back the unit test
+// tests/dflash-speculative/test-fattn-per-slot-kv-sm75 as a reference
+// oracle of algorithmic per-row-CTA batch invariance. They are NO LONGER
+// invoked from the production dispatch path.
+//
+// The production dispatcher entry point at the bottom of this file
+// (ggml_cuda_flash_attn_ext_per_slot_kv_sm75) now routes to the stock
+// wmma_f16 kernel with cols_per_block + parallel_blocks fixed at
+// compile time. Per §15.7, the existing per-row mask is the determinism
+// primitive; the heuristic dispatch was the non-determinism source.
+//
+// Eventual deletion of this file is deferred to a soak period after
+// P2 ships and is confirmed stable.
+//
+// Historical context (Stage 2.1 → 2.3 lifecycle):
+// ----------------------------------------------------------------------------
+// SoTA sm_75 batch-invariant flash-attention replacement attempt for
 // ggml_cuda_flash_attn_ext_wmma_f16. Targets the Qwen 3.5/3.6 production
 // tuple (HEAD_DIM_Q = HEAD_DIM_V = 256). See
 // specs/deltanet/fattn-per-slot-kv-sm75.md for the full design.
@@ -2359,167 +2380,34 @@ cleanup:
 // and gqa <= 16, route to Stage 2.3 (split-K + combine).
 
 #include "ggml-cuda/common.cuh"
-#include "ggml-cuda/convert.cuh"
+// NB: fattn-wmma-f16.cuh transitively includes convert.cuh.
+#include "ggml-cuda/fattn-wmma-f16.cuh"
 
+// Production dispatcher for GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV.
+//
+// Per spec §15.7: the determinism contract is delivered by forcing
+// cols_per_block + parallel_blocks to NP-independent constants on the
+// wmma_f16 path. The existing per-row mask already handles per-row K
+// exclusion bit-identically (proof in §15.7). The bespoke per-slot
+// kernels above are deprecated from production routing.
+//
+// Production target shape: Dq=Dv=256, gqa<=16, Q->ne[1] in {1..8} for
+// batched decode at NP up to 8. Single instantiation:
+//   ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, half>
+//
+// per_row_k_bound (dst->src[5]) is plumbed but unused here; available
+// for future perf optimization (K-loop tail trim).
 void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 {
-    const ggml_tensor * Q             = dst->src[0];
-    const ggml_tensor * K             = dst->src[1];
-    const ggml_tensor * V             = dst->src[2];
-    const ggml_tensor * mask          = dst->src[3];
-    const ggml_tensor * slot_seq_lens = dst->src[5];
+    const ggml_tensor * Q               = dst->src[0];
+    const ggml_tensor * V               = dst->src[2];
+    const ggml_tensor * mask            = dst->src[3];
+    const ggml_tensor * per_row_k_bound = dst->src[5];
 
-    GGML_ASSERT(Q && K && V && mask && slot_seq_lens);
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);   // ggml FA convention: Q is fp32
-    // K/V may be quantized (Q4_0 + Hadamard in production); kernel takes fp16,
-    // so we inline-dequant below (mirrors fattn-mma-f16.cu:102-125 pattern).
-    GGML_ASSERT(mask->type == GGML_TYPE_F16);
-    GGML_ASSERT(slot_seq_lens->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q && V && mask && per_row_k_bound);
+    GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
+    GGML_ASSERT(Q->ne[1] <= 8);  // production target NP <= 8
 
-    const int Dq      = (int) Q->ne[0];
-    const int Dv      = (int) V->ne[0];
-    const int n_tok   = (int) Q->ne[1];
-    const int n_hq    = (int) Q->ne[2];
-    const int n_seqs  = (int) Q->ne[3];
-    const int n_kvmax = (int) K->ne[1];
-    const int n_hkv   = (int) K->ne[2];
-    const int KVB     = 32;  // SoTA SMEM redesign — KVB=32 halves K-block count
-
-    GGML_ASSERT(Dq == 256 && Dv == 256);
-    GGML_ASSERT(n_hq % n_hkv == 0);
-    const int gqa = n_hq / n_hkv;
-    GGML_ASSERT(gqa <= 16);
-
-    // Op_params: scale, max_bias, softcap, prec, swa_window (same as FA_EXT).
-    float scale = 1.0f, max_bias = 0.0f, softcap = 0.0f;
-    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
-    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
-    if (softcap != 0.0f) {
-        scale /= softcap;
-    }
-    const bool use_softcap = (softcap != 0.0f);
-
-    // Convert Q from fp32 to fp16 (FA kernels consume fp16 Q).
-    ggml_cuda_pool_alloc<uint16_t> Q_h_buf(ctx.pool(),
-        (size_t)Dq * n_tok * n_hq * n_seqs);
-    GGML_ASSERT(Q_h_buf.get() != nullptr);
-    {
-        auto to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-        to_fp16(Q->data, (half *) Q_h_buf.get(),
-                1, (int64_t)Dq * n_tok * n_hq * n_seqs, ctx.stream());
-    }
-
-    cudaStream_t stream = ctx.stream();
-    const uint16_t * Q_d = Q_h_buf.get();
-    const uint16_t * M_d = (const uint16_t *) mask->data;
-    const int32_t  * S_d = (const int32_t  *) slot_seq_lens->data;
-    float          * O_d = (float          *) dst->data;
-
-    // Inline K/V dequant to fp16 if needed (Q4_0 in production).
-    // Buffers allocated from pool; lifetime tied to this function scope.
-    ggml_cuda_pool_alloc<uint16_t> K_dq_buf(ctx.pool());
-    ggml_cuda_pool_alloc<uint16_t> V_dq_buf(ctx.pool());
-    const uint16_t * K_d;
-    const uint16_t * V_d;
-    if (K->type == GGML_TYPE_F16) {
-        K_d = (const uint16_t *) K->data;
-    } else {
-        const int64_t n_K = ggml_nelements(K);
-        K_dq_buf.alloc(n_K);
-        GGML_ASSERT(K_dq_buf.get() != nullptr);
-        auto to_fp16 = ggml_get_to_fp16_cuda(K->type);
-        to_fp16(K->data, (half *) K_dq_buf.get(), 1, n_K, stream);
-        K_d = K_dq_buf.get();
-    }
-    if (V->type == GGML_TYPE_F16) {
-        V_d = (const uint16_t *) V->data;
-    } else {
-        const int64_t n_V = ggml_nelements(V);
-        V_dq_buf.alloc(n_V);
-        GGML_ASSERT(V_dq_buf.get() != nullptr);
-        auto to_fp16 = ggml_get_to_fp16_cuda(V->type);
-        to_fp16(V->data, (half *) V_dq_buf.get(), 1, n_V, stream);
-        V_d = V_dq_buf.get();
-    }
-
-    // Production dispatch: prefill → multi-row; decode → Stage 2.3 (split-K
-    // with on-device pb computation, CUDA-graph-capture compatible).
-    if (n_tok > 1) {
-        const dim3 grid(n_seqs, n_tok, n_hq);
-        const dim3 block(32, 4, 1);
-        fattn_per_slot_kv_sm75_multi_row_kernel<<<grid, block, 0, stream>>>(
-            Q_d, K_d, V_d, M_d, S_d, O_d,
-            Dq, Dv, KVB,
-            n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
-            scale, softcap, use_softcap
-        );
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    // Stage 2.3 (decode path): split-K with on-device pb + dst_meta init.
-    // MAX_PB_HARD_CAP chosen to give grid.z = 16 → at NP=1 grid = (1,4,16) =
-    // 64 CTAs (vs wmma_f16's 96 at decode shape); enough to fill 72 SMs at
-    // ~1 block/SM occupancy. Slots whose n_kv would imply higher pb just lose
-    // some split-K granularity but stay correct.
-    constexpr int MAX_PB_HARD_CAP = 16;
-
-    ggml_cuda_pool_alloc<int32_t> pb_buf(ctx.pool(), n_seqs);
-    GGML_ASSERT(pb_buf.get() != nullptr);
-
-    // Compute pb_per_slot on device.
-    {
-        const int threads = (n_seqs <= 32) ? 32 : 64;
-        const dim3 block(threads, 1, 1);
-        const dim3 grid((n_seqs + threads - 1) / threads, 1, 1);
-        fattn_per_slot_kv_sm75_compute_pb_kernel<<<grid, block, 0, stream>>>(
-            S_d, pb_buf.get(), n_seqs, MAX_PB_HARD_CAP);
-    }
-
-    // Pool-allocate partials + meta sized for MAX_PB.
-    const size_t n_partial = (size_t)n_seqs * n_hq * MAX_PB_HARD_CAP * Dv;
-    const size_t n_meta    = (size_t)n_seqs * n_hq * MAX_PB_HARD_CAP;
-    ggml_cuda_pool_alloc<float>  dst_partial_buf(ctx.pool(), n_partial);
-    ggml_cuda_pool_alloc<float2> dst_meta_buf(ctx.pool(), n_meta);
-    GGML_ASSERT(dst_partial_buf.get() != nullptr);
-    GGML_ASSERT(dst_meta_buf.get() != nullptr);
-
-    // Init dst_meta to (-INF, 0) on device (cudaMemset can't write -INF fp32).
-    {
-        const int threads = 256;
-        const int blocks  = ((int)n_meta + threads - 1) / threads;
-        fattn_per_slot_kv_sm75_init_meta_kernel<<<blocks, threads, 0, stream>>>(
-            dst_meta_buf.get(), (int)n_meta);
-    }
-
-    // Launch FA kernel with grid.z = MAX_PB_HARD_CAP. CTAs at
-    // ip >= pb_for_slot return early after writing sentinel meta.
-    // Decode (n_tokens=1) uses the 1-row state specialization to avoid
-    // the 64-reg accumulator footprint of the generic kernel that was
-    // likely spilling to local memory.
-    GGML_ASSERT(n_tok == 1);  // device dispatch only reaches here at decode
-    {
-        const dim3 grid(n_seqs, n_hq, MAX_PB_HARD_CAP);
-        const dim3 block(32, 4, 1);
-        fattn_per_slot_kv_sm75_decode_split_k_kernel<<<grid, block, 0, stream>>>(
-            Q_d, K_d, V_d, M_d, S_d, pb_buf.get(),
-            dst_partial_buf.get(), dst_meta_buf.get(),
-            Dq, Dv, KVB,
-            n_hq, n_hkv, n_seqs, n_kvmax,
-            MAX_PB_HARD_CAP,
-            scale, softcap, use_softcap);
-    }
-
-    // Combine across ip per (slot, head_global).
-    {
-        const dim3 grid(n_seqs, n_hq, 1);
-        const dim3 block(Dv, 1, 1);
-        fattn_per_slot_kv_sm75_combine_kernel<<<grid, block, 0, stream>>>(
-            dst_partial_buf.get(), dst_meta_buf.get(), pb_buf.get(), O_d,
-            Dv, n_hq, n_seqs, MAX_PB_HARD_CAP);
-    }
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, half>(ctx, dst);
 }
