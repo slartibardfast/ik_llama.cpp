@@ -312,6 +312,18 @@ if (GGML_CUDA)
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # Phase CX.A — ne[1] sweep test for the wmma fp16 frag_c_VKQ claim.
+    # The companion dispatch-np-invariance test only varies K-cache stride
+    # at ne[1]=1; this varies ne[1] ∈ {1, 2, 4, 8} with row-0 input
+    # invariant, exposing inter-row WMMA fp16 rounding if present.
+    set(TEST_TARGET test-fattn-per-slot-kv-ncols-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-fattn-per-slot-kv-ncols-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
