@@ -2685,6 +2685,18 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
 
+    // Opt-in: force a single shape-independent matmul kernel for all
+    // ne[1] values. Default dispatch picks MMVQ at small batch, MMQ at
+    // medium, cuBLAS at large — different fp accumulator orders break
+    // NP-cross byte-identity when one slot decodes alone vs batched.
+    // Forcing MMQ (per-tile structure, row-independent) for all ne[1]
+    // gives byte-identical row-0 output regardless of batch size.
+    // See specs/deltanet/fattn-per-slot-kv-sm75.md §15.22.
+    static const bool force_shape_invariant_dispatch = []() {
+        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+
     bool use_dequantize_mul_mat_vec = ggml_cuda_dmmv_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src0->ne[0] % (GGML_CUDA_DMMV_X*2) == 0 && src1->ne[1] == 1;
@@ -2695,6 +2707,9 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     bool              use_mul_mat_q =  ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
+    // Note: force-MMQ only safe when MMQ supports the type. ggml_cuda_should_use_mmq
+    // returns false for unsupported types; we re-check after the per-type test below.
+
     // if mmvq is available it's a better choice than dmmv:
 #ifndef GGML_CUDA_FORCE_DMMV
     use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && !use_mul_mat_vec_q;
@@ -2703,7 +2718,25 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     bool any_gpus_with_slow_fp16 = false;
 
     const int cc            = ggml_cuda_info().devices[ctx.device].cc;
-    use_mul_mat_q           = use_mul_mat_q           && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
+    // ggml_cuda_should_use_mmq() is shape-aware (returns false at very small
+    // ne[1]) AND type-aware (returns false for types MMQ doesn't support).
+    // In force_shape_invariant_dispatch mode, override the shape rejection
+    // by querying with a "safe" ne11 that bypasses the size cutoff — but
+    // keep the type rejection so unsupported types (e.g. Q4_0_AR16) still
+    // fall through to MMVQ/cuBLAS without aborting at runtime.
+    if (force_shape_invariant_dispatch) {
+        // Call with ne11=16 which is below the DP4A cutoff but above
+        // MMVQ's preferred range — exercises the type-support test only.
+        use_mul_mat_q       = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/16);
+    } else {
+        use_mul_mat_q       = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
+    }
+    // When forcing shape-invariant + MMQ-supported, suppress MMVQ/DMMV so
+    // MMQ is the chosen path regardless of batch size.
+    if (force_shape_invariant_dispatch && use_mul_mat_q) {
+        use_mul_mat_vec_q         = false;
+        use_dequantize_mul_mat_vec = false;
+    }
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1) {
