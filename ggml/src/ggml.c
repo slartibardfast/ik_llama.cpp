@@ -10235,10 +10235,13 @@ void ggml_flash_attn_ext_set_prec(
 // ggml_flash_attn_ext_per_slot_kv
 //
 // Same shape inference as ggml_flash_attn_ext, with an additional
-// src[5]=slot_seq_lens i32 tensor of length n_seqs. The CUDA dispatcher
-// uses slot_seq_lens to bound the per-slot K-loop iteration count (the
-// determinism fix); CPU eval falls through to ggml_compute_forward_flash_attn_ext
-// which ignores src[5].
+// src[5]=per_row_k_bound i32 tensor of length q->ne[1] (n_tok). The CUDA
+// dispatcher passes per_row_k_bound to a bounded wmma_f16 variant which
+// masks K positions >= bound[row] inside the K-loop — eliminating
+// dependence of softmax statistics on K-positions beyond the row's bound.
+// CPU eval falls through to ggml_compute_forward_flash_attn_ext (ignores
+// src[5]).
+// See specs/deltanet/fattn-per-slot-kv-sm75.md §15.6.
 
 struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
         struct ggml_context * ctx,
@@ -10246,7 +10249,7 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
-        struct ggml_tensor  * slot_seq_lens,
+        struct ggml_tensor  * per_row_k_bound,
         float                 scale,
         float                 max_bias,
         float                 softcap) {
@@ -10264,13 +10267,13 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
         GGML_ASSERT(mask);
     }
 
-    GGML_ASSERT(slot_seq_lens);
-    GGML_ASSERT(slot_seq_lens->type == GGML_TYPE_I32);
-    // slot_seq_lens is a 1-D tensor of length n_seqs (== q->ne[3]).
-    GGML_ASSERT(slot_seq_lens->ne[0] == q->ne[3]);
-    GGML_ASSERT(slot_seq_lens->ne[1] == 1);
-    GGML_ASSERT(slot_seq_lens->ne[2] == 1);
-    GGML_ASSERT(slot_seq_lens->ne[3] == 1);
+    GGML_ASSERT(per_row_k_bound);
+    GGML_ASSERT(per_row_k_bound->type == GGML_TYPE_I32);
+    // per_row_k_bound is a 1-D tensor of length q->ne[1] (n_tok).
+    GGML_ASSERT(per_row_k_bound->ne[0] == q->ne[1]);
+    GGML_ASSERT(per_row_k_bound->ne[1] == 1);
+    GGML_ASSERT(per_row_k_bound->ne[2] == 1);
+    GGML_ASSERT(per_row_k_bound->ne[3] == 1);
 
     bool is_node = false;
 
@@ -10291,8 +10294,8 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
-    result->src[4] = NULL;          // sinks slot (unused for per-slot-kv variant)
-    result->src[5] = slot_seq_lens; // per-slot KV occupancy (i32, length n_seqs)
+    result->src[4] = NULL;            // sinks slot (unused for per-slot-kv variant)
+    result->src[5] = per_row_k_bound; // per-row K-loop bound (i32, length q->ne[1])
 
     return result;
 }
@@ -24576,8 +24579,8 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         case GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV:
             {
                 // CPU fallback for both ops uses the same forward kernel.
-                // PER_SLOT_KV's src[5]=slot_seq_lens is ignored on CPU (CPU
-                // path uses K->ne[1] for all slots, matching the existing
+                // PER_SLOT_KV's src[5]=per_row_k_bound is ignored on CPU (CPU
+                // path uses K->ne[1] for all rows, matching the existing
                 // non-deterministic behavior). The new op is CUDA-only for
                 // determinism semantics; CPU eval is a correctness-only path.
                 ggml_compute_forward_flash_attn_ext(params, tensor);

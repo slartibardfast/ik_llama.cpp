@@ -665,7 +665,7 @@ extern "C" {
         GGML_OP_CONV_2D_DW,
 
         GGML_OP_FLASH_ATTN_EXT,
-        GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV,  // FA with per-slot KV occupancy (src[5] = slot_seq_lens i32)
+        GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV,  // FA with per-row K-loop bound (src[5] = per_row_k_bound i32, length q->ne[1])
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2436,18 +2436,20 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // FA with per-slot KV occupancy enforcement (deterministic at np>1).
+    // FA with per-row K-loop bound (deterministic at np>1).
     // Identical shape inference to ggml_flash_attn_ext; adds
-    // `slot_seq_lens` (i32, length n_seqs) as src[5]. The CUDA dispatcher
-    // uses slot_seq_lens to bound the per-slot K-loop in the FA kernel.
+    // `per_row_k_bound` (i32, length q->ne[1]) as src[5]. The CUDA
+    // dispatcher passes per_row_k_bound to a bounded wmma_f16 variant
+    // that masks K positions >= bound[row] inside the K-loop.
     // CPU eval falls through to the standard FA forward (ignores src[5]).
+    // See specs/deltanet/fattn-per-slot-kv-sm75.md §15.6.
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
-            struct ggml_tensor  * slot_seq_lens,
+            struct ggml_tensor  * per_row_k_bound,
             float                 scale,
             float                 max_bias,
             float                 softcap);
