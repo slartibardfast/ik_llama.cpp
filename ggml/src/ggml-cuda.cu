@@ -1681,6 +1681,23 @@ static void ggml_cuda_op_mul_mat_cublas(
     GGML_ASSERT(src1_ddf_i != nullptr);
     GGML_ASSERT(dst_dd_i   != nullptr);
 
+    // Determinism gate: under LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1, pin a
+    // fixed cuBLAS gemm algorithm so cuBLAS doesn't pick different algos at
+    // different (M, N, K) shapes — different algos can produce different fp
+    // accumulator orders → different bytes. ALGO0_TENSOR_OP is the conservative
+    // choice that runs on every Turing+ device; cuBLAS will fall back if a TC
+    // algo isn't supported for the requested compute/data type combination.
+    static const cublasGemmAlgo_t s_cublas_algo = []() {
+        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+        return (e && e[0] == '1' && e[1] == '\0')
+            ? CUBLAS_GEMM_ALGO0_TENSOR_OP
+            : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    }();
+    static const bool s_force_sid_cublas = []() {
+        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+
     const int64_t ne00 = src0->ne[0];
     const int64_t ne10 = src1->ne[0];
 
@@ -1696,6 +1713,12 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const int compute_capability = ggml_cuda_info().devices[id].cc;
 
+    // Under shape-invariant dispatch on Turing, BF16-native path at M=1 uses
+    // different numerics from the F16-conversion path used at M>1 (Turing has
+    // no BF16 TC). Force ALL BF16 matmuls through the F16-conversion path so
+    // the per-M code path is uniform.
+    const bool force_bf16_via_f16 = s_force_sid_cublas && compute_capability < CC_AMPERE;
+
     // BF16 native path: on sm_80+ cuBLAS picks BF16 tensor cores via CUBLAS_COMPUTE_32F.
     // On sm_75 (Turing) cuBLAS has no BF16 TC and falls back to magma_sgemmEx (FP32
     // compute, no TC) — fine at batch=1 (cublasGemv is well-tuned and beats FP16 path
@@ -1706,7 +1729,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     // Batch=1 keeps the BF16-native path (preserves baseline tg). Range overflow is
     // not a concern for inference activations on this model class.
     const bool bf16_native_eligible =
-        compute_capability >= CC_AMPERE || src1_ncols == 1;
+        (compute_capability >= CC_AMPERE || src1_ncols == 1) && !force_bf16_via_f16;
     if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && bf16_native_eligible) {
 
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
@@ -1744,7 +1767,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                                  src1_ptr,       CUDA_R_16BF, ne10,
                     &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
                     CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    s_cublas_algo));
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff, src1_ncols, stream);
@@ -1782,7 +1805,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                         src1_ptr,       CUDA_R_16BF, ne10,
                         &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
                         CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        s_cublas_algo));
 
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
             to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff, src1_ncols, stream);
@@ -1887,7 +1910,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                                 src1_ptr,       CUDA_R_16F, ne10,
                     &beta_f16,   dst_f16.get(), CUDA_R_16F, ldc,
                     CUBLAS_COMPUTE_16F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    s_cublas_algo));
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
         to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff, src1_ncols, stream);
@@ -1915,12 +1938,19 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float beta = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        // F32 path: cuBLAS rejects CUDA_R_32F + CUBLAS_COMPUTE_32F + ALGO0
+        // ("requested functionality is not supported"). Keep cublasSgemm and
+        // rely on the math-mode gate at handle creation (CUBLAS_DEFAULT_MATH
+        // under env disables TF32). True byte-identity across M requires a
+        // deeper fix — likely cuBLASLt with full algo pinning OR a custom
+        // F32 GEMM. Tracked as Phase C follow-up.
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+        (void)s_force_sid_cublas;
     }
 
     GGML_UNUSED(dst);
@@ -2354,6 +2384,14 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     using traits = batched_mul_mat_traits<src0_type>;
     using cuda_t = typename traits::cuda_type;
 
+    // Determinism: pin a fixed cuBLAS algo when LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1.
+    static const cublasGemmAlgo_t s_cublas_algo_b = []() {
+        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+        return (e && e[0] == '1' && e[1] == '\0')
+            ? CUBLAS_GEMM_ALGO0_TENSOR_OP
+            : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    }();
+
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
     GGML_ASSERT(src0->type == src0_type);
@@ -2464,7 +2502,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 beta,     dst_t, cu_data_type,   ne0,       ne1*ne0, // strideC
                 ne12*ne13,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                s_cublas_algo_b));
     } else {
         //printf("Using cublasGemmBatchedEx for %s\n", dst->name);
         //printf("    src0: %ld x %ld x %ld x %ld; %zu x %zu x %zu x %zu\n",src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
@@ -2506,7 +2544,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
                 ne23,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                s_cublas_algo_b));
     }
 
     // Convert output back to F32 if needed
@@ -2735,6 +2773,13 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // MMQ is the chosen path regardless of batch size.
     if (force_shape_invariant_dispatch && use_mul_mat_q) {
         use_mul_mat_vec_q         = false;
+        use_dequantize_mul_mat_vec = false;
+    }
+    // For non-quantized F16/BF16/F32 weights under shape-invariant dispatch:
+    // also suppress the dmmv fast-path at M=1, so M=1 routes through cuBLAS
+    // like M>1. Without this, M=1 takes a structurally different code path
+    // (dequantize_mul_mat_vec) — that's not a shape-pinnable difference.
+    if (force_shape_invariant_dispatch && !ggml_is_quantized(src0->type)) {
         use_dequantize_mul_mat_vec = false;
     }
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);

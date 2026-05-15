@@ -497,6 +497,15 @@ if (GGML_CUDA)
             ${CMAKE_SOURCE_DIR}/ggml/src
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-mmvq-q4-0-ar16-shape-invariance PRIVATE ggml)
+
+        # PHASE_MMQ_Q4_0_AR16 Phase C: cuBLAS pinned-algo closure binding.
+        # Sweeps F16/BF16/F32 weight types at M ∈ {1, 4, 8, 16, 32} under
+        # LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1; binds row-0 byte-identical.
+        llama_build_and_test(dflash-speculative/test-cublas-pinned-shape-invariant.cpp)
+        target_include_directories(test-cublas-pinned-shape-invariant PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-cublas-pinned-shape-invariant PRIVATE ggml)
     endif()
 endif()
 

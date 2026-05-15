@@ -932,7 +932,15 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+            // Determinism gate: under LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1
+            // disable TF32 fast path so F32 SGEMM/GemmEx doesn't switch
+            // accumulator precision based on cuBLAS's shape heuristic.
+            static const bool s_force_sid_math = []() {
+                const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+                return e && e[0] == '1' && e[1] == '\0';
+            }();
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device],
+                s_force_sid_math ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
         }
         return cublas_handles[device];
     }
