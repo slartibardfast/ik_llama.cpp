@@ -216,7 +216,17 @@ static void delta_net_f32_cuda(
     const int num_blocks = n_seqs * n_heads * (head_dim/WARP_SIZE);
     const size_t smem_size = 2 * head_dim * sizeof(float);
 
-    if (n_tokens <= 8) {
+    // Determinism: pin threads_per_block to 256 under LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1.
+    // Without this gate, the kernel switches 256↔128 at n_tokens=8, which
+    // changes the cross-warp reduction tree size (8-way vs 4-way) in
+    // reduce_sum() AND the per-step fp32 accumulator order inside the
+    // recurrent state update — different bits, accumulated drift.
+    static const bool s_force_sid_dn = []() {
+        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    const bool use_256 = s_force_sid_dn || (n_tokens <= 8);
+    if (use_256) {
         constexpr int threads_per_block = 256;
         if (head_dim == 64) {
             delta_net_recurrent_f32<64, threads_per_block><<<num_blocks, threads_per_block, smem_size, stream>>>(
