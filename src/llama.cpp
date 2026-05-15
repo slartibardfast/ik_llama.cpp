@@ -4106,23 +4106,32 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
     }
 
-    // Populate inp_slot_seq_lens for the deterministic FA path (sm_75 only).
-    // Per spec OQ-4: per-slot KV occupancy = llama_kv_cache_seq_pos_max + 1.
-    // For inactive seq_ids (no cached cells), pos_max returns 0 → n_kv=0,
-    // which the kernel handles as a zero-output slot (early-return path).
-    if (lctx.default_decoder.inp_slot_seq_lens) {
-        const int64_t n_seqs = lctx.default_decoder.inp_slot_seq_lens->ne[0];
-        std::vector<int32_t> slot_seq_lens(n_seqs, 0);
-        // batch.seq_id[i] is an array of seq_ids for token i. For the new FA
-        // op, n_seqs equals the batch's slot count and slot index = seq_id.
-        // Compute max n_kv per slot from kv_self.
-        for (int64_t s = 0; s < n_seqs; s++) {
-            const llama_pos pos_max = llama_kv_cache_seq_pos_max(lctx.transformer_kv, (llama_seq_id)s);
-            slot_seq_lens[s] = (pos_max < 0) ? 0 : (int32_t)(pos_max + 1);
+    // Populate inp_per_row_k_bound for the deterministic FA path (sm_75 only).
+    // Per spec §15.6: per query row i, bound[i] = max over the token's seq_ids
+    // of (seq_pos_max + 1). The CUDA kernel uses this to mask K positions
+    // >= bound[i] inside the K-loop, restoring np>1 determinism.
+    // For inactive seq_ids (no cached cells), pos_max returns -1 → 0,
+    // which the kernel handles as a zero-K-bound row (full mask).
+    if (lctx.default_decoder.inp_per_row_k_bound) {
+        const int64_t n_tok = lctx.default_decoder.inp_per_row_k_bound->ne[0];
+        GGML_ASSERT(n_tok == (int64_t)batch.n_tokens);
+        std::vector<int32_t> per_row_k_bound(n_tok, 0);
+        for (int64_t i = 0; i < n_tok; i++) {
+            int32_t row_bound = 0;
+            const int32_t n_sid = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+            for (int32_t j = 0; j < n_sid; j++) {
+                const llama_seq_id sid =
+                    (batch.n_seq_id && batch.seq_id) ? batch.seq_id[i][j] : (llama_seq_id)i;
+                const llama_pos pos_max =
+                    llama_kv_cache_seq_pos_max(lctx.transformer_kv, sid);
+                const int32_t b = (pos_max < 0) ? 0 : (int32_t)(pos_max + 1);
+                if (b > row_bound) row_bound = b;
+            }
+            per_row_k_bound[i] = row_bound;
         }
-        ggml_backend_tensor_set(lctx.default_decoder.inp_slot_seq_lens,
-                                slot_seq_lens.data(), 0,
-                                slot_seq_lens.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(lctx.default_decoder.inp_per_row_k_bound,
+                                per_row_k_bound.data(), 0,
+                                per_row_k_bound.size() * sizeof(int32_t));
     }
 
     if (lctx.default_decoder.inp_pos && lctx.default_decoder.inp_scale) {

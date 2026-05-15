@@ -112,7 +112,7 @@ void llm_build_context::init() {
     lctx.default_decoder.inp_pos_bucket    = nullptr;
     lctx.inp_embd_enc      = nullptr;
     lctx.default_decoder.inp_KQ_mask_cross = nullptr;
-    lctx.default_decoder.inp_slot_seq_lens = nullptr;
+    lctx.default_decoder.inp_per_row_k_bound = nullptr;
 }
 
 void llm_build_context::free() {
@@ -2694,19 +2694,16 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                              ggml_row_size(split_vl->type, n_embd_head_v), 0);
                 cb(v, "v", il_cb);
 
-                // Phase 2 closure: route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV
-                // at the Qwen 3.5/3.6 production shape (Dq=Dv=256, gqa <= 16).
-                // The new op consumes a per-slot KV-occupancy tensor as src[5]
-                // and the CUDA kernel uses it to bound the per-slot K-loop,
-                // restoring np>1 determinism. CPU fallback ignores src[5].
-                // Sinks are not supported on the new op (src[4]=NULL by design).
-                // The new op is opt-IN via LLAMA_FATTN_PER_SLOT_KV_ENABLE=1.
-                // Default is wmma_f16 because long-context apples-to-apples
-                // captures show the new op is 4-12× slower per FA call at
-                // production shape (data/deltanet/perf/replacement/SUMMARY.md).
-                // Determinism contract still holds via the unit test's
-                // structural argument; production keeps the perf-competitive
-                // wmma_f16 path until a redesigned kernel beats it.
+                // Route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV at the
+                // Qwen 3.5/3.6 production shape (Dq=Dv=256, gqa <= 16).
+                // The new op consumes a per-row K-loop bound tensor as
+                // src[5] (length q->ne[1] = n_tok). Per spec §15.6 CUDA
+                // dispatch routes to a wmma_f16 variant that masks K
+                // positions >= bound[row] inside the K-loop, restoring
+                // np>1 determinism at no perf cost over baseline wmma_f16.
+                // CPU fallback ignores src[5]. Sinks are not supported
+                // on the new op (src[4]=NULL by design). The new op is
+                // opt-IN via LLAMA_FATTN_PER_SLOT_KV_ENABLE=1.
                 static const bool fa_per_slot_enabled = []() {
                     const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_ENABLE");
                     return e && std::strcmp(e, "1") == 0;
@@ -2720,13 +2717,13 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     && sinks == nullptr;
 
                 if (use_per_slot_kv) {
-                    if (!lctx.default_decoder.inp_slot_seq_lens) {
-                        lctx.default_decoder.inp_slot_seq_lens =
-                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q->ne[3]);
-                        ggml_set_input(lctx.default_decoder.inp_slot_seq_lens);
+                    if (!lctx.default_decoder.inp_per_row_k_bound) {
+                        lctx.default_decoder.inp_per_row_k_bound =
+                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q->ne[1]);
+                        ggml_set_input(lctx.default_decoder.inp_per_row_k_bound);
                     }
                     cur = ggml_flash_attn_ext_per_slot_kv(ctx0, q, k, v, KQ_mask,
-                            lctx.default_decoder.inp_slot_seq_lens,
+                            lctx.default_decoder.inp_per_row_k_bound,
                             KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
                     cb(cur, "flash_attn_per_slot_kv", il_cb);

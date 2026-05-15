@@ -107,10 +107,11 @@ struct llama_decoder {
     struct ggml_tensor * inp_KQ_mask_cross = nullptr; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale         = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states    = nullptr;
-    // Per-slot KV occupancy for the deterministic FA path (sm_75 only).
-    // Populated each decode step from kv_self->seq_pos_max per active seq.
-    // Consumed as src[5] of ggml_flash_attn_ext_per_slot_kv.
-    struct ggml_tensor * inp_slot_seq_lens = nullptr; // I32 [n_seqs]
+    // Per-row K-loop bound for the deterministic FA path (sm_75 only).
+    // Populated each decode step: for each query row i, set bound[i] =
+    // (kv_self->seq_pos_max(seq_id_of_row_i) + 1). Consumed as src[5] of
+    // ggml_flash_attn_ext_per_slot_kv. See specs/deltanet/fattn-per-slot-kv-sm75.md §15.6.
+    struct ggml_tensor * inp_per_row_k_bound = nullptr; // I32 [q->ne[1]] (n_tok)
 
     // PHASE45 D9.6f: per-seq slot allocator for the linear-attn recurrent
     // state buffer (s_l[il]); maps llama_seq_id -> slot index.
