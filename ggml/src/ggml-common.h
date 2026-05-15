@@ -86,6 +86,12 @@ typedef sycl::half2 ggml_half2;
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
 
+// Q4_0_AR16: 16-element symmetric Q4 blocks with the same nibble-replica
+// layout as Q4_0 (low/high per even/odd k). QR_AR16=2 (2 quants per int8;
+// nibble-packed). QI_AR16 = 16/(4*2) = 2 ints per block.
+#define QI_AR16 (QK_AR16 / (4 * QR_AR16))
+#define QR_AR16 2
+
 #define QI4_1 (QK4_1 / (4 * QR4_1))
 #define QR4_1 2
 

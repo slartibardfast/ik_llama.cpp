@@ -55,6 +55,7 @@ static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected b
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_AR16:
         case GGML_TYPE_Q4_1:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q5_0:
@@ -177,6 +178,10 @@ static constexpr __device__ int get_mmq_y_device() {
 }
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{mmq_y*WARP_SIZE   + mmq_y, mmq_y*WARP_SIZE/QI4_0   + mmq_y/QI4_0,     0}
+// Q4_0_AR16 has half-size blocks (16 vs 32 elements) so 2x more block scales per
+// WARP_SIZE-wide K-row. qs count is unchanged (int-count doesn't depend on block
+// size). See PHASE_MMQ_Q4_0_AR16.md §2.1.
+#define MMQ_DP4A_TXS_Q4_0_AR16 tile_x_sizes{mmq_y*WARP_SIZE + mmq_y, mmq_y*WARP_SIZE/QI_AR16 + mmq_y/QI_AR16,   0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{mmq_y*WARP_SIZE   + mmq_y, mmq_y*WARP_SIZE/QI4_1   + mmq_y/QI4_1,     0}
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{mmq_y*WARP_SIZE*2 + mmq_y, mmq_y*WARP_SIZE*2/QI8_0 + mmq_y/(QI8_0/2), 0}
 #define MMQ_DP4A_TXS_Q8_0_16 tile_x_sizes{mmq_y*WARP_SIZE*2 + mmq_y, mmq_y*WARP_SIZE*4/QI8_0 + mmq_y/(QI8_0/4), 0}
@@ -190,6 +195,7 @@ static constexpr __device__ int get_mmq_y_device() {
 static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml_type type, int mmq_y) {
     switch (type) {
         case GGML_TYPE_Q4_0    : return MMQ_DP4A_TXS_Q4_0;
+        case GGML_TYPE_Q4_0_AR16: return MMQ_DP4A_TXS_Q4_0_AR16;
         case GGML_TYPE_Q4_1    : return MMQ_DP4A_TXS_Q4_1;
         case GGML_TYPE_Q5_0    : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1    : return MMQ_DP4A_TXS_Q8_1;
@@ -237,12 +243,16 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 
 #define MMQ_MMA_TILE_X_K_Q8_0 (2*WARP_SIZE + 2*WARP_SIZE/QI8_0                 + 4)
 #define MMQ_MMA_TILE_X_K_Q8_1 (2*WARP_SIZE + 2*WARP_SIZE/QI8_0                 + 4)
+// Q4_0_AR16: 2*WARP_SIZE qs ints + 2*WARP_SIZE/QI_AR16 scales = 2*32 + 32 = 96; +4 = 100.
+// 100 % 8 == 4: passes the existing padding-pattern static_assert.
+#define MMQ_MMA_TILE_X_K_Q4_0_AR16 (2*WARP_SIZE + 2*WARP_SIZE/QI_AR16             + 4)
 #define MMQ_MMA_TILE_X_K_Q2_K (2*WARP_SIZE + WARP_SIZE                         + 4)
 #define MMQ_MMA_TILE_X_K_Q3_K (2*WARP_SIZE + WARP_SIZE/2                       + 4)
 #define MMQ_MMA_TILE_X_K_Q6_K (2*WARP_SIZE + WARP_SIZE/QI6_K     + WARP_SIZE/8 + 7)
 
 static_assert(MMQ_MMA_TILE_X_K_Q8_0 % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_Q8_1 % 8 == 4, "Wrong padding.");
+static_assert(MMQ_MMA_TILE_X_K_Q4_0_AR16 % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_Q2_K % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_Q3_K % 8 == 4, "Wrong padding.");
 static_assert(MMQ_MMA_TILE_X_K_Q6_K % 8 == 4, "Wrong padding.");
@@ -250,6 +260,7 @@ static_assert(MMQ_MMA_TILE_X_K_Q6_K % 8 == 4, "Wrong padding.");
 static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0    : return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_Q4_0_AR16: return MMQ_MMA_TILE_X_K_Q4_0_AR16;
         case GGML_TYPE_Q4_1    : return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q5_0    : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1    : return MMQ_MMA_TILE_X_K_Q8_1;
