@@ -3207,9 +3207,31 @@ void server_context::add_sampled_tokens() {
     // when M >= 2.
     std::vector<float> packed_hidden;
 
+    // Strict-sequential decode mode (opt-in via env). When set, only ONE
+    // slot's decode token is added to the batch per update_slots() call.
+    // Limits concurrent batched-decode (ne[1]>1 in FA) which is the
+    // remaining NP-determinism gap when LLAMA_FATTN_PER_SLOT_KV_ENABLE=1.
+    // Throughput drops to NP=1-effective; determinism becomes
+    // byte-identical across NP. See specs/deltanet/fattn-per-slot-kv-sm75.md §15.16.
+    static const bool strict_sequential_decode = []() {
+        const char * e = std::getenv("LLAMA_FATTN_STRICT_SEQUENTIAL_DECODE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    bool added_a_decode_slot_this_call = false;
+
     for (auto& slot : slots) {
         slot.released = false;
         if (slot.state == SLOT_STATE_IDLE) {
+            continue;
+        }
+
+        // In strict-sequential decode mode, skip remaining decode slots after
+        // one has been added to the batch. Prefill (LOAD_PROMPT) was already
+        // serialized by --no-cont-batching at line 3583; this enforces the
+        // same serialization at the decode-token-add step.
+        if (strict_sequential_decode &&
+            added_a_decode_slot_this_call &&
+            slot.state == SLOT_STATE_PROCESSING) {
             continue;
         }
 
@@ -3301,6 +3323,11 @@ void server_context::add_sampled_tokens() {
 
             SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                 (int)slot.n_ctx, (int)slot.cache_tokens.size(), (int)slot.truncated);
+
+            // Mark that this update_slots() call has added a decode-state
+            // slot's token; in strict-sequential-decode mode the next
+            // iterations skip further decode slots.
+            added_a_decode_slot_this_call = true;
         }
         slot.n_past = slot.cache_tokens.n_tokens();
     }
@@ -3580,8 +3607,23 @@ bool server_context::create_checkpoint(server_slot & slot) {
 }
 
 void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
+    // Strict-sequential prompt-loading: at most one slot's prompt added
+    // per batch. Mirrors strict-sequential-decode mode at the prefill
+    // level so prefill ubatch shape == NP=1 prefill ubatch shape exactly.
+    // See specs/deltanet/fattn-per-slot-kv-sm75.md §15.16.
+    static const bool strict_sequential_decode_prompt = []() {
+        const char * e = std::getenv("LLAMA_FATTN_STRICT_SEQUENTIAL_DECODE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    bool added_a_prompt_this_call = false;
+
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
+            // In strict-sequential mode, only one prompt per batch.
+            if (strict_sequential_decode_prompt && added_a_prompt_this_call) {
+                break;
+            }
+            const int32_t batch_n_tokens_before = batch.n_tokens;
             // this slot still has a prompt to be processed
             if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                 auto& prompt_tokens = slot.prompt_tokens;
@@ -3921,6 +3963,12 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
             if (batch.n_tokens >= n_batch) {
                 break;
+            }
+            // Mark that this update_slots() call has added prompt tokens
+            // for this slot (whether or not it completed). Strict-sequential
+            // mode then prevents subsequent slots from adding to this batch.
+            if (batch.n_tokens > batch_n_tokens_before) {
+                added_a_prompt_this_call = true;
             }
         }
     }
