@@ -87,21 +87,22 @@ __global__ void test_load_tiles_q4_0_ar16_kernel(
     }
 }
 
-// CPU oracle: compute expected x_qs / x_df contents.
+// CPU oracle: compute expected x_qs / x_df contents under the §2.5 unified
+// linear-K-per-int layout.
 //
-// For block_q4_0_ar16[i, kbx]: 1 fp16 scale d + 8 bytes of nibbles (16 quants).
-// load_tiles_q4_0_ar16 stores into x_qs[i*MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*4 + kqsx + {0,2}]:
-//   - kbx ∈ [0..15], kqsx ∈ [0..1].
-//   - Each thread reads 1 int (4 bytes = 8 quants) at qs[kqsx*4 .. kqsx*4+3].
-//   - Splits low/high nibble. Sign-recenters (-8).
-//   - Low (kqsx + 0) → quants at even positions within this 8-quant int.
-//   - High (kqsx + 2) → quants at odd positions within this 8-quant int.
+// AR16 source-byte convention (per dequantize_block_q4_0_ar16):
+//   qs[i].low  = K position 2*i  (even K)
+//   qs[i].high = K position 2*i+1 (odd  K)
+//
+// load_tiles_q4_0_ar16 emits to x_qs[i*stride + kbx*4 + s] (s ∈ 0..3) where
+// slot s holds 4 sign-recentered int8 quants at K positions [4s..4s+3] of
+// block kbx. The unpack regroups even/odd nibbles via __byte_perm.
 static void cpu_oracle_x_qs(
         const std::vector<uint8_t> & src_bytes,
         int n_rows, int stride_bytes,
         int kbx0_blocks,
         std::vector<int32_t> & out_x_qs) {
-    const int per_row = 2*WARP_SIZE;
+    const int per_row = 2*WARP_SIZE;  // 64 ints
     out_x_qs.assign((size_t)n_rows * per_row, 0);
 
     for (int i = 0; i < n_rows; ++i) {
@@ -110,31 +111,19 @@ static void cpu_oracle_x_qs(
                                    + (size_t)(kbx0_blocks + kbx) * sizeof(block_q4_0_ar16);
             // block_q4_0_ar16: 2 bytes d (fp16) + 8 bytes qs.
             const uint8_t * qs = src_bytes.data() + block_off + sizeof(uint16_t);
-            for (int kqsx = 0; kqsx < 2; ++kqsx) {
-                // Read 4 bytes starting at qs + kqsx*4 as int32 (little-endian).
-                uint32_t qs_int = 0;
-                qs_int |= ((uint32_t)qs[kqsx*4 + 0]) << 0;
-                qs_int |= ((uint32_t)qs[kqsx*4 + 1]) << 8;
-                qs_int |= ((uint32_t)qs[kqsx*4 + 2]) << 16;
-                qs_int |= ((uint32_t)qs[kqsx*4 + 3]) << 24;
-                // Low nibbles, sign-recenter by -8.
-                const uint32_t lo_unpacked = (qs_int >> 0) & 0x0F0F0F0F;
-                // __vsubss4 is per-byte signed subtract. Emulate: each byte = lo_unpacked_byte - 8.
-                int32_t lo_recentered = 0;
-                int32_t hi_recentered = 0;
+            // Dequant the 16 K positions of this block: K=2*j is qs[j]&0xF, K=2*j+1 is qs[j]>>4. Sign-recenter.
+            int8_t k_vals[16];
+            for (int j = 0; j < 8; ++j) {
+                k_vals[2*j + 0] = (int8_t)(qs[j] & 0x0F) - 8;
+                k_vals[2*j + 1] = (int8_t)((qs[j] >> 4) & 0x0F) - 8;
+            }
+            // Pack into 4 linear-K-per-int ints: slot s holds [K=4s, K=4s+1, K=4s+2, K=4s+3].
+            for (int s = 0; s < 4; ++s) {
+                int32_t packed = 0;
                 for (int b = 0; b < 4; ++b) {
-                    int8_t lo = (int8_t)((lo_unpacked >> (b*8)) & 0xFF) - 8;
-                    int8_t hi = (int8_t)(((qs_int >> 4) >> (b*8)) & 0x0F) - 8;
-                    lo_recentered |= ((int32_t)(uint8_t)lo) << (b*8);
-                    hi_recentered |= ((int32_t)(uint8_t)hi) << (b*8);
+                    packed |= ((int32_t)(uint8_t)k_vals[4*s + b]) << (b*8);
                 }
-                // x_qs[i * MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*4 + kqsx + 0]   = lo
-                // x_qs[i * MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*4 + kqsx + 2]   = hi
-                // We dump only the first 2*WARP_SIZE ints per row (the x_qs portion).
-                const int qs_offset_lo = kbx * (2 * QI_AR16) + kqsx + 0;
-                const int qs_offset_hi = kbx * (2 * QI_AR16) + kqsx + QI_AR16;
-                out_x_qs[i * per_row + qs_offset_lo] = lo_recentered;
-                out_x_qs[i * per_row + qs_offset_hi] = hi_recentered;
+                out_x_qs[i * per_row + kbx*4 + s] = packed;
             }
         }
     }
@@ -287,17 +276,19 @@ int main() {
     bool ok = true;
 
     // Sweep (mmq_y, nwarps) consistent with MMQ kernel templating.
-    // mmq_y capped at 64 — at MMA_TILE_X_K_Q4_0_AR16=100 ints/row, mmq_y=128
-    // would need 50 KB SMEM which exceeds Turing's default 48 KB opt-in.
-    // Production MMQ uses mmq_y ∈ {8, 16, 32, 64} per ggml_cuda_mmq_get_y_host.
-    ok &= run_config<16, 4>(rng, /*need_check=*/false, /*i_max=*/15);
-    ok &= run_config<32, 4>(rng, /*need_check=*/false, /*i_max=*/31);
-    ok &= run_config<64, 4>(rng, /*need_check=*/false, /*i_max=*/63);
-    ok &= run_config<64, 8>(rng, /*need_check=*/false, /*i_max=*/63);
+    // Under unified §2.5 layout: MMQ_MMA_TILE_X_K_Q4_0_AR16 = 84 ints/row.
+    // mmq_y=128 → 128*84*4 = 43008 bytes = 42 KB SMEM. Fits Turing default 48 KB.
+    // Production MMQ uses mmq_y ∈ {8, 16, 32, 64, 128} per ggml_cuda_mmq_get_y_host.
+    ok &= run_config<16,  4>(rng, /*need_check=*/false, /*i_max=*/15);
+    ok &= run_config<32,  4>(rng, /*need_check=*/false, /*i_max=*/31);
+    ok &= run_config<64,  4>(rng, /*need_check=*/false, /*i_max=*/63);
+    ok &= run_config<64,  8>(rng, /*need_check=*/false, /*i_max=*/63);
+    ok &= run_config<128, 8>(rng, /*need_check=*/false, /*i_max=*/127);
 
     // need_check=true with i_max < mmq_y-1.
     ok &= run_config<32, 4>(rng, /*need_check=*/true, /*i_max=*/20);
     ok &= run_config<64, 8>(rng, /*need_check=*/true, /*i_max=*/40);
+    ok &= run_config<128, 8>(rng, /*need_check=*/true, /*i_max=*/100);
 
     if (ok) {
         fprintf(stderr, "OVERALL: PASS\n");

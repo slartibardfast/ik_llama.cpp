@@ -178,10 +178,12 @@ static constexpr __device__ int get_mmq_y_device() {
 }
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{mmq_y*WARP_SIZE   + mmq_y, mmq_y*WARP_SIZE/QI4_0   + mmq_y/QI4_0,     0}
-// Q4_0_AR16 has half-size blocks (16 vs 32 elements) so 2x more block scales per
-// WARP_SIZE-wide K-row. qs count is unchanged (int-count doesn't depend on block
-// size). See PHASE_MMQ_Q4_0_AR16.md §2.1.
-#define MMQ_DP4A_TXS_Q4_0_AR16 tile_x_sizes{mmq_y*WARP_SIZE + mmq_y, mmq_y*WARP_SIZE/QI_AR16 + mmq_y/QI_AR16,   0}
+// Q4_0_AR16 uses the unified Q8_0-style unpacked sign-recentered linear-K-per-int
+// layout for BOTH DP4A and MMA paths. Per AR16 block: 4 ints in x_qs at K stride
+// 4 K/int (linear). Per warp tile row: 16 blocks × 4 ints = 2*WARP_SIZE ints =
+// same as the MMA path. 16 floats of scale per row (one per AR16 block).
+// See PHASE_MMQ_Q4_0_AR16.md §2.5.
+#define MMQ_DP4A_TXS_Q4_0_AR16 tile_x_sizes{mmq_y*(2*WARP_SIZE) + mmq_y, mmq_y*16 + mmq_y/4, 0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{mmq_y*WARP_SIZE   + mmq_y, mmq_y*WARP_SIZE/QI4_1   + mmq_y/QI4_1,     0}
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{mmq_y*WARP_SIZE*2 + mmq_y, mmq_y*WARP_SIZE*2/QI8_0 + mmq_y/(QI8_0/2), 0}
 #define MMQ_DP4A_TXS_Q8_0_16 tile_x_sizes{mmq_y*WARP_SIZE*2 + mmq_y, mmq_y*WARP_SIZE*4/QI8_0 + mmq_y/(QI8_0/4), 0}
@@ -243,9 +245,11 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 
 #define MMQ_MMA_TILE_X_K_Q8_0 (2*WARP_SIZE + 2*WARP_SIZE/QI8_0                 + 4)
 #define MMQ_MMA_TILE_X_K_Q8_1 (2*WARP_SIZE + 2*WARP_SIZE/QI8_0                 + 4)
-// Q4_0_AR16: 2*WARP_SIZE qs ints + 2*WARP_SIZE/QI_AR16 scales = 2*32 + 32 = 96; +4 = 100.
-// 100 % 8 == 4: passes the existing padding-pattern static_assert.
-#define MMQ_MMA_TILE_X_K_Q4_0_AR16 (2*WARP_SIZE + 2*WARP_SIZE/QI_AR16             + 4)
+// Q4_0_AR16 under the unified linear-K layout (§2.5): 2*WARP_SIZE qs ints +
+// 16 floats of scale (one per AR16 block) + 4 pad = 84. 84 % 8 == 4: passes
+// the existing padding-pattern static_assert. The "QI_AR16_LINEAR=4" denominator
+// reflects ints-per-block in the UNIFIED layout (vs raw QI_AR16=2 for source bytes).
+#define MMQ_MMA_TILE_X_K_Q4_0_AR16 (2*WARP_SIZE + 2*WARP_SIZE/4                  + 4)
 #define MMQ_MMA_TILE_X_K_Q2_K (2*WARP_SIZE + WARP_SIZE                         + 4)
 #define MMQ_MMA_TILE_X_K_Q3_K (2*WARP_SIZE + WARP_SIZE/2                       + 4)
 #define MMQ_MMA_TILE_X_K_Q6_K (2*WARP_SIZE + WARP_SIZE/QI6_K     + WARP_SIZE/8 + 7)
@@ -379,25 +383,43 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
-// load_tiles_q4_0_ar16 — clone of load_tiles_q4_0 adjusted for AR16's
-// half-size blocks (16 elements vs 32). Per PHASE_MMQ_Q4_0_AR16.md §2.1.
-//   QI_AR16 = 2 ints per block (vs QI4_0=4 for Q4_0).
-//   blocks_per_tile_x_row = WARP_SIZE / QI_AR16 = 16 (vs 8 for Q4_0).
-//   x_qs row stride = MMQ_MMA_TILE_X_K_Q4_0_AR16 = 100 (vs 76).
+// load_tiles_q4_0_ar16 — unified Q8_0-style linear-K-per-int layout for both
+// DP4A and MMA paths. See PHASE_MMQ_Q4_0_AR16.md §2.5 for the layout decision.
+//
+// AR16 source-byte convention (per dequantize_block_q4_0_ar16):
+//   qs[i].low  = K position 2*i  (even K)
+//   qs[i].high = K position 2*i+1 (odd  K)
+//
+// x_qs output convention (per UNIFIED layout):
+//   x_qs[i*stride_row + kbx*4 + s] holds 4 sign-recentered int8 weights at
+//   K positions [4s, 4s+1, 4s+2, 4s+3] of block kbx. Linear K within each int.
+//   Per warp tile row: 16 blocks × 4 ints = 2*WARP_SIZE = 64 ints.
+//   stride_row = MMQ_MMA_TILE_X_K_Q4_0_AR16 = 84 for MMA path,
+//                (2*WARP_SIZE + 1) = 65 for DP4A path.
+//
+// Each lane reads ONE int from qs[] (kqsx*4..kqsx*4+3 = K=kqsx*8..kqsx*8+7
+// raw), unpacks even/odd nibbles, regroups into 2 linear-K ints (K=kqsx*8..+3
+// and K=kqsx*8+4..+7), sign-recenters, and stores at slots kbx*4 + kqsx*2 + {0,1}.
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_0_ar16(
     const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
 
 #ifdef INT8_MMA_AVAILABLE
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + 2*WARP_SIZE);
+    constexpr int x_qs_stride = MMQ_MMA_TILE_X_K_Q4_0_AR16;  // 84
+    constexpr int x_df_stride = MMQ_MMA_TILE_X_K_Q4_0_AR16;  // sparse: 16 scales at offset 2*WARP_SIZE
 #else
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_AR16, mmq_y);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
+    constexpr int x_qs_stride = 2*WARP_SIZE + 1;  // 65
+    // DP4A x_df is packed: 16 scales per row + small pad.
 #endif // INT8_MMA_AVAILABLE
 
+    // 16 AR16 blocks per warp tile row × 2 ints per block (raw byte sourcing) = 32 lanes.
+    // Each lane writes 2 linear-K-per-int ints (kbx*4 + kqsx*2 + {0,1}).
     const int kbx  = threadIdx.x / QI_AR16;   // 0..15 (which AR16 block in warp tile)
-    const int kqsx = threadIdx.x % QI_AR16;   // 0..1  (which int within block; each block has 8 bytes = 2 ints)
+    const int kqsx = threadIdx.x % QI_AR16;   // 0..1  (which raw int within block; each block has 8 bytes = 2 raw ints)
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
@@ -408,19 +430,31 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         }
 
         const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *)(x + i*stride) + kbx0 + kbx;
-        const int qs0 = get_int_b2(bxi->qs, kqsx);
+        const int qs = get_int_b2(bxi->qs, kqsx);  // 4 raw bytes, K=kqsx*8..+7 (even/odd packed).
 
-#ifdef INT8_MMA_AVAILABLE
-        // Same nibble-split + sign-recenter pattern as Q4_0. Each block writes
-        // 2 ints (low/high nibbles) per kqsx, at MMA stride MMQ_MMA_TILE_X_K_Q4_0_AR16.
-        x_qs[i*MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*(2*QI_AR16) + kqsx + 0]        = __vsubss4((qs0 >> 0) & 0x0F0F0F0F, 0x08080808);
-        x_qs[i*MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*(2*QI_AR16) + kqsx + QI_AR16]  = __vsubss4((qs0 >> 4) & 0x0F0F0F0F, 0x08080808);
-#else
-        x_qs[i*(WARP_SIZE + 1) + threadIdx.x] = qs0;
-#endif // INT8_MMA_AVAILABLE
+        // Unpack even/odd nibbles, regroup to linear K.
+        // qs_evens = bytes [K=2*0, K=2*1, K=2*2, K=2*3] → K=kqsx*8 + {0,2,4,6}.
+        // qs_odds  = bytes [K=2*0+1, ...]              → K=kqsx*8 + {1,3,5,7}.
+        const int qs_evens = qs & 0x0F0F0F0F;
+        const int qs_odds  = (qs >> 4) & 0x0F0F0F0F;
+        // __byte_perm(a, b, sel): byte i of result = byte(sel>>4i & 0xF) of (a/b).
+        // 0x5140 → [a.0, b.0, a.1, b.1] = [K=kqsx*8+0, K=kqsx*8+1, K=kqsx*8+2, K=kqsx*8+3] = linear K=kqsx*8..+3.
+        // 0x7362 → [a.2, b.2, a.3, b.3] = [K=kqsx*8+4, K=kqsx*8+5, K=kqsx*8+6, K=kqsx*8+7] = linear K=kqsx*8+4..+7.
+        const int lin_low  = __byte_perm(qs_evens, qs_odds, 0x5140);
+        const int lin_high = __byte_perm(qs_evens, qs_odds, 0x7362);
+        // Sign-recenter (each byte: 0..15 unsigned → -8..7 signed).
+        const int lin_low_s  = __vsubss4(lin_low,  0x08080808);
+        const int lin_high_s = __vsubss4(lin_high, 0x08080808);
+
+        // Store at slots kbx*4 + kqsx*2 + {0,1}. Both MMA and DP4A paths share
+        // the linear-K layout; only the row stride differs.
+        x_qs[i*x_qs_stride + kbx*4 + kqsx*2 + 0] = lin_low_s;   // K = kqsx*8 + {0..3}
+        x_qs[i*x_qs_stride + kbx*4 + kqsx*2 + 1] = lin_high_s;  // K = kqsx*8 + {4..7}
     }
 
-    const int blocks_per_tile_x_row = WARP_SIZE / QI_AR16;   // 16
+    // Scale loop: one scale per AR16 block. 16 blocks per warp tile row.
+    // blocks_per_tile_x_row = 16. Each warp lane handles one block's scale.
+    const int blocks_per_tile_x_row = WARP_SIZE / QI_AR16;   // 16 blocks per row
     const int kbxd = threadIdx.x % blocks_per_tile_x_row;
 
 #pragma unroll
@@ -434,9 +468,11 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *)(x + i*stride) + kbx0 + kbxd;
 
 #ifdef INT8_MMA_AVAILABLE
-        x_df[i*MMQ_MMA_TILE_X_K_Q4_0_AR16       + kbxd] = bxi->d;
+        // MMA layout: x_df at row offset (2*WARP_SIZE) from x_qs base, 16 scales/row.
+        x_df[i*x_df_stride + kbxd] = bxi->d;
 #else
-        x_df[i*(WARP_SIZE/QI_AR16) + i/QI_AR16 + kbxd] = bxi->d;
+        // DP4A layout: x_df packed at row stride 16 with small overflow pad (mmq_y/4).
+        x_df[i*16 + i/4 + kbxd] = bxi->d;
 #endif // INT8_MMA_AVAILABLE
     }
 }
