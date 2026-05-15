@@ -2700,8 +2700,15 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 // and the CUDA kernel uses it to bound the per-slot K-loop,
                 // restoring np>1 determinism. CPU fallback ignores src[5].
                 // Sinks are not supported on the new op (src[4]=NULL by design).
+                // Env LLAMA_FATTN_PER_SLOT_KV_DISABLE=1 forces wmma_f16
+                // dispatch for perf-comparison captures.
+                static const bool fa_per_slot_disabled = []() {
+                    const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_DISABLE");
+                    return e && std::strcmp(e, "1") == 0;
+                }();
                 const bool use_per_slot_kv =
-                    cparams.flash_attn
+                    !fa_per_slot_disabled
+                    && cparams.flash_attn
                     && q->ne[0] == 256 && v->ne[0] == 256
                     && (q->ne[2] / k->ne[2]) <= 16
                     && !(model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra)
