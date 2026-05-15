@@ -487,6 +487,16 @@ if (GGML_CUDA)
             ${CMAKE_SOURCE_DIR}/ggml/src
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-mmq-q4-0-ar16-shape-invariance PRIVATE ggml)
+
+        # PHASE_MMQ_Q4_0_AR16 Phase B: MMVQ closure binding. With env UNSET,
+        # batch ≤ MMVQ_MAX_BATCH_SIZE = 8 routes to MMVQ. Test combines B.2
+        # (cosine + NMSE vs CPU fp32 reference at M=1) and B.4 (row-0
+        # byte-identical across M ∈ {1, 2, 4, 8}).
+        llama_build_and_test(dflash-speculative/test-mmvq-q4-0-ar16-shape-invariance.cpp)
+        target_include_directories(test-mmvq-q4-0-ar16-shape-invariance PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-mmvq-q4-0-ar16-shape-invariance PRIVATE ggml)
     endif()
 endif()
 

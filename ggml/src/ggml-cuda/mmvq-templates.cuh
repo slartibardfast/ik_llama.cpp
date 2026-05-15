@@ -16,6 +16,7 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0   : return vec_dot_q4_0_q8_1;
+        case GGML_TYPE_Q4_0_AR16 : return vec_dot_q4_0_ar16_q8_1;
         case GGML_TYPE_Q4_1   : return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0   : return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1   : return vec_dot_q5_1_q8_1;
@@ -43,6 +44,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0    : return VDR_Q4_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q4_0_AR16 : return VDR_Q4_0_AR16_Q8_1_MMVQ;
         case GGML_TYPE_Q4_1    : return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0    : return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1    : return VDR_Q5_1_Q8_1_MMVQ;
@@ -98,7 +100,11 @@ static __device__ void k_mul_mat_vec_q(
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        // y block index that aligns with kbx. For qk >= QK8_1 (all standard
+        // types) this equals kbx * (qk/QK8_1); for qk < QK8_1 (Q4_0_AR16:
+        // qk=16, QK8_1=32) multiple x-blocks share one y-block. Compose as
+        // (kbx * qk) / QK8_1 — equal to kbx * (qk/QK8_1) when qk >= QK8_1.
+        const int kby = (kbx * qk) / QK8_1;
 
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
@@ -192,7 +198,8 @@ static __device__ void k_fused_mul_mat_vec_q(
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        // See k_mul_mat_vec_q for explanation of this formulation.
+        const int kby = (kbx * qk) / QK8_1;
 
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
@@ -451,6 +458,7 @@ static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
 }
 
 extern void mul_mat_vec_q4_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
+extern void mul_mat_vec_q4_0_ar16_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q4_1_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q5_0_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);
 extern void mul_mat_vec_q5_1_q8_1_cuda(const mmvq_args & args, cudaStream_t stream);

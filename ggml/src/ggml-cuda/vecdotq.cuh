@@ -582,6 +582,68 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
 }
 
+// Q4_0_AR16 MMVQ: per-thread vec_dot for one AR16 block (16 K positions).
+// Two adjacent AR16 blocks share one Q8_1 block (32 K positions); use kbx & 1
+// to pick the matching half (low K=0..15 vs high K=16..31). AR16's per-byte
+// nibble convention is low=K=2i (even), high=K=2i+1 (odd) — we unpack to
+// linear-K via __byte_perm before dp4a, and compute the half-sum (16-K) for
+// the -8 sign-recenter correction inline (Q8_1's stored s_a covers 32 K, not 16).
+#define VDR_Q4_0_AR16_Q8_1_MMVQ 2
+
+static __device__ __forceinline__ float vec_dot_q4_0_ar16_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    (void)iqs;  // each thread covers one full AR16 block; no within-block sub-tiling
+
+    const block_q4_0_ar16 * bq = (const block_q4_0_ar16 *) vbq + kbx;
+    const int half = kbx & 1;   // 0 = low half of Q8_1, 1 = high half
+
+    // 2 ints (= 8 bytes) of AR16 quants for 16 K positions (even+odd nibble per byte).
+    int v_raw[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        v_raw[i] = get_int_b2(bq->qs, i);
+    }
+
+    // 4 ints (= 16 K positions in int8) from this half of the Q8_1 block.
+    int u[4];
+    const int q8_int_offset = half * 4;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        u[i] = get_int_b4(bq8_1->qs, q8_int_offset + i);
+    }
+
+    // Unpack AR16 even/odd nibbles to linear-K 4 ints (16 K positions, 4 K per int).
+    int v_linear[4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v_even = v_raw[i] & 0x0F0F0F0F;          // [K=8i+0, 8i+2, 8i+4, 8i+6]
+        const int v_odd  = (v_raw[i] >> 4) & 0x0F0F0F0F;   // [K=8i+1, 8i+3, 8i+5, 8i+7]
+        v_linear[2*i + 0] = __byte_perm(v_even, v_odd, 0x5140);  // [K=8i+0..8i+3]
+        v_linear[2*i + 1] = __byte_perm(v_even, v_odd, 0x7362);  // [K=8i+4..8i+7]
+    }
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sumi = ggml_cuda_dp4a(v_linear[i], u[i], sumi);
+    }
+
+    // sum_a_half = sum of int8 q_a over THIS half (16 K positions).
+    // Q8_1's stored s = d_a * sum_K_full(q_a) covers 32 K; we need the half-sum.
+    int sum_a_half = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum_a_half = __dp4a(0x01010101, u[i], sum_a_half);
+    }
+
+    const float d_a = __low2float(bq8_1->ds);
+    const float d_w = __half2float(bq->d);
+
+    // (q_w - 8) * d_w · q_a * d_a summed over 16 K positions
+    // = d_w * d_a * (sumi - 8 * sum_a_half)
+    return d_w * d_a * ((float)sumi - 8.0f * (float)sum_a_half);
+}
+
 static __device__ __forceinline__ float vec_dot_q6_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
