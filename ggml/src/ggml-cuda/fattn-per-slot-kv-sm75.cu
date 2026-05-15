@@ -1484,6 +1484,44 @@ __global__ void fattn_per_slot_kv_sm75_combine_kernel(
 }
 
 // ============================================================================
+// Stage 2.3 helper: compute pb_per_slot on device.
+// ============================================================================
+//
+// Avoids the host cudaStreamSynchronize that breaks CUDA graph capture.
+// pb formula matches oracle: pb = max(1, ⌈n_kv / 256⌉), capped at MAX_PB.
+// Launch: 1D grid covering n_seqs threads.
+
+__global__ void fattn_per_slot_kv_sm75_compute_pb_kernel(
+    const int32_t * __restrict__ slot_seq_lens,
+    int32_t       * __restrict__ pb_per_slot,
+    int n_seqs,
+    int max_pb_cap)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n_seqs) return;
+    const int n_kv = slot_seq_lens[s];
+    int pb = (n_kv + 255) / 256;
+    if (pb < 1) pb = 1;
+    if (pb > max_pb_cap) pb = max_pb_cap;
+    pb_per_slot[s] = pb;
+}
+
+// ============================================================================
+// Stage 2.3 helper: initialize dst_meta to (-INF, 0) on device.
+// ============================================================================
+//
+// cudaMemsetAsync can't write -INF directly (fp32 bit pattern). Tiny kernel.
+
+__global__ void fattn_per_slot_kv_sm75_init_meta_kernel(
+    float2 * __restrict__ dst_meta,
+    int n_elements)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+    dst_meta[idx] = make_float2(-INFINITY, 0.0f);
+}
+
+// ============================================================================
 // Host-side launcher (extern "C" symbol consumed by the unit test).
 // ============================================================================
 
@@ -1821,11 +1859,8 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
         V_d = V_dq_buf.get();
     }
 
-    // Production wiring uses Stage 2.2b (single-pass Approach C decode pack)
-    // for n_tok == 1 and Stage 2.2a for prefill. Stage 2.3 split-K is deferred
-    // — it requires a host sync on max_pb which is incompatible with CUDA
-    // graph capture (graph_reuse is set in production cparams). Follow-up
-    // will reintroduce split-K with on-device pb computation.
+    // Production dispatch: prefill → Stage 2.2a; decode → Stage 2.3 (split-K
+    // with on-device pb computation, CUDA-graph-capture compatible).
     if (n_tok > 1) {
         const dim3 grid(n_seqs, n_tok, n_hq);
         const dim3 block(32, 4, 1);
@@ -1835,16 +1870,66 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
             n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
             scale, softcap, use_softcap
         );
-    } else {
-        const dim3 grid(n_seqs, n_hkv, 1);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // Stage 2.3 (decode path): split-K with on-device pb + dst_meta init.
+    // MAX_PB_HARD_CAP chosen to give grid.z = 16 → at NP=1 grid = (1,4,16) =
+    // 64 CTAs (vs wmma_f16's 96 at decode shape); enough to fill 72 SMs at
+    // ~1 block/SM occupancy. Slots whose n_kv would imply higher pb just lose
+    // some split-K granularity but stay correct.
+    constexpr int MAX_PB_HARD_CAP = 16;
+
+    ggml_cuda_pool_alloc<int32_t> pb_buf(ctx.pool(), n_seqs);
+    GGML_ASSERT(pb_buf.get() != nullptr);
+
+    // Compute pb_per_slot on device.
+    {
+        const int threads = (n_seqs <= 32) ? 32 : 64;
+        const dim3 block(threads, 1, 1);
+        const dim3 grid((n_seqs + threads - 1) / threads, 1, 1);
+        fattn_per_slot_kv_sm75_compute_pb_kernel<<<grid, block, 0, stream>>>(
+            S_d, pb_buf.get(), n_seqs, MAX_PB_HARD_CAP);
+    }
+
+    // Pool-allocate partials + meta sized for MAX_PB.
+    const size_t n_partial = (size_t)n_seqs * n_hq * MAX_PB_HARD_CAP * Dv;
+    const size_t n_meta    = (size_t)n_seqs * n_hq * MAX_PB_HARD_CAP;
+    ggml_cuda_pool_alloc<float>  dst_partial_buf(ctx.pool(), n_partial);
+    ggml_cuda_pool_alloc<float2> dst_meta_buf(ctx.pool(), n_meta);
+    GGML_ASSERT(dst_partial_buf.get() != nullptr);
+    GGML_ASSERT(dst_meta_buf.get() != nullptr);
+
+    // Init dst_meta to (-INF, 0) on device (cudaMemset can't write -INF fp32).
+    {
+        const int threads = 256;
+        const int blocks  = ((int)n_meta + threads - 1) / threads;
+        fattn_per_slot_kv_sm75_init_meta_kernel<<<blocks, threads, 0, stream>>>(
+            dst_meta_buf.get(), (int)n_meta);
+    }
+
+    // Launch FA kernel with grid.z = MAX_PB_HARD_CAP. CTAs at
+    // ip >= pb_for_slot return early after writing sentinel meta.
+    {
+        const dim3 grid(n_seqs, n_hkv, MAX_PB_HARD_CAP);
         const dim3 block(32, 4, 1);
-        fattn_per_slot_kv_sm75_stage22b_kernel<<<grid, block, 0, stream>>>(
-            Q_d, K_d, V_d, M_d, S_d, O_d,
+        fattn_per_slot_kv_sm75_stage23_kernel<<<grid, block, 0, stream>>>(
+            Q_d, K_d, V_d, M_d, S_d, pb_buf.get(),
+            dst_partial_buf.get(), dst_meta_buf.get(),
             Dq, Dv, KVB,
             n_hq, n_hkv, n_seqs, n_kvmax,
-            /*H_packed=*/gqa,
-            scale, softcap, use_softcap
-        );
+            /*H_packed=*/gqa, MAX_PB_HARD_CAP,
+            scale, softcap, use_softcap);
+    }
+
+    // Combine across ip per (slot, head_global).
+    {
+        const dim3 grid(n_seqs, n_hq, 1);
+        const dim3 block(Dv, 1, 1);
+        fattn_per_slot_kv_sm75_combine_kernel<<<grid, block, 0, stream>>>(
+            dst_partial_buf.get(), dst_meta_buf.get(), pb_buf.get(), O_d,
+            Dv, n_hq, n_seqs, MAX_PB_HARD_CAP);
     }
     CUDA_CHECK(cudaGetLastError());
 }
