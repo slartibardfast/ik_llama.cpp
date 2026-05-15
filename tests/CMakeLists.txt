@@ -477,6 +477,16 @@ if (GGML_CUDA)
         install(TARGETS ${TEST_TARGET} RUNTIME)
         add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
         set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+        # PHASE_MMQ_Q4_0_AR16 A.10: closure binding. Plain C++ (no .cu), drives
+        # the full ggml-cuda backend via ggml_backend_cuda_init, runs ggml_mul_mat
+        # at M ∈ {1,4,8,16,32} with LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1, and
+        # bit-compares dst column 0 across M's.
+        llama_build_and_test(dflash-speculative/test-mmq-q4-0-ar16-shape-invariance.cpp)
+        target_include_directories(test-mmq-q4-0-ar16-shape-invariance PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test-mmq-q4-0-ar16-shape-invariance PRIVATE ggml)
     endif()
 endif()
 
