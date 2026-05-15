@@ -453,6 +453,30 @@ if (GGML_CUDA)
         install(TARGETS ${TEST_TARGET} RUNTIME)
         add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
         set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+        # PHASE_MMQ_Q4_0_AR16 A.5: vec_dot_q4_0_ar16_q8_1_mma (INT8 tensor-core)
+        # × scalar fp32 reference. Closure binding: cos ≥ 0.9999, NMSE ≤ 1e-4
+        # AND byte-identical to A.4 DP4A output on same inputs.
+        set(TEST_TARGET test-mmq-q4-0-ar16-mma)
+        add_executable(${TEST_TARGET}
+            dflash-speculative/test-mmq-q4-0-ar16-mma.cu)
+        target_include_directories(${TEST_TARGET} PRIVATE
+            ${CMAKE_SOURCE_DIR}/ggml/src
+            ${CMAKE_SOURCE_DIR}/ggml/include
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(${TEST_TARGET} PRIVATE CUDA::cudart ggml)
+        target_compile_definitions(${TEST_TARGET} PRIVATE
+            GGML_USE_CUDA
+            GGML_CUDA_FUSION=1
+            GGML_CUDA_MIN_BATCH_OFFLOAD=32
+            GGML_CUDA_DMMV_X=32
+            GGML_CUDA_MMV_Y=1
+            GGML_CUDA_PEER_MAX_BATCH_SIZE=128
+            K_QUANTS_PER_ITERATION=2)
+        set_target_properties(${TEST_TARGET} PROPERTIES CUDA_ARCHITECTURES 75)
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+        set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
     endif()
 endif()
 

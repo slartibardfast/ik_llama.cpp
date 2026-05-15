@@ -519,6 +519,88 @@ static __device__ __forceinline__ void vec_dot_q4_0_ar16_q8_1_dp4a(
     }
 }
 
+// vec_dot_q4_0_ar16_q8_1_mma — INT8 MMA path (sm_75+) against unified linear-K
+// storage. Mirrors vec_dot_q8_0_q8_1_mma's structure but uses mma_K4 (16 K
+// positions per op = 1 AR16 block per iter) instead of mma_K8 (32 K = 1 Q8_0
+// block). Scale stride = 16 ints (1 scale per AR16 block) vs Q8_0's 8.
+//
+// Per iter: 1 mma_K4 op covers 16 K = 4 ints in linear-K layout.
+// Per call: 8 iters × 16 K = 128 K's (one block_q8_1_mmq).
+// Two calls per kb0 (k00=0, k00=WARP_SIZE) cover 256 K's.
+template <int mmq_x, int mmq_y, int nwarps>
+static __device__ __forceinline__ void vec_dot_q4_0_ar16_q8_1_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00) {
+
+    typedef mma_int_A_I16K4 mma_A;
+    typedef mma_int_B_J8K4  mma_B;
+    typedef mma_int_C_I16J8 mma_C;
+
+    constexpr int row_stride = MMQ_MMA_TILE_X_K_Q4_0_AR16;  // 84
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = 2 * granularity;
+    constexpr int ntx = rows_per_warp/mma_C::I;
+
+    y += (threadIdx.y % ntx) * (mma_B::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) (x_qs + 2*WARP_SIZE);
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    mma_A A[ntx];
+    float dA[ntx][mma_C::ne/2];
+
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+    #pragma unroll
+    for (int k01 = 0; k01 < WARP_SIZE; k01 += VDR_Q4_0_AR16_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+        mma_B  B;
+        float dB[mma_C::ne/2];
+        B.load(y_qs + k01, MMQ_TILE_Y_K);
+        #pragma unroll
+        for (int l = 0; l < mma_C::ne/2; ++l) {
+            const int j = mma_C::get_j(l);
+            // DS4 layout: (d, s) per 32-K Q8_1 sub-block. Use d only (low half).
+            dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+        }
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            A[n].load(x_qs + (i0 + n*mma_A::I)*row_stride + k0, row_stride);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int i = i0 + n*mma_A::I + mma_C::get_i(2*l);
+                // Scale lookup: one scale per AR16 block. k0/VDR = block index.
+                dA[n][l] = x_df[i*row_stride + k0/VDR_Q4_0_AR16_Q8_1_MMQ];
+            }
+            mma_C C;
+            C.mma_K4(A[n], B);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne; ++l) {
+                sum[(n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+            }
+        }
+        #pragma unroll
+        for (int j0 = ntx*mma_C::J; j0 < mmq_x; j0 += ntx*mma_C::J) {
+            B.load(y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int j = j0 + mma_C::get_j(l);
+                dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+            #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                mma_C C;
+                C.mma_K4(A[n], B);
+                #pragma unroll
+                for (int l = 0; l < mma_C::ne; ++l) {
+                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+                }
+            }
+        }
+    }
+}
+
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s_r4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
 
