@@ -298,6 +298,20 @@ if (GGML_CUDA)
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # NP-invariance unit test on the production dispatch path
+    # (specs/deltanet/fattn-per-slot-kv-sm75.md §15.7). Drives the
+    # ggml_flash_attn_ext_per_slot_kv op through the CUDA backend with
+    # two K-cache occupancies and asserts byte-identity. Separate from
+    # test-fattn-per-slot-kv-sm75 which validates the deprecated bespoke
+    # kernels against a host scalar reference.
+    set(TEST_TARGET test-fattn-per-slot-kv-dispatch-np-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-fattn-per-slot-kv-dispatch-np-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
