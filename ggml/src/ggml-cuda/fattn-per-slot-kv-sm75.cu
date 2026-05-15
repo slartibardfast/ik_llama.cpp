@@ -460,7 +460,7 @@ __global__ void fattn_per_slot_kv_sm75_stage21_kernel(
 }
 
 // ============================================================================
-// Stage 2.2a kernel — 4-warp CTA (128 threads), same Approach A geometry.
+// multi-row kernel — 4-warp CTA (128 threads), same Approach A geometry.
 // ============================================================================
 //
 // Sub-stage of Stage 2.2 per Q&A decision (7b incremental). ONLY change from
@@ -487,7 +487,7 @@ __global__ void fattn_per_slot_kv_sm75_stage21_kernel(
 // mma.sync internal reduction. Cross-warp SMEM sum introduces another
 // associative-add ordering, but cosine ≥ 0.9999 holds at fp32 precision.
 
-__global__ void fattn_per_slot_kv_sm75_stage22a_kernel(
+__global__ void fattn_per_slot_kv_sm75_multi_row_kernel(
     const uint16_t * __restrict__ Q,
     const uint16_t * __restrict__ K,
     const uint16_t * __restrict__ V,
@@ -713,12 +713,12 @@ __global__ void fattn_per_slot_kv_sm75_stage22a_kernel(
 // 0..H-1 are real heads; rows H..15 are zero-padded.
 //
 // At gqa=6 (production target Qwen 3.6 27B): 6 real rows + 10 padded.
-// Useful mma work: 6/16 = 37.5% (vs Stage 2.2a's 1/16 = 6.25% at decode).
+// Useful mma work: 6/16 = 37.5% (vs multi-row's 1/16 = 6.25% at decode).
 // 6x effective mma-throughput improvement at decode shape.
 //
 // SCOPE: this kernel handles ONLY n_tokens=1 with H_packed <= 16 packed
 // heads (one CTA per (slot, kv_head)). For n_tokens > 1 or H_packed > 16,
-// the launcher falls through to Stage 2.2a (Approach A).
+// the launcher falls through to multi-row (Approach A).
 //
 // GRID & BLOCK:
 //   grid (n_seqs, n_kv_heads, 1) — was (n_seqs, n_tokens, n_heads_q)
@@ -728,7 +728,7 @@ __global__ void fattn_per_slot_kv_sm75_stage22a_kernel(
 //   1 (slot, kv_head) tuple. All H heads of the gqa group processed
 //   together. Single q_row = 0 (decode).
 //   K-cache and V-cache are SHARED across all H heads in this gqa group
-//   (one K head feeds all H Q heads) — no extra K/V loading vs Stage 2.2a.
+//   (one K head feeds all H Q heads) — no extra K/V loading vs multi-row.
 //
 // VKQ DISTRIBUTION:
 //   16 rows × Dv=256 dims = 4096 fp32 per CTA = 32 fp32/thread (128 threads).
@@ -2179,14 +2179,14 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
     // Launch. Variant selectable via env (debug):
     //   FATTN_KERNEL_VARIANT=phase1   → 1-warp scalar (Phase 1)
     //   FATTN_KERNEL_VARIANT=stage21  → 1-warp mma.sync (Stage 2.1)
-    //   FATTN_KERNEL_VARIANT=stage22a → 4-warp Approach A (forced — all shapes)
+    //   FATTN_KERNEL_VARIANT=multi_row → 4-warp Approach A (forced — all shapes)
     //   default                        → Approach C decode pack (Stage 2.2b)
-    //                                     for n_tokens=1, else Stage 2.2a.
+    //                                     for n_tokens=1, else multi-row.
     {
         const char * variant = std::getenv("FATTN_KERNEL_VARIANT");
         const bool use_phase1   = (variant && std::strcmp(variant, "phase1")   == 0);
         const bool use_stage21  = (variant && std::strcmp(variant, "stage21")  == 0);
-        const bool use_stage22a = (variant && std::strcmp(variant, "stage22a") == 0);
+        const bool use_multi_row = (variant && std::strcmp(variant, "multi_row") == 0);
 
         if (use_phase1) {
             const dim3 grid(n_seqs, n_tok, n_hq);
@@ -2206,11 +2206,11 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
                 cfg.scale, cfg.softcap, cfg.use_softcap
             );
-        } else if (use_stage22a || n_tok > 1) {
-            // Stage 2.2a for prefill / multi-token paths (or forced via env).
+        } else if (use_multi_row || n_tok > 1) {
+            // multi-row for prefill / multi-token paths (or forced via env).
             const dim3 grid(n_seqs, n_tok, n_hq);
             const dim3 block(32, 4, 1);
-            fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block>>>(
+            fattn_per_slot_kv_sm75_multi_row_kernel<<<grid, block>>>(
                 Q_d, K_d, V_d, M_d, S_d, O_d,
                 Dq, Dv, KVB,
                 n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
@@ -2225,10 +2225,10 @@ extern "C" int fattn_per_slot_kv_sm75_launch(
                 (variant && std::strcmp(variant, "stage23") == 0);
             const int gqa = n_hq / n_hkv;
             if (gqa > 16) {
-                // Fall back to Stage 2.2a for unsupported gqa values.
+                // Fall back to multi-row for unsupported gqa values.
                 const dim3 grid(n_seqs, n_tok, n_hq);
                 const dim3 block(32, 4, 1);
-                fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block>>>(
+                fattn_per_slot_kv_sm75_multi_row_kernel<<<grid, block>>>(
                     Q_d, K_d, V_d, M_d, S_d, O_d,
                     Dq, Dv, KVB,
                     n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
@@ -2355,7 +2355,7 @@ cleanup:
 //   - dst is fp32 output [Dv, n_heads_q, n_tokens, n_seqs]
 //
 // Phase 1 wiring scope: gqa <= 16 (Approach C decode pack supports up to 16
-// rows). For n_tokens > 1, route to Stage 2.2a (prefill path). For n_tokens=1
+// rows). For n_tokens > 1, route to multi-row (prefill path). For n_tokens=1
 // and gqa <= 16, route to Stage 2.3 (split-K + combine).
 
 #include "ggml-cuda/common.cuh"
@@ -2445,12 +2445,12 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
         V_d = V_dq_buf.get();
     }
 
-    // Production dispatch: prefill → Stage 2.2a; decode → Stage 2.3 (split-K
+    // Production dispatch: prefill → multi-row; decode → Stage 2.3 (split-K
     // with on-device pb computation, CUDA-graph-capture compatible).
     if (n_tok > 1) {
         const dim3 grid(n_seqs, n_tok, n_hq);
         const dim3 block(32, 4, 1);
-        fattn_per_slot_kv_sm75_stage22a_kernel<<<grid, block, 0, stream>>>(
+        fattn_per_slot_kv_sm75_multi_row_kernel<<<grid, block, 0, stream>>>(
             Q_d, K_d, V_d, M_d, S_d, O_d,
             Dq, Dv, KVB,
             n_tok, n_hq, n_hkv, n_seqs, n_kvmax,
