@@ -1903,29 +1903,23 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
     float kqmax    = -INFINITY;
     float kqrowsum = 0.0f;
 
-    // SMEM (same as single-head kernel).
-    __shared__ half  Q_smem[N_ROWS * 256];   // 8 KiB (15 rows wasted but small)
-    __shared__ half  K_smem[32 * 256];        // 16 KiB
-    __shared__ half  V_smem[32 * 256];        // 16 KiB
-    __shared__ float D_partials[NWARPS][N_ROWS][8];  // 2 KiB
-    __shared__ float KQ_smem[32];             // row-0 KQ only, KVB max = 32
+    // SoTA SMEM allocation — only stage what gets reused.
+    //   Q_smem  : 1 real row (others read as 0 in A tile) ............... 512 B
+    //   K_smem  : KVB=32 max × Dq (each elem read 16× across mma) ....... 16 KiB
+    //   V        : NOT staged — each V elem read exactly once (no reuse);
+    //              read directly via __ldg in V-accum below
+    //   D_part  : NWARPS × 8 cols (row 0 only — 15 mma rows wasted at decode)
+    //   KQ_smem  : KVB max .............................................. 128 B
+    // Total ≈ 16.7 KiB → 3 blocks/SM at 64 KiB cap (vs 1 block/SM previously).
+    __shared__ half  Q_smem[256];                       // 1 row, 512 B
+    __shared__ half  K_smem[32 * 256];                  // 16 KiB (KVB ≤ 32)
+    __shared__ float D_partials[NWARPS][8];             // 128 B (row 0 cols only)
+    __shared__ float KQ_smem[32];                       // 128 B
 
-    // Cooperative load Q row 0 (other 15 rows zero — set once).
+    // Cooperative load Q row 0 only.
     {
-        const int total = N_ROWS * Dq;
-        const int per_thread = (total + 127) / 128;
-        for (int e = 0; e < per_thread; e++) {
-            const int idx = tid + e * 128;
-            if (idx >= total) break;
-            const int r = idx / Dq;
-            const int c = idx % Dq;
-            half v;
-            if (r == 0) {
-                v = __ushort_as_half(Q[Q_off(c)]);
-            } else {
-                v = __float2half(0.0f);
-            }
-            Q_smem[r * Dq + c] = v;
+        for (int d = tid; d < Dq; d += 128) {
+            Q_smem[d] = __ushort_as_half(Q[Q_off(d)]);
         }
     }
     __syncthreads();
@@ -1934,7 +1928,7 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
         const int kb_end = min(kb + KVB, k_end_global);
         const int blk    = kb_end - kb;
 
-        // Cooperative load K + V blocks.
+        // Cooperative load K block only (V skipped — see V_smem comment above).
         {
             const int total = blk * Dq;
             const int per_thread = (total + 127) / 128;
@@ -1945,16 +1939,6 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
                 const int d_idx = idx % Dq;
                 const int k_global = kb + n_idx;
                 K_smem[n_idx * Dq + d_idx] = __ushort_as_half(K[K_off(d_idx, k_global)]);
-            }
-            const int total_v = blk * Dv;
-            const int per_thread_v = (total_v + 127) / 128;
-            for (int e = 0; e < per_thread_v; e++) {
-                const int idx = tid + e * 128;
-                if (idx >= total_v) break;
-                const int n_idx = idx / Dv;
-                const int d_idx = idx % Dv;
-                const int k_global = kb + n_idx;
-                V_smem[n_idx * Dv + d_idx] = __ushort_as_half(V[V_off(d_idx, k_global)]);
             }
         }
         __syncthreads();
@@ -1974,15 +1958,23 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
             for (int k_chunk = k_chunk_start; k_chunk < k_chunk_end; k_chunk++) {
                 const int k_start = k_chunk * 16;
 
+                // A tile: row 0 is real Q (from Q_smem[Dq]); rows 1..15 are zero
+                // (mma m=16 hardware constraint; only row 0 output is used).
                 tile<16, 8, half2> A;
                 #pragma unroll
                 for (int l = 0; l < A.ne; l++) {
                     const int row       = A.get_i(l);
                     const int half2_col = A.get_j(l);
-                    const int d0 = k_start + 2 * half2_col;
-                    const int d1 = d0 + 1;
-                    half a = Q_smem[row * Dq + d0];
-                    half b = Q_smem[row * Dq + d1];
+                    half a, b;
+                    if (row == 0) {
+                        const int d0 = k_start + 2 * half2_col;
+                        const int d1 = d0 + 1;
+                        a = Q_smem[d0];
+                        b = Q_smem[d1];
+                    } else {
+                        a = __float2half(0.0f);
+                        b = __float2half(0.0f);
+                    }
                     A.x[l] = __halves2half2(a, b);
                 }
 
@@ -1996,22 +1988,20 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
                 mma(D, A, B);
             }
 
-            // Write partial D (just row 0 useful, write only that to save bandwidth).
-            // D row 0 is held by threads tx ∈ {0, 1, 2, 3} in D.x[0] and D.x[1].
-            // Other threads' D contents for row 0 are not held.
-            // Strategy: write each warp's row 0 to SMEM, then sum across warps.
+            // Write D row 0 only. Threads tx ∈ {0..3} hold the row 0 values in
+            // D.x[0] (col 2*lane) and D.x[1] (col 2*lane+1).
             if (lane < 4) {
-                D_partials[warp_id][0][2 * lane    ] = D.x[0];
-                D_partials[warp_id][0][2 * lane + 1] = D.x[1];
+                D_partials[warp_id][2 * lane    ] = D.x[0];
+                D_partials[warp_id][2 * lane + 1] = D.x[1];
             }
             __syncthreads();
 
-            // Sum row 0 across warps; broadcast to KQ_smem[n_start..n_start+7].
+            // Sum across warps; broadcast to KQ_smem[n_start..n_start+7].
             if (tid < 8) {
                 float sum = 0.0f;
                 #pragma unroll
                 for (int w = 0; w < NWARPS; w++) {
-                    sum += D_partials[w][0][tid];
+                    sum += D_partials[w][tid];
                 }
                 KQ_smem[n_start + tid] = sum;
             }
@@ -2028,8 +2018,9 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
         __syncthreads();
 
         // Online softmax + V accum. Each thread maintains identical scalar
-        // state; results agree because inputs (KQ_smem) are identical across
-        // threads.
+        // state. V is read directly from global via __ldg (cached in L2);
+        // each V element is read exactly once per V-accum so SMEM staging
+        // wouldn't reduce traffic.
         float new_max = kqmax;
         for (int i = 0; i < blk; i++) {
             if (KQ_smem[i] > new_max) new_max = KQ_smem[i];
@@ -2049,11 +2040,13 @@ __global__ void fattn_per_slot_kv_sm75_decode_split_k_kernel(
             const float sm = (kq == -INFINITY) ? 0.0f : __expf(kq - new_max);
             if (sm == 0.0f) continue;
             kqrowsum += sm;
+            const int k_global = kb + i;
             #pragma unroll
             for (int j = 0; j < VKQ_PER_THREAD; j++) {
                 const int d = tid + j * 128;
                 if (d < Dv) {
-                    VKQ[j] += sm * __half2float(V_smem[i * Dv + d]);
+                    const half v_h = __ldg((const half *)&V[V_off(d, k_global)]);
+                    VKQ[j] += sm * __half2float(v_h);
                 }
             }
         }
@@ -2392,7 +2385,7 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
     const int n_seqs  = (int) Q->ne[3];
     const int n_kvmax = (int) K->ne[1];
     const int n_hkv   = (int) K->ne[2];
-    const int KVB     = 16;  // primary at Dv=256 per spec §9
+    const int KVB     = 32;  // SoTA SMEM redesign — KVB=32 halves K-block count
 
     GGML_ASSERT(Dq == 256 && Dv == 256);
     GGML_ASSERT(n_hq % n_hkv == 0);
