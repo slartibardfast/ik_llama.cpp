@@ -1956,19 +1956,27 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float beta = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        // F32 path: cuBLAS rejects CUDA_R_32F + CUBLAS_COMPUTE_32F + ALGO0
-        // ("requested functionality is not supported"). Keep cublasSgemm and
-        // rely on the math-mode gate at handle creation (CUBLAS_DEFAULT_MATH
-        // under env disables TF32). True byte-identity across M requires a
-        // deeper fix — likely cuBLASLt with full algo pinning OR a custom
-        // F32 GEMM. Tracked as Phase C follow-up.
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha, src0_ddf_i,  ne00,
-                            src1_ddf1_i, ne10,
-                    &beta,  dst_dd_i,    ldc));
-        (void)s_force_sid_cublas;
+        if (s_force_sid_cublas) {
+            // Deterministic row-pinned F32 GEMM (CUDA cores, no TC on Turing
+            // for F32 anyway). Each CTA = 1 warp = one output cell with
+            // stride-32 K loop + fixed warp-reduce. Byte-identical across M.
+            ggml_cuda_mul_mat_f32_pinned(
+                src0_ddf_i, src1_ddf1_i, dst_dd_i,
+                /*K=*/(int)ne10,
+                /*N_rows=*/(int)row_diff,
+                /*M=*/(int)src1_ncols,
+                /*K_stride_w=*/(int)ne00,
+                /*K_stride_a=*/(int)ne10,
+                /*N_dst_stride=*/(int)ldc,
+                stream);
+        } else {
+            CUBLAS_CHECK(
+                cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha, src0_ddf_i,  ne00,
+                                src1_ddf1_i, ne10,
+                        &beta,  dst_dd_i,    ldc));
+        }
     }
 
     GGML_UNUSED(dst);

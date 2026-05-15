@@ -44,3 +44,29 @@ void ggml_cuda_mul_mat_f16_pinned(
         int           K_stride_a,    // = K for contiguous
         int           N_dst_stride,  // dst columns: stride along m
         cudaStream_t  stream);
+
+// Deterministic F32 weight × F32 activation → F32 dst.
+//
+// Turing has no F32 tensor cores, so this kernel uses CUDA cores with a
+// scalar FMA accumulator per output cell. Each CTA = 1 warp = computes
+// one output cell dst[n, m]. The 32 threads stride-32 across the K axis;
+// per-thread partial sums are warp-reduced via __shfl_xor in a fixed
+// reduction tree. K-loop iteration order is fixed and shape-independent,
+// so cell (n, m) is byte-identical regardless of total M.
+//
+// Performance: O(K / 32) FMAs per cell per thread. Memory-bound for
+// large K. Not a hot path in production (Qwen 3.6 27B has zero F32
+// matmuls in decode — empirically verified by F32-SGEMM diagnostic
+// counter at the cublasSgemm call site). Included for correctness
+// closure of the cuBLAS-pinned binding, not perf.
+void ggml_cuda_mul_mat_f32_pinned(
+        const float * weight,    // K * N_rows floats, weight[k + n*K]
+        const float * act,       // K * M       floats, act   [k + m*K]
+        float       * dst,       // N_rows * M floats, dst[n + m*N_dst_stride]
+        int           K,
+        int           N_rows,
+        int           M,
+        int           K_stride_w,
+        int           K_stride_a,
+        int           N_dst_stride,
+        cudaStream_t  stream);

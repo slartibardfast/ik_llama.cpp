@@ -173,3 +173,69 @@ void ggml_cuda_mul_mat_f16_pinned(
         weight, act, dst, K, N_rows, M,
         K_stride_w, K_stride_a, N_dst_stride);
 }
+
+// ===== F32 path =====
+//
+// Each CTA = 1 warp, computes ONE output cell dst[n, m].
+// K loop strided by 32, per-thread fp32 accumulator, warp-reduce in
+// fixed tree order. K-loop order is independent of M → byte-identity
+// across batch.
+
+__launch_bounds__(WARP_SIZE, 4)
+static __global__ void mul_mat_f32_pinned_kernel(
+        const float * __restrict__ weight,
+        const float * __restrict__ act,
+        float       * __restrict__ dst,
+        const int K,
+        const int N_rows,
+        const int M,
+        const int K_stride_w,
+        const int K_stride_a,
+        const int N_dst_stride) {
+
+    const int n = blockIdx.x;
+    const int m = blockIdx.y;
+    if (n >= N_rows || m >= M) return;
+
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+
+    // K loop in fixed stride-32 order. Per-thread accumulator covers
+    // K positions {tid, tid+32, tid+64, ...}. Order is identical for any
+    // (n, m, total_M) — only the underlying values vary.
+    const float * w_row = weight + (size_t)n * K_stride_w;
+    const float * a_col = act    + (size_t)m * K_stride_a;
+    for (int k = tid; k < K; k += WARP_SIZE) {
+        acc += w_row[k] * a_col[k];
+    }
+
+    // Warp reduce in fixed butterfly order (16, 8, 4, 2, 1).
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (tid == 0) {
+        dst[(size_t)n + (size_t)m * N_dst_stride] = acc;
+    }
+}
+
+void ggml_cuda_mul_mat_f32_pinned(
+        const float * weight,
+        const float * act,
+        float       * dst,
+        int           K,
+        int           N_rows,
+        int           M,
+        int           K_stride_w,
+        int           K_stride_a,
+        int           N_dst_stride,
+        cudaStream_t  stream) {
+
+    const dim3 grid(N_rows, M, 1);
+    const dim3 block(WARP_SIZE, 1, 1);
+
+    mul_mat_f32_pinned_kernel<<<grid, block, 0, stream>>>(
+        weight, act, dst, K, N_rows, M,
+        K_stride_w, K_stride_a, N_dst_stride);
+}
