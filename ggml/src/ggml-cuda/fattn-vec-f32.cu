@@ -1,6 +1,29 @@
 #include "fattn-vec-f32.cuh"
 #include "fattn-vec-f32-interface.cuh"
 
+// NP-invariant strict entry: cols_per_block=1, force_parallel_blocks=1,
+// K/V auto-dequant to F16. See header for context.
+void ggml_cuda_flash_attn_ext_vec_f32_strict_np_invariant(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * V = dst->src[2];
+    GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
+
+    constexpr int Dk = 256;
+    constexpr int Dv = 256;
+    constexpr int cols_per_block = 1;
+    constexpr int nwarps = Dk / WARP_SIZE;  // = 8
+    constexpr size_t nbytes_shared = 0;
+    fattn_kernel_t fattn_kernel =
+        flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, GGML_TYPE_F16, GGML_TYPE_F16, /*use_logit_softcap=*/false>;
+    launch_fattn<Dv, cols_per_block, 1>(
+        ctx, dst, fattn_kernel, nwarps, nbytes_shared,
+        /*KQ_row_granularity=*/Dv,
+        /*need_f16_K=*/true, /*need_f16_V=*/true,
+        /*warp_size=*/WARP_SIZE,
+        /*force_parallel_blocks=*/1);
+}
+
 #define FATTN_VEC_F32_CASE(D, type_K, type_V)                               \
     if (Q->ne[0] == (D) && K->type == (type_K) && V->type == (type_V)) {    \
         ggml_cuda_flash_attn_ext_vec_f32_case<D, D, type_K, type_V>(ctx, dst); \

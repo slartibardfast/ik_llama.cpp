@@ -840,7 +840,14 @@ static void on_no_fattn_vec_case(const int Dk, const int Dv) {
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int KQ_row_granularity, const bool need_f16_K, const bool need_f16_V, const int warp_size = WARP_SIZE) {
+    const int KQ_row_granularity, const bool need_f16_K, const bool need_f16_V, const int warp_size = WARP_SIZE,
+    const int force_parallel_blocks = 0) {
+    // force_parallel_blocks: if > 0, pin parallel_blocks to this value
+    // regardless of the occupancy-based heuristic. Needed for the
+    // NP-invariant FA path (spec §15.10): the heuristic chooses
+    // parallel_blocks based on Q->ne[1]*ne[2]*ne[3], which is shape-
+    // dependent. Pinning pb=1 makes the K-loop partitioning identical
+    // across all NP — required for the per-row CTA byte-identity contract.
 
     const bool is_mla = DV == 512; // TODO better parameterization
 
@@ -1017,6 +1024,12 @@ void launch_fattn(
             efficiency_percent_best = efficiency_percent;
             parallel_blocks = parallel_blocks_test;
         }
+    }
+
+    // Override the occupancy-based parallel_blocks heuristic if the
+    // caller forces a specific value (NP-invariant FA path, spec §15.10).
+    if (force_parallel_blocks > 0) {
+        parallel_blocks = force_parallel_blocks;
     }
 
     blocks_num.x = ntiles_x;
