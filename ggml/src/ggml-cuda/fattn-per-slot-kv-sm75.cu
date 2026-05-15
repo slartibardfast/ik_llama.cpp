@@ -2410,6 +2410,13 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
 
     // cols_per_block=8 covers any ne[1] via multi-CTA tiling
     // (blocks_num.x = ceil(ne[1]/8)). parallel_blocks=1 pins the K-loop
-    // partitioning. Both are compile-time constants — NP-independent.
-    ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, half>(ctx, dst);
+    // partitioning. KQ_acc_t=float (not half) — fp16 warp_reduce_sum
+    // is non-associative on slot-position (the cache allocator places
+    // each slot's valid K-positions at varying thread offsets within
+    // the warp; fp16 partial sums at those positions diverge enough to
+    // flip argmax tokens downstream). fp32 accumulator has ~24-bit
+    // precision vs fp16's ~11; partial-sum order still matters
+    // theoretically but the rounding effect drops below the threshold
+    // that flips argmax. See spec §15.10.
+    ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, float>(ctx, dst);
 }
