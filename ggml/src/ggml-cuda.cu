@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mul-mat-f16-pinned.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -1897,23 +1898,40 @@ static void ggml_cuda_op_mul_mat_cublas(
             }
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
-        ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
-        const half alpha_f16 = 1.0f;
-        const half beta_f16 = 0.0f;
+        if (s_force_sid_cublas && ne10 % MUL_MAT_F16_PINNED_TILE_K == 0) {
+            // Deterministic row-pinned F16 GEMM: writes F32 directly. K must
+            // be a multiple of TILE_K (= 16). Each output cell is owned by
+            // exactly one CTA with a fixed K loop → byte-identical regardless
+            // of M.
+            ggml_cuda_mul_mat_f16_pinned(
+                src0_ptr, src1_ptr, dst_dd_i,
+                /*K=*/ne10,
+                /*N_rows=*/row_diff,
+                /*M=*/src1_ncols,
+                /*K_stride_w=*/ne00,
+                /*K_stride_a=*/ne10,
+                /*N_dst_stride=*/ldc,
+                stream);
+        } else {
+            ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f16, src0_ptr,       CUDA_R_16F, ne00,
-                                src1_ptr,       CUDA_R_16F, ne10,
-                    &beta_f16,   dst_f16.get(), CUDA_R_16F, ldc,
-                    CUBLAS_COMPUTE_16F,
-                    s_cublas_algo));
+            const half alpha_f16 = 1.0f;
+            const half beta_f16 = 0.0f;
 
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-        to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff, src1_ncols, stream);
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f16, src0_ptr,       CUDA_R_16F, ne00,
+                                    src1_ptr,       CUDA_R_16F, ne10,
+                        &beta_f16,   dst_f16.get(), CUDA_R_16F, ldc,
+                        CUBLAS_COMPUTE_16F,
+                        s_cublas_algo));
+
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff, src1_ncols, stream);
+        }
     } else {
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
