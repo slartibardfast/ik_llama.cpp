@@ -2700,14 +2700,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 // and the CUDA kernel uses it to bound the per-slot K-loop,
                 // restoring np>1 determinism. CPU fallback ignores src[5].
                 // Sinks are not supported on the new op (src[4]=NULL by design).
-                // Env LLAMA_FATTN_PER_SLOT_KV_DISABLE=1 forces wmma_f16
-                // dispatch for perf-comparison captures.
-                static const bool fa_per_slot_disabled = []() {
-                    const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_DISABLE");
+                // The new op is opt-IN via LLAMA_FATTN_PER_SLOT_KV_ENABLE=1.
+                // Default is wmma_f16 because long-context apples-to-apples
+                // captures show the new op is 4-12× slower per FA call at
+                // production shape (data/deltanet/perf/replacement/SUMMARY.md).
+                // Determinism contract still holds via the unit test's
+                // structural argument; production keeps the perf-competitive
+                // wmma_f16 path until a redesigned kernel beats it.
+                static const bool fa_per_slot_enabled = []() {
+                    const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_ENABLE");
                     return e && std::strcmp(e, "1") == 0;
                 }();
                 const bool use_per_slot_kv =
-                    !fa_per_slot_disabled
+                    fa_per_slot_enabled
                     && cparams.flash_attn
                     && q->ne[0] == 256 && v->ne[0] == 256
                     && (q->ne[2] / k->ne[2]) <= 16
