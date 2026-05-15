@@ -379,6 +379,68 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// load_tiles_q4_0_ar16 — clone of load_tiles_q4_0 adjusted for AR16's
+// half-size blocks (16 elements vs 32). Per PHASE_MMQ_Q4_0_AR16.md §2.1.
+//   QI_AR16 = 2 ints per block (vs QI4_0=4 for Q4_0).
+//   blocks_per_tile_x_row = WARP_SIZE / QI_AR16 = 16 (vs 8 for Q4_0).
+//   x_qs row stride = MMQ_MMA_TILE_X_K_Q4_0_AR16 = 100 (vs 76).
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q4_0_ar16(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
+
+#ifdef INT8_MMA_AVAILABLE
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*WARP_SIZE);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_AR16, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // INT8_MMA_AVAILABLE
+
+    const int kbx  = threadIdx.x / QI_AR16;   // 0..15 (which AR16 block in warp tile)
+    const int kqsx = threadIdx.x % QI_AR16;   // 0..1  (which int within block; each block has 8 bytes = 2 ints)
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *)(x + i*stride) + kbx0 + kbx;
+        const int qs0 = get_int_b2(bxi->qs, kqsx);
+
+#ifdef INT8_MMA_AVAILABLE
+        // Same nibble-split + sign-recenter pattern as Q4_0. Each block writes
+        // 2 ints (low/high nibbles) per kqsx, at MMA stride MMQ_MMA_TILE_X_K_Q4_0_AR16.
+        x_qs[i*MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*(2*QI_AR16) + kqsx + 0]        = __vsubss4((qs0 >> 0) & 0x0F0F0F0F, 0x08080808);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q4_0_AR16 + kbx*(2*QI_AR16) + kqsx + QI_AR16]  = __vsubss4((qs0 >> 4) & 0x0F0F0F0F, 0x08080808);
+#else
+        x_qs[i*(WARP_SIZE + 1) + threadIdx.x] = qs0;
+#endif // INT8_MMA_AVAILABLE
+    }
+
+    const int blocks_per_tile_x_row = WARP_SIZE / QI_AR16;   // 16
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_AR16) {
+        int i = i0 + threadIdx.y * QI_AR16 + threadIdx.x / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *)(x + i*stride) + kbx0 + kbxd;
+
+#ifdef INT8_MMA_AVAILABLE
+        x_df[i*MMQ_MMA_TILE_X_K_Q4_0_AR16       + kbxd] = bxi->d;
+#else
+        x_df[i*(WARP_SIZE/QI_AR16) + i/QI_AR16 + kbxd] = bxi->d;
+#endif // INT8_MMA_AVAILABLE
+    }
+}
+
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_iq1_s_r4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
 
