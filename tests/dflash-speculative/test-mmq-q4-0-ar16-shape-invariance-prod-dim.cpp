@@ -141,7 +141,10 @@ int main() {
     }
 
     // ---------- Sweep M values, compare row-0 output ----------
-    const std::vector<int64_t> Ms = {1, 4, 8, 16, 32};
+    // CY.F.15 added M=12 (serial prefill) and M=96 (NP=8 batched prefill).
+    // If row-0 differs across these, MMQ at production batch sizes is the
+    // multi-seq drift source.
+    const std::vector<int64_t> Ms = {1, 4, 8, 12, 16, 32, 96};
     std::vector<std::vector<float>> outs;
     outs.reserve(Ms.size());
 

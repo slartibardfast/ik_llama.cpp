@@ -413,6 +413,30 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.F.14 — find first-divergent layer between serial seq=0 and
+    # batched seq=0 (multi-seq batch). Uses dflash extract-layers (authoritative
+    # capture with dtype branching) to pin down which layer introduces the
+    # batched-vs-serial drift.
+    set(TEST_TARGET test-cy-batched-layer-first-div)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-batched-layer-first-div.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # Phase CY.F.15 — drill into layer 0 to find first divergent intra-layer
+    # tag (DeltaNet inputs/outputs, qkv projections, FFN) between serial seq=0
+    # and batched seq=0 row. Uses cb_eval matched-name capture with F16→F32
+    # dtype branching (matches libllama mechanism).
+    set(TEST_TARGET test-cy-layer0-serial-vs-batched)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-layer0-serial-vs-batched.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-4 / 5 / 7 — focused CUDA probe for warp_reduce_sum mask-shape
     # non-associativity, warp_reduce_max invariance, and compact-then-reduce
     # fix candidate. CUDA target; sm_75 required.
