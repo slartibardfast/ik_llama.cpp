@@ -214,9 +214,17 @@ int main() {
 
     // Capture snapshot of all 64 layers at decode step 1.
     // n_layer for qwen3.6 27B is 64; extract API supports up to 80.
+    // CY.F.18: optionally narrow to a single layer via LLAMA_TEST_BISECT_LAYER
+    // (single int) to test whether one barrier alone suppresses the race.
     const int n_layer = 64;
     std::vector<int32_t> layer_ids;
-    for (int i = 0; i < n_layer; ++i) layer_ids.push_back(i);
+    if (const char * e = std::getenv("LLAMA_TEST_BISECT_LAYER"); e) {
+        int only = std::atoi(e);
+        layer_ids.push_back(only);
+        fprintf(stderr, "[CY.F.18] Bisect: extracting ONLY layer %d\n", only);
+    } else {
+        for (int i = 0; i < n_layer; ++i) layer_ids.push_back(i);
+    }
 
     // CONTROL run pair: NO layer markers set. Pure decode. Tests whether
     // the race fires when nothing is forcing graph serialization.
