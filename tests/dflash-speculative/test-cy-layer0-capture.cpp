@@ -69,10 +69,28 @@ static bool my_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     captured c;
     c.name = t->name;
     c.ne   = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
-    c.type = t->type;
-    const size_t nb = ggml_nbytes(t);
-    c.data.resize(nb);
-    ggml_backend_tensor_get(t, c.data.data(), 0, nb);
+    // Match d1-capture mechanism's dtype branching (libllama/llama.cpp:9682):
+    // residual / FFN tensors land as F32 for single-token decodes and F16 for
+    // multi-token ubatches. Without dtype branching, ggml_nbytes-based copies
+    // of F16 tensors are silently misinterpreted as F32 in downstream reads.
+    const int64_t n_elements = (int64_t) ggml_nelements(t);
+    if (t->type == GGML_TYPE_F32) {
+        c.type = GGML_TYPE_F32;
+        c.data.resize((size_t) n_elements * sizeof(float));
+        ggml_backend_tensor_get(t, c.data.data(), 0, c.data.size());
+    } else if (t->type == GGML_TYPE_F16) {
+        c.type = GGML_TYPE_F32;  // store as F32 after conversion (matches d1)
+        std::vector<ggml_fp16_t> h_stage((size_t) n_elements);
+        ggml_backend_tensor_get(t, h_stage.data(), 0, (size_t) n_elements * sizeof(ggml_fp16_t));
+        c.data.resize((size_t) n_elements * sizeof(float));
+        ggml_fp16_to_fp32_row(h_stage.data(), (float *) c.data.data(), n_elements);
+    } else {
+        // Other types — write raw bytes; downstream must interpret.
+        c.type = t->type;
+        const size_t nb = ggml_nbytes(t);
+        c.data.resize(nb);
+        ggml_backend_tensor_get(t, c.data.data(), 0, nb);
+    }
     st->store.push_back(std::move(c));
     return true;
 }
