@@ -169,6 +169,7 @@ int main() {
     cparams.n_seq_max   = 8;
     cparams.type_k      = GGML_TYPE_Q4_0;
     cparams.type_v      = GGML_TYPE_Q4_0;
+    cparams.type_reduce = GGML_TYPE_F32;  // CY.F.16: disable F32→F16 cast at ne[1]>32
     cparams.flash_attn  = true;
     cparams.mla_attn    = 3;
     cparams.k_cache_hadamard = true;

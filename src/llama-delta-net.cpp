@@ -674,7 +674,16 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     // dispatch below would otherwise evaluate gated_output->ne[1] > 32 independently
     // for each block, returning F32 for tiny blocks and F16 for large ones — the
     // ggml_concat at the end of this function then aborts on dtype mismatch.
-    const bool force_reduce_cast = (cur->ne[1] > 32);
+    //
+    // Phase CY.F.16: when cur->ne[1] > 32 (multi-token batches), the cross-device
+    // reduce path casts gated_output F32→F16 then back to F32, introducing ~1e-3
+    // precision loss. This is the source of the multi-seq batched vs serial drift.
+    // LLAMA_DELTA_NO_REDUCE_CAST=1 disables the cast for empirical verification.
+    static const bool delta_no_reduce_cast = []() {
+        const char * e = std::getenv("LLAMA_DELTA_NO_REDUCE_CAST");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    const bool force_reduce_cast = delta_no_reduce_cast ? false : (cur->ne[1] > 32);
 
     // Phase CY: the all_same_seq fast path takes a structurally different
     // code path (single call to build_layer_attn_linear_core, no per-block

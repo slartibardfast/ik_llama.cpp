@@ -7165,6 +7165,27 @@ struct llama_context * llama_init_from_model(
             cparams.reduce_type = GGML_TYPE_F32;
         }
     }
+    // Phase CY.F.16: Qwen 3.5 / 3.6 hybrid (DeltaNet + full-attention) requires
+    // F32 cross-device reduce for batch-shape-invariant determinism. The default
+    // F16 cast at cur->ne[1] > 32 introduces ~1e-3 precision loss that breaks
+    // cross-NP byte-identity between NP=1 (cast doesn't fire at short ne[1])
+    // and NP=N>=5 (cast fires when total tokens cross 32). Forcing F32 matches
+    // the GPT-OSS precedent above and is verified via test-cy-seq-id-batched
+    // (serial == batched logits with cparams.type_reduce=GGML_TYPE_F32).
+    // Option B (async F32 reduce with stream-overlap) is a future workstream
+    // that will eliminate the bandwidth cost; this Option A trades ~2× cross-
+    // device reduce traffic at prefill for deterministic output.
+    if ((model->arch == LLM_ARCH_QWEN35 || model->arch == LLM_ARCH_QWEN35MOE) &&
+            model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+        if (cparams.reduce_type != GGML_TYPE_F32) {
+            LLAMA_LOG_WARN("=====================================================================\n");
+            LLAMA_LOG_WARN("Qwen3.5/3.6 hybrid with split mode graph requires f32 reduce\n");
+            LLAMA_LOG_WARN("for batch-shape-invariant determinism (Phase CY.F.16).\n");
+            LLAMA_LOG_WARN("    => changing cparams.reduce_type to GGML_TYPE_F32\n");
+            LLAMA_LOG_WARN("=====================================================================\n");
+            cparams.reduce_type = GGML_TYPE_F32;
+        }
+    }
 
     if (model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_QWEN35MOE && cparams.mtp != 0) {
         cparams.mtp = 0;
