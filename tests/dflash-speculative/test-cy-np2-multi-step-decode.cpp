@@ -118,6 +118,22 @@ static std::vector<llama_token> decode_n_steps(
             llama_batch_free(dec_batch);
             return {};
         }
+        // CY.F.17: at NP=2, compare per-seq logits bit-by-bit each step.
+        // First step where slot 0's logits differ from slot 1's pinpoints
+        // when the singlewarp slots' state actually diverges.
+        if (np_active == 2 && std::getenv("LLAMA_TEST_COMPARE_LOGITS")) {
+            float * l0 = llama_get_logits_ith(ctx, 0);
+            float * l1 = llama_get_logits_ith(ctx, 1);
+            if (l0 && l1) {
+                int diffs = 0; float maxd = 0.0f;
+                for (int v = 0; v < n_vocab; ++v) {
+                    uint32_t a, b;
+                    std::memcpy(&a, &l0[v], 4); std::memcpy(&b, &l1[v], 4);
+                    if (a != b) { ++diffs; float d=std::fabs(l0[v]-l1[v]); if (d>maxd) maxd=d; }
+                }
+                fprintf(stderr, "[step %2d] logits: %d/%d differ max|Δ|=%.3e\n", step, diffs, n_vocab, maxd);
+            }
+        }
         for (int sid = 0; sid < np_active; ++sid) {
             float * logits = llama_get_logits_ith(ctx, sid);
             if (!logits) { llama_batch_free(dec_batch); return {}; }
