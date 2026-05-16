@@ -2253,9 +2253,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ith == split_backend_id) {
                         auto node = split->graph.nodes[0];
                         int n = node->op_params[1];
+                        // CY.F.18 probe: env-gate the post-reduce needs_sync
+                        // clearing. The default (false) optimistically assumes
+                        // the reduce's sync covers all later consumer reads,
+                        // but peer P2P writes from the reduce may not be fully
+                        // propagated when downstream splits read.
+                        static const bool keep_sync_after_reduce =
+                            std::getenv("GGML_SCHED_KEEP_SYNC_AFTER_REDUCE") != nullptr;
                         for (int j = 0; j < n; ++j) {
                             if (node->src[j]) {
-                                sched->needs_sync[j] = false;
+                                sched->needs_sync[j] = keep_sync_after_reduce;
                             }
                         }
                     }
@@ -2328,9 +2335,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ith == split_backend_id) {
                         auto node = split->graph.nodes[0];
                         int n = node->op_params[1];
+                        // CY.F.18 probe: env-gate the post-reduce needs_sync
+                        // clearing (see openmp path above for rationale).
+                        static const bool keep_sync_after_reduce =
+                            std::getenv("GGML_SCHED_KEEP_SYNC_AFTER_REDUCE") != nullptr;
                         for (int j = 0; j < n; ++j) {
                             if (node->src[j]) {
-                                sched->needs_sync[j] = false;
+                                sched->needs_sync[j] = keep_sync_after_reduce;
                             }
                         }
                     }
