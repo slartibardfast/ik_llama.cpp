@@ -4471,7 +4471,17 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    // CY.F.18 probe: GGML_CUDA_BACKEND_SYNC_DEVICE=1 uses cudaDeviceSynchronize
+    // (drains ALL streams + peer-write receivers) instead of cudaStreamSynchronize
+    // (only own stream). Hypothesis: cross-device peer writes queued on another
+    // backend's stream are not drained by the stream sync, causing slot-1 race
+    // when downstream code reads peer-written memory.
+    static const bool sync_device = std::getenv("GGML_CUDA_BACKEND_SYNC_DEVICE") != nullptr;
+    if (sync_device) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
     GGML_UNUSED(backend);
 }
