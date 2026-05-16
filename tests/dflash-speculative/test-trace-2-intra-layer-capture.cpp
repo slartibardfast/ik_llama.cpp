@@ -144,6 +144,22 @@ int main() {
         "Qcur_hadamard-1003", "Qcur_hadamard-2003",
         "Kcur_hadamard-1003", "Kcur_hadamard-2003",
         "Vcur_hadamard-1003", "Vcur_hadamard-2003",
+        // TRACE-3: capture the actual FA inputs — views into the K and
+        // V caches. These reveal the post-quantize Q4_0 cache contents
+        // that FA will read.
+        "q-1003", "q-2003",
+        "k-1003", "k-2003",
+        "v-1003", "v-2003",
+        "v_cache_view-1003", "v_cache_view-2003",
+        // TRACE-6 (this run): capture EVERY downstream FA + output-
+        // projection intermediate to pinpoint where slot-parity first
+        // diverges within the layer-3 block.
+        "flash_attn_per_slot_kv-1003", "flash_attn_per_slot_kv-2003",
+        "flash_attn_h-1003", "flash_attn_h-2003",
+        "flash_attn_reshaped-1003", "flash_attn_reshaped-2003",
+        "kqv_wo-1003", "kqv_wo-2003",
+        "kqv_wo_biased-1003", "kqv_wo_biased-2003",
+        "attn_combined-3", "attn_out_with_input-3",
     };
 
     llama_context_params cparams = llama_context_default_params();

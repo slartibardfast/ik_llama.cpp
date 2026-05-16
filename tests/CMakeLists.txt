@@ -351,6 +351,20 @@ if (GGML_CUDA)
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # TRACE-4 / 5 / 7 — focused CUDA probe for warp_reduce_sum mask-shape
+    # non-associativity, warp_reduce_max invariance, and compact-then-reduce
+    # fix candidate. CUDA target; sm_75 required.
+    if (GGML_CUDA)
+        set(TEST_TARGET test-trace-4-warp-reduce-mask-shape)
+        add_executable(${TEST_TARGET}
+            dflash-speculative/test-trace-4-warp-reduce-mask-shape.cu)
+        set_target_properties(${TEST_TARGET} PROPERTIES CUDA_ARCHITECTURES "75")
+        target_link_libraries(${TEST_TARGET} PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+        set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+    endif()
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
