@@ -308,6 +308,13 @@ int main() {
                 for (int i = first_div_s0; i < first_div_s0+5 && i < (int)np1_baseline.size(); ++i) fprintf(stderr, " %d", np1_baseline[i]);
                 fprintf(stderr, "\n");
             }
+            if (first_div_s1 >= 0) {
+                fprintf(stderr, "  slot1[%d..%d]:", first_div_s1, std::min(first_div_s1+4, (int)per_seq[1].size()-1));
+                for (int i = first_div_s1; i < first_div_s1+5 && i < (int)per_seq[1].size(); ++i) fprintf(stderr, " %d", per_seq[1][i]);
+                fprintf(stderr, "\n  NP=1 [%d..%d]:", first_div_s1, std::min(first_div_s1+4, (int)np1_baseline.size()-1));
+                for (int i = first_div_s1; i < first_div_s1+5 && i < (int)np1_baseline.size(); ++i) fprintf(stderr, " %d", np1_baseline[i]);
+                fprintf(stderr, "\n");
+            }
         }
         llama_free(ctx);
     }
