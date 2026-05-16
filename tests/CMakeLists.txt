@@ -376,6 +376,19 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.F.6 — ggml_reduce(OP_ADD, n) shape-invariance unit test.
+    # Drives the cross-device sum op at M ∈ {1,2,4,8} with same col-0 inputs.
+    set(TEST_TARGET test-ggml-reduce-shape-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-ggml-reduce-shape-invariance.cpp)
+    target_include_directories(${TEST_TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/src
+        ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-4 / 5 / 7 — focused CUDA probe for warp_reduce_sum mask-shape
     # non-associativity, warp_reduce_max invariance, and compact-then-reduce
     # fix candidate. CUDA target; sm_75 required.
