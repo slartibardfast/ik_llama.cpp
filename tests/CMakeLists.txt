@@ -324,6 +324,24 @@ if (GGML_CUDA)
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # Phase CX.B — RMSNorm batch-shape invariance.
+    set(TEST_TARGET test-rmsnorm-batch-shape-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-rmsnorm-batch-shape-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # Phase CX.C — RoPE batch-shape invariance.
+    set(TEST_TARGET test-rope-batch-shape-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-rope-batch-shape-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
     llama_build_and_test(dflash-speculative/test-dflash-load-dense-qwen3.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-source-layer-count.cpp)
     llama_build_and_test(dflash-speculative/test-dflash-load-block-size.cpp)
