@@ -413,6 +413,18 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.F.17 — NP=2 multi-step decode race repro. CY.F.9b only checks
+    # post-prefill logits and always PASSES. The production NP=2 failure
+    # surfaces during 32-step decode. This test reproduces the multi-step
+    # decode pattern WITHOUT the HTTP server.
+    set(TEST_TARGET test-cy-np2-multi-step-decode)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-np2-multi-step-decode.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # Phase CY.F.14 — find first-divergent layer between serial seq=0 and
     # batched seq=0 (multi-seq batch). Uses dflash extract-layers (authoritative
     # capture with dtype branching) to pin down which layer introduces the
