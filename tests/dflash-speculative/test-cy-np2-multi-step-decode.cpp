@@ -137,8 +137,22 @@ int main() {
         ? std::atoi(std::getenv("LLAMA_TEST_N_PREDICT")) : 32;
     const int n_runs = std::getenv("LLAMA_TEST_N_RUNS")
         ? std::atoi(std::getenv("LLAMA_TEST_N_RUNS")) : 5;
-    const std::string prompt =
-        "The history of artificial intelligence began in earnest with the work of";
+    const char * prompt_env = std::getenv("LLAMA_TEST_PROMPT");
+    // Long production-realistic prompt by default (~256 tokens of text).
+    const std::string prompt = prompt_env ? prompt_env :
+        "The history of artificial intelligence began in earnest with the work of Alan Turing, "
+        "who in 1950 published the influential paper 'Computing Machinery and Intelligence', "
+        "introducing the imitation game now widely known as the Turing test. "
+        "Following Turing's pioneering ideas, the field saw rapid growth during the 1956 "
+        "Dartmouth workshop organized by John McCarthy, Marvin Minsky, Nathaniel Rochester, "
+        "and Claude Shannon. McCarthy coined the term 'artificial intelligence' for the workshop. "
+        "Through the 1960s and 1970s, researchers developed expert systems, theorem provers, "
+        "and natural language interfaces, though hardware limitations of the era constrained "
+        "the scale at which these systems could operate. Funding cycles produced two notable "
+        "AI winters before deep learning, building on three decades of neural network research, "
+        "transformed the field starting in the 2010s. The transformer architecture, introduced "
+        "in 2017 by Vaswani et al., became the foundation for modern large language models. "
+        "These models demonstrate emergent capabilities including reasoning, summarization, and";
 
     llama_backend_init();
 
