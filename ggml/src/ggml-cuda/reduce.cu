@@ -435,7 +435,12 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         }
         return;
     }
-    if (dst->ne[1] < 32 && ctx.p2p_enabled) {
+    // CY.F.18 env-gate: GGML_CUDA_REDUCE_NO_P2P=1 forces the non-P2P fallback
+    // path (uses cudaMemcpyPeerAsync + local kernel, properly sync-fenced)
+    // instead of the kernel-direct P2P path (which may not fence peer writes
+    // visibly across devices on sm_75 / Turing).
+    static const bool reduce_no_p2p = std::getenv("GGML_CUDA_REDUCE_NO_P2P") != nullptr;
+    if (!reduce_no_p2p && dst->ne[1] < 32 && ctx.p2p_enabled) {
         GGML_ASSERT(dst->type != GGML_TYPE_Q8_0);
         for (int ii = 0; ii < nhave; ++ii) {
             int i = idx[ii];

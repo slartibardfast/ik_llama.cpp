@@ -85,6 +85,9 @@ static CaptureResult run_one_capture(
     cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0;
     cp.flash_attn = true; cp.mla_attn = 3;
     cp.k_cache_hadamard = true; cp.v_cache_hadamard = true;
+    if (std::getenv("LLAMA_TEST_NO_GRAPH_REUSE")) {
+        cp.graph_reuse = false;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) return result;
 
