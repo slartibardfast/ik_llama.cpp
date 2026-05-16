@@ -425,6 +425,17 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.F.18 — layer-bisect probe. Captures per-layer residual at
+    # decode step 1 across two NP=2 runs, finds first divergent layer for
+    # slot 1 (race source).
+    set(TEST_TARGET test-cy-f18-layer-bisect)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-f18-layer-bisect.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # Phase CY.F.14 — find first-divergent layer between serial seq=0 and
     # batched seq=0 (multi-seq batch). Uses dflash extract-layers (authoritative
     # capture with dtype branching) to pin down which layer introduces the
