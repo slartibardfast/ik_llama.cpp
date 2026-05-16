@@ -389,6 +389,30 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.F.9 — umbrella seq_id sequential prefill test. Drives
+    # llama_decode at seq_id ∈ {0..N-1} sequentially on a single context
+    # with n_seq_max=N. Compares post-prefill logits bit-wise. Exposes any
+    # slot-id > 0 addressing bug in the serial path.
+    set(TEST_TARGET test-cy-seq-id-sequential)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-seq-id-sequential.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # Phase CY.F.9b — batched multi-seq prefill vs serial baseline. Same
+    # context, all N seqs batched into ONE llama_decode call. Per-seq
+    # last-token logits are compared to the serial baseline. If differs,
+    # the bug is in batched multi-seq graph build.
+    set(TEST_TARGET test-cy-seq-id-batched)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-seq-id-batched.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-4 / 5 / 7 — focused CUDA probe for warp_reduce_sum mask-shape
     # non-associativity, warp_reduce_max invariance, and compact-then-reduce
     # fix candidate. CUDA target; sm_75 required.
