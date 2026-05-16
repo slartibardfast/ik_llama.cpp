@@ -676,7 +676,21 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     // ggml_concat at the end of this function then aborts on dtype mismatch.
     const bool force_reduce_cast = (cur->ne[1] > 32);
 
-    if (all_same_seq) {
+    // Phase CY: the all_same_seq fast path takes a structurally different
+    // code path (single call to build_layer_attn_linear_core, no per-block
+    // split, no ggml_concat) than the per-block slow path. Empirically this
+    // produces a layer-6+ cross-NP fp32-ULP divergence between NP=1 (fast
+    // path) and NP≥2 (slow path) for the slot-0 row, even though all DeltaNet
+    // intermediates at layer 0 are byte-identical (per CY.B.1 capture).
+    //
+    // Gating this fast path behind LLAMA_DELTA_FORCE_SLOW=1 lets us measure
+    // the perf cost and confirm the layer-6 source. If perf cost is small,
+    // we can flip this to be the default for production NP-determinism.
+    static const bool delta_force_slow = []() {
+        const char * e = std::getenv("LLAMA_DELTA_FORCE_SLOW");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (!delta_force_slow && all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.default_decoder.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, force_reduce_cast);
     }
