@@ -199,6 +199,56 @@ int main() {
     for (int i = 0; i < 8 && i < (int)np1_baseline.size(); ++i) fprintf(stderr, " %d", np1_baseline[i]);
     fprintf(stderr, "\n");
 
+    // ALSO check: at end of BATCHED PREFILL, do slot 0 and slot 1 produce
+    // bit-identical logits? Same prompt → should be bit-identical. If not,
+    // the singlewarp kernel produces different output for seq=0 and seq=1
+    // CTAs in the same n_seqs=2 grid, even with identical inputs.
+    {
+        fprintf(stderr, "[CY.F.17] Bit-compare slot 0 vs slot 1 last-prefill-token logits...\n");
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 4096 * 8;
+        cp.n_batch = 2048; cp.n_ubatch = 2048;
+        cp.n_seq_max = 2;
+        cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0;
+        cp.flash_attn = true; cp.mla_attn = 3;
+        cp.k_cache_hadamard = true; cp.v_cache_hadamard = true;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        llama_batch batch = llama_batch_init(2 * n_prompt, 0, 1);
+        for (int sid = 0; sid < 2; ++sid) {
+            for (int i = 0; i < n_prompt; i++) {
+                common_batch_add(batch, tokens[i], i, {(llama_seq_id) sid}, i == n_prompt - 1);
+            }
+        }
+        if (llama_decode(ctx, batch) == 0) {
+            const int idx0 = (0 + 1) * n_prompt - 1;
+            const int idx1 = (1 + 1) * n_prompt - 1;
+            float * l0 = llama_get_logits_ith(ctx, idx0);
+            float * l1 = llama_get_logits_ith(ctx, idx1);
+            if (l0 && l1) {
+                const int nv = llama_n_vocab(model);
+                int diffs = 0; float maxd = 0.0f;
+                int idx_first = -1;
+                for (int v = 0; v < nv; ++v) {
+                    uint32_t a, b;
+                    std::memcpy(&a, &l0[v], 4); std::memcpy(&b, &l1[v], 4);
+                    if (a != b) {
+                        ++diffs;
+                        float d = std::fabs(l0[v]-l1[v]);
+                        if (d > maxd) maxd = d;
+                        if (idx_first < 0) idx_first = v;
+                    }
+                }
+                fprintf(stderr, "[CY.F.17] slot0 vs slot1 prefill last-tok logits: %d/%d differ, max|Δ|=%.3e (first diff vocab=%d)\n",
+                        diffs, nv, maxd, idx_first);
+                if (diffs > 0) {
+                    fprintf(stderr, "[CY.F.17] => singlewarp kernel produces different output for seq=0 vs seq=1 CTAs in same n_seqs=2 grid.\n");
+                }
+            }
+        }
+        llama_batch_free(batch);
+        llama_free(ctx);
+    }
+
     // Run NP=2 N_RUNS times.
     int slot0_match_baseline = 0;
     int slot1_match_baseline = 0;
