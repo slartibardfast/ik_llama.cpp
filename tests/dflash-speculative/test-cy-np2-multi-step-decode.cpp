@@ -43,6 +43,11 @@ static llama_token greedy_argmax(const float * logits, int n_vocab) {
     return best;
 }
 
+// CY.F.18: capture per-step logits per slot for cross-run race localization.
+// Each step records the full F32 logit vector for slot 0 and slot 1.
+// Caller compares run-0 vs run-1 per step to find first divergent step.
+static std::vector<std::vector<std::vector<float>>> g_per_step_logits;
+
 static std::vector<llama_token> decode_n_steps(
         llama_context * ctx,
         const std::vector<llama_token> & prompt_tokens,
@@ -139,6 +144,12 @@ static std::vector<llama_token> decode_n_steps(
             if (!logits) { llama_batch_free(dec_batch); return {}; }
             last_tok[sid] = greedy_argmax(logits, n_vocab);
             per_seq_out[sid].push_back(last_tok[sid]);
+            // CY.F.18 race-localization: store per-step logit vector when
+            // g_per_step_logits has a slot for this (sid, step).
+            if (np_active == 2 && (int)g_per_step_logits.size() > sid &&
+                (int)g_per_step_logits[sid].size() <= step) {
+                g_per_step_logits[sid].emplace_back(logits, logits + n_vocab);
+            }
         }
         llama_batch_free(dec_batch);
     }
@@ -265,6 +276,13 @@ int main() {
         llama_free(ctx);
     }
 
+    // CY.F.18 race-localization: optionally capture per-step logits for each
+    // run, then compare run-0 vs run-N at each step to find when the race
+    // first diverges. Enable with LLAMA_TEST_RACE_LOCALIZE=1.
+    const bool race_localize = std::getenv("LLAMA_TEST_RACE_LOCALIZE") != nullptr;
+    std::vector<std::vector<std::vector<std::vector<float>>>> per_run_step_logits;
+    if (race_localize) per_run_step_logits.resize(n_runs);
+
     // Run NP=2 N_RUNS times.
     int slot0_match_baseline = 0;
     int slot1_match_baseline = 0;
@@ -283,7 +301,15 @@ int main() {
         std::vector<std::vector<llama_token>> per_seq;
         const bool serial_pref = std::getenv("LLAMA_TEST_SERIAL_PREFILL") &&
                                  std::strcmp(std::getenv("LLAMA_TEST_SERIAL_PREFILL"), "1") == 0;
+        // CY.F.18 race-localization: enable per-step logit capture for this run.
+        if (race_localize) {
+            g_per_step_logits.assign(2, std::vector<std::vector<float>>{});
+        }
         decode_n_steps(ctx, tokens, n_predict, 2, 2, per_seq, serial_pref);
+        if (race_localize) {
+            per_run_step_logits[run] = std::move(g_per_step_logits);
+            g_per_step_logits.clear();
+        }
         slot0_outs[run] = per_seq[0];
         slot1_outs[run] = per_seq[1];
         bool s0 = per_seq[0] == np1_baseline;
@@ -323,6 +349,49 @@ int main() {
     fprintf(stderr, "  slot0 matches NP=1: %d/%d\n", slot0_match_baseline, n_runs);
     fprintf(stderr, "  slot1 matches NP=1: %d/%d\n", slot1_match_baseline, n_runs);
     fprintf(stderr, "  slot0 == slot1:     %d/%d\n", slot0_eq_slot1, n_runs);
+
+    // CY.F.18: cross-run per-step logit comparison. For each pair (run 0, run r>0),
+    // walk slot 0 and slot 1 step by step, find the first step where logits
+    // differ between runs. The step pinpoints when the race fires; the
+    // magnitude hints at which op is racing.
+    if (race_localize && n_runs >= 2) {
+        const int n_vocab = llama_n_vocab(model);
+        fprintf(stderr, "\n[CY.F.18] Cross-run logit divergence per slot:\n");
+        for (int r = 1; r < n_runs; ++r) {
+            for (int sid = 0; sid < 2; ++sid) {
+                const auto & a = per_run_step_logits[0][sid];
+                const auto & b = per_run_step_logits[r][sid];
+                const int n_steps = std::min((int)a.size(), (int)b.size());
+                int first_div = -1;
+                float first_max = 0.0f;
+                int first_diffs = 0;
+                for (int s = 0; s < n_steps; ++s) {
+                    int diffs = 0; float maxd = 0.0f;
+                    for (int v = 0; v < n_vocab; ++v) {
+                        uint32_t ua, ub;
+                        std::memcpy(&ua, &a[s][v], 4);
+                        std::memcpy(&ub, &b[s][v], 4);
+                        if (ua != ub) {
+                            ++diffs;
+                            float d = std::fabs(a[s][v] - b[s][v]);
+                            if (d > maxd) maxd = d;
+                        }
+                    }
+                    if (diffs > 0) {
+                        first_div = s; first_max = maxd; first_diffs = diffs;
+                        break;
+                    }
+                }
+                if (first_div < 0) {
+                    fprintf(stderr, "  run0 vs run%d slot%d: byte-identical across all %d decoded steps\n",
+                            r, sid, n_steps);
+                } else {
+                    fprintf(stderr, "  run0 vs run%d slot%d: FIRST DIVERGENT step=%d, %d/%d logits differ, max|Δ|=%.3e\n",
+                            r, sid, first_div, first_diffs, n_vocab, first_max);
+                }
+            }
+        }
+    }
 
     llama_free_model(model);
     llama_backend_free();
