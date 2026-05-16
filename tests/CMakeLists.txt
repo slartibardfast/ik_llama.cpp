@@ -352,6 +352,17 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Phase CY.B.1 — intra-layer-0 DeltaNet named captures to find the first
+    # divergent tag between NP=1 (all_same_seq=true) and NP=4
+    # (all_same_seq=false) per llama-delta-net.cpp:679/711-727.
+    set(TEST_TARGET test-cy-layer0-capture)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-cy-layer0-capture.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-4 / 5 / 7 — focused CUDA probe for warp_reduce_sum mask-shape
     # non-associativity, warp_reduce_max invariance, and compact-then-reduce
     # fix candidate. CUDA target; sm_75 required.
