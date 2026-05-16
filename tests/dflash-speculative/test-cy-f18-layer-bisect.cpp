@@ -134,6 +134,13 @@ static CaptureResult run_one_capture(
         llama_set_dflash_extract_layers(ctx, layer_ids.data(), (int32_t) layer_ids.size());
     }
 
+    // CY.F.18 probe: optionally insert an explicit llama_synchronize between
+    // prefill and decode step 1. If this alone fixes the race, the race is
+    // a cross-call async leak (prefill ops not done when decode starts).
+    if (std::getenv("LLAMA_TEST_SYNC_BETWEEN")) {
+        llama_synchronize(ctx);
+    }
+
     // Decode step 1 (batched, one token per slot).
     {
         llama_batch dec_batch = llama_batch_init(np_active, 0, 1);
