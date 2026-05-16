@@ -166,18 +166,19 @@ static bool run_one(ggml_backend_t backend,
         return false;
     }
 
-    // Extract row 0's output. fa is [Dv, n_tok, N_HEADS_Q, N_SEQS] F32.
-    // Row 0 (token 0) per head: Dv * N_HEADS_Q values.
-    std::vector<float> dst_full((size_t)Dv * n_tok * N_HEADS_Q * N_SEQS);
+    // Extract row 0's output. fa shape is [Dv, N_HEADS_Q, n_tok, N_SEQS] F32
+    // per ggml_flash_attn_ext_per_slot_kv (ne = {v->ne[0], q->ne[2], q->ne[1], q->ne[3]}).
+    // Memory: idx = d + h*Dv + t*Dv*N_HEADS_Q + s*Dv*N_HEADS_Q*n_tok. Row 0 (t=0) per head: Dv * N_HEADS_Q values.
+    std::vector<float> dst_full((size_t)Dv * N_HEADS_Q * n_tok * N_SEQS);
     ggml_backend_tensor_get(fa, dst_full.data(), 0, dst_full.size() * sizeof(float));
 
     row0_out.assign((size_t)Dv * N_HEADS_Q * N_SEQS, 0.0f);
     for (int s = 0; s < N_SEQS; ++s) {
         for (int h = 0; h < N_HEADS_Q; ++h) {
             for (int d = 0; d < Dv; ++d) {
-                const size_t full_idx = (size_t)d + 0 * Dv
-                                      + (size_t)h * Dv * n_tok
-                                      + (size_t)s * Dv * n_tok * N_HEADS_Q;
+                const size_t full_idx = (size_t)d + (size_t)h * Dv
+                                      + 0 * (size_t)Dv * N_HEADS_Q
+                                      + (size_t)s * Dv * N_HEADS_Q * n_tok;
                 const size_t row0_idx = (size_t)d + (size_t)h * Dv + (size_t)s * Dv * N_HEADS_Q;
                 row0_out[row0_idx] = dst_full[full_idx];
             }
