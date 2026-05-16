@@ -153,44 +153,50 @@ int main() {
     // For multi-device-split DeltaNet: il_cb = 1000*il + dev_id.
     // For il=0: il_cb ∈ {0, 1}. For il=6: il_cb ∈ {6000, 6001}.
     auto add_layer = [&](int il) {
-        auto suff = [il](int dev) {
+        // build_qkv (and build_fused_delta_net inside it) receives `il` from
+        // its callers (build_layer_attn_linear_core line 569 passes `il` not
+        // il_cb). So DeltaNet kernel internal tags use plain "-<il>" suffix.
+        std::vector<std::string> per_il_bases = {
+            "q_in","k_in","v_in","beta_in","g_in","state_in",
+            "q_fused","k_fused","v_fused","g_fused","beta_fused","state_fused",
+            "delta_net_fused_raw","output_tokens","new_state",
+            "q","k","v","query_flat","key","value",
+            "q_conv_normed","k_conv_normed","attn_output",
+        };
+        char ilstr[16];
+        snprintf(ilstr, sizeof(ilstr), "-%d", il);
+        for (auto & b : per_il_bases) st.match_names.push_back(b + ilstr);
+
+        // build_qkvz (line 510) and FFN-inside-per-device (line 779) pass
+        // il_cb = 1000*il + dev to cb. These tags use "-<il_cb>" suffix.
+        auto suff_cb = [il](int dev) {
             char buf[32];
             int il_cb = 1000*il + dev;
             snprintf(buf, sizeof(buf), "-%d", il_cb);
             return std::string(buf);
         };
-        std::vector<std::string> bases = {
-            "q_in","k_in","v_in","beta_in","g_in","state_in",
-            "q_fused","k_fused","v_fused","g_fused","beta_fused","state_fused",
-            "delta_net_fused_raw","output_tokens","new_state",
+        std::vector<std::string> per_ilcb_bases = {
             "qkv_mixed","z","linear_attn_qkv_mixed","linear_attn_mixed_qkvz",
-            "q","k","v","query_flat","key","value",
-        };
-        for (auto & b : bases) {
-            st.match_names.push_back(b + suff(0));
-            st.match_names.push_back(b + suff(1));
-        }
-        // FFN tags inside per-device loop use il_cb suffix
-        std::vector<std::string> per_device_ffn_bases = {
             "ffn_norm","ffn_up","ffn_gate","ffn_silu","ffn_down","ffn_up_gate",
             "ffn_with_extra","inp_normed","norm",
         };
-        for (auto & b : per_device_ffn_bases) {
-            st.match_names.push_back(b + suff(0));
-            st.match_names.push_back(b + suff(1));
+        for (auto & b : per_ilcb_bases) {
+            st.match_names.push_back(b + suff_cb(0));
+            st.match_names.push_back(b + suff_cb(1));
         }
         // Per-layer (non-device-aware) residual tags use just "-<il>"
         std::vector<std::string> per_layer_bases = {
             "l_out","ffn_combined","ffn_with_inp","ffn_out_with_inp","attn_combined",
         };
-        char ilstr[16];
-        snprintf(ilstr, sizeof(ilstr), "-%d", il);
         for (auto & b : per_layer_bases) st.match_names.push_back(b + ilstr);
     };
     add_layer(0);
-    add_layer(5);  // last byte-identical layer
-    add_layer(6);  // first divergent layer
-    add_layer(7);  // FA layer that amplifies
+    add_layer(5);   // last byte-identical layer (NP=1 vs NP=N≥2)
+    add_layer(6);   // first divergent layer (NP=1 vs NP=N≥2)
+    add_layer(7);   // FA layer that amplifies
+    add_layer(19);  // FA layer immediately before NP=8 boundary (NP≤4 vs NP=8 byte-identical here)
+    add_layer(20);  // first divergent layer for NP≤4 vs NP=8
+    add_layer(21);  // amplification check
     st.match_names.push_back("inp_embd");
 
     llama_context_params cparams = llama_context_default_params();
