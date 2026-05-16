@@ -43,6 +43,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ /*sinks*/,
+        const int  * __restrict__ per_row_k_bound,
         float      * __restrict__ dst,
         float2     * __restrict__ /*dst_meta*/,
         const float scale,
@@ -105,6 +106,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
     // We use the same `nb11` ggml stride which is bytes-per-K-row.
 
     // K-loop in canonical [0..ne11) order — the determinism contract:
+    (void) per_row_k_bound;  // CY.F.17: reverted — per_row_k_bound is 0 during prefill (cache empty), can't bound here.
     for (int k = 0; k < ne11; ++k) {
         // -------- dot(K[k], Q_reg) --------
         // Per-thread partial: 8 multiply-add over the thread's 8 head_dim
@@ -214,10 +216,13 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
 // Dispatcher wrapper for the per-slot-kv path.
 extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * Q               = dst->src[0];
+    const ggml_tensor * K               = dst->src[1];
+    const ggml_tensor * V               = dst->src[2];
+    const ggml_tensor * mask            = dst->src[3];
+    // CY.F.17: per_row_k_bound is dst->src[5]. Int32 tensor [n_tokens]
+    // bounding the per-row K-loop iteration. Absent → fall back to ne11.
+    const ggml_tensor * per_row_k_bound = dst->src[5];
 
     GGML_ASSERT(Q && K && V && mask);
     GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
@@ -226,6 +231,7 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     GGML_ASSERT(K->type == V->type && "K and V must have same dtype");
     GGML_ASSERT((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) &&
                 "FIX-C v5 singlewarp supports Q4_0 (production) or F16 (test) KV cache");
+    GGML_ASSERT(!per_row_k_bound || per_row_k_bound->type == GGML_TYPE_I32);
 
     float scale, max_bias, softcap;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -248,13 +254,18 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     const dim3 grid((unsigned)Q->ne[1], (unsigned)Q->ne[2], (unsigned)Q->ne[3]);
     const dim3 block(WARP_SIZE, 1, 1);
 
+    const int * per_row_k_bound_dev = per_row_k_bound
+        ? (const int *) per_row_k_bound->data
+        : nullptr;
+
     auto launch_kernel = [&](auto kernel) {
         kernel<<<grid, block, 0, ctx.stream()>>>(
             (const char *) Q->data,
             (const char *) K->data,
             (const char *) V->data,
             (const char *) mask->data,
-            nullptr,
+            nullptr,            // sinks (unused)
+            per_row_k_bound_dev,
             (float *) dst->data,
             nullptr,
             scale, max_bias, m0, m1, softcap, n_head_log2,
