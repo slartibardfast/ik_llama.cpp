@@ -144,7 +144,7 @@ int main() {
     // CY.F.15 added M=12 (serial prefill) and M=96 (NP=8 batched prefill).
     // If row-0 differs across these, MMQ at production batch sizes is the
     // multi-seq drift source.
-    const std::vector<int64_t> Ms = {1, 4, 8, 12, 16, 32, 96};
+    const std::vector<int64_t> Ms = {1, 2, 4, 8, 12, 16, 32, 96, 215, 430, 860, 1720};
     std::vector<std::vector<float>> outs;
     outs.reserve(Ms.size());
 
@@ -201,6 +201,30 @@ int main() {
             total_diffs += diffs_here;
         } else {
             fprintf(stderr, "  M=%2lld: byte-identical to M=1 baseline\n", (long long)Ms[mi]);
+        }
+    }
+
+    // Pairwise compare among prefill shapes: M=215 vs M=430 vs M=860 vs M=1720.
+    // If MMQ has tile-count-dependent reduction order at large M, these
+    // should differ from each other (not just from M=1).
+    fprintf(stderr, "\n--- pairwise compares within prefill regime ---\n");
+    int prefill_first_idx = -1;
+    for (size_t i = 0; i < Ms.size(); ++i) {
+        if (Ms[i] == 215) { prefill_first_idx = (int)i; break; }
+    }
+    if (prefill_first_idx >= 0) {
+        const auto & base215 = outs[prefill_first_idx];
+        for (size_t mi = prefill_first_idx + 1; mi < Ms.size(); ++mi) {
+            const auto & cur = outs[mi];
+            int diffs = 0;
+            for (int64_t i = 0; i < N_ROWS; ++i) {
+                uint32_t a, b;
+                std::memcpy(&a, &base215[i], sizeof(uint32_t));
+                std::memcpy(&b, &cur[i], sizeof(uint32_t));
+                if (a != b) ++diffs;
+            }
+            fprintf(stderr, "  M=%lld vs M=215: %d/%lld differ\n",
+                    (long long)Ms[mi], diffs, (long long)N_ROWS);
         }
     }
 
