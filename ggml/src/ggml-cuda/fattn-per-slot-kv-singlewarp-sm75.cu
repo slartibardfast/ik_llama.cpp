@@ -221,9 +221,11 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
 
     GGML_ASSERT(Q && K && V && mask);
     GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
-    GGML_ASSERT(K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(K->type == V->type && "K and V must have same dtype");
+    GGML_ASSERT((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) &&
+                "FIX-C v5 singlewarp supports Q4_0 (production) or F16 (test) KV cache");
 
     float scale, max_bias, softcap;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -246,8 +248,8 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     const dim3 grid((unsigned)Q->ne[1], (unsigned)Q->ne[2], (unsigned)Q->ne[3]);
     const dim3 block(WARP_SIZE, 1, 1);
 
-    flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>
-        <<<grid, block, 0, ctx.stream()>>>(
+    auto launch_kernel = [&](auto kernel) {
+        kernel<<<grid, block, 0, ctx.stream()>>>(
             (const char *) Q->data,
             (const char *) K->data,
             (const char *) V->data,
@@ -263,5 +265,11 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
             (int)K->nb[1], (int)K->nb[2], (int)K->nb[3],
             (int)V->nb[1], (int)V->nb[2], (int)V->nb[3],
             (int)dst->ne[0], (int)dst->ne[1], (int)dst->ne[2], (int)dst->ne[3]);
+    };
+    if (K->type == GGML_TYPE_Q4_0) {
+        launch_kernel(flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>);
+    } else { // GGML_TYPE_F16
+        launch_kernel(flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_F16, GGML_TYPE_F16>);
+    }
     CUDA_CHECK(cudaGetLastError());
 }

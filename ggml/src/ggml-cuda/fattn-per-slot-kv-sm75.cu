@@ -2482,8 +2482,8 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
         case 3: // singlewarp — FIX-C v5: per-row single-warp CTA, fp32 canonical k-loop,
                 // batch-invariant by construction (no cross-warp reductions). The
                 // production target for the determinism contract.
-            GGML_ASSERT(K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
-                        "FIX-C v5 singlewarp path expects Q4_0 KV cache");
+                // Supports Q4_0 (production) and F16 (unit-test) KV cache via
+                // the dispatcher's internal type branching.
             ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(ctx, dst);
             return;
         case 1: // vec_f32 — partial batch-invariance (NP=2 OK; NP>=4 has cross-warp partial bug)
