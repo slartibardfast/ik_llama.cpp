@@ -152,10 +152,18 @@ int main() {
             st.match_names.push_back(b + suff(0));
             st.match_names.push_back(b + suff(1));
         }
-        // Per-layer (non-device-aware) residual + FFN tags use just "-<il>"
+        // FFN tags inside per-device loop use il_cb suffix
+        std::vector<std::string> per_device_ffn_bases = {
+            "ffn_norm","ffn_up","ffn_gate","ffn_silu","ffn_down","ffn_up_gate",
+            "ffn_with_extra","inp_normed","norm",
+        };
+        for (auto & b : per_device_ffn_bases) {
+            st.match_names.push_back(b + suff(0));
+            st.match_names.push_back(b + suff(1));
+        }
+        // Per-layer (non-device-aware) residual tags use just "-<il>"
         std::vector<std::string> per_layer_bases = {
-            "l_out","norm","ffn_norm","ffn_up","ffn_gate","ffn_silu","ffn_down",
-            "ffn_combined","ffn_with_inp","ffn_out_with_inp","ffn_up_gate",
+            "l_out","ffn_combined","ffn_with_inp","ffn_out_with_inp","attn_combined",
         };
         char ilstr[16];
         snprintf(ilstr, sizeof(ilstr), "-%d", il);
