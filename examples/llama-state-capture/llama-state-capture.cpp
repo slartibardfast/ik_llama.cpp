@@ -43,16 +43,33 @@ struct capture_state {
     std::unordered_set<std::string> name_prefixes;
     std::set<int>                   layers;
     bool                            all_layers = false;
+    bool                            all_in_layer = false; // bypass prefix filter
+    bool                            decode_only = false;  // skip prefill ubatches
     std::string                     out_dir;
     int                             n_seq_max = 1;
     std::string                     prompt_id;
-    // ubatch sequence number — increments per fired callback per tensor name
-    // (so multi-ubatch prefill produces multiple records per name)
+    // Execution-phase tracking. set_phase() updates `phase_label` (used in
+    // filenames + manifest) and resets per-phase counters so each phase has
+    // its own ubatch_idx sequence keyed by tensor name.
+    std::string                     phase_label = "prefill";
+    bool                            in_decode   = false;
+    int                             decode_step_idx = -1;
     std::unordered_map<std::string, int> ubatch_counter;
+    // Per-(phase, name) order index — increments in cb_eval fire order so the
+    // manifest preserves the actual execution sequence for the diff walker.
+    int                             order_idx = 0;
     std::vector<std::string>        manifest_records;
     int                             n_captured = 0;
     int                             n_skipped_type = 0;
 };
+
+static void capture_set_phase(capture_state * st, const std::string & label, bool decode, int step) {
+    st->phase_label   = label;
+    st->in_decode     = decode;
+    st->decode_step_idx = step;
+    st->ubatch_counter.clear();
+    st->order_idx = 0;
+}
 
 static std::vector<std::string> split_csv(const std::string & s) {
     std::vector<std::string> out;
@@ -103,8 +120,19 @@ static bool capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) 
     int layer = -1;
     if (!parse_name(t->name, prefix, layer)) return false;
 
-    if (st->name_prefixes.find(prefix) == st->name_prefixes.end()) return false;
-    if (!st->all_layers && layer >= 0 && st->layers.find(layer) == st->layers.end()) {
+    // Phase gating — `--decode-only` skips prefill.
+    if (st->decode_only && !st->in_decode) return false;
+
+    // Layer gating — applies regardless of all_in_layer. Layer-less tensors
+    // (layer == -1) are only captured when `all_layers` is set, since the
+    // diagnostic target is intra-layer ops.
+    if (!st->all_layers) {
+        if (layer < 0)                                 return false;
+        if (st->layers.find(layer) == st->layers.end()) return false;
+    }
+
+    // Prefix gating — bypassed by `--all-in-layer`.
+    if (!st->all_in_layer && st->name_prefixes.find(prefix) == st->name_prefixes.end()) {
         return false;
     }
 
@@ -135,16 +163,18 @@ static bool capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) 
     }
 
     // Generate unique filename. Multi-ubatch prefill fires cb multiple times
-    // per name; use ubatch counter to disambiguate.
+    // per name; use ubatch counter to disambiguate. Counter is per-phase so
+    // prefill ubatches and decode steps don't collide.
     std::string base = t->name;
     int ub = st->ubatch_counter[base]++;
-    char fname[256];
+    int oi = st->order_idx++;
+    char fname[384];
     if (layer >= 0) {
-        std::snprintf(fname, sizeof(fname), "layer%02d/%s.ub%d.bin",
-                      layer, base.c_str(), ub);
+        std::snprintf(fname, sizeof(fname), "%s/layer%02d/%s.ub%d.bin",
+                      st->phase_label.c_str(), layer, base.c_str(), ub);
     } else {
-        std::snprintf(fname, sizeof(fname), "no-layer/%s.ub%d.bin",
-                      base.c_str(), ub);
+        std::snprintf(fname, sizeof(fname), "%s/no-layer/%s.ub%d.bin",
+                      st->phase_label.c_str(), base.c_str(), ub);
     }
     std::string path = st->out_dir + "/" + fname;
     {
@@ -163,12 +193,16 @@ static bool capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) 
     f.write((const char *) f32.data(), f32.size() * sizeof(float));
 
     // Manifest entry — one JSON object per capture, comma-separated below.
-    char rec[1024];
+    // `order` is the fire-order index within `phase`; manifest readers can
+    // sort on (phase, order) to recover the actual op execution sequence.
+    char rec[1280];
     std::snprintf(rec, sizeof(rec),
-        "{\"prompt_id\":\"%s\",\"name\":\"%s\",\"prefix\":\"%s\",\"layer\":%d,"
+        "{\"prompt_id\":\"%s\",\"phase\":\"%s\",\"order\":%d,"
+        "\"name\":\"%s\",\"prefix\":\"%s\",\"layer\":%d,"
         "\"shape\":[%lld,%lld,%lld,%lld],\"orig_dtype\":\"%s\","
         "\"n_seq_max\":%d,\"ubatch_idx\":%d,\"file\":\"%s\"}",
-        st->prompt_id.c_str(), base.c_str(), prefix.c_str(), layer,
+        st->prompt_id.c_str(), st->phase_label.c_str(), oi,
+        base.c_str(), prefix.c_str(), layer,
         (long long)t->ne[0], (long long)t->ne[1],
         (long long)t->ne[2], (long long)t->ne[3],
         ggml_type_name(t->type), st->n_seq_max, ub, fname);
@@ -179,13 +213,20 @@ static bool capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) 
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "Usage: %s -m MODEL --prompt-file PROMPT --tensors PREFIXES \\\n"
-        "       --layers LAYERS --out-dir OUT_DIR [--np N] [--prompt-id ID]\n"
-        "  PREFIXES: comma-separated tensor-name prefixes (e.g. q,k,v,l_out)\n"
-        "  LAYERS:   comma-separated layer indices, or 'all' for any layer\n"
-        "  OUT_DIR:  output directory for .bin files + manifest.json\n"
-        "  N:        n_seq_max (default 1); prompt is duplicated to all slots\n"
-        "  ID:       short prompt identifier for manifest entries\n"
+        "Usage: %s -m MODEL --prompt-file PROMPT --layers LAYERS --out-dir OUT_DIR\n"
+        "       [--tensors PREFIXES | --all-in-layer] [--decode-only]\n"
+        "       [--np N] [--prompt-id ID]\n"
+        "  PREFIXES:      comma-separated tensor-name prefixes (e.g. q,k,v,l_out)\n"
+        "  --all-in-layer bypass prefix filter; capture every named tensor at the\n"
+        "                 listed layers (use with --decode-only to keep size sane).\n"
+        "  --decode-only  skip prefill ubatches; only capture during the synthetic\n"
+        "                 decode steps gated by LLAMA_CAPTURE_DECODE_STEPS=N.\n"
+        "  LAYERS:        comma-separated layer indices, or 'all' for any layer\n"
+        "  OUT_DIR:       output directory for .bin files + manifest.json. Files\n"
+        "                 land under {OUT_DIR}/{phase}/layer{LL}/{name}.ub{N}.bin\n"
+        "                 where phase is 'prefill' or 'decode-{step}'.\n"
+        "  N:             n_seq_max (default 1); prompt is duplicated to all slots\n"
+        "  ID:            short prompt identifier for manifest entries\n"
         "\nProduction-config pass-through args supported (-ngl, --device, etc.).\n",
         argv0);
 }
@@ -195,6 +236,8 @@ static void print_usage(const char * argv0) {
 int main(int argc, char ** argv) {
     std::string prompt_file_arg, tensors_arg, layers_arg, out_dir, prompt_id = "p0";
     int np = 1;
+    bool all_in_layer = false;
+    bool decode_only  = false;
 
     // Manually parse our own flags + filter argv for gpt_params_parse.
     std::vector<char *> filtered = { argv[0] };
@@ -213,10 +256,14 @@ int main(int argc, char ** argv) {
         else if (a == "--out-dir") out_dir = need("--out-dir");
         else if (a == "--np") np = std::atoi(need("--np").c_str());
         else if (a == "--prompt-id") prompt_id = need("--prompt-id");
+        else if (a == "--all-in-layer") all_in_layer = true;
+        else if (a == "--decode-only")  decode_only  = true;
         else filtered.push_back(argv[i]);
     }
 
-    if (prompt_file_arg.empty() || tensors_arg.empty() || layers_arg.empty() || out_dir.empty()) {
+    // With --all-in-layer the tensors arg is optional; otherwise required.
+    if (prompt_file_arg.empty() || layers_arg.empty() || out_dir.empty()
+        || (tensors_arg.empty() && !all_in_layer)) {
         print_usage(argv[0]);
         return 2;
     }
@@ -250,15 +297,18 @@ int main(int argc, char ** argv) {
 
     // Build capture state.
     capture_state st;
-    st.out_dir   = out_dir;
-    st.n_seq_max = np;
-    st.prompt_id = prompt_id;
+    st.out_dir      = out_dir;
+    st.n_seq_max    = np;
+    st.prompt_id    = prompt_id;
+    st.all_in_layer = all_in_layer;
+    st.decode_only  = decode_only;
     for (auto & p : split_csv(tensors_arg)) st.name_prefixes.insert(p);
     {
         std::string trimmed = layers_arg;
         if (trimmed == "all") st.all_layers = true;
         else for (auto & lstr : split_csv(layers_arg)) st.layers.insert(std::atoi(lstr.c_str()));
     }
+    capture_set_phase(&st, "prefill", /*decode=*/false, /*step=*/-1);
 
     // Set cb_eval on gpt_params so llama_init_from_gpt_params propagates it
     // into the new context's cparams.
@@ -304,6 +354,9 @@ int main(int argc, char ** argv) {
         // tokens.size() + step for each slot.
         const llama_token decode_tok = tokens.back();
         for (int step = 0; step < decode_steps; ++step) {
+            char step_label[32];
+            std::snprintf(step_label, sizeof(step_label), "decode-%d", step);
+            capture_set_phase(&st, step_label, /*decode=*/true, /*step=*/step);
             llama_batch dbatch = llama_batch_init(np, 0, np);
             for (int sid = 0; sid < np; ++sid) {
                 common_batch_add(dbatch, decode_tok,
