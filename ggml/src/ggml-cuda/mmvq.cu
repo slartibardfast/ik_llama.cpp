@@ -13,7 +13,8 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
         const char * src0_dd_u, const char * src0_dd_g, const char * src1_ddq_i, float * dst_dd_i, const char * ids_data,
         const void * bias_u, const void * bias_g,
         const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-        const int64_t src1_padded_row_size, ggml_unary_op unary_op, float limit, cudaStream_t stream) {
+        const int64_t src1_padded_row_size, ggml_unary_op unary_op, float limit, cudaStream_t stream,
+        bool force_rpcb1 = false) {
 
     const int64_t row_diff = row_high - row_low;
 
@@ -42,7 +43,8 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
                    /* ids_nb0  */ uint64_t(ids_nb0),
                    /* bias_nb1 */ uint64_t(bias_nb1),
                    /* unary_op */ unary_op,
-                   /* limit    */ limit > 1e-6f ? limit : INFINITY
+                   /* limit    */ limit > 1e-6f ? limit : INFINITY,
+                   /* force_rpcb1 */ force_rpcb1
     };
 
     switch (type) {
@@ -260,7 +262,8 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
     const ggml_tensor * bias_u, const ggml_tensor * bias_g,
     const char * src0_dd_u, const char * src0_dd_g, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, ggml_unary_op unary_op, float limit, cudaStream_t stream) {
+    const int64_t src1_padded_row_size, ggml_unary_op unary_op, float limit, cudaStream_t stream,
+    bool force_rpcb1) {
 
     if (!bias_u && !bias_g) {
         GGML_ASSERT(unary_op == GGML_UNARY_OP_SILU ||
@@ -280,7 +283,9 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
     const int64_t ne10 = src1->ne[0];
     GGML_ASSERT(ne10 % QK8_1 == 0);
     GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(src1->ne[1] == 1);
+    // F.4.1' — src1->ne[1] may be >1 (ncols_y batching) for the non-packed
+    // up_gate path (force_rpcb1=true); otherwise the legacy slot-packed launch
+    // uses ne[1]==1 with ne[2]==Ny. Caller's responsibility either way.
     // F.4.1 DIAGNOSTIC — src1->ne[2]>1 allowed for slot-packed launch.
     //if (ids && ids->ne[0] != dst->ne[2]) {
     //    printf("%s(%s->%s): unexpected situation\n", __func__, src0->name, dst->name);
@@ -299,7 +304,7 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
         src0_dd_u, src0_dd_g, src1_ddq_i, dst_dd_i, ids ? (const char *)ids->data : nullptr,
         bias_u ? bias_u->data : nullptr, bias_g ? bias_g->data : nullptr,
         row_low, row_high, src1_ncols,
-        src1_padded_row_size, unary_op, limit, stream);
+        src1_padded_row_size, unary_op, limit, stream, force_rpcb1);
 
     GGML_UNUSED(src1_ddf_i);
 }

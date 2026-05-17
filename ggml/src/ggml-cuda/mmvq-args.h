@@ -23,5 +23,10 @@ struct mmvq_args {
     const uint64_t bias_nb1;
     ggml_unary_op  unary_op;
     float          limit;
+    // F.4.1' — when true the fused mmvq dispatcher pins rows_per_cuda_block=1
+    // regardless of ncols_y, recovering the NP-invariant reduction tree while
+    // amortizing weight reads across ncols_y output columns. Only honored by
+    // the fused path; the plain mul_mat_vec_q path ignores this flag.
+    const bool     force_rpcb1;
 };
 

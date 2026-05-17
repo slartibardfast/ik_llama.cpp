@@ -155,7 +155,13 @@ static __device__ void k_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+// F.4.1' — rows_per_cuda_block is a template parameter so that the up_gate
+// slot-batched dispatcher can pin it to 1 regardless of ncols_y. This keeps
+// the cross-row reduction tree identical to the ncols_y=1 path that NPC.4
+// shipped, while amortizing weight reads across ncols_y output columns.
+// Default callers receive the same rpcb selection as before via the
+// fused_mul_mat_vec_q_default_rpcb helper.
+template <ggml_type type, int ncols_y, int nwarps, int rows_per_cuda_block>
 static __device__ void k_fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
     const float * __restrict__ bias_u, const float * __restrict__ bias_g,
@@ -167,15 +173,6 @@ static __device__ void k_fused_mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
-
-    //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
-    //    ncols_y < 4 ? 1 : 2 : 1;
-
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
-    constexpr int rows_per_cuda_block = 1;
-#else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
-#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -301,7 +298,7 @@ static __global__ void mul_mat_vec_q(
     k_mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int rows_per_cuda_block>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -324,9 +321,21 @@ static __global__ void fused_mul_mat_vec_q(
     const float * cx_u_b = bias_u ? (const float *)((const char *)bias_u + i02*bias_nb1) : nullptr;
     const float * cx_g_b = bias_g ? (const float *)((const char *)bias_g + i02*bias_nb1) : nullptr;
     const char * cy = (const char *)vy + i2*nb12;
-    k_fused_mul_mat_vec_q<type, ncols_y, nwarps>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
+    k_fused_mul_mat_vec_q<type, ncols_y, nwarps, rows_per_cuda_block>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
             unary_op, limit);
 }
+
+// F.4.1' — fused launch dispatcher. When args.force_rpcb1 is set, all
+// instantiations are pinned to rows_per_cuda_block=1 regardless of ncols_y,
+// preserving the cross-row reduction order of the ncols_y=1 path that NPC.4
+// shipped while amortizing weight reads across ncols_y output columns.
+#define MMVQ_FUSED_LAUNCH(NCOLS, RPCB) \
+    fused_mul_mat_vec_q<type, NCOLS, nwarps, RPCB><<<block_nums, block_dims, 0, stream>>>( \
+            args.vx_u, args.vx_g, args.vy, \
+            args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1, \
+            args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, \
+            args.nb02, args.nb12, args.nb2, args.ids_nb0, \
+            args.unary_op, args.limit)
 
 template <ggml_type type, int nwarps>
 static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
@@ -336,68 +345,59 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
 
     int id = ggml_cuda_get_device();
 
-    int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
-        args.ncols_y < 4 ? 1 : 2 : 1;
+    // F.4.1' — force_rpcb1 (only honored by fused branch) pins rows_per_cuda_block=1
+    // across all ncols_y. The non-fused branch always uses the default selection.
+    const bool rdna_or_newer = ggml_cuda_info().devices[id].cc >= CC_RDNA2;
+    const int rpcb_default = rdna_or_newer ? 1 : (args.ncols_y < 4 ? 1 : 2);
+    const int rpcb_fused = args.force_rpcb1 ? 1 : rpcb_default;
 
-    const int64_t nblocks = (args.nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
-    const dim3 block_nums(nblocks, args.ne2, 1);
     const dim3 block_dims(WARP_SIZE, nwarps, 1);
 
     if (args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT) {
-    switch (args.ncols_y) {
-        case 1:
-            fused_mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 2:
-            fused_mul_mat_vec_q<type, 2, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 3:
-            fused_mul_mat_vec_q<type, 3, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 4:
-            fused_mul_mat_vec_q<type, 4, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 5:
-            fused_mul_mat_vec_q<type, 5, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 6:
-            fused_mul_mat_vec_q<type, 6, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 7:
-            fused_mul_mat_vec_q<type, 7, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        case 8:
-            fused_mul_mat_vec_q<type, 8, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
-                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
-                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
-                    args.unary_op, args.limit);
-            break;
-        default:
-            GGML_ABORT("fatal error");
-            break;
+    const int64_t nblocks = (args.nrows_x + rpcb_fused - 1) / rpcb_fused;
+    const dim3 block_nums(nblocks, args.ne2, 1);
+    if (args.force_rpcb1) {
+        switch (args.ncols_y) {
+            case 1: MMVQ_FUSED_LAUNCH(1, 1); break;
+            case 2: MMVQ_FUSED_LAUNCH(2, 1); break;
+            case 3: MMVQ_FUSED_LAUNCH(3, 1); break;
+            case 4: MMVQ_FUSED_LAUNCH(4, 1); break;
+            case 5: MMVQ_FUSED_LAUNCH(5, 1); break;
+            case 6: MMVQ_FUSED_LAUNCH(6, 1); break;
+            case 7: MMVQ_FUSED_LAUNCH(7, 1); break;
+            case 8: MMVQ_FUSED_LAUNCH(8, 1); break;
+            default: GGML_ABORT("fatal error"); break;
+        }
+    } else if (rdna_or_newer) {
+        // RDNA2+: original code already used rpcb=1 across all ncols_y.
+        switch (args.ncols_y) {
+            case 1: MMVQ_FUSED_LAUNCH(1, 1); break;
+            case 2: MMVQ_FUSED_LAUNCH(2, 1); break;
+            case 3: MMVQ_FUSED_LAUNCH(3, 1); break;
+            case 4: MMVQ_FUSED_LAUNCH(4, 1); break;
+            case 5: MMVQ_FUSED_LAUNCH(5, 1); break;
+            case 6: MMVQ_FUSED_LAUNCH(6, 1); break;
+            case 7: MMVQ_FUSED_LAUNCH(7, 1); break;
+            case 8: MMVQ_FUSED_LAUNCH(8, 1); break;
+            default: GGML_ABORT("fatal error"); break;
+        }
+    } else {
+        // sm_75 default: rpcb=2 for ncols_y>=4, else rpcb=1.
+        switch (args.ncols_y) {
+            case 1: MMVQ_FUSED_LAUNCH(1, 1); break;
+            case 2: MMVQ_FUSED_LAUNCH(2, 1); break;
+            case 3: MMVQ_FUSED_LAUNCH(3, 1); break;
+            case 4: MMVQ_FUSED_LAUNCH(4, 2); break;
+            case 5: MMVQ_FUSED_LAUNCH(5, 2); break;
+            case 6: MMVQ_FUSED_LAUNCH(6, 2); break;
+            case 7: MMVQ_FUSED_LAUNCH(7, 2); break;
+            case 8: MMVQ_FUSED_LAUNCH(8, 2); break;
+            default: GGML_ABORT("fatal error"); break;
+        }
     }
     } else {
+    const int64_t nblocks = (args.nrows_x + rpcb_default - 1) / rpcb_default;
+    const dim3 block_nums(nblocks, args.ne2, 1);
     switch (args.ncols_y) {
         case 1:
             mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
@@ -449,7 +449,14 @@ static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     // path with shared weights), the reduction needs more threads per block
     // → nwarps=4. NP-invariance: dropping nwarps when ne2>=2 changes the
     // reduction order across warps and produces ~1 ULP drift vs ne2=1.
-    if (args.ids_data == nullptr && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
+    //
+    // F.4.1' — force_rpcb1 callers (non-packed up_gate path) require a fixed
+    // reduction order across all ncols_y to stay byte-identical across NP.
+    // Pin nwarps=4 unconditionally for them on sm_75; otherwise NP=8 (ncols_y=8)
+    // would drop to nwarps=2 and diverge from NP={1,2,4} (ncols_y∈{1,2,4}).
+    if (args.force_rpcb1 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
+        nwarps = 4;
+    } else if (args.ids_data == nullptr && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
         nwarps = args.ncols_y <= 4 ? 4 : 2;
     } else if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
         nwarps = args.ncols_y <= 4 ? 4 : 2;

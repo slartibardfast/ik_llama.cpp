@@ -3726,31 +3726,18 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
                 src0_1->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        // F.4.1 DIAGNOSTIC — ne2-packed collapsed launch (broken; investigating)
+        // F.4.1' — non-packed launch: pass Ny as src1_ncols (kernel's ncols_y)
+        // and request force_rpcb1=true so the dispatcher pins rows_per_cuda_block=1
+        // across all ncols_y. This recovers Ny× weight-bandwidth (one weight read
+        // per row, fanned out across Ny output columns) while preserving the
+        // ncols_y=1 cross-row reduction tree that NPC.4 shipped → NP-invariant.
         const int64_t Ny = src1->ne[1];
-
-        auto local_src0_1 = *src0_1;
-        local_src0_1.nb[2] = 0;
-
-        auto local_src1 = *src1;
-        local_src1.ne[1] = 1;
-        local_src1.ne[2] = Ny;
-        local_src1.nb[1] = nb10_padded;
-        local_src1.nb[2] = nb10_padded;
-        local_src1.nb[3] = nb10_padded*Ny;
-
-        auto local_dst = *dst;
-        local_dst.ne[1] = 1;
-        local_dst.ne[2] = Ny;
-        local_dst.nb[2] = dst->nb[1];
-        local_dst.nb[3] = dst->nb[1]*Ny;
-
-        ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, &local_src0_1, &local_src1, /*ids=*/nullptr, &local_dst,
+        ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, src0_1, src1, /*ids=*/nullptr, dst,
                 dst->src[4], dst->src[5],
                 (const char *)src0_1->data, (const char *)src0_2->data,
                 /*src1_ddf_i=*/nullptr, src1_quantized.get(),
-                (float *)local_dst.data, 0, local_src0_1.ne[1], 1, ne10_padded,
-                (ggml_unary_op)dst->op_params[0], limit, stream);
+                (float *)dst->data, 0, src0_1->ne[1], Ny, ne10_padded,
+                (ggml_unary_op)dst->op_params[0], limit, stream, /*force_rpcb1=*/true);
         CUDA_CHECK(cudaGetLastError());
         return;
     } else {
