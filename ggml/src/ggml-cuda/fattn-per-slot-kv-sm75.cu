@@ -2452,52 +2452,17 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
     GGML_ASSERT(Q && K && V && mask && per_row_k_bound);
     GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
 
-    // FIX-C v4 (2026-05-16) — env-gated dispatcher.
+    // FIX-C v5 — single-warp per-row CTA, fp32 canonical k-loop, batch-
+    // invariant by construction (no cross-warp reductions). This is the
+    // production determinism contract, validated by DATA-1 (V4 harness
+    // PASS at NP={1,2,4,8}), DATA-3 (NP=8 × 10-run stability), DATA-4
+    // (n_prompt=1024+ correctness). Supports Q4_0 (production) and F16
+    // (unit-test) KV cache via the dispatcher's internal type branching.
     //
-    // Mode selection via LLAMA_PSKV_MODE env var:
-    //   "wmma"     (default) — wmma_f16_case_pb1<256,256,8,float>  (HAS slot-parity bug per TRACE-1..6)
-    //   "vec_f32"            — vec_f32_case<256,256,Q4_0,Q4_0>     (per-row CTA, fp32 acc, batch-invariant)
-    //   "vec_f16"            — vec_f16_case<256,256,Q4_0,Q4_0>     (per-row CTA, fp16 acc, batch-invariant, faster)
-    //
-    // The vec_* kernels are per-row CTA with online Welford softmax,
-    // canonical k-loop, no Split-K (parallel_blocks=1). For same-prompt
-    // multi-slot batched decode, all slots' outputs are byte-identical
-    // by construction. See yarn-agentic/PHASE_MMQ_Q4_0_AR16.md §6b CX.D
-    // and yarn-agentic/RESEARCH_2026-05-16.md.
-    //
-    // The 3-way gate exists so we can measure perf empirically before
-    // committing to a single mode. Once measurement lands, the winner
-    // becomes the default and the env gate stays for fallback.
-    static const int pskv_mode = []() {
-        const char * e = std::getenv("LLAMA_PSKV_MODE");
-        if (!e || !*e) return 0;
-        if (std::strcmp(e, "singlewarp") == 0) return 3;
-        if (std::strcmp(e, "vec_f32") == 0) return 1;
-        if (std::strcmp(e, "vec_f16") == 0) return 2;
-        if (std::strcmp(e, "wmma")    == 0) return 0;
-        return 0;
-    }();
-
-    switch (pskv_mode) {
-        case 3: // singlewarp — FIX-C v5: per-row single-warp CTA, fp32 canonical k-loop,
-                // batch-invariant by construction (no cross-warp reductions). The
-                // production target for the determinism contract.
-                // Supports Q4_0 (production) and F16 (unit-test) KV cache via
-                // the dispatcher's internal type branching.
-            ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(ctx, dst);
-            return;
-        case 1: // vec_f32 — partial batch-invariance (NP=2 OK; NP>=4 has cross-warp partial bug)
-            GGML_ASSERT(K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
-                        "FIX-C v4 vec_f32 path expects Q4_0 KV cache");
-            ggml_cuda_flash_attn_ext_vec_f32_case<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
-            return;
-        case 2: // vec_f16 — partial batch-invariance, fp16 ε floor
-            GGML_ASSERT(K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
-                        "FIX-C v4 vec_f16 path expects Q4_0 KV cache");
-            ggml_cuda_flash_attn_ext_vec_f16_case<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
-            return;
-        default: // wmma — current production, batched WMMA (HAS the slot-parity bug)
-            ggml_cuda_flash_attn_ext_wmma_f16_case_pb1<256, 256, 8, float>(ctx, dst);
-            return;
-    }
+    // The prior LLAMA_PSKV_MODE env-gate (wmma | vec_f32 | vec_f16 |
+    // singlewarp) was a measurement scaffold; the wmma/vec_* paths have
+    // documented batch-invariance bugs (slot-parity / cross-warp partial)
+    // and are retained only as historical reference in this file's
+    // earlier kernels block. Production dispatch is hardcoded singlewarp.
+    ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(ctx, dst);
 }

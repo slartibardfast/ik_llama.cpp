@@ -930,17 +930,19 @@ struct ggml_backend_cuda_context {
 
     cublasHandle_t cublas_handle(int device) {
         if (cublas_handles[device] == nullptr) {
+            // CUBLAS_WORKSPACE_CONFIG must be set before first cuBLAS call
+            // for deterministic SGEMM/GemmEx. setenv() with overwrite=0
+            // preserves caller-supplied values; production bakes the
+            // canonical :4096:8 setting that cuBLAS docs require.
+            setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            // Determinism gate: under LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1
-            // disable TF32 fast path so F32 SGEMM/GemmEx doesn't switch
-            // accumulator precision based on cuBLAS's shape heuristic.
-            static const bool s_force_sid_math = []() {
-                const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
-                return e && e[0] == '1' && e[1] == '\0';
-            }();
+            // Determinism: disable TF32 fast path so F32 SGEMM/GemmEx
+            // doesn't switch accumulator precision based on cuBLAS's shape
+            // heuristic. Baked on; the prior LLAMA_FATTN_SHAPE_INVARIANT_
+            // DISPATCH gate is removed.
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device],
-                s_force_sid_math ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
+                CUBLAS_DEFAULT_MATH));
         }
         return cublas_handles[device];
     }
