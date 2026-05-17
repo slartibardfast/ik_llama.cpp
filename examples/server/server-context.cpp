@@ -3918,10 +3918,18 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_prompt++;
                     slot.n_past++;
                     slot.image_just_processed = false;
-                    if (params_base.do_checkpoint && slot.n_prompt_tokens - slot.n_past_prompt == params_base.ctx_checkpoints_tolerance) {
-                        slot.do_checkpoint = true;
-                        break;
-                    }
+                    // NPC.4: do NOT break early to insert a "tolerance" checkpoint
+                    // mid-prefill. That break splits prefill into two batches
+                    // (n_prompt-tolerance, tolerance) — the second batch is a
+                    // small-shape "incremental prefill" against the already-
+                    // filled KV cache, which dispatches through a different FA
+                    // kernel tile than the single-batch prefill case. The two
+                    // paths produce slightly different slot-0 KV state and
+                    // break cross-NP byte-identity (NP=1 with a small slot-set
+                    // diverges from NP>=2 in the generation tail). Checkpointing
+                    // still happens at slot release and via interval-based
+                    // create_checkpoint_at_interval; we just don't FORCE a
+                    // mid-prefill split.
                     
                 }
                 LOG_VERBOSE("prompt processing progress", {
