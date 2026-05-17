@@ -4386,10 +4386,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntx = (args.ne11 + mmq_x - 1) / mmq_x;
     const dim3 block_nums_xy_tiling(nty, ntx, 1);
 
-    // CY.F.17: env-gate stream_K disable for shape-invariance.
-    // Stream_K's tile-count-dependent fixup produces M-dependent output.
-    static const bool stream_k_disabled = std::getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K") != nullptr;
-    const bool use_stream_k = !stream_k_disabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
+    // Stream_K's tile-count-dependent fixup produces M-dependent output
+    // (a different reduction order at different batch shapes), which breaks
+    // NP-invariance. Disabled by default for determinism. Opt-in via
+    // GGML_CUDA_MMQ_ENABLE_STREAM_K=1 if a non-determinism-critical workload
+    // needs the perf back.
+    static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
+    const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
     if (!use_stream_k) {
         if (args.ne01 % mmq_y == 0) {
             constexpr bool need_check = false;
@@ -4439,9 +4442,9 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
     const int block_num_y = (args.ne01 + mmq_y - 1) / mmq_y;
-    // CY.F.17: env-gate stream_K disable for shape-invariance.
-    static const bool stream_k_disabled = std::getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K") != nullptr;
-    const bool use_stream_k = !stream_k_disabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
+    // See launch_mul_mat_q above — stream_K disabled by default for NP-invariance.
+    static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
+    const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
 
     int mmq_x_best  = 0;
     int nparts_best = INT_MAX;
