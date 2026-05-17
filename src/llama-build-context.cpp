@@ -2703,22 +2703,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 // np>1 determinism at no perf cost over baseline wmma_f16.
                 // CPU fallback ignores src[5]. Sinks are not supported
                 // on the new op (src[4]=NULL by design). The new op is
-                // opt-IN via LLAMA_FATTN_PER_SLOT_KV_ENABLE=1.
-                static const bool fa_per_slot_enabled = []() {
-                    const char * e = std::getenv("LLAMA_FATTN_PER_SLOT_KV_ENABLE");
-                    return e && std::strcmp(e, "1") == 0;
-                }();
-                // The per-row-K-bound dispatch routes ALL FA calls (decode
-                // and prefill alike) to wmma_f16_case_pb1<256, 256, 8, half>.
-                // cols_per_block=8 + parallel_blocks=1 are NP-independent
-                // compile-time constants; for prefill ne[1]>8 the kernel
-                // launches ceil(ne[1]/8) CTAs in x-dim, covering all rows.
-                // Restricting the route to decode (ne[1]<=8) leaked shape
-                // dependence through prefill's heuristic into the KV cache
-                // state, breaking the NP-cross determinism contract.
+                // 2026-05-17 (audit A.1'): the default wmma_f16_case<256,256,32,half>
+                // prefill route is shape-dependent at n_tokens > 256 (fp16 KQ
+                // accumulator + cols_per_block=32 heuristic together produce
+                // M-dependent rounding). NP=2 vlong (502 tok) diverges at
+                // attn_out_with_input-3 token 256 vs NP=1, max|Δ|=3.8e-3.
+                // The per-slot-kv route forces wmma_f16_case_pb1<256,256,8,
+                // float> (cols=8, fp32 KQ acc, parallel_blocks=1 compile-time)
+                // which is byte-identical at NP={1,2} on the same prompt.
+                // Always-on now; the prior LLAMA_FATTN_PER_SLOT_KV_ENABLE
+                // env-gate was a measurement-period scaffold, not a feature.
+                // See yarn-agentic/MEMORY.md 2026-05-17.
                 const bool use_per_slot_kv =
-                    fa_per_slot_enabled
-                    && cparams.flash_attn
+                    cparams.flash_attn
                     && q->ne[0] == 256 && v->ne[0] == 256
                     && (q->ne[2] / k->ne[2]) <= 16
                     && !(model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra)
