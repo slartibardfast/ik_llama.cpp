@@ -9,7 +9,6 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
-#include "mtmd-helper.h"
 
 #include <fstream>
 #include <iostream>

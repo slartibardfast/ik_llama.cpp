@@ -3,11 +3,9 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 #include "llama-context.h"
-#include "llama-delta-net.h"
 
 #include "ggml.h"
 
-#include <unordered_set>
 #include <algorithm>
 
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
