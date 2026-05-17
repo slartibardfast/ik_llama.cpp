@@ -290,6 +290,37 @@ int main(int argc, char ** argv) {
     }
     llama_batch_free(batch);
 
+    // Optional second decode step: --decode-steps N runs N additional
+    // single-token decode steps (one greedy-sampled token per slot per
+    // step). Captures fire for each step's named tensors; ubatch_counter
+    // disambiguates per-call output files.
+    const char * decode_steps_env = std::getenv("LLAMA_CAPTURE_DECODE_STEPS");
+    int decode_steps = decode_steps_env ? std::atoi(decode_steps_env) : 0;
+    if (decode_steps > 0) {
+        // For determinism testing: use a fixed token (e.g., last prompt token)
+        // for the synthetic decode, so the input is independent of any
+        // sampling-step nondeterminism. We just want to compare kernel
+        // outputs for the same input across NP. The position is
+        // tokens.size() + step for each slot.
+        const llama_token decode_tok = tokens.back();
+        for (int step = 0; step < decode_steps; ++step) {
+            llama_batch dbatch = llama_batch_init(np, 0, np);
+            for (int sid = 0; sid < np; ++sid) {
+                common_batch_add(dbatch, decode_tok,
+                    (llama_pos)(tokens.size() + step),
+                    { (llama_seq_id) sid }, true);
+            }
+            if (llama_decode(ctx, dbatch) != 0) {
+                fprintf(stderr, "decode-step %d failed\n", step);
+                llama_batch_free(dbatch);
+                return 3;
+            }
+            llama_batch_free(dbatch);
+        }
+        fprintf(stderr, "[capture] ran %d decode steps after prefill\n",
+                decode_steps);
+    }
+
     // Write manifest.json.
     {
         std::string mkcmd = "mkdir -p '" + out_dir + "'";
