@@ -1,0 +1,5 @@
+set(TARGET llama-state-capture)
+add_executable(${TARGET} llama-state-capture.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
