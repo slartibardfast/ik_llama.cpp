@@ -1973,10 +1973,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
     if (split->n_inputs < 1) return;
-    // CY.F.18 probe: GGML_SCHED_FORCE_SYNC_INPUTS=1 keeps needs_sync true after
-    // sync (instead of clearing to false). Forces sync on every input read.
-    static const bool force_sync_inputs = std::getenv("GGML_SCHED_FORCE_SYNC_INPUTS") != nullptr;
-    const bool k_set_sync = force_sync_inputs;
+    // When the graph contains a reduce op, peer P2P writes from the reduce
+    // broadcast leave each participating backend's stream with async writes
+    // that must be re-drained on every cross-backend input read. A single
+    // sync (the original optimization, clearing needs_sync after one sync)
+    // is not sufficient — empirical: drained-once, multiple writes accumulate
+    // across the per-layer cycle and the next consumer reads stale data.
+    // With has_reduce, keep needs_sync persistent so every input-read syncs.
+    const bool k_set_sync = sched->has_reduce;
     int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t last_input_backend = nullptr;
@@ -2256,16 +2260,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ith == split_backend_id) {
                         auto node = split->graph.nodes[0];
                         int n = node->op_params[1];
-                        // CY.F.18 probe: env-gate the post-reduce needs_sync
-                        // clearing. The default (false) optimistically assumes
-                        // the reduce's sync covers all later consumer reads,
-                        // but peer P2P writes from the reduce may not be fully
-                        // propagated when downstream splits read.
-                        static const bool keep_sync_after_reduce =
-                            std::getenv("GGML_SCHED_KEEP_SYNC_AFTER_REDUCE") != nullptr;
+                        // After reduce, every participating backend has async
+                        // peer writes to drain on the next consumer read. The
+                        // pre-fix clear-to-false here was the optimization that
+                        // caused the race; mark sticky-true instead.
                         for (int j = 0; j < n; ++j) {
                             if (node->src[j]) {
-                                sched->needs_sync[j] = keep_sync_after_reduce;
+                                sched->needs_sync[j] = true;
                             }
                         }
                     }
@@ -2338,13 +2339,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ith == split_backend_id) {
                         auto node = split->graph.nodes[0];
                         int n = node->op_params[1];
-                        // CY.F.18 probe: env-gate the post-reduce needs_sync
-                        // clearing (see openmp path above for rationale).
-                        static const bool keep_sync_after_reduce =
-                            std::getenv("GGML_SCHED_KEEP_SYNC_AFTER_REDUCE") != nullptr;
+                        // After reduce, every participating backend has async
+                        // peer writes to drain on the next consumer read; see
+                        // openmp path above. Mark sticky-true.
                         for (int j = 0; j < n; ++j) {
                             if (node->src[j]) {
-                                sched->needs_sync[j] = keep_sync_after_reduce;
+                                sched->needs_sync[j] = true;
                             }
                         }
                     }
