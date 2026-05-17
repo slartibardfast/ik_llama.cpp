@@ -2856,7 +2856,30 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     } else {
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
         IK_NVTX_RANGE("op_mul_mat_cublas", dst->name);
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        // Shape-invariance for the non-quantized cuBLAS fallback. The LM
+        // head (model.output, typically F16/BF16) routes here, and at decode
+        // time M = n_active_slots. cuBLAS picks GEMV at M=1 vs small-GEMM
+        // at M>1, yielding different bits for the same slot-0 input. With
+        // multi-slot decode batches that flips an argmax somewhere after
+        // ~50 generation steps and the slots diverge from the NP=1 path.
+        // Split M>1 cases into M separate M=1 calls so every slot's column
+        // takes the same code path it would take alone at NP=1.
+        if (src1->ne[1] > 1 && src1->ne[2] == 1 && src1->ne[3] == 1
+            && ggml_is_contiguous(src1)
+            && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+            const int64_t M = src1->ne[1];
+            ggml_tensor src1_slot = *src1;
+            ggml_tensor dst_slot  = *dst;
+            src1_slot.ne[1] = 1;
+            dst_slot.ne[1]  = 1;
+            for (int64_t m = 0; m < M; ++m) {
+                src1_slot.data = (char *) src1->data + m * src1->nb[1];
+                dst_slot.data  = (char *) dst->data  + m * dst->nb[1];
+                ggml_cuda_op_mul_mat(ctx, src0, &src1_slot, &dst_slot, ggml_cuda_op_mul_mat_cublas, nullptr);
+            }
+        } else {
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        }
         IK_NVTX_END();
     }
     return node_n;

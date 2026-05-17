@@ -397,6 +397,8 @@ int main(int argc, char ** argv) {
         const int n_vocab = llama_n_vocab(model);
         // last_tok[sid] holds the token most recently produced for slot sid.
         std::vector<llama_token> last_tok(np, tokens.back());
+        // Per-slot generated-token log for post-hoc text comparison.
+        std::vector<std::vector<llama_token>> gen_tokens(np);
 
         // llama_get_logits_ith(ctx, i) is indexed by BATCH POSITION (the
         // index in batch->logits[]), not by slot. We hand in the position
@@ -419,6 +421,7 @@ int main(int argc, char ** argv) {
         const int n_tok = (int) tokens.size();
         for (int sid = 0; sid < np; ++sid) {
             last_tok[sid] = argmax_at((sid + 1) * n_tok - 1, last_tok[sid]);
+            gen_tokens[sid].push_back(last_tok[sid]);
         }
 
         const llama_pos pos0 = (llama_pos) tokens.size();
@@ -446,11 +449,26 @@ int main(int argc, char ** argv) {
             if (step + 1 < autoregress_steps) {
                 for (int sid = 0; sid < np; ++sid) {
                     last_tok[sid] = argmax_at(sid, last_tok[sid]);
+                    gen_tokens[sid].push_back(last_tok[sid]);
                 }
             }
         }
         fprintf(stderr, "[capture] ran %d autoregressive steps after prefill\n",
                 autoregress_steps);
+
+        // Write per-slot generated text to the out dir so cross-NP comparison
+        // can verify text-level identity, not just per-tensor identity.
+        for (int sid = 0; sid < np; ++sid) {
+            std::string txt;
+            for (auto t : gen_tokens[sid]) {
+                txt += common_token_to_piece(ctx, t);
+            }
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/gen-slot%d.txt",
+                          out_dir.c_str(), sid);
+            std::ofstream of(path);
+            of << txt;
+        }
     }
 
     // Write manifest.json.
