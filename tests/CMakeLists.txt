@@ -681,4 +681,9 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
+# audit F.2: capture loader / byte-identity harness (PLAN_DETERMINISM_AUDIT.md)
+add_executable(test-capture-loader-smoke audit/test-capture-loader-smoke.cpp)
+target_include_directories(test-capture-loader-smoke PRIVATE audit)
+target_compile_features(test-capture-loader-smoke PRIVATE cxx_std_17)
+
 
