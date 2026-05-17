@@ -2749,18 +2749,15 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
 
-    // Opt-in: force a single shape-independent matmul kernel for all
-    // ne[1] values. Default dispatch picks MMVQ at small batch, MMQ at
-    // medium, cuBLAS at large — different fp accumulator orders break
-    // NP-cross byte-identity when one slot decodes alone vs batched.
-    // Forcing MMQ (per-tile structure, row-independent) for all ne[1]
-    // gives byte-identical row-0 output regardless of batch size.
-    // See specs/deltanet/fattn-per-slot-kv-sm75.md §15.22.
-    static const bool force_shape_invariant_dispatch = []() {
-        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
-
+    // Shape-invariant matmul dispatch: always force MMQ for quantized
+    // weights so the per-row-0 output bits are independent of ne[1].
+    // Default ggml dispatch picks MMVQ at small batch, MMQ at medium,
+    // cuBLAS at large — different fp accumulator orders break NP-cross
+    // byte-identity when one slot decodes alone vs batched. Forcing MMQ
+    // (per-tile structure, row-independent) gives byte-identical row-0
+    // output regardless of batch size. Always-on now; the prior
+    // LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH env-gate was a measurement-
+    // period scaffold, not a feature — see NPC.4 MEMORY entry.
     bool use_dequantize_mul_mat_vec = ggml_cuda_dmmv_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src0->ne[0] % (GGML_CUDA_DMMV_X*2) == 0 && src1->ne[1] == 1;
@@ -2770,9 +2767,6 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool              use_mul_mat_q =  ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-
-    // Note: force-MMQ only safe when MMQ supports the type. ggml_cuda_should_use_mmq
-    // returns false for unsupported types; we re-check after the per-type test below.
 
     // if mmvq is available it's a better choice than dmmv:
 #ifndef GGML_CUDA_FORCE_DMMV
@@ -2784,28 +2778,20 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int cc            = ggml_cuda_info().devices[ctx.device].cc;
     // ggml_cuda_should_use_mmq() is shape-aware (returns false at very small
     // ne[1]) AND type-aware (returns false for types MMQ doesn't support).
-    // In force_shape_invariant_dispatch mode, override the shape rejection
-    // by querying with a "safe" ne11 that bypasses the size cutoff — but
-    // keep the type rejection so unsupported types (e.g. Q4_0_AR16) still
-    // fall through to MMVQ/cuBLAS without aborting at runtime.
-    if (force_shape_invariant_dispatch) {
-        // Call with ne11=16 which is below the DP4A cutoff but above
-        // MMVQ's preferred range — exercises the type-support test only.
-        use_mul_mat_q       = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/16);
-    } else {
-        use_mul_mat_q       = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
-    }
-    // When forcing shape-invariant + MMQ-supported, suppress MMVQ/DMMV so
-    // MMQ is the chosen path regardless of batch size.
-    if (force_shape_invariant_dispatch && use_mul_mat_q) {
-        use_mul_mat_vec_q         = false;
+    // Call with ne11=16 to bypass the size cutoff but keep the type test —
+    // unsupported types (e.g. Q4_0_AR16) still fall through to MMVQ/cuBLAS.
+    use_mul_mat_q = use_mul_mat_q && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/16);
+    // When MMQ is available, suppress MMVQ/DMMV so MMQ is chosen regardless
+    // of batch size.
+    if (use_mul_mat_q) {
+        use_mul_mat_vec_q          = false;
         use_dequantize_mul_mat_vec = false;
     }
-    // For non-quantized F16/BF16/F32 weights under shape-invariant dispatch:
-    // also suppress the dmmv fast-path at M=1, so M=1 routes through cuBLAS
-    // like M>1. Without this, M=1 takes a structurally different code path
-    // (dequantize_mul_mat_vec) — that's not a shape-pinnable difference.
-    if (force_shape_invariant_dispatch && !ggml_is_quantized(src0->type)) {
+    // For non-quantized F16/BF16/F32 weights: also suppress the dmmv
+    // fast-path at M=1, so M=1 routes through cuBLAS like M>1. Without
+    // this, M=1 takes a structurally different code path that's not
+    // shape-pinnable.
+    if (!ggml_is_quantized(src0->type)) {
         use_dequantize_mul_mat_vec = false;
     }
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
@@ -3717,22 +3703,38 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
                 src0_1->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        if (src1->ne[1] == 1 && src0_1->type == src0_2->type) {
-            ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, src0_1, src1, nullptr, dst,
+        // Route every n_tokens<=8 case through the fused single-token kernel,
+        // one launch per slot. The previous dispatch took the in-kernel-fused
+        // path only at ne[1]==1 and fell back to two-separate MMVQ + standalone
+        // fused_mul_silu_f32 for ne[1] in [2,8]; the in-kernel silu and the
+        // standalone silu round expf differently across compilation units, so
+        // slot-0 drifted by ~1 ULP between NP=1 and NP>1. Looping the fused
+        // kernel per slot gives every NP value bit-identical slot-0 output.
+        const int64_t Ny = src1->ne[1];
+
+        auto local_src1 = *src1;
+        local_src1.ne[1] = 1;
+        local_src1.nb[1] = nb10_padded;
+        local_src1.nb[2] = nb10_padded;
+        local_src1.nb[3] = nb10_padded;
+
+        auto local_dst = *dst;
+        local_dst.ne[1] = 1;
+        local_dst.nb[2] = local_dst.nb[1];
+        local_dst.nb[3] = local_dst.nb[1];
+
+        for (int64_t iy = 0; iy < Ny; ++iy) {
+            local_dst.data = (char *)dst->data + iy*dst->nb[1];
+            const char * src1_ddq_slot = src1_quantized.get() + iy*nb10_padded;
+            ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, src0_1, &local_src1, /*ids=*/nullptr, &local_dst,
                     dst->src[4], dst->src[5],
-                    (const char *)src0_1->data, (const char *)src0_2->data, (const float *)src1->data, src1_quantized.get(),
-                    (float *)dst->data, 0, src0_1->ne[1], 1, ne10_padded,
+                    (const char *)src0_1->data, (const char *)src0_2->data,
+                    /*src1_ddf_i=*/nullptr, src1_ddq_slot,
+                    (float *)local_dst.data, 0, src0_1->ne[1], 1, ne10_padded,
                     (ggml_unary_op)dst->op_params[0], limit, stream);
-            return;
+            CUDA_CHECK(cudaGetLastError());
         }
-
-        ggml_cuda_op_mul_mat_vec_q(ctx, src0_1, src1, dst, (const char *)src0_1->data, nullptr, src1_quantized.get(), dst_up.get(),
-                0, src0_1->ne[1], src1->ne[1], ne10_padded, stream);
-        CUDA_CHECK(cudaGetLastError());
-
-        ggml_cuda_op_mul_mat_vec_q(ctx, src0_2, src1, dst, (const char *)src0_2->data, nullptr, src1_quantized.get(), (float *)dst->data,
-                0, src0_2->ne[1], src1->ne[1], ne10_padded, stream);
-        CUDA_CHECK(cudaGetLastError());
+        return;
     } else {
 
         if (ggml_cuda_should_use_mmq(src0_1->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) {

@@ -1603,10 +1603,37 @@ static ggml_tensor * llm_build_kqv(
                     0);
         cb(v, "v", il);
 
-        cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        cb(cur, "fa", il);
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
+        // NPC.4 fix: route to the per-slot-kv FA variant on the single-device
+        // path when the PSKV predicate holds (same predicate as the multi-
+        // device split branch at build_std_attention). The plain
+        // ggml_flash_attn_ext dispatches into a wmma_f16 shape-dependent
+        // kernel that drifts ~1e-3 between NP=1 and NP=2; the PSKV op uses
+        // wmma_f16_case_pb1<256,256,8,float> which is byte-identical at
+        // NP={1,2,...}. See specs/deltanet/fattn-per-slot-kv-sm75.md §15.6.
+        const bool use_per_slot_kv =
+                q->ne[0] == 256 && v->ne[0] == 256
+                && (q->ne[2] / k->ne[2]) <= 16
+                && sinks == nullptr
+                && !(model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra);
+
+        if (use_per_slot_kv) {
+            if (!lctx.default_decoder.inp_per_row_k_bound) {
+                lctx.default_decoder.inp_per_row_k_bound =
+                        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q->ne[1]);
+                ggml_set_input(lctx.default_decoder.inp_per_row_k_bound);
+            }
+            cur = ggml_flash_attn_ext_per_slot_kv(ctx, q, k, v, kq_mask,
+                    lctx.default_decoder.inp_per_row_k_bound,
+                    kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, "fa", il);
+            // PSKV op does not take sinks (predicate requires sinks==nullptr).
+        } else {
+            cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, "fa", il);
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+        }
         if (n_swa > 0) {
             ((int32_t *)cur->op_params)[4] = n_swa;
         }

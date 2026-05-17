@@ -1107,7 +1107,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS GGML_MAX_SRC
+// Bumped from GGML_MAX_SRC (10) to accommodate the deterministic FA path's
+// inp_per_row_k_bound graph input on single-device builds. NPC.4 ran into
+// the prior 10-input cap when the per-slot-kv FA op started being used on
+// the single-device branch for Qwen 3.6 27B (all 16 full-attn layers share
+// one split). 32 leaves headroom for several more shared inputs of the
+// same shape without further bumps.
+#define GGML_SCHED_MAX_SPLIT_INPUTS 32
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
