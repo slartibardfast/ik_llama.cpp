@@ -205,17 +205,27 @@ int main() {
     fprintf(stderr, "[CY.F.17] n_prompt=%d n_predict=%d n_runs=%d\n",
             n_prompt, n_predict, n_runs);
 
+    // Bisection knobs (CY.F.19 / task #210): override unit-test config to step
+    // toward the harness config. Goal: identify which difference flips PASS→FAIL.
+    const int env_ubatch = std::getenv("LLAMA_TEST_UBATCH")
+        ? std::atoi(std::getenv("LLAMA_TEST_UBATCH")) : 2048;
+    const int env_mla    = std::getenv("LLAMA_TEST_MLA_ATTN")
+        ? std::atoi(std::getenv("LLAMA_TEST_MLA_ATTN")) : 3;
+    const bool env_no_hadamard = std::getenv("LLAMA_TEST_NO_HADAMARD") != nullptr;
+    fprintf(stderr, "[CY.F.17] bisection knobs: ubatch=%d mla_attn=%d hadamard=%s\n",
+            env_ubatch, env_mla, env_no_hadamard ? "OFF" : "ON");
+
     // Run NP=1 baseline once for reference.
     fprintf(stderr, "[CY.F.17] NP=1 baseline...\n");
     std::vector<llama_token> np1_baseline;
     {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 4096 * 8;
-        cp.n_batch = 2048; cp.n_ubatch = 2048;
+        cp.n_batch = 2048; cp.n_ubatch = env_ubatch;
         cp.n_seq_max = 1;
         cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0;
-        cp.flash_attn = true; cp.mla_attn = 3;
-        cp.k_cache_hadamard = true; cp.v_cache_hadamard = true;
+        cp.flash_attn = true; cp.mla_attn = env_mla;
+        cp.k_cache_hadamard = !env_no_hadamard; cp.v_cache_hadamard = !env_no_hadamard;
         llama_context * ctx = llama_init_from_model(model, cp);
         std::vector<std::vector<llama_token>> per_seq;
         decode_n_steps(ctx, tokens, n_predict, 1, 1, per_seq);
@@ -234,11 +244,11 @@ int main() {
         fprintf(stderr, "[CY.F.17] Bit-compare slot 0 vs slot 1 last-prefill-token logits...\n");
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 4096 * 8;
-        cp.n_batch = 2048; cp.n_ubatch = 2048;
+        cp.n_batch = 2048; cp.n_ubatch = env_ubatch;
         cp.n_seq_max = 2;
         cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0;
-        cp.flash_attn = true; cp.mla_attn = 3;
-        cp.k_cache_hadamard = true; cp.v_cache_hadamard = true;
+        cp.flash_attn = true; cp.mla_attn = env_mla;
+        cp.k_cache_hadamard = !env_no_hadamard; cp.v_cache_hadamard = !env_no_hadamard;
         llama_context * ctx = llama_init_from_model(model, cp);
         llama_batch batch = llama_batch_init(2 * n_prompt, 0, 1);
         for (int sid = 0; sid < 2; ++sid) {
@@ -292,11 +302,11 @@ int main() {
     for (int run = 0; run < n_runs; ++run) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 4096 * 8;
-        cp.n_batch = 2048; cp.n_ubatch = 2048;
+        cp.n_batch = 2048; cp.n_ubatch = env_ubatch;
         cp.n_seq_max = 2;
         cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0;
-        cp.flash_attn = true; cp.mla_attn = 3;
-        cp.k_cache_hadamard = true; cp.v_cache_hadamard = true;
+        cp.flash_attn = true; cp.mla_attn = env_mla;
+        cp.k_cache_hadamard = !env_no_hadamard; cp.v_cache_hadamard = !env_no_hadamard;
         llama_context * ctx = llama_init_from_model(model, cp);
         std::vector<std::vector<llama_token>> per_seq;
         const bool serial_pref = std::getenv("LLAMA_TEST_SERIAL_PREFILL") &&
