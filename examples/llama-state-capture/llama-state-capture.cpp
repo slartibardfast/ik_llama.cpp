@@ -220,7 +220,13 @@ static void print_usage(const char * argv0) {
         "  --all-in-layer bypass prefix filter; capture every named tensor at the\n"
         "                 listed layers (use with --decode-only to keep size sane).\n"
         "  --decode-only  skip prefill ubatches; only capture during the synthetic\n"
-        "                 decode steps gated by LLAMA_CAPTURE_DECODE_STEPS=N.\n"
+        "                 decode steps gated by LLAMA_CAPTURE_DECODE_STEPS=N\n"
+        "                 OR the autoregressive steps gated by --autoregress N.\n"
+        "  --autoregress N  after prefill, run N steps of greedy autoregressive\n"
+        "                 generation (argmax @ temp=0), tagged 'auto-{step}'.\n"
+        "                 Exercises the production decode path; use it to\n"
+        "                 localize NP-divergences that surface only after\n"
+        "                 several real generation steps.\n"
         "  LAYERS:        comma-separated layer indices, or 'all' for any layer\n"
         "  OUT_DIR:       output directory for .bin files + manifest.json. Files\n"
         "                 land under {OUT_DIR}/{phase}/layer{LL}/{name}.ub{N}.bin\n"
@@ -236,6 +242,7 @@ static void print_usage(const char * argv0) {
 int main(int argc, char ** argv) {
     std::string prompt_file_arg, tensors_arg, layers_arg, out_dir, prompt_id = "p0";
     int np = 1;
+    int autoregress_steps = 0;
     bool all_in_layer = false;
     bool decode_only  = false;
 
@@ -258,6 +265,7 @@ int main(int argc, char ** argv) {
         else if (a == "--prompt-id") prompt_id = need("--prompt-id");
         else if (a == "--all-in-layer") all_in_layer = true;
         else if (a == "--decode-only")  decode_only  = true;
+        else if (a == "--autoregress")  autoregress_steps = std::atoi(need("--autoregress").c_str());
         else filtered.push_back(argv[i]);
     }
 
@@ -372,6 +380,77 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "[capture] ran %d decode steps after prefill\n",
                 decode_steps);
+    }
+
+    // --autoregress N: run N steps of real greedy autoregressive generation,
+    // mirroring what llama-server does at temp=0. Each step samples
+    // argmax(logits[last_pos]) per slot and feeds the new token back in the
+    // next batch. Per-step phase tag is "auto-{step}" so the comparator
+    // can align across NP runs.
+    //
+    // This exercises the production decoding path (per-slot token feedback,
+    // per-slot KV writeback at the actual generated positions) that the
+    // synthetic LLAMA_CAPTURE_DECODE_STEPS path does NOT cover. Use it to
+    // localize NP=1-vs-NP>=2 divergences that surface only after several
+    // autoregressive steps.
+    if (autoregress_steps > 0) {
+        const int n_vocab = llama_n_vocab(model);
+        // last_tok[sid] holds the token most recently produced for slot sid.
+        std::vector<llama_token> last_tok(np, tokens.back());
+
+        // llama_get_logits_ith(ctx, i) is indexed by BATCH POSITION (the
+        // index in batch->logits[]), not by slot. We hand in the position
+        // where logits=true was set for each slot.
+        auto argmax_at = [&](int batch_pos, llama_token fallback) -> llama_token {
+            const float * logits = llama_get_logits_ith(ctx, batch_pos);
+            if (!logits) return fallback;
+            int best = 0;
+            float bv = logits[0];
+            for (int v = 1; v < n_vocab; ++v) {
+                if (logits[v] > bv) { bv = logits[v]; best = v; }
+            }
+            return (llama_token) best;
+        };
+
+        // Sample from prefill logits. Prefill batch laid out slot-major:
+        // slot 0 occupies batch positions [0, n_tok); its last token (with
+        // logits=true) is at position n_tok-1. Slot sid's last token is at
+        // position (sid+1)*n_tok - 1.
+        const int n_tok = (int) tokens.size();
+        for (int sid = 0; sid < np; ++sid) {
+            last_tok[sid] = argmax_at((sid + 1) * n_tok - 1, last_tok[sid]);
+        }
+
+        const llama_pos pos0 = (llama_pos) tokens.size();
+        for (int step = 0; step < autoregress_steps; ++step) {
+            char step_label[32];
+            std::snprintf(step_label, sizeof(step_label), "auto-%d", step);
+            capture_set_phase(&st, step_label, /*decode=*/true, /*step=*/step);
+
+            llama_batch abatch = llama_batch_init(np, 0, np);
+            for (int sid = 0; sid < np; ++sid) {
+                common_batch_add(abatch, last_tok[sid],
+                                 pos0 + (llama_pos) step,
+                                 { (llama_seq_id) sid }, /*logits=*/true);
+            }
+            if (llama_decode(ctx, abatch) != 0) {
+                fprintf(stderr, "autoregress step %d failed\n", step);
+                llama_batch_free(abatch);
+                return 3;
+            }
+            llama_batch_free(abatch);
+
+            // Sample for the NEXT step. (No need on the final step.)
+            // Autoregress batch has one entry per slot with logits=true,
+            // so slot sid is at batch position sid.
+            if (step + 1 < autoregress_steps) {
+                for (int sid = 0; sid < np; ++sid) {
+                    last_tok[sid] = argmax_at(sid, last_tok[sid]);
+                }
+            }
+        }
+        fprintf(stderr, "[capture] ran %d autoregressive steps after prefill\n",
+                autoregress_steps);
     }
 
     // Write manifest.json.
