@@ -280,7 +280,8 @@ void ggml_cuda_op_fused_mul_mat_vec_q_id(ggml_backend_cuda_context & ctx,
     const int64_t ne10 = src1->ne[0];
     GGML_ASSERT(ne10 % QK8_1 == 0);
     GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1);
-    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1);
+    GGML_ASSERT(src1->ne[1] == 1);
+    // F.4.1 DIAGNOSTIC — src1->ne[2]>1 allowed for slot-packed launch.
     //if (ids && ids->ne[0] != dst->ne[2]) {
     //    printf("%s(%s->%s): unexpected situation\n", __func__, src0->name, dst->name);
     //    printf("  src0 = %ld x %ld x %ld x %ld\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);

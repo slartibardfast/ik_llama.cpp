@@ -3726,37 +3726,32 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
                 src0_1->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        // Route every n_tokens<=8 case through the fused single-token kernel,
-        // one launch per slot. The previous dispatch took the in-kernel-fused
-        // path only at ne[1]==1 and fell back to two-separate MMVQ + standalone
-        // fused_mul_silu_f32 for ne[1] in [2,8]; the in-kernel silu and the
-        // standalone silu round expf differently across compilation units, so
-        // slot-0 drifted by ~1 ULP between NP=1 and NP>1. Looping the fused
-        // kernel per slot gives every NP value bit-identical slot-0 output.
+        // F.4.1 DIAGNOSTIC — ne2-packed collapsed launch (broken; investigating)
         const int64_t Ny = src1->ne[1];
+
+        auto local_src0_1 = *src0_1;
+        local_src0_1.nb[2] = 0;
 
         auto local_src1 = *src1;
         local_src1.ne[1] = 1;
+        local_src1.ne[2] = Ny;
         local_src1.nb[1] = nb10_padded;
         local_src1.nb[2] = nb10_padded;
-        local_src1.nb[3] = nb10_padded;
+        local_src1.nb[3] = nb10_padded*Ny;
 
         auto local_dst = *dst;
         local_dst.ne[1] = 1;
-        local_dst.nb[2] = local_dst.nb[1];
-        local_dst.nb[3] = local_dst.nb[1];
+        local_dst.ne[2] = Ny;
+        local_dst.nb[2] = dst->nb[1];
+        local_dst.nb[3] = dst->nb[1]*Ny;
 
-        for (int64_t iy = 0; iy < Ny; ++iy) {
-            local_dst.data = (char *)dst->data + iy*dst->nb[1];
-            const char * src1_ddq_slot = src1_quantized.get() + iy*nb10_padded;
-            ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, src0_1, &local_src1, /*ids=*/nullptr, &local_dst,
-                    dst->src[4], dst->src[5],
-                    (const char *)src0_1->data, (const char *)src0_2->data,
-                    /*src1_ddf_i=*/nullptr, src1_ddq_slot,
-                    (float *)local_dst.data, 0, src0_1->ne[1], 1, ne10_padded,
-                    (ggml_unary_op)dst->op_params[0], limit, stream);
-            CUDA_CHECK(cudaGetLastError());
-        }
+        ggml_cuda_op_fused_mul_mat_vec_q_id(ctx, &local_src0_1, &local_src1, /*ids=*/nullptr, &local_dst,
+                dst->src[4], dst->src[5],
+                (const char *)src0_1->data, (const char *)src0_2->data,
+                /*src1_ddf_i=*/nullptr, src1_quantized.get(),
+                (float *)local_dst.data, 0, local_src0_1.ne[1], 1, ne10_padded,
+                (ggml_unary_op)dst->op_params[0], limit, stream);
+        CUDA_CHECK(cudaGetLastError());
         return;
     } else {
 

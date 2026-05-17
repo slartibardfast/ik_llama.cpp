@@ -442,7 +442,16 @@ template <ggml_type type>
 static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     int nwarps = 1;
     int id = ggml_cuda_get_device();
-    if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) { // NVIDIA and AMD older than RDNA2
+    // Pick nwarps based on whether grid.y is already adding parallelism via
+    // MoE expert indexing. With ids_data!=nullptr, ne2 is the per-expert
+    // slot count and grid.y >= 2 already saturates the GPU; nwarps=1 keeps
+    // block size small. Without ids (single matmul, or slot-packed fused
+    // path with shared weights), the reduction needs more threads per block
+    // → nwarps=4. NP-invariance: dropping nwarps when ne2>=2 changes the
+    // reduction order across warps and produces ~1 ULP drift vs ne2=1.
+    if (args.ids_data == nullptr && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
+        nwarps = args.ncols_y <= 4 ? 4 : 2;
+    } else if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
         nwarps = args.ncols_y <= 4 ? 4 : 2;
     }
     switch (nwarps) {
