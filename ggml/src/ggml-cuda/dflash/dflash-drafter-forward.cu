@@ -532,6 +532,7 @@ extern "C" void dflash_drafter_forward_launch(
     float          norm_eps,
     int            BLOCK_SIZE,
     int            N_slots,
+    int            n_slots_cap,
     int            SeqLen,
     int            L_d,
     int            D_emb,
@@ -640,10 +641,15 @@ extern "C" void dflash_drafter_forward_launch(
                         cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);  // need value for kernel launch arg
 
+        // Per-layer base pointers use n_slots_cap (the storage stride
+        // baked at allocation time), NOT N_slots (the dispatch count).
+        // When N_slots < n_slots_cap, the kernel's slot loop only writes
+        // [0, N_slots) but layer stride must still match storage so
+        // layer L's base lands at the right bytes.
         const __half * k_cache_layer = d_k_cache + static_cast<std::size_t>(layer) *
-                                       N_slots * SeqLen * H_kv * D_h;
+                                       n_slots_cap * SeqLen * H_kv * D_h;
         const __half * v_cache_layer = d_v_cache + static_cast<std::size_t>(layer) *
-                                       N_slots * SeqLen * H_kv * D_h;
+                                       n_slots_cap * SeqLen * H_kv * D_h;
 
         // Step 1: attn_norm
         rmsnorm_kernel<<<grid_rows, block, 0, stream>>>(
@@ -679,9 +685,9 @@ extern "C" void dflash_drafter_forward_launch(
         cache_write_kv_kernel<<<grid_rows, block, 0, stream>>>(
             k_buf, v_buf,
             d_k_cache + static_cast<std::size_t>(layer) *
-                static_cast<std::size_t>(N_slots) * SeqLen * H_kv * D_h,
+                static_cast<std::size_t>(n_slots_cap) * SeqLen * H_kv * D_h,
             d_v_cache + static_cast<std::size_t>(layer) *
-                static_cast<std::size_t>(N_slots) * SeqLen * H_kv * D_h,
+                static_cast<std::size_t>(n_slots_cap) * SeqLen * H_kv * D_h,
             d_slot_positions, Q, SeqLen, H_kv, D_h);
 
         // Step 4: attention

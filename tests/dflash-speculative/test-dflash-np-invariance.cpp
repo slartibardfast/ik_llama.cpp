@@ -244,7 +244,7 @@ int run_at_N(int N_slots, const TinyShape & s, const std::vector<LayerWeights> &
         d.d_gate.data(), d.d_up.data(), d.d_down.data(),
         d.d_output_norm, d.d_layer_types,
         s.swa_window, s.rope_base, s.norm_eps,
-        s.BLOCK_SIZE, N_slots, s.SeqLen, s.L_d,
+        s.BLOCK_SIZE, N_slots, /*n_slots_cap*/ N_slots, s.SeqLen, s.L_d,
         s.D_emb, s.H_q, s.H_kv, s.D_h, s.intermediate,
         d.d_out, /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());

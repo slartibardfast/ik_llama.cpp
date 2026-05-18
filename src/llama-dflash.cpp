@@ -535,7 +535,8 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
                           const llama_dflash_drafter & dw,
                           struct llama_context * ctx,
                           int mal_anchors,
-                          llama_seq_id seq_id) {
+                          llama_seq_id seq_id,
+                          int slot_idx = 0) {
     const int D_emb = dw.hidden_size;
     const int L_src = (int) dw.target_layer_ids.size();
 
@@ -575,118 +576,189 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
         ctx->default_decoder.dflash_extract_n[i][seq_id] = buf.size();
     }
 
-    return cuda_ok(cudaMemcpy(st.d_target_hiddens, h_stage.data(),
+    // Multi-slot layout: d_target_hiddens is [N_slots_cap, mal_cap, L_src, D_emb].
+    // Write this slot's MAL anchors at the slot's base offset; the rectangular
+    // stride uses mal_cap (not mal_anchors) so adjacent slots don't overlap.
+    const std::size_t slot_stride = (std::size_t) st.mal_cap * L_src * D_emb;
+    __half * d_slot = st.d_target_hiddens + (std::size_t) slot_idx * slot_stride;
+    return cuda_ok(cudaMemcpy(d_slot, h_stage.data(),
                               h_stage.size() * sizeof(__half), cudaMemcpyHostToDevice),
                    "upload staged target_hiddens");
 }
 
 } // namespace
 
+// Single-slot trampoline. Phase 4 collapsed the bulk single-slot
+// dispatch into llama_dflash_draft_batch with n_slots=1 — preserving
+// byte-identical output (slot-0 pointer offsets are zero so the
+// multi-slot path degenerates to the prior layout exactly).
 int32_t llama_dflash_draft(
         struct llama_context * ctx_tgt,
         llama_token            anchor_token_id,
         int32_t                anchor_pos,
         llama_token          * out_candidates,
         int32_t                max_candidates) {
+    const llama_seq_id sid0 = 0;
+    return llama_dflash_draft_batch(
+            ctx_tgt,
+            /*n_slots*/ 1,
+            &anchor_token_id,
+            &anchor_pos,
+            &sid0,
+            out_candidates,
+            max_candidates);
+}
+
+// Multi-slot batched draft. Phase 4: full per-slot dispatch.
+//
+// Memory layout invariants (set up by Phase 2 alloc_ctx_scratch sized
+// to st.n_slots_cap, populated by Phase 3 cb_eval per-seq demux):
+//   d_target_hiddens : [n_slots_cap, mal_cap, L_src, D_emb]
+//   d_ctx_states    : [n_slots_cap, mal_cap, D_emb]
+//   d_anchor_pos    : [n_slots_cap, mal_cap]
+//   d_input_emb     : [n_slots_cap, Q,   D_emb]
+//   d_slot_positions: [n_slots_cap]
+//   d_drafter_hidden: [n_slots_cap, BS,  D_emb]
+//   d_drafter_logits: [n_slots_cap, BS,  V]
+//   d_k_cache       : [L_d, n_slots_cap, SeqLen, H_kv, D_h]
+//   d_v_cache       : [L_d, n_slots_cap, SeqLen, H_kv, D_h]
+//
+// combine_features and inject_kv_fused take a single MAL_anchors stride
+// across all slots; production slots have variable MAL (anchor_pos), so
+// those two kernels are dispatched serially per slot with N_slots=1 at
+// the slot's pointer offset. drafter_forward and lm_head are shape-
+// uniform across slots and dispatch ONCE with N_slots=n_slots —
+// recovering the in-flight parallelism on those two stages.
+int32_t llama_dflash_draft_batch(
+        struct llama_context * ctx_tgt,
+        int32_t                n_slots,
+        const llama_token    * anchor_token_ids,
+        const int32_t        * anchor_positions,
+        const llama_seq_id   * seq_ids,
+        llama_token          * out_candidates,
+        int32_t                max_total_candidates) {
     if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
     auto & st = *ctx_tgt->dflash_state;
-    if (!st.drafter) return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!st.drafter)                        return LLAMA_DFLASH_INVALID_DRAFTER;
     auto & dw = *st.drafter;
 
-    // Operating block size: kernels validated for {4, 5, 6, 8}. The
-    // drafter GGUF carries the model's MAX block size (16); for T5 we
-    // run at the spec's documented production operating point of 4.
-    // T8 may sweep {4, 5, 6, 8} for perf tuning.
+    if (n_slots < 1)                        return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (n_slots > st.n_slots_cap)           return LLAMA_DFLASH_NP_GT_1;
+    if (!anchor_token_ids)                  return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!anchor_positions)                  return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!out_candidates)                    return LLAMA_DFLASH_INVALID_DRAFTER;
+
     const int BS = 4;
-    if (max_candidates < BS) {
-        std::fprintf(stderr, "[%s] out_candidates size %d < BLOCK_SIZE %d\n", MODULE, max_candidates, BS);
+    if (max_total_candidates < BS * n_slots) {
+        std::fprintf(stderr, "[%s] out_candidates size %d < BS*n_slots = %d\n",
+                     MODULE, max_total_candidates, BS * n_slots);
         return LLAMA_DFLASH_INVALID_DRAFTER;
     }
 
-    if (anchor_pos < 0 || anchor_pos >= st.seq_len_cap) {
-        std::fprintf(stderr, "[%s] anchor_pos %d out of range [0, %d)\n", MODULE, anchor_pos, st.seq_len_cap);
-        return LLAMA_DFLASH_INVALID_DRAFTER;
-    }
-
-    const int D_emb       = dw.hidden_size;
-    const int L_d         = dw.n_layers;
-    const int H_kv        = dw.n_kv_heads;
-    const int D_h         = dw.head_dim;
-    const int H_q         = dw.n_q_heads;
+    const int D_emb        = dw.hidden_size;
+    const int L_d          = dw.n_layers;
+    const int H_kv         = dw.n_kv_heads;
+    const int D_h          = dw.head_dim;
+    const int H_q          = dw.n_q_heads;
     const int intermediate = dw.intermediate_size;
-    const int swa_window  = dw.sliding_window;
-    const float rope_base = dw.rope_theta;
-    const float norm_eps  = dw.rms_norm_eps;
-    const int L_src       = (int) dw.target_layer_ids.size();
-    const int N_slots     = 1;
-    const int Q           = 1 + BS;
-    const int SeqLen      = st.seq_len_cap;
-    const int V           = st.target_vocab_size;
-    const int MAL         = anchor_pos;   // combine over all positions [0, anchor_pos)
-    if (MAL <= 0) {
-        std::fprintf(stderr, "[%s] draft called at anchor_pos=0 (no context to combine)\n", MODULE);
-        return LLAMA_DFLASH_INVALID_DRAFTER;
-    }
-    if (MAL > st.mal_cap) {
-        std::fprintf(stderr, "[%s] MAL %d exceeds capacity %d\n", MODULE, MAL, st.mal_cap);
-        return LLAMA_DFLASH_INVALID_DRAFTER;
-    }
+    const int swa_window   = dw.sliding_window;
+    const float rope_base  = dw.rope_theta;
+    const float norm_eps   = dw.rms_norm_eps;
+    const int L_src        = (int) dw.target_layer_ids.size();
+    const int Q            = 1 + BS;
+    const int SeqLen       = st.seq_len_cap;
+    const int V            = st.target_vocab_size;
 
-    // ── 1. Stage target hiddens from cb_eval buffer ──
-    // Phase 3: single-slot path always reads seq_id=0. Phase 4 will loop
-    // over active seq_ids when dispatching multi-slot.
-    if (!stage_target_hiddens(st, dw, ctx_tgt, MAL, /*seq_id*/ 0)) return LLAMA_DFLASH_MISSING_METADATA;
-
-    // anchor_positions[a] = a  (each context token at its seq_pos)
-    {
-        std::vector<int> ap(MAL);
-        for (int a = 0; a < MAL; ++a) ap[a] = a;
-        cudaMemcpy(st.d_anchor_pos, ap.data(), (std::size_t) MAL * sizeof(int),
-                   cudaMemcpyHostToDevice);
+    // Per-slot anchor_pos = each slot's MAL. Validate range and pack
+    // host-side anchor_positions array we'll upload per slot.
+    for (int s = 0; s < n_slots; ++s) {
+        const int ap_s = anchor_positions[s];
+        if (ap_s <= 0 || ap_s >= st.seq_len_cap) {
+            std::fprintf(stderr, "[%s] slot %d anchor_pos %d out of range (0, %d)\n",
+                         MODULE, s, ap_s, st.seq_len_cap);
+            return LLAMA_DFLASH_INVALID_DRAFTER;
+        }
+        if (ap_s > st.mal_cap) {
+            std::fprintf(stderr, "[%s] slot %d MAL %d exceeds capacity %d\n",
+                         MODULE, s, ap_s, st.mal_cap);
+            return LLAMA_DFLASH_INVALID_DRAFTER;
+        }
     }
 
-    // ── 2. combine_features ──
-    dflash_combine_features_launch(
-        st.d_target_hiddens, dw.dflash_fc, dw.dflash_hidden_norm, norm_eps,
-        st.d_ctx_states, N_slots, MAL, L_src, D_emb, 0);
-
-    // ── 3. inject_kv_fused × L_d (writes K, V at the MAL context positions) ──
-    // Per-layer stride spans the full N_slots_cap × SeqLen × H_kv × D_h
-    // sub-block (layout: [L_d, N_slots, SeqLen, H_kv, D_h]). The kernel
-    // is told N_slots at call-time so single-slot dispatch only touches
-    // slot 0; multi-slot reuses the same per-layer base pointer.
+    // ── 1+2. Per-slot stage + combine_features + inject_kv × L_d ──
     const std::size_t n_kv_per_layer = (std::size_t) st.n_slots_cap * SeqLen * H_kv * D_h;
-    for (int l = 0; l < L_d; ++l) {
-        dflash_inject_kv_fused_launch(
-            st.d_ctx_states, dw.attn_k[l], dw.attn_v[l], dw.attn_k_norm[l],
-            rope_base, norm_eps,
-            st.d_k_cache + (std::size_t) l * n_kv_per_layer,
-            st.d_v_cache + (std::size_t) l * n_kv_per_layer,
-            st.d_anchor_pos, N_slots, MAL, H_kv, D_h, D_emb, SeqLen, 0);
+    const std::size_t hiddens_slot_stride = (std::size_t) st.mal_cap * L_src * D_emb;
+    const std::size_t ctx_slot_stride     = (std::size_t) st.mal_cap * D_emb;
+    const std::size_t anchor_slot_stride  = (std::size_t) st.mal_cap;
+    const std::size_t kv_slot_stride      = (std::size_t) SeqLen * H_kv * D_h;
+
+    for (int s = 0; s < n_slots; ++s) {
+        const int MAL_s = anchor_positions[s];
+        const llama_seq_id sid = seq_ids ? seq_ids[s] : (llama_seq_id) s;
+
+        // Stage target hiddens for slot s at its slot-major offset.
+        if (!stage_target_hiddens(st, dw, ctx_tgt, MAL_s, sid, s)) {
+            return LLAMA_DFLASH_MISSING_METADATA;
+        }
+
+        // anchor_positions[a] = a for slot s, packed into d_anchor_pos
+        // at slot s's offset.
+        {
+            std::vector<int> ap(MAL_s);
+            for (int a = 0; a < MAL_s; ++a) ap[a] = a;
+            cudaMemcpy(st.d_anchor_pos + s * anchor_slot_stride,
+                       ap.data(), (std::size_t) MAL_s * sizeof(int),
+                       cudaMemcpyHostToDevice);
+        }
+
+        // combine_features for slot s — N_slots=1 at slot offsets.
+        dflash_combine_features_launch(
+            st.d_target_hiddens + s * hiddens_slot_stride,
+            dw.dflash_fc, dw.dflash_hidden_norm, norm_eps,
+            st.d_ctx_states    + s * ctx_slot_stride,
+            /*N_slots*/ 1, MAL_s, L_src, D_emb, 0);
+
+        // inject_kv_fused × L_d for slot s — N_slots=1 at slot offsets.
+        // Per-layer base pointer must include slot offset within the
+        // [L_d, n_slots_cap, SeqLen, ...] cache.
+        for (int l = 0; l < L_d; ++l) {
+            dflash_inject_kv_fused_launch(
+                st.d_ctx_states + s * ctx_slot_stride,
+                dw.attn_k[l], dw.attn_v[l], dw.attn_k_norm[l],
+                rope_base, norm_eps,
+                st.d_k_cache + (std::size_t) l * n_kv_per_layer + s * kv_slot_stride,
+                st.d_v_cache + (std::size_t) l * n_kv_per_layer + s * kv_slot_stride,
+                st.d_anchor_pos + s * anchor_slot_stride,
+                /*N_slots*/ 1, MAL_s, H_kv, D_h, D_emb, SeqLen, 0);
+        }
     }
 
-    // ── 4. Compose input embeddings: anchor + BS×MASK ──
-    if (!cuda_ok(cudaMemcpy(
-            st.d_input_emb + (std::size_t) 0 * D_emb,
-            st.target_token_embd + (std::size_t) anchor_token_id * D_emb,
-            (std::size_t) D_emb * sizeof(__half), cudaMemcpyDeviceToDevice),
-            "copy anchor emb")) return LLAMA_DFLASH_LOAD_FAILED;
-
-    for (int i = 1; i < Q; ++i) {
+    // ── 3. Compose input embeddings slot-major: [N_slots, Q, D_emb] ──
+    for (int s = 0; s < n_slots; ++s) {
+        const std::size_t s_off = (std::size_t) s * Q * D_emb;
         if (!cuda_ok(cudaMemcpy(
-                st.d_input_emb + (std::size_t) i * D_emb,
-                st.target_token_embd + (std::size_t) dw.mask_token_id * D_emb,
+                st.d_input_emb + s_off + (std::size_t) 0 * D_emb,
+                st.target_token_embd + (std::size_t) anchor_token_ids[s] * D_emb,
                 (std::size_t) D_emb * sizeof(__half), cudaMemcpyDeviceToDevice),
-                "copy mask emb")) return LLAMA_DFLASH_LOAD_FAILED;
+                "copy anchor emb")) return LLAMA_DFLASH_LOAD_FAILED;
+        for (int i = 1; i < Q; ++i) {
+            if (!cuda_ok(cudaMemcpy(
+                    st.d_input_emb + s_off + (std::size_t) i * D_emb,
+                    st.target_token_embd + (std::size_t) dw.mask_token_id * D_emb,
+                    (std::size_t) D_emb * sizeof(__half), cudaMemcpyDeviceToDevice),
+                    "copy mask emb")) return LLAMA_DFLASH_LOAD_FAILED;
+        }
     }
 
-    // slot_positions = anchor_pos
+    // ── 4. slot_positions[s] = anchor_positions[s] ──
     {
-        int sp = anchor_pos;
-        cudaMemcpy(st.d_slot_positions, &sp, sizeof(int), cudaMemcpyHostToDevice);
+        std::vector<int> sp(n_slots);
+        for (int s = 0; s < n_slots; ++s) sp[s] = anchor_positions[s];
+        cudaMemcpy(st.d_slot_positions, sp.data(),
+                   (std::size_t) n_slots * sizeof(int), cudaMemcpyHostToDevice);
     }
 
-    // ── 5. drafter_forward ──
+    // ── 5. drafter_forward — multi-slot in ONE launch ──
     std::vector<const __half *> p_attn_norm(L_d), p_q_w(L_d), p_q_norm(L_d);
     std::vector<const __half *> p_k_w(L_d), p_k_norm(L_d), p_v_w(L_d), p_o_w(L_d);
     std::vector<const __half *> p_ffn_norm(L_d), p_gate(L_d), p_up(L_d), p_down(L_d);
@@ -704,6 +776,11 @@ int32_t llama_dflash_draft(
         p_down[l]      = dw.ffn_down[l];
     }
 
+    // N_slots = n_slots (dispatch count) is decoupled from n_slots_cap
+    // (storage stride) — kernel uses N_slots for grid iteration and
+    // n_slots_cap for the per-layer K/V cache base offset. This
+    // matches Phase 2's [L_d, n_slots_cap, SeqLen, H_kv, D_h] cache
+    // allocation regardless of how many slots the call actually wants.
     dflash_drafter_forward_launch(
         st.d_input_emb, st.d_k_cache, st.d_v_cache, st.d_slot_positions,
         p_attn_norm.data(), p_q_w.data(), p_q_norm.data(),
@@ -712,71 +789,36 @@ int32_t llama_dflash_draft(
         dw.output_norm,
         st.d_layer_types,
         swa_window, rope_base, norm_eps,
-        BS, N_slots, SeqLen, L_d,
+        BS, n_slots, st.n_slots_cap, SeqLen, L_d,
         D_emb, H_q, H_kv, D_h, intermediate,
         st.d_drafter_hidden, 0);
 
-    // ── 6. drafter_lm_head ──
+    // ── 6. drafter_lm_head — flat n_slots*BS rows ──
     dflash_drafter_lm_head_launch(
         st.d_drafter_hidden, st.target_lm_head, st.d_drafter_logits,
-        N_slots * BS, D_emb, V, 0);
+        n_slots * BS, D_emb, V, 0);
 
     cudaDeviceSynchronize();
 
-    // ── 7. Per-row argmax on CPU (BS small, V=248320; fp32 logits) ──
+    // ── 7. Per-row argmax on CPU; slot-major out_candidates ──
     cudaMemcpy(st.h_logits.data(), st.d_drafter_logits,
-               (std::size_t) BS * V * sizeof(float), cudaMemcpyDeviceToHost);
+               (std::size_t) n_slots * BS * V * sizeof(float),
+               cudaMemcpyDeviceToHost);
 
-    for (int row = 0; row < BS; ++row) {
-        const float * r = st.h_logits.data() + (std::size_t) row * V;
-        int argmax = 0;
-        float maxv = r[0];
-        for (int v = 1; v < V; ++v) {
-            if (r[v] > maxv) { maxv = r[v]; argmax = v; }
+    for (int s = 0; s < n_slots; ++s) {
+        for (int row = 0; row < BS; ++row) {
+            const float * r = st.h_logits.data() + ((std::size_t) s * BS + row) * V;
+            int argmax = 0;
+            float maxv = r[0];
+            for (int v = 1; v < V; ++v) {
+                if (r[v] > maxv) { maxv = r[v]; argmax = v; }
+            }
+            out_candidates[s * BS + row] = (llama_token) argmax;
         }
-        out_candidates[row] = (llama_token) argmax;
     }
 
     st.n_cycles += 1;
-    return BS;
-}
-
-// Multi-slot batched draft. Phase 1 surface: shape verified, but the
-// per-slot scratch sizing (Phase 2) and cb_eval seq_id demux (Phase 3)
-// are not yet landed. So at this revision we only accept n_slots == 1
-// and trampoline to the existing single-slot path.
-int32_t llama_dflash_draft_batch(
-        struct llama_context * ctx_tgt,
-        int32_t                n_slots,
-        const llama_token    * anchor_token_ids,
-        const int32_t        * anchor_positions,
-        const llama_seq_id   * seq_ids,
-        llama_token          * out_candidates,
-        int32_t                max_total_candidates) {
-    if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
-    if (n_slots < 1)                        return LLAMA_DFLASH_INVALID_DRAFTER;
-    if (!anchor_token_ids)                  return LLAMA_DFLASH_INVALID_DRAFTER;
-    if (!anchor_positions)                  return LLAMA_DFLASH_INVALID_DRAFTER;
-    if (!out_candidates)                    return LLAMA_DFLASH_INVALID_DRAFTER;
-
-    if (n_slots > 1) {
-        return LLAMA_DFLASH_NP_GT_1;
-    }
-
-    if (seq_ids && seq_ids[0] != 0) {
-        // Single-slot trampoline is byte-identical to llama_dflash_draft
-        // only when seq_id == 0 (the implicit slot the current
-        // single-slot dispatch services). Multi-seq_id support arrives
-        // in Phase 3.
-        return LLAMA_DFLASH_NP_GT_1;
-    }
-
-    return llama_dflash_draft(
-            ctx_tgt,
-            anchor_token_ids[0],
-            anchor_positions[0],
-            out_candidates,
-            max_total_candidates);
+    return BS * n_slots;
 }
 
 // Internal helper called from llama.cpp's llama_context destructor.

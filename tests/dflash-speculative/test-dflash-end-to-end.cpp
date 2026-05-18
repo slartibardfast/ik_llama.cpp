@@ -184,7 +184,7 @@ int run_pipeline_synthetic(const dflash_reference::DrafterWeights & w) {
         p_ffn_norm.data(), p_gate.data(), p_up.data(), p_down.data(),
         d_layer_types,
         swa_window, rope_base, norm_eps,
-        BLOCK_SIZE, N_slots, SeqLen, L_d,
+        BLOCK_SIZE, N_slots, /*n_slots_cap*/ N_slots, SeqLen, L_d,
         D_emb, H_q, H_kv, D_h, intermediate,
         d_hidden, 0);
     CUDA_CHECK(cudaDeviceSynchronize());

@@ -64,8 +64,8 @@ extern "C" {
 // BLOCK_SIZE must be one of {4, 5, 6, 8}.
 void dflash_drafter_forward_launch(
     const __half * d_input_tokens_emb,      // [N_slots, 1+BLOCK_SIZE, D_emb]
-    __half       * d_k_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h] (drafter writes K/V at query positions)
-    __half       * d_v_cache,               // [L_d, N_slots, SeqLen, H_kv, D_h]
+    __half       * d_k_cache,               // [L_d, n_slots_cap, SeqLen, H_kv, D_h] (drafter writes K/V at query positions)
+    __half       * d_v_cache,               // [L_d, n_slots_cap, SeqLen, H_kv, D_h]
     const int    * d_slot_positions,        // [N_slots] — anchor_pos for each slot
     const __half * const * d_layer_attn_norm_w,   // [L_d] pointers to [D_emb]
     const __half * const * d_layer_q_w,           // [L_d] pointers to [H_q*D_h, D_emb]
@@ -84,7 +84,8 @@ void dflash_drafter_forward_launch(
     float          rope_base,                      // = 10000000.0
     float          norm_eps,                       // = 1e-6
     int            BLOCK_SIZE,                     // {4, 5, 6, 8}
-    int            N_slots,
+    int            N_slots,                        // dispatch count (slots to compute), ≤ n_slots_cap
+    int            n_slots_cap,                    // storage stride for K/V cache layer offset
     int            SeqLen,
     int            L_d,
     int            D_emb,

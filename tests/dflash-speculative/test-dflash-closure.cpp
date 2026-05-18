@@ -318,7 +318,7 @@ int run_closure(
         dw.output_norm,
         d_layer_types,
         swa_window, rope_base, norm_eps,
-        BLOCK_SIZE, N_slots, SeqLen, L_d,
+        BLOCK_SIZE, N_slots, /*n_slots_cap*/ N_slots, SeqLen, L_d,
         D_emb, H_q, H_kv, D_h, intermediate,
         d_hidden, 0);
     CUDA_CHECK(cudaDeviceSynchronize());

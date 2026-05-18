@@ -206,6 +206,10 @@ int kernel_vs_reference_test() {
         s.BLOCK_SIZE, s.N_slots, s.SeqLen, s.L_d,
         s.D_emb, s.H_q, s.H_kv, s.D_h, s.intermediate,
         ref_h.data());
+    // Note: line above calls dflash_reference::drafter_forward_reference
+    // (CPU ref), which is NOT the GPU launcher and does not take an
+    // n_slots_cap param. Test is disabled in CMakeLists (line 514) due
+    // to a pre-existing reference-signature mismatch — see CMake note.
 
     // Now drive the kernel: move all inputs to GPU.
     __half *d_input_emb = nullptr, *d_k_cache = nullptr, *d_v_cache = nullptr;
@@ -271,7 +275,7 @@ int kernel_vs_reference_test() {
         nullptr,  // d_output_norm_w — skipped at the kvr tiny-shape test
         d_layer_types,
         s.swa_window, s.rope_base, s.norm_eps,
-        s.BLOCK_SIZE, s.N_slots, s.SeqLen, s.L_d,
+        s.BLOCK_SIZE, s.N_slots, /*n_slots_cap*/ s.N_slots, s.SeqLen, s.L_d,
         s.D_emb, s.H_q, s.H_kv, s.D_h, s.intermediate,
         d_out, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -499,7 +503,7 @@ int run_stub_kernel_check(int N_slots, int BLOCK_SIZE, int SeqLen) {
         /*d_output_norm_w*/    nullptr,
         /*d_layer_types*/      nullptr,
         swa_window, rope_base, norm_eps,
-        BLOCK_SIZE, N_slots, SeqLen,
+        BLOCK_SIZE, N_slots, /*n_slots_cap*/ N_slots, SeqLen,
         L_d, D_emb, H_q, H_kv, D_h, intermediate,
         d_out, /*stream*/ 0);
     CUDA_CHECK(cudaDeviceSynchronize());

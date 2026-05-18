@@ -556,6 +556,12 @@ if (GGML_CUDA)
         # extract buffer count and that seq_id=1's buffer is populated.
         llama_build_and_test(dflash-speculative/test-dflash-extract-multi-seq.cpp)
 
+        # DFlash multi-slot Phase 4: byte-identical-binding gate.
+        # Verifies that draft_batch(n_slots=2, [0,1]) produces the same
+        # 8 candidates as two serial draft_batch(n_slots=1) calls (one
+        # per seq_id). Pins the multi-slot dispatch semantic.
+        llama_build_and_test(dflash-speculative/test-dflash-batch-vs-serial.cpp)
+
         # Empirical np-invariance probe — drafter_forward at N_slots ∈
         # {1,2,4,8} with identical slot content; slot 0 output must be
         # byte-identical across all N values.
