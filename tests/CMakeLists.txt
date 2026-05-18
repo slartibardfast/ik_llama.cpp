@@ -551,6 +551,11 @@ if (GGML_CUDA)
             ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(test-dflash-closure PRIVATE CUDA::cudart ggml)
 
+        # DFlash multi-slot Phase 3: cb_eval per-seq demux gate. Decodes
+        # a 2-seq batch through the qwen35 graph; verifies each seq_id's
+        # extract buffer count and that seq_id=1's buffer is populated.
+        llama_build_and_test(dflash-speculative/test-dflash-extract-multi-seq.cpp)
+
         # Empirical np-invariance probe — drafter_forward at N_slots ∈
         # {1,2,4,8} with identical slot content; slot 0 output must be
         # byte-identical across all N values.

@@ -5289,6 +5289,18 @@ static int llama_decode_internal(
             u_batch.seq_id = seq_id_arr.data();
         }
 
+        // DFlash multi-slot: publish the per-row primary seq_id so the
+        // cb_eval extract hook can demux rows into per-seq buffers
+        // (see llama_dflash_extract_cb_eval). Only populated when the
+        // hook is armed; otherwise stays empty (and cb_eval not invoked).
+        if (lctx.cparams.dflash_extract_count > 0) {
+            auto & rs = lctx.default_decoder.dflash_ubatch_row_seq;
+            rs.resize(n_tokens);
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                rs[i] = u_batch.seq_id[i][0];
+            }
+        }
+
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
             int32_t ret = llama_kv_cache_update(&lctx);
@@ -9686,41 +9698,65 @@ static bool llama_dflash_extract_cb_eval(struct ggml_tensor * t, bool ask, void 
         return true;
     }
     const size_t nbytes = ggml_nbytes(t);
-    auto & buf = ctx->default_decoder.dflash_extract_buf[slot];
+    auto & buf_per_seq = ctx->default_decoder.dflash_extract_buf[slot];
+    auto & n_per_seq   = ctx->default_decoder.dflash_extract_n[slot];
+    auto & row_seq     = ctx->default_decoder.dflash_ubatch_row_seq;
+    const int64_t n_elements = (int64_t) ggml_nelements(t);
+    // Row count = t->ne[1] for the 2D [D_emb, n_tokens] residual; 1 for
+    // the degenerate 1D case (single-token decode where build_qwen35
+    // collapses the row dim).
+    const int64_t n_rows = (t->ne[1] > 0) ? t->ne[1] : 1;
+    const int64_t D_emb  = (n_rows > 0)   ? n_elements / n_rows : n_elements;
     if (std::getenv("DFLASH_DIAG") && slot == 0) {
-        std::fprintf(stderr, "[dflash-diag cb_eval] slot 0 layer %d: t->type=%s nbytes=%zu ne=[%lld,%lld,%lld,%lld]\n",
+        std::fprintf(stderr, "[dflash-diag cb_eval] slot 0 layer %d: t->type=%s nbytes=%zu ne=[%lld,%lld,%lld,%lld] rows=%lld D=%lld row_seq.size=%zu\n",
                      il, ggml_type_name(t->type), nbytes,
                      (long long)t->ne[0], (long long)t->ne[1],
-                     (long long)t->ne[2], (long long)t->ne[3]);
+                     (long long)t->ne[2], (long long)t->ne[3],
+                     (long long)n_rows, (long long)D_emb, row_seq.size());
     }
     // Append: cb_eval may fire multiple times per llama_decode when the
-    // batch is split into ubatches. The accumulated buffer ends up with
-    // one row per decoded position in seq order. Resetting on each
-    // ubatch would discard all but the last ubatch's rows. Callers that
-    // need to truncate after a partial-accept rollback do so explicitly
-    // via llama_dflash_trim_extract_buf (see include/llama.h).
+    // batch is split into ubatches. Each row is demuxed by its primary
+    // seq_id (row_seq[row]) and appended to the matching per-seq buffer.
+    // Callers that need to truncate after a partial-accept rollback do so
+    // explicitly via llama_dflash_trim_extract (see include/llama.h).
     //
     // Type handling: the `l_out-<il>` node lands as F32 for single-token
     // decodes and F16 for multi-token prefill/verify ubatches (the build
     // graph keeps the residual stream in F16 when the batch dim is > 1).
-    // Both shapes need to land in `buf` as F32 with stride = D_emb.
-    const size_t old_n_floats = buf.size();
-    const int64_t n_elements = (int64_t) ggml_nelements(t);
+    // Both shapes land in the per-seq buf as F32 with stride = D_emb.
+    if (D_emb <= 0) {
+        return true;
+    }
+    const size_t n_seq = buf_per_seq.size();
     if (t->type == GGML_TYPE_F32) {
-        buf.resize(old_n_floats + (size_t) n_elements);
-        ggml_backend_tensor_get(t, buf.data() + old_n_floats, 0, nbytes);
+        const size_t row_nbytes = (size_t) D_emb * sizeof(float);
+        for (int64_t row = 0; row < n_rows; ++row) {
+            const llama_seq_id sid = (row < (int64_t) row_seq.size()) ? row_seq[row] : 0;
+            if (sid < 0 || (size_t) sid >= n_seq) continue;
+            auto & b = buf_per_seq[sid];
+            const size_t old = b.size();
+            b.resize(old + (size_t) D_emb);
+            ggml_backend_tensor_get(t, b.data() + old, row * row_nbytes, row_nbytes);
+            n_per_seq[sid] = b.size();
+        }
     } else if (t->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> h_stage((size_t) n_elements);
         ggml_backend_tensor_get(t, h_stage.data(), 0, nbytes);
-        buf.resize(old_n_floats + (size_t) n_elements);
-        ggml_fp16_to_fp32_row(h_stage.data(), buf.data() + old_n_floats, n_elements);
+        for (int64_t row = 0; row < n_rows; ++row) {
+            const llama_seq_id sid = (row < (int64_t) row_seq.size()) ? row_seq[row] : 0;
+            if (sid < 0 || (size_t) sid >= n_seq) continue;
+            auto & b = buf_per_seq[sid];
+            const size_t old = b.size();
+            b.resize(old + (size_t) D_emb);
+            ggml_fp16_to_fp32_row(h_stage.data() + row * D_emb, b.data() + old, D_emb);
+            n_per_seq[sid] = b.size();
+        }
     } else {
         // Unknown type for cb_eval extract — skip rather than corrupt buf.
         // (BF16 would need ggml_bf16_to_fp32_row; quant types don't apply
         // to residual streams.)
         return true;
     }
-    ctx->default_decoder.dflash_extract_n[slot] = buf.size();
     return true;
 }
 
@@ -9736,10 +9772,14 @@ void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t *
     for (int32_t i = n; i < LLAMA_DFLASH_MAX_EXTRACT_LAYERS; ++i) {
         ctx->cparams.dflash_extract_layers[i] = 0;
     }
+    // Size the inner (per-seq) vectors to cparams.n_seq_max so the
+    // cb_eval hook can demux rows by seq_id without reallocating.
+    const size_t n_seq_max = (size_t) std::max<uint32_t>(ctx->cparams.n_seq_max, 1u);
     for (int32_t i = 0; i < LLAMA_DFLASH_MAX_EXTRACT_LAYERS; ++i) {
-        ctx->default_decoder.dflash_extract_buf[i].clear();
-        ctx->default_decoder.dflash_extract_n[i] = 0;
+        ctx->default_decoder.dflash_extract_buf[i].assign(n_seq_max, std::vector<float>{});
+        ctx->default_decoder.dflash_extract_n[i].assign(n_seq_max, 0);
     }
+    ctx->default_decoder.dflash_ubatch_row_seq.clear();
     if (n > 0) {
         ctx->cparams.cb_eval = llama_dflash_extract_cb_eval;
         ctx->cparams.cb_eval_user_data = ctx;
@@ -9754,15 +9794,28 @@ void llama_set_dflash_extract_layers(struct llama_context * ctx, const int32_t *
 }
 
 size_t llama_get_dflash_extract_data(struct llama_context * ctx, int32_t idx, float * dst, size_t max_elements) {
+    return llama_get_dflash_extract_data_seq(ctx, idx, /*seq_id*/ 0, dst, max_elements);
+}
+
+size_t llama_get_dflash_extract_data_seq(struct llama_context * ctx,
+                                         int32_t                idx,
+                                         llama_seq_id           seq_id,
+                                         float                * dst,
+                                         size_t                 max_elements) {
     if (idx < 0 || idx >= ctx->cparams.dflash_extract_count) {
         return 0;
     }
-    const size_t n = ctx->default_decoder.dflash_extract_n[idx];
+    const auto & n_per_seq   = ctx->default_decoder.dflash_extract_n[idx];
+    const auto & buf_per_seq = ctx->default_decoder.dflash_extract_buf[idx];
+    if (seq_id < 0 || (size_t) seq_id >= buf_per_seq.size()) {
+        return 0;
+    }
+    const size_t n = n_per_seq[seq_id];
     if (n == 0) {
         return 0;
     }
     const size_t to_copy = n < max_elements ? n : max_elements;
-    std::memcpy(dst, ctx->default_decoder.dflash_extract_buf[idx].data(), to_copy * sizeof(float));
+    std::memcpy(dst, buf_per_seq[seq_id].data(), to_copy * sizeof(float));
     return to_copy;
 }
 

@@ -158,8 +158,21 @@ struct llama_decoder {
     // contiguous float count actually written for the last decode.
     // Cap mirrors dflash_extract_layers[80] in llama-cparams.h (Qwen 3.6 27B
     // 65-layer capture + headroom).
-    std::vector<float> dflash_extract_buf[80];
-    size_t             dflash_extract_n[80] = {};
+    //
+    // Inner vector is indexed by primary seq_id of each row, sized to
+    // cparams.n_seq_max at llama_set_dflash_extract_layers time. The
+    // cb_eval hook demuxes rows into the correct per-seq buffer using
+    // dflash_ubatch_row_seq (populated by the decode driver before sched
+    // compute). At n_seq_max=1 the seq_id=0 buffer is the only one used
+    // and behavior is byte-identical to the pre-Phase-3 flat storage.
+    std::vector<std::vector<float>> dflash_extract_buf[80];
+    std::vector<size_t>             dflash_extract_n[80];
+
+    // Per-row primary seq_id (seq_id[i][0]) of the current ubatch.
+    // Length == u_batch.n_tokens; populated by llama_decode_internal
+    // before ggml_backend_sched_graph_compute_async so the DFlash
+    // cb_eval hook can demux rows by seq_id at append time.
+    std::vector<llama_seq_id> dflash_ubatch_row_seq;
 
     // PHASE45 D9.6f: PHASE36 Step 1 fused multi-draft cgraph counters.
     int32_t mtp_fused_last_compute_count = 0;

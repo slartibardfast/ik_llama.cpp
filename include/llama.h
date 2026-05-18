@@ -1104,6 +1104,19 @@ extern "C" {
     // write.
     LLAMA_API size_t llama_get_dflash_extract_data(struct llama_context * ctx, int32_t idx, float * dst, size_t max_elements);
 
+    // Per-seq_id variant of llama_get_dflash_extract_data. At n_seq_max>1
+    // the cb_eval hook demuxes rows of each ubatch into per-seq buffers
+    // by their primary seq_id; this getter copies a specific seq_id's
+    // contiguous float buffer for source-layer slot `idx`. Returns 0 if
+    // idx is out of range, seq_id is out of range (>= n_seq_max), no
+    // extract is configured, or that seq_id's buffer is empty.
+    LLAMA_API size_t llama_get_dflash_extract_data_seq(
+            struct llama_context * ctx,
+            int32_t                idx,
+            llama_seq_id           seq_id,
+            float                * dst,
+            size_t                 max_elements);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

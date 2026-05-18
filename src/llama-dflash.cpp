@@ -534,7 +534,8 @@ namespace {
 bool stage_target_hiddens(llama_dflash_ctx_state & st,
                           const llama_dflash_drafter & dw,
                           struct llama_context * ctx,
-                          int mal_anchors) {
+                          int mal_anchors,
+                          llama_seq_id seq_id) {
     const int D_emb = dw.hidden_size;
     const int L_src = (int) dw.target_layer_ids.size();
 
@@ -544,16 +545,23 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
         // dflash_extract_buf is indexed by source-layer SLOT (0..L_src-1),
         // NOT by target layer id. The cb_eval hook stores at the slot
         // index it finds for the matched layer; this matches the order
-        // of llama_set_dflash_extract_layers' input array.
-        std::vector<float> & buf = ctx->default_decoder.dflash_extract_buf[i];
+        // of llama_set_dflash_extract_layers' input array. Inner vector
+        // is per-seq_id (sized to cparams.n_seq_max at hook install).
+        auto & buf_per_seq = ctx->default_decoder.dflash_extract_buf[i];
+        if (seq_id < 0 || (size_t) seq_id >= buf_per_seq.size()) {
+            std::fprintf(stderr, "[%s] stage_target_hiddens: seq_id %d out of range (n_seq_max=%zu)\n",
+                         MODULE, (int) seq_id, buf_per_seq.size());
+            return false;
+        }
+        std::vector<float> & buf = buf_per_seq[seq_id];
         const int il = dw.target_layer_ids[i];
         if (i == 0 && std::getenv("DFLASH_DIAG")) {
-            std::fprintf(stderr, "[dflash-diag stage] slot 0 layer %d: buf_rows=%zu MAL=%d\n",
-                         il, buf.size() / (std::size_t) D_emb, mal_anchors);
+            std::fprintf(stderr, "[dflash-diag stage] slot 0 layer %d seq_id %d: buf_rows=%zu MAL=%d\n",
+                         il, (int) seq_id, buf.size() / (std::size_t) D_emb, mal_anchors);
         }
         if ((int) (buf.size() / D_emb) < mal_anchors) {
-            std::fprintf(stderr, "[%s] extract buffer too short for slot %d (layer %d): have %zu rows, need %d\n",
-                         MODULE, i, il, buf.size() / (std::size_t) D_emb, mal_anchors);
+            std::fprintf(stderr, "[%s] extract buffer too short for slot %d (layer %d) seq_id %d: have %zu rows, need %d\n",
+                         MODULE, i, il, (int) seq_id, buf.size() / (std::size_t) D_emb, mal_anchors);
             return false;
         }
         for (int a = 0; a < mal_anchors; ++a) {
@@ -564,7 +572,7 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
         }
         // Trim to mal_anchors rows for next cycle.
         buf.resize((std::size_t) mal_anchors * D_emb);
-        ctx->default_decoder.dflash_extract_n[i] = buf.size();
+        ctx->default_decoder.dflash_extract_n[i][seq_id] = buf.size();
     }
 
     return cuda_ok(cudaMemcpy(st.d_target_hiddens, h_stage.data(),
@@ -625,7 +633,9 @@ int32_t llama_dflash_draft(
     }
 
     // ── 1. Stage target hiddens from cb_eval buffer ──
-    if (!stage_target_hiddens(st, dw, ctx_tgt, MAL)) return LLAMA_DFLASH_MISSING_METADATA;
+    // Phase 3: single-slot path always reads seq_id=0. Phase 4 will loop
+    // over active seq_ids when dispatching multi-slot.
+    if (!stage_target_hiddens(st, dw, ctx_tgt, MAL, /*seq_id*/ 0)) return LLAMA_DFLASH_MISSING_METADATA;
 
     // anchor_positions[a] = a  (each context token at its seq_pos)
     {
@@ -813,27 +823,37 @@ int32_t llama_dflash_trim_extract(
     }
     if (D_emb <= 0) return LLAMA_DFLASH_MISSING_METADATA;
 
+    // Apply trim semantics to every populated per-seq buffer. At
+    // n_seq_max=1 only seq_id=0 is populated (Phase 3 default); at
+    // n_seq_max>1 with Phase 3 single-slot dispatch this still only
+    // affects seq_id=0 (others remain empty no-ops). Phase 4's
+    // multi-slot draft path drives separate seq_id populations.
     for (int i = 0; i < n_slots; ++i) {
-        std::vector<float> & buf = ctx_tgt->default_decoder.dflash_extract_buf[i];
-        const std::size_t row = (std::size_t) D_emb;
-        const std::size_t n_rows_have = buf.size() / row;
-        const std::size_t n_rows_before = n_rows_have;
-        if (p_end < 0 || (std::size_t) p_end >= n_rows_have) {
-            // Truncate to first p_start rows.
-            if ((std::size_t) p_start < n_rows_have) {
-                buf.resize((std::size_t) p_start * row);
+        auto & buf_per_seq = ctx_tgt->default_decoder.dflash_extract_buf[i];
+        auto & n_per_seq   = ctx_tgt->default_decoder.dflash_extract_n[i];
+        for (size_t sid = 0; sid < buf_per_seq.size(); ++sid) {
+            std::vector<float> & buf = buf_per_seq[sid];
+            if (buf.empty()) continue;
+            const std::size_t row = (std::size_t) D_emb;
+            const std::size_t n_rows_have = buf.size() / row;
+            const std::size_t n_rows_before = n_rows_have;
+            if (p_end < 0 || (std::size_t) p_end >= n_rows_have) {
+                // Truncate to first p_start rows.
+                if ((std::size_t) p_start < n_rows_have) {
+                    buf.resize((std::size_t) p_start * row);
+                }
+            } else {
+                // Remove slice [p_start, p_end).
+                if ((std::size_t) p_start >= n_rows_have) continue;
+                const std::size_t b_start = (std::size_t) p_start * row;
+                const std::size_t b_end   = (std::size_t) p_end   * row;
+                buf.erase(buf.begin() + b_start, buf.begin() + b_end);
             }
-        } else {
-            // Remove slice [p_start, p_end).
-            if ((std::size_t) p_start >= n_rows_have) continue;
-            const std::size_t b_start = (std::size_t) p_start * row;
-            const std::size_t b_end   = (std::size_t) p_end   * row;
-            buf.erase(buf.begin() + b_start, buf.begin() + b_end);
-        }
-        ctx_tgt->default_decoder.dflash_extract_n[i] = buf.size();
-        if (i == 0 && std::getenv("DFLASH_DIAG")) {
-            std::fprintf(stderr, "[dflash-diag trim] slot 0: before=%zu p_start=%d p_end=%d after=%zu\n",
-                         n_rows_before, p_start, p_end, buf.size() / row);
+            n_per_seq[sid] = buf.size();
+            if (i == 0 && sid == 0 && std::getenv("DFLASH_DIAG")) {
+                std::fprintf(stderr, "[dflash-diag trim] slot 0 seq_id 0: before=%zu p_start=%d p_end=%d after=%zu\n",
+                             n_rows_before, p_start, p_end, buf.size() / row);
+            }
         }
     }
     return LLAMA_DFLASH_OK;
