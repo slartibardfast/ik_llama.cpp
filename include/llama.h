@@ -1805,6 +1805,35 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             llama_token          * out_candidates,
             int32_t                max_candidates);
 
+    // Multi-slot batched draft. Runs one DFlash drafter cycle covering
+    // n_slots target slots in a single kernel pipeline.
+    // - n_slots: number of seq_id slots to draft for. Must be >= 1 and
+    //   <= the n_seq_max the context was created with (the value
+    //   captured at llama_set_dflash bind time).
+    // - anchor_token_ids: array of length n_slots; one anchor token per
+    //   slot (the token the target sampled at that slot's current pos).
+    // - anchor_positions: array of length n_slots; the target seq_pos
+    //   where each slot's anchor sits.
+    // - seq_ids: array of length n_slots; the llama_seq_id each slot
+    //   corresponds to (used to demux cb_eval extract rows). NULL is
+    //   permitted only when n_slots == 1; it then defaults to seq_id=0.
+    // - out_candidates: caller-provided buffer of size
+    //   >= n_slots * BLOCK_SIZE; filled with BLOCK_SIZE drafted token
+    //   ids per slot, slot-major (slot s rows at offset s*BLOCK_SIZE).
+    // - max_total_candidates: total capacity of out_candidates; must be
+    //   >= n_slots * BLOCK_SIZE.
+    // Returns the total number of candidates written
+    // (= n_slots * BLOCK_SIZE) on success or a negative
+    // llama_dflash_status code on failure.
+    LLAMA_API int32_t llama_dflash_draft_batch(
+            struct llama_context * ctx_tgt,
+            int32_t                n_slots,
+            const llama_token    * anchor_token_ids,
+            const int32_t        * anchor_positions,
+            const llama_seq_id   * seq_ids,
+            llama_token          * out_candidates,
+            int32_t                max_total_candidates);
+
     // T6.C: trim the cb_eval extract buffer to match a seq_rm
     // rollback. Mirrors llama_kv_cache_seq_rm semantics:
     //   - p_end == -1 (or p_end > seq length): truncate to first

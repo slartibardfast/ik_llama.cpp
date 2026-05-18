@@ -705,6 +705,44 @@ int32_t llama_dflash_draft(
     return BS;
 }
 
+// Multi-slot batched draft. Phase 1 surface: shape verified, but the
+// per-slot scratch sizing (Phase 2) and cb_eval seq_id demux (Phase 3)
+// are not yet landed. So at this revision we only accept n_slots == 1
+// and trampoline to the existing single-slot path.
+int32_t llama_dflash_draft_batch(
+        struct llama_context * ctx_tgt,
+        int32_t                n_slots,
+        const llama_token    * anchor_token_ids,
+        const int32_t        * anchor_positions,
+        const llama_seq_id   * seq_ids,
+        llama_token          * out_candidates,
+        int32_t                max_total_candidates) {
+    if (!ctx_tgt || !ctx_tgt->dflash_state) return LLAMA_DFLASH_NOT_IMPLEMENTED;
+    if (n_slots < 1)                        return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!anchor_token_ids)                  return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!anchor_positions)                  return LLAMA_DFLASH_INVALID_DRAFTER;
+    if (!out_candidates)                    return LLAMA_DFLASH_INVALID_DRAFTER;
+
+    if (n_slots > 1) {
+        return LLAMA_DFLASH_NP_GT_1;
+    }
+
+    if (seq_ids && seq_ids[0] != 0) {
+        // Single-slot trampoline is byte-identical to llama_dflash_draft
+        // only when seq_id == 0 (the implicit slot the current
+        // single-slot dispatch services). Multi-seq_id support arrives
+        // in Phase 3.
+        return LLAMA_DFLASH_NP_GT_1;
+    }
+
+    return llama_dflash_draft(
+            ctx_tgt,
+            anchor_token_ids[0],
+            anchor_positions[0],
+            out_candidates,
+            max_total_candidates);
+}
+
 // Internal helper called from llama.cpp's llama_context destructor.
 // Releases per-context DFlash scratch (KV cache + scratch buffers)
 // but NOT the drafter — drafter is caller-owned, freed by
@@ -811,6 +849,13 @@ enum llama_dflash_layer_type llama_dflash_layer_type_at(
 }
 int32_t llama_dflash_draft(struct llama_context * /*ctx*/, llama_token /*anchor*/, int32_t /*pos*/,
                             llama_token * /*out*/, int32_t /*max*/) {
+    return LLAMA_DFLASH_NOT_IMPLEMENTED;
+}
+int32_t llama_dflash_draft_batch(struct llama_context * /*ctx*/, int32_t /*n_slots*/,
+                                  const llama_token * /*anchor_token_ids*/,
+                                  const int32_t * /*anchor_positions*/,
+                                  const llama_seq_id * /*seq_ids*/,
+                                  llama_token * /*out*/, int32_t /*max*/) {
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
 }
 int32_t llama_dflash_trim_extract(struct llama_context * /*ctx*/, int32_t /*ps*/, int32_t /*pe*/) {
