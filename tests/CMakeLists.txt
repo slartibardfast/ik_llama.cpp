@@ -562,6 +562,14 @@ if (GGML_CUDA)
         # per seq_id). Pins the multi-slot dispatch semantic.
         llama_build_and_test(dflash-speculative/test-dflash-batch-vs-serial.cpp)
 
+        # DFlash multi-slot Phase 6: full-pipeline np-invariance + throughput
+        # measurement of record. Drives llama_dflash_draft_batch at
+        # NP ∈ {1,2,4,8} with identical per-seq content; asserts slot-0
+        # byte-identity across NP (orchestrator-level np-invariance
+        # complementing T7's kernel-level probe) and reports per-NP
+        # aggregate t/s.
+        llama_build_and_test(dflash-speculative/test-dflash-np-multislot.cpp)
+
         # DFlash multi-slot Phase 5: orchestrator-level fan-out gate.
         # Verifies that common_speculative_draft_batched({spec0, spec1})
         # over a shared ctx (share-the-bind on the drafter) produces
