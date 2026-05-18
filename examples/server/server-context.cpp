@@ -147,6 +147,12 @@ bool server_context::load_model(const gpt_params& params_) {
     has_eos_token = llama_add_eos_token(model) != 1;
 
     bool has_draft_model = !params_base.speculative.model.empty() || !params_base.speculative.params.empty();
+    // DFlash sidecar drafters share the target's tokenizer and ship as
+    // a GGUF without tokenizer.ggml.tokens — they cannot be loaded
+    // through the standalone draft-model loader below. Route the
+    // sidecar path into common_speculative_init via mparams_dft and
+    // skip the standalone draft model load + ctx allocation.
+    const bool is_dflash_spec = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH;
     std::string& mmproj_path = params_base.mmproj.path;
     if (!mmproj_path.empty()) {
         mtmd_context_params mparams = mtmd_context_params_default();
@@ -178,8 +184,16 @@ bool server_context::load_model(const gpt_params& params_) {
             SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
         }
     }
-    // Load draft model for speculative decoding if specified
-    if (has_draft_model) {
+    // Load draft model for speculative decoding if specified.
+    if (has_draft_model && is_dflash_spec) {
+        // DFlash: route sidecar GGUF path into mparams_dft.path so
+        // common_speculative_init can pass it to llama_dflash_drafter_load.
+        // The sidecar is not a standalone model and must not go through
+        // llama_model_load_from_file.
+        params_base.speculative.mparams_dft.path = params_base.speculative.model;
+        LLAMA_LOG_INFO("DFlash sidecar drafter path: %s\n",
+                       params_base.speculative.mparams_dft.path.c_str());
+    } else if (has_draft_model) {
         LLAMA_LOG_INFO("\n\n==================================loading DRAFT model==================================\n\n");
 
         gpt_params params_dft;
@@ -231,18 +245,6 @@ bool server_context::load_model(const gpt_params& params_) {
 }
 
 void server_context::init() {
-    // DFlash drafter is single-slot only at this gate. T5 ships np=1;
-    // np-invariance binding is T7. Refuse boot at n_parallel>1 rather
-    // than silently mis-route the cycle.
-    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
-        params_base.n_parallel > 1) {
-        LOG_ERROR(
-            "DFlash speculative decoding requires n_parallel=1 at T5 "
-            "(np>1 binding is T7). Refusing to initialise with n_parallel=%d.",
-            { {"n_parallel", params_base.n_parallel} });
-        std::exit(1);
-    }
-
     const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
 
     LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel} });
