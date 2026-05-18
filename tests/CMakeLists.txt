@@ -562,6 +562,15 @@ if (GGML_CUDA)
         # per seq_id). Pins the multi-slot dispatch semantic.
         llama_build_and_test(dflash-speculative/test-dflash-batch-vs-serial.cpp)
 
+        # DFlash multi-slot Phase 5: orchestrator-level fan-out gate.
+        # Verifies that common_speculative_draft_batched({spec0, spec1})
+        # over a shared ctx (share-the-bind on the drafter) produces
+        # candidates byte-identical to two serial common_speculative_draft
+        # calls, AND that an asymmetric per-seq prefill yields per-slot
+        # candidates that differ (seq_id routes through the all-DFlash
+        # gate). Pins the server-orchestrator adapter contract.
+        llama_build_and_test(dflash-speculative/test-dflash-spec-batched-fanout.cpp)
+
         # Empirical np-invariance probe — drafter_forward at N_slots ∈
         # {1,2,4,8} with identical slot content; slot 0 output must be
         # byte-identical across all N values.

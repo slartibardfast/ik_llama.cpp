@@ -1790,6 +1790,13 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_context        * ctx_tgt,
             struct llama_dflash_drafter * drafter);
 
+    // Returns the drafter currently bound to ctx via llama_set_dflash,
+    // or NULL if no drafter is bound. Used by multi-slot orchestrators
+    // (e.g. llama-server --parallel N --spec dflash) to share a single
+    // drafter binding across per-slot wrapper states without rebinding.
+    LLAMA_API struct llama_dflash_drafter * llama_get_dflash_drafter(
+            struct llama_context * ctx);
+
     // Drafter property queries (all read from drafter metadata; cheap).
     LLAMA_API int32_t      llama_dflash_n_source_layers(const struct llama_dflash_drafter * drafter);
     LLAMA_API int32_t      llama_dflash_block_size     (const struct llama_dflash_drafter * drafter);

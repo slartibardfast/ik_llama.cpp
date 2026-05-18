@@ -487,6 +487,11 @@ int32_t llama_set_dflash(
 // Query API
 // ─────────────────────────────────────────────────────────────────────
 
+struct llama_dflash_drafter * llama_get_dflash_drafter(struct llama_context * ctx) {
+    if (!ctx || !ctx->dflash_state) return nullptr;
+    return ctx->dflash_state->drafter;
+}
+
 int32_t llama_dflash_n_source_layers(const struct llama_dflash_drafter * drafter) {
     return drafter ? (int32_t) drafter->target_layer_ids.size() : -1;
 }

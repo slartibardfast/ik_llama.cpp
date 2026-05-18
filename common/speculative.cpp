@@ -970,14 +970,34 @@ struct common_speculative_state_dflash : public common_speculative_state {
     llama_context             * ctx_tgt = nullptr;
     llama_dflash_drafter      * drafter = nullptr;
     int32_t                     block_size = 0;
+    llama_seq_id                seq_id = 0;
+    // True when this state loaded + bound the drafter and therefore
+    // owns the drafter pointer; false when a prior per-slot state on the
+    // same ctx already bound it and we share the existing binding.
+    bool                        owns_drafter = false;
 
     common_speculative_state_dflash(
             enum common_speculative_type type,
             llama_context              * ctx_tgt_,
-            const std::string          & drafter_path)
+            const std::string          & drafter_path,
+            llama_seq_id                 seq_id_)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt_)
+        , seq_id(seq_id_)
     {
+        // Share-the-bind: if a prior per-slot state on the same ctx
+        // already bound a drafter, reuse it. The drafter file is loaded
+        // exactly once per ctx — repeat loads would burn VRAM and the
+        // second llama_set_dflash would free the first binding.
+        llama_dflash_drafter * existing = llama_get_dflash_drafter(ctx_tgt);
+        if (existing) {
+            drafter = existing;
+            block_size = llama_dflash_block_size(drafter);
+            owns_drafter = false;
+            LOG_INF("%s: DFlash drafter on ctx_tgt is already bound (seq_id=%d, block_size=%d)\n",
+                    __func__, (int) seq_id, block_size);
+            return;
+        }
         drafter = llama_dflash_drafter_load(drafter_path.c_str());
         if (!drafter) {
             LOG_ERR("%s: failed to load DFlash drafter from '%s'\n",
@@ -992,15 +1012,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
             drafter = nullptr;
             return;
         }
-        LOG_INF("%s: DFlash sidecar drafter bound to ctx_tgt (block_size=%d)\n",
-                __func__, block_size);
+        owns_drafter = true;
+        LOG_INF("%s: DFlash sidecar drafter bound to ctx_tgt (seq_id=%d, block_size=%d)\n",
+                __func__, (int) seq_id, block_size);
     }
 
     ~common_speculative_state_dflash() override {
         // ctx_tgt's destructor releases the per-context DFlash state
-        // (llama_dflash_release_ctx_state). We free only the drafter
-        // we loaded here.
-        if (drafter) llama_dflash_drafter_free(drafter);
+        // (llama_dflash_release_ctx_state). We free the drafter only if
+        // this state loaded it; co-owned bindings are released by the
+        // first state to be destroyed that holds owns_drafter.
+        if (drafter && owns_drafter) llama_dflash_drafter_free(drafter);
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -1030,8 +1052,16 @@ struct common_speculative_state_dflash : public common_speculative_state {
         result.assign(block_size, 0);
         // anchor_pos = prompt_tgt.size() — the seq position where id_last
         // sits when fed into the target verify decode for this cycle.
-        const int32_t rc = llama_dflash_draft(
-                ctx_tgt, id_last, (int32_t) prompt_tgt.size(),
+        // Route through the multi-slot entrypoint at n_slots=1 so that
+        // the single-slot and multi-slot dispatch paths share regression
+        // coverage (the n_slots=1 trampoline is byte-identical to the
+        // legacy llama_dflash_draft).
+        const llama_token   anchor_id  = id_last;
+        const int32_t       anchor_pos = (int32_t) prompt_tgt.size();
+        const llama_seq_id  s_id       = seq_id;
+        const int32_t rc = llama_dflash_draft_batch(
+                ctx_tgt, /*n_slots*/ 1,
+                &anchor_id, &anchor_pos, &s_id,
                 result.data(), (int32_t) result.size());
         if (rc < 0) {
             LOG_WRN("%s: llama_dflash_draft failed: rc=%d (giving up this cycle)\n", __func__, rc);
@@ -1283,7 +1313,7 @@ common_speculative * common_speculative_init(
                     ? params.mparams_dft.path
                     : params.model;
                 auto state = std::make_unique<common_speculative_state_dflash>(
-                    config.type, ctx_tgt, drafter_path);
+                    config.type, ctx_tgt, drafter_path, seq_id);
                 if (!state->drafter) {
                     LOG_ERR("%s: failed to construct DFlash sidecar state\n", __func__);
                     return nullptr;
@@ -1493,6 +1523,92 @@ std::vector<llama_tokens> common_speculative_draft_batched(
     }
 
     if (!all_mtp) {
+        // All-DFlash batched fan-out: every spec is a DFlash impl on a
+        // shared ctx_tgt → one llama_dflash_draft_batch call covers all
+        // slots in a single kernel pipeline. Falls through to the
+        // per-slot serial fallback otherwise.
+        std::vector<common_speculative_state_dflash *> df_states(inputs.size(), nullptr);
+        bool all_dflash = true;
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            common_speculative * spec = inputs[i].spec;
+            if (spec == nullptr || spec->impls.empty()) { all_dflash = false; break; }
+            common_speculative_state_dflash * df = nullptr;
+            for (auto & impl : spec->impls) {
+                if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    df = dynamic_cast<common_speculative_state_dflash *>(impl.get());
+                    break;
+                }
+            }
+            if (df == nullptr || df->drafter == nullptr) { all_dflash = false; break; }
+            df_states[i] = df;
+        }
+        if (all_dflash && df_states.size() > 1) {
+            llama_context * ctx0 = df_states[0]->ctx_tgt;
+            for (size_t i = 1; i < df_states.size() && all_dflash; ++i) {
+                if (df_states[i]->ctx_tgt != ctx0) all_dflash = false;
+            }
+        }
+
+        if (all_dflash && df_states.size() > 1) {
+            const size_t   N  = df_states.size();
+            // The drafter advertises its MAX block size (block_size).
+            // The kernel's actual operating BS may be smaller; the
+            // batched call returns the total count written and the
+            // per-slot stride is rc / N. We size the output buffer to
+            // n_slots * drafter_BS (the API's documented capacity).
+            const int32_t  drafter_BS = df_states[0]->block_size;
+            if (drafter_BS <= 0 || params.n_max <= 0) {
+                return out;
+            }
+            std::vector<llama_token>  anchor_ids((size_t) N);
+            std::vector<int32_t>      anchor_ps ((size_t) N);
+            std::vector<llama_seq_id> seq_ids   ((size_t) N);
+            for (size_t i = 0; i < N; ++i) {
+                anchor_ids[i] = inputs[i].id_last;
+                anchor_ps[i]  = (int32_t) inputs[i].prompt_tgt.size();
+                seq_ids[i]    = df_states[i]->seq_id;
+            }
+            std::vector<llama_token> flat_out((size_t) N * (size_t) drafter_BS, 0);
+            const int32_t rc = llama_dflash_draft_batch(
+                    df_states[0]->ctx_tgt,
+                    (int32_t) N,
+                    anchor_ids.data(), anchor_ps.data(), seq_ids.data(),
+                    flat_out.data(), (int32_t) flat_out.size());
+            if (rc >= 0) {
+                // Per-slot operating BS comes from rc (== n_slots * BS).
+                const int32_t per_slot = (rc > 0 && N > 0) ? (rc / (int32_t) N) : 0;
+                const int32_t n_max_block = std::min<int32_t>(params.n_max, per_slot);
+                LOG_DBG("%s: all-DFlash batched fan-out: n_slots=%zu rc=%d per_slot=%d n_max_block=%d\n",
+                        __func__, N, rc, per_slot, n_max_block);
+                for (size_t i = 0; i < N; ++i) {
+                    const size_t base = i * (size_t) per_slot;
+                    if (n_max_block > 0) {
+                        out[i].assign(flat_out.begin() + (ptrdiff_t) base,
+                                      flat_out.begin() + (ptrdiff_t) (base + (size_t) n_max_block));
+                    } else {
+                        out[i].clear();
+                    }
+                    common_speculative * spec = inputs[i].spec;
+                    for (auto & impl : spec->impls) {
+                        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            spec->curr_impl = impl.get();
+                            impl->n_call_draft++;
+                            impl->n_gen_drafts++;
+                            impl->n_gen_tokens += (size_t) n_max_block;
+                            break;
+                        }
+                    }
+                    if (spec->tuner && spec->tuner->enabled) {
+                        spec->last_n_drafted = n_max_block;
+                    }
+                }
+                return out;
+            }
+            LOG_WRN("%s: llama_dflash_draft_batch failed: rc=%d (falling back to serial)\n",
+                    __func__, rc);
+            // Fall through to the per-slot serial fallback below.
+        }
+
         // Fallback: per-slot serial via existing common_speculative_draft.
         for (size_t i = 0; i < inputs.size(); ++i) {
             // common_speculative_draft takes params by reference; we use
