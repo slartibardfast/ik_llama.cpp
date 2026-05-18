@@ -110,21 +110,25 @@ struct llama_dflash_ctx_state {
     const __nv_bfloat16 * target_lm_head    = nullptr;   // BF16
     int                   target_vocab_size = 0;
 
-    // Drafter KV cache: L_d * SeqLen * H_kv * D_h * 2 (K and V).
+    // Drafter KV cache: L_d * N_slots_cap * SeqLen * H_kv * D_h * 2 (K and V).
     __half * d_k_cache = nullptr;
     __half * d_v_cache = nullptr;
     int seq_len_cap = 0;
 
     // Scratch buffers, sized at allocate-once time.
-    __half * d_ctx_states     = nullptr;     // [MAL_anchors, D_emb]
-    __half * d_target_hiddens = nullptr;     // [MAL_anchors, L_src, D_emb]
-    __half * d_input_emb      = nullptr;     // [(1+BS), D_emb]
-    __half * d_drafter_hidden = nullptr;     // [BS, D_emb]
-    float  * d_drafter_logits = nullptr;     // [BS, V]
-    int    * d_anchor_pos     = nullptr;     // [MAL_anchors]
-    int    * d_slot_positions = nullptr;     // [1]
+    // Multi-slot layouts (slot-major) baked in at allocation; the
+    // single-slot dispatch only writes/reads slot-0 offsets. Phase 4
+    // turns on full multi-slot use of these buffers.
+    __half * d_ctx_states     = nullptr;     // [N_slots_cap, MAL_anchors, D_emb]
+    __half * d_target_hiddens = nullptr;     // [N_slots_cap, MAL_anchors, L_src, D_emb]
+    __half * d_input_emb      = nullptr;     // [N_slots_cap, (1+BS), D_emb]
+    __half * d_drafter_hidden = nullptr;     // [N_slots_cap, BS, D_emb]
+    float  * d_drafter_logits = nullptr;     // [N_slots_cap, BS, V]
+    int    * d_anchor_pos     = nullptr;     // [N_slots_cap, MAL_anchors]
+    int    * d_slot_positions = nullptr;     // [N_slots_cap]
     int    * d_layer_types    = nullptr;     // [L_d]
     int      mal_cap          = 0;           // largest MAL allocated for so far
+    int      n_slots_cap      = 1;           // captured from ctx_tgt->cparams.n_seq_max at bind
 
     // Host scratch for logit readback + argmax (since we do CPU argmax for T5).
     std::vector<float> h_logits;
@@ -331,10 +335,16 @@ const void * find_target_tensor_data(struct llama_model * model, const char * na
 }
 
 // Allocate per-context DFlash scratch + drafter KV cache.
-// seq_len_cap = sequence-length budget for the drafter cache.
-// mal_cap     = maximum MAL_anchors (= context positions to combine over).
+// seq_len_cap  = sequence-length budget for the drafter cache.
+// mal_cap      = maximum MAL_anchors (= context positions to combine over).
+// n_slots_cap  = max NP slots the bound context may serve. Captured from
+//                ctx_tgt->cparams.n_seq_max at llama_set_dflash time. The
+//                slot-major layouts in llama_dflash_ctx_state are sized
+//                for the full N_slots_cap; the single-slot dispatch
+//                writes/reads slot-0 offsets only until Phase 4 turns on
+//                multi-slot use.
 bool allocate_ctx_scratch(llama_dflash_ctx_state & st, const llama_dflash_drafter & dw,
-                          int seq_len_cap, int mal_cap) {
+                          int seq_len_cap, int mal_cap, int n_slots_cap) {
     const int L_d   = dw.n_layers;
     const int H_kv  = dw.n_kv_heads;
     const int D_h   = dw.head_dim;
@@ -344,7 +354,13 @@ bool allocate_ctx_scratch(llama_dflash_ctx_state & st, const llama_dflash_drafte
     const int V     = st.target_vocab_size;
     const int L_src = (int) dw.target_layer_ids.size();
 
-    const std::size_t n_kv_per_layer = (std::size_t) seq_len_cap * H_kv * D_h;
+    if (n_slots_cap < 1) n_slots_cap = 1;
+
+    // KV cache layout per kernel cuh: [L_d, N_slots, SeqLen, H_kv, D_h].
+    // The single-slot dispatch passes a per-layer pointer that starts at
+    // [l, 0, 0, 0, 0]; with N_slots=1 in the dispatch the kernel only
+    // writes/reads the slot-0 sub-block.
+    const std::size_t n_kv_per_layer = (std::size_t) n_slots_cap * seq_len_cap * H_kv * D_h;
     const std::size_t kv_bytes = (std::size_t) L_d * n_kv_per_layer * sizeof(__half);
 
     if (!cuda_ok(cudaMalloc(&st.d_k_cache, kv_bytes), "alloc K cache")) return false;
@@ -352,29 +368,32 @@ bool allocate_ctx_scratch(llama_dflash_ctx_state & st, const llama_dflash_drafte
     cudaMemset(st.d_k_cache, 0, kv_bytes);
     cudaMemset(st.d_v_cache, 0, kv_bytes);
 
-    if (!cuda_ok(cudaMalloc(&st.d_ctx_states, (std::size_t) mal_cap * D_emb * sizeof(__half)),
+    const std::size_t N = (std::size_t) n_slots_cap;
+
+    if (!cuda_ok(cudaMalloc(&st.d_ctx_states, N * (std::size_t) mal_cap * D_emb * sizeof(__half)),
                  "alloc ctx_states")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_target_hiddens, (std::size_t) mal_cap * L_src * D_emb * sizeof(__half)),
+    if (!cuda_ok(cudaMalloc(&st.d_target_hiddens, N * (std::size_t) mal_cap * L_src * D_emb * sizeof(__half)),
                  "alloc target_hiddens stage")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_input_emb, (std::size_t) Q * D_emb * sizeof(__half)),
+    if (!cuda_ok(cudaMalloc(&st.d_input_emb, N * (std::size_t) Q * D_emb * sizeof(__half)),
                  "alloc input_emb")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_drafter_hidden, (std::size_t) BS * D_emb * sizeof(__half)),
+    if (!cuda_ok(cudaMalloc(&st.d_drafter_hidden, N * (std::size_t) BS * D_emb * sizeof(__half)),
                  "alloc drafter_hidden")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_drafter_logits, (std::size_t) BS * V * sizeof(float)),
+    if (!cuda_ok(cudaMalloc(&st.d_drafter_logits, N * (std::size_t) BS * V * sizeof(float)),
                  "alloc drafter_logits")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_anchor_pos, (std::size_t) mal_cap * sizeof(int)),
+    if (!cuda_ok(cudaMalloc(&st.d_anchor_pos, N * (std::size_t) mal_cap * sizeof(int)),
                  "alloc anchor_pos")) return false;
-    if (!cuda_ok(cudaMalloc(&st.d_slot_positions, sizeof(int)),
+    if (!cuda_ok(cudaMalloc(&st.d_slot_positions, N * sizeof(int)),
                  "alloc slot_positions")) return false;
     if (!cuda_ok(cudaMalloc(&st.d_layer_types, (std::size_t) L_d * sizeof(int)),
                  "alloc layer_types")) return false;
     cudaMemcpy(st.d_layer_types, dw.layer_types.data(),
                (std::size_t) L_d * sizeof(int), cudaMemcpyHostToDevice);
 
-    st.h_logits.assign((std::size_t) BS * V, 0.0f);
+    st.h_logits.assign(N * (std::size_t) BS * V, 0.0f);
 
     st.seq_len_cap = seq_len_cap;
     st.mal_cap     = mal_cap;
+    st.n_slots_cap = n_slots_cap;
     return true;
 }
 
@@ -433,10 +452,13 @@ int32_t llama_set_dflash(
     }
 
     // Allocate scratch. seq_len_cap = ctx size; mal_cap = same (we may
-    // combine over the entire seen context).
+    // combine over the entire seen context). n_slots_cap captured from
+    // the target context's parallel-sequence cap so multi-slot dispatch
+    // (Phase 4) has room without re-allocating.
     const int seq_len_cap = (int) ctx_tgt->cparams.n_ctx;
     const int mal_cap     = seq_len_cap;
-    if (!allocate_ctx_scratch(*st, *drafter, seq_len_cap, mal_cap)) {
+    const int n_slots_cap = (int) std::max<uint32_t>(ctx_tgt->cparams.n_seq_max, 1u);
+    if (!allocate_ctx_scratch(*st, *drafter, seq_len_cap, mal_cap, n_slots_cap)) {
         free_ctx_scratch(*st);
         delete st;
         return LLAMA_DFLASH_LOAD_FAILED;
@@ -619,7 +641,11 @@ int32_t llama_dflash_draft(
         st.d_ctx_states, N_slots, MAL, L_src, D_emb, 0);
 
     // ── 3. inject_kv_fused × L_d (writes K, V at the MAL context positions) ──
-    const std::size_t n_kv_per_layer = (std::size_t) SeqLen * H_kv * D_h;
+    // Per-layer stride spans the full N_slots_cap × SeqLen × H_kv × D_h
+    // sub-block (layout: [L_d, N_slots, SeqLen, H_kv, D_h]). The kernel
+    // is told N_slots at call-time so single-slot dispatch only touches
+    // slot 0; multi-slot reuses the same per-layer base pointer.
+    const std::size_t n_kv_per_layer = (std::size_t) st.n_slots_cap * SeqLen * H_kv * D_h;
     for (int l = 0; l < L_d; ++l) {
         dflash_inject_kv_fused_launch(
             st.d_ctx_states, dw.attn_k[l], dw.attn_v[l], dw.attn_k_norm[l],
