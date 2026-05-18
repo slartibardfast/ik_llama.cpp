@@ -543,6 +543,26 @@ extern "C" void dflash_drafter_forward_launch(
     __half       * d_out_hidden,
     cudaStream_t   stream)
 {
+    // Guard the N_slots / n_slots_cap contract: N_slots is the dispatch
+    // count and must fit inside the storage stride. Swapping the two —
+    // or passing the same value when caller meant different — would
+    // silently read layers > 0 from wrong byte offsets. See spec
+    // kernel-design.md §6.1 clarification #4.
+    if (N_slots < 1 || n_slots_cap < N_slots) {
+        std::fprintf(stderr,
+            "[dflash_drafter_forward_launch] invalid N_slots=%d n_slots_cap=%d "
+            "(require 1 <= N_slots <= n_slots_cap)\n",
+            N_slots, n_slots_cap);
+        const std::size_t n_out_bytes =
+            static_cast<std::size_t>(N_slots < 1 ? 1 : N_slots) *
+            static_cast<std::size_t>(BLOCK_SIZE) *
+            static_cast<std::size_t>(D_emb) * sizeof(__half);
+        if (d_out_hidden != nullptr) {
+            cudaMemsetAsync(d_out_hidden, 0, n_out_bytes, stream);
+        }
+        return;
+    }
+
     // Stub-mode guard: if any required weight pointer is null we
     // zero the output and bail. The test driver in this mode runs
     // the reference smoke + a plumbing check at SKIP exit; this is
