@@ -454,6 +454,14 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_AR16) {
         int i = i0 + threadIdx.y * QI_AR16 + threadIdx.x / blocks_per_tile_x_row;
 
+        // OOB guard: when nwarps*QI_AR16 > mmq_y (e.g. mmq_y=16 nwarps=2 in the
+        // I=8 path) the thread coverage exceeds the row budget. Skip to avoid
+        // shmem-overflow into neighbouring CTAs. No-op at mmq_y=128 nwarps=8
+        // since i ∈ [0, 128) always — branch DCE'd.
+        if (i >= mmq_y) {
+            continue;
+        }
+
         if (need_check) {
             i = min(i, i_max);
         }
@@ -4088,6 +4096,394 @@ struct mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_IQ5_KS_R4> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y, nwarps>;
 };
 
+// =====================================================================
+// I=8 fragment path — sm_75 shmem-reduction MMQ for decode-shape (mmq_x ≤ 16).
+// Uses mma_int_C_I8J8 fragment so a CTA can run with mmq_y ∈ {16, 32},
+// 4-8× less per-CTA shmem than the I=16 path's mmq_y=128, unlocking
+// 2-8 CTAs/SM (~56-100% theoretical occupancy on TU102) vs ~25% today.
+//
+// Algorithm bit-for-bit equivalent to vec_dot_q8_0_q8_1_mma /
+// vec_dot_q4_0_ar16_q8_1_mma — same K visit order, same accumulator
+// arithmetic, same sum-array layout — only fragment geometry differs.
+// NPC byte-identity preserved across NP={1,2,4,8}.
+// =====================================================================
+
+// I=8 sibling of vec_dot_q8_0_q8_1_mma. K=8 ints (32 s8) per iter via mma_K8.
+template <int mmq_x, int mmq_y, int nwarps, mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_i8(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00) {
+
+    typedef mma_int_A_I8K8 mma_A;
+    typedef mma_int_B_J8K8 mma_B;
+    typedef mma_int_C_I8J8 mma_C;
+
+    // rows_per_warp = mmq_y / nwarps (NOT granularity which assumes I=16 doubled
+    // row layout). ntx = rows_per_warp/mma_C::I = minitiles per warp.
+    constexpr int rows_per_warp = mmq_y / nwarps;
+    constexpr int ntx           = rows_per_warp / mma_C::I;
+
+    y += (threadIdx.y % ntx) * (mma_B::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*WARP_SIZE;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+    const half2 * y_ds = (const half2 *) y;
+
+    mma_A A[ntx];
+    float dA[ntx][mma_C::ne/2];
+
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+    #pragma unroll
+    for (int k01 = 0; k01 < WARP_SIZE; k01 += QI8_0) {
+        const int k0 = k00 + k01;
+        mma_B  B;
+        float dB[mma_C::ne/2];
+        B.load(y_qs + k01, MMQ_TILE_Y_K);
+        #pragma unroll
+        for (int l = 0; l < mma_C::ne/2; ++l) {
+            const int j = mma_C::get_j(l);
+            if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+            } else {
+                dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+        }
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            A[n].load(x_qs + (i0 + n*mma_A::I)*MMQ_MMA_TILE_X_K_Q8_0 + k0, MMQ_MMA_TILE_X_K_Q8_0);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int i = i0 + n*mma_A::I + mma_C::get_i(2*l);
+                dA[n][l] = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
+            }
+            mma_C C;
+            C.mma_K8(A[n], B);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne; ++l) {
+                sum[(n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+            }
+        }
+        #pragma unroll
+        for (int j0 = ntx*mma_C::J; j0 < mmq_x; j0 += ntx*mma_C::J) {
+            B.load(y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int j = j0 + mma_C::get_j(l);
+                if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+                    dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                } else {
+                    dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                }
+            }
+            #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                mma_C C;
+                C.mma_K8(A[n], B);
+                #pragma unroll
+                for (int l = 0; l < mma_C::ne; ++l) {
+                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+                }
+            }
+        }
+    }
+}
+
+// I=8 sibling of vec_dot_q4_0_ar16_q8_1_mma. K=4 ints per iter via mma_K4.
+template <int mmq_x, int mmq_y, int nwarps>
+static __device__ __forceinline__ void vec_dot_q4_0_ar16_q8_1_mma_i8(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00) {
+
+    typedef mma_int_A_I8K4 mma_A;
+    typedef mma_int_B_J8K4 mma_B;
+    typedef mma_int_C_I8J8 mma_C;
+
+    constexpr int row_stride    = MMQ_MMA_TILE_X_K_Q4_0_AR16;
+    constexpr int rows_per_warp = mmq_y / nwarps;
+    constexpr int ntx           = rows_per_warp / mma_C::I;
+
+    y += (threadIdx.y % ntx) * (mma_B::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) (x_qs + 2*WARP_SIZE);
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    mma_A A[ntx];
+    float dA[ntx][mma_C::ne/2];
+
+    const int i0 = (threadIdx.y/ntx)*rows_per_warp;
+
+    #pragma unroll
+    for (int k01 = 0; k01 < WARP_SIZE; k01 += VDR_Q4_0_AR16_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+        mma_B  B;
+        float dB[mma_C::ne/2];
+        B.load(y_qs + k01, MMQ_TILE_Y_K);
+        #pragma unroll
+        for (int l = 0; l < mma_C::ne/2; ++l) {
+            const int j = mma_C::get_j(l);
+            dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+        }
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            A[n].load(x_qs + (i0 + n*mma_A::I)*row_stride + k0, row_stride);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int i = i0 + n*mma_A::I + mma_C::get_i(2*l);
+                dA[n][l] = x_df[i*row_stride + k0/VDR_Q4_0_AR16_Q8_1_MMQ];
+            }
+            mma_C C;
+            C.mma_K4(A[n], B);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne; ++l) {
+                sum[(n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+            }
+        }
+        #pragma unroll
+        for (int j0 = ntx*mma_C::J; j0 < mmq_x; j0 += ntx*mma_C::J) {
+            B.load(y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+            #pragma unroll
+            for (int l = 0; l < mma_C::ne/2; ++l) {
+                const int j = j0 + mma_C::get_j(l);
+                dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            }
+            #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                mma_C C;
+                C.mma_K4(A[n], B);
+                #pragma unroll
+                for (int l = 0; l < mma_C::ne; ++l) {
+                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += C.x[l]*dA[n][l/2]*dB[l%2];
+                }
+            }
+        }
+    }
+}
+
+// I=8 sibling of mmq_write_back_mma.
+template<int mmq_x, int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void mmq_write_back_mma_i8(
+    const float * __restrict__ sum, float * __restrict__ dst, const int & stride, const int & i_max, const int & j_max) {
+
+    typedef mma_int_C_I8J8 mma_C;
+
+    constexpr int rows_per_warp = mmq_y / nwarps;
+    constexpr int ntx           = rows_per_warp / mma_C::I;
+
+    const int i0 = (threadIdx.y / ntx) * (ntx*mma_C::I);
+#ifdef INT8_MMA_AVAILABLE
+    static_assert(nwarps*mma_C::I*ntx == mmq_y, "i8: nwarps*mma_C::I*ntx != mmq_y");
+#endif
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx*mma_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < mma_C::ne; ++l) {
+                const int j = j0 + (threadIdx.y % ntx) * mma_C::J + mma_C::get_j(l);
+                if (j > j_max) {
+                    continue;
+                }
+                const int i = i0 + n*mma_C::I + mma_C::get_i(l);
+                if (need_check && i > i_max) {
+                    continue;
+                }
+                dst[j*stride + i] = sum[(j0/mma_C::J + n)*mma_C::ne + l];
+            }
+        }
+    }
+}
+
+// I=8 trait table — distinct from the I=16 mmq_type_traits above. Decode-only
+// (mmq_x ≤ 16); larger mmq_x continues to dispatch through the I=16 path.
+template <int mmq_x, int mmq_y, int nwarps, bool need_check, ggml_type type>
+struct mmq_type_traits_i8;
+
+template <int mmq_x, int mmq_y, int nwarps, bool need_check>
+struct mmq_type_traits_i8<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_Q4_0> {
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q4_0<mmq_y, nwarps, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma_i8<mmq_x, mmq_y, nwarps, MMQ_Q8_1_DS_LAYOUT_DS4>;
+};
+
+template <int mmq_x, int mmq_y, int nwarps, bool need_check>
+struct mmq_type_traits_i8<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_Q4_0_AR16> {
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q4_0_ar16<mmq_y, nwarps, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q4_0_ar16_q8_1_mma_i8<mmq_x, mmq_y, nwarps>;
+};
+
+// I=8 sibling of mul_mat_q_process_tile. Templated on mmq_y (not pulled from
+// get_mmq_y_device) so the dispatch can pick mmq_y ∈ {16, 32}.
+template <ggml_type type, int mmq_x, int mmq_y_arg, int nwarps, bool need_check, bool fixup>
+static __device__ void mul_mat_q_process_tile_i8(
+    const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+    const int & ne00, const int & ne01, const int & stride01, const int & ne10, const int & ne11, const int & stride11, const int & ne0,
+    const int & it, const int & jt, const int & kb0_start, const int & kb0_stop) {
+
+    constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
+    constexpr int              mmq_y      = mmq_y_arg;
+    constexpr load_tiles_mmq_t load_tiles = mmq_type_traits_i8<mmq_x, mmq_y, nwarps, need_check, type>::load_tiles;
+
+    extern __shared__ char data_mul_mat_q[];
+    int * tile_y = (int *) data_mul_mat_q;
+    int * tile_x = tile_y + GGML_PAD(mmq_x*(WARP_SIZE + WARP_SIZE/QI8_1), nwarps*WARP_SIZE);
+
+    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits_i8<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_mma;
+    constexpr mmq_write_back_t write_back = mmq_write_back_mma_i8<mmq_x, mmq_y, nwarps, need_check>;
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+
+    float sum[mmq_x*mmq_y / (nwarps*WARP_SIZE)] = {0.0f};
+
+    const int tile_x_max_i = ne01 - it*mmq_y - 1;
+    const int tile_y_max_j = ne11 - jt*mmq_x - 1;
+
+    const int * y = (const int *) yc + jt*(mmq_x*sizeof(block_q8_1_mmq)/sizeof(int));
+
+    constexpr int y_block_ints     = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int y_blocks_per_kb0 = MMQ_ITER_K / (4*QK8_1);
+    constexpr int y_ints_per_kb0   = y_blocks_per_kb0 * y_block_ints;
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        load_tiles(x + int64_t(stride01)*it*mmq_y, tile_x, kb0, tile_x_max_i, stride01);
+
+        const int kb_iter = kb0 / blocks_per_iter;
+
+        {
+            const int * by0 = y + stride11*(kb_iter*y_ints_per_kb0 + 0*y_block_ints);
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
+                int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y, sum, 0);
+        __syncthreads();
+
+        {
+            const int * by0 = y + stride11*(kb_iter*y_ints_per_kb0 + 1*y_block_ints);
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
+                int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y, sum, WARP_SIZE);
+        __syncthreads();
+    }
+
+    if (fixup) {
+        write_back(sum, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
+    } else {
+        write_back(sum, dst + jt*mmq_x*ne0 + it*mmq_y, ne0, tile_x_max_i, tile_y_max_j);
+    }
+}
+
+// I=8 split-K main kernel. launch_bounds tuned per (mmq_y_arg, nwarps) at
+// dispatch site; default here targets 100% theoretical occupancy at mmq_y=16
+// nwarps=2 (64 threads/CTA × 16 CTAs/SM bid) or ~50% at mmq_y=32 nwarps=4
+// (128 threads × 8 CTAs/SM bid). Actual delivery shmem-capped — see PHASE doc.
+template <ggml_type type, int mmq_x, int mmq_y_arg, int nwarps, bool need_check, int split_k, int min_blocks_per_sm>
+__launch_bounds__(WARP_SIZE*nwarps, min_blocks_per_sm)
+static __global__ void mul_mat_q_split_k_i8(
+    const char * __restrict__ x, const char * __restrict__ yc,
+    float * __restrict__ dst, float * __restrict__ tmp_fixup,
+    const int ne00, const int ne01, const int stride01,
+    const int ne10, const int ne11, const int stride11, const int ne0) {
+
+    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    const     int blocks_per_ne00 = ne00 / qk;
+
+    const int it      = blockIdx.x;
+    const int jt      = blockIdx.y;
+    const int k_slice = blockIdx.z;
+
+    int kb0_start = (blocks_per_ne00 * k_slice)       / split_k;
+    int kb0_stop  = (blocks_per_ne00 * (k_slice + 1)) / split_k;
+    kb0_start -= kb0_start % blocks_per_iter;
+    kb0_stop  -= kb0_stop  % blocks_per_iter;
+    if (k_slice == split_k - 1) {
+        kb0_stop = blocks_per_ne00 - (blocks_per_ne00 % blocks_per_iter);
+    }
+    if (kb0_start >= kb0_stop) {
+        return;
+    }
+
+    if (k_slice == 0) {
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile_i8<type, mmq_x, mmq_y_arg, nwarps, need_check, fixup>(
+            x, yc, dst, nullptr,
+            ne00, ne01, stride01, ne10, ne11, stride11, ne0,
+            it, jt, kb0_start, kb0_stop);
+    } else {
+        const int slot = (k_slice - 1) * gridDim.x * gridDim.y
+                       + jt * gridDim.x
+                       + it;
+        float * fixup_ptr = tmp_fixup + (slot - blockIdx.x) * (mmq_x * mmq_y_arg);
+
+        constexpr bool fixup = true;
+        mul_mat_q_process_tile_i8<type, mmq_x, mmq_y_arg, nwarps, need_check, fixup>(
+            x, yc, dst, fixup_ptr,
+            ne00, ne01, stride01, ne10, ne11, stride11, ne0,
+            it, jt, kb0_start, kb0_stop);
+    }
+}
+
+// I=8 split-K fixup. Element-wise — each thread owns one or more (i, j) cells
+// in the tile (cycled in flat-index order). Avoids the dp4a-style sum[]
+// indexing which assumes mmq_y >= WARP_SIZE (breaks at mmq_y_i8 = 16 since
+// 16/32 floors to 0).
+template <int mmq_x, int mmq_y_arg, int nwarps, bool need_check, int split_k>
+__launch_bounds__(WARP_SIZE*nwarps, 4)
+static __global__ void mul_mat_q_split_k_fixup_i8(
+    float * __restrict__ dst, const float * __restrict__ tmp_fixup,
+    const int ne01, const int ne11, const int ne0) {
+
+    constexpr int mmq_y = mmq_y_arg;
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    const int gx = gridDim.x;
+    const int gy = gridDim.y;
+
+    const int tile_x_max_i = ne01 - it*mmq_y - 1;
+    const int tile_y_max_j = ne11 - jt*mmq_x - 1;
+
+    const int lane = threadIdx.y*WARP_SIZE + threadIdx.x;
+    constexpr int cells = mmq_x * mmq_y;
+    constexpr int threads = nwarps * WARP_SIZE;
+
+    #pragma unroll
+    for (int idx_base = 0; idx_base < cells; idx_base += threads) {
+        const int idx = idx_base + lane;
+        if (idx >= cells) break;
+        const int i = idx % mmq_y;
+        const int j = idx / mmq_y;
+        if (j > tile_y_max_j) continue;
+        if (need_check && i > tile_x_max_i) continue;
+
+        float s = 0.0f;
+        #pragma unroll
+        for (int slice = 1; slice < split_k; ++slice) {
+            const int slot = (slice - 1) * gx * gy + jt * gx + it;
+            s += tmp_fixup[slot * cells + j*mmq_y + i];
+        }
+        dst[(jt*mmq_x + j) * ne0 + (it*mmq_y + i)] += s;
+    }
+}
+
+// =====================================================================
+// END I=8 fragment path
+// =====================================================================
+
 template <ggml_type type, int mmq_x, int nwarps, bool need_check, bool fixup>
 static __device__ void mul_mat_q_process_tile(
     const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -4379,6 +4775,11 @@ template <ggml_type type, int mmq_x, int nwarps, bool need_check, int split_k>
     // → 50% theoretical occupancy (vs 25% at minBlocksPerSM=1). Lever A
     // stacked on split-K. Gated on 0 register spills per
     // [feedback_launch_bounds_non_monotonic] — see PHASE_TU102_SPECIALIZATION.md.
+    // 2026-05-19 probe: minBlocksPerSM=4 achieves 100% theoretical occupancy
+    // (REG:64 STACK:0 fast path) but TG delta = 0% at NP=2 × 256k — proves
+    // occupancy is NOT the binding constraint; shmem bandwidth at mmq_y=128
+    // is. Kept at 2; see PHASE_TU102_SPECIALIZATION.md target #1 for the
+    // I=8 ground-up rewrite path.
     __launch_bounds__(WARP_SIZE*nwarps, 2)
 #endif
 static __global__ void mul_mat_q_split_k(
@@ -4562,6 +4963,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     constexpr int split_k_factor = (mmq_x <= 16) ? 4 : 1;
     const bool use_split_k = !use_stream_k && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD) && (split_k_factor > 1);
 
+    // I=8 fragment path — sm_75-only ground-up shmem-reduction kernel for the
+    // decode-shape (mmq_x ≤ 16) hot path. mmq_y_i8=16 with nwarps=2 bids for
+    // 100% theoretical occupancy; actual occupancy delivered ~56% by the
+    // 64 KB/SM shmem cap. Engaged only for Q4_0 / Q4_0_AR16 (the production
+    // weight types). See PHASE_TU102_SPECIALIZATION.md target #1 ground-up.
+    constexpr int  mmq_y_i8           = 16;
+    constexpr int  nwarps_i8          = 2;   // mmq_y_i8 / mma_C::I = 16/8 = 2
+    constexpr int  min_blocks_per_sm_i8 = 16; // launch_bounds bid (HW caps by shmem)
+    constexpr bool i8_type_supported  = (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_0_AR16);
+    constexpr bool i8_shape_supported = (mmq_x <= 16);
+    const bool use_split_k_i8 = use_split_k
+        && i8_type_supported
+        && i8_shape_supported
+        && cc == CC_TURING;
+
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
     if (use_split_k) {
         // Raise shmem limit for the split-K main kernel too.
@@ -4574,6 +4990,55 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 mul_mat_q_split_k<type, mmq_x, MMQ_NWARPS, true,  split_k_factor>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
             split_k_shmem_raised[id] = true;
+        }
+    }
+
+    if constexpr (i8_type_supported && i8_shape_supported) {
+        if (use_split_k_i8) {
+            // Per-CTA shmem for the i8 path: smaller mmq_y_i8 → smaller weight tile.
+            const int shmem_i8 = mmq_get_shmem<type>(mmq_x, mmq_y_i8, cc);
+            static bool split_k_i8_shmem_raised[GGML_CUDA_MAX_DEVICES] = {false};
+            if (!split_k_i8_shmem_raised[id]) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    mul_mat_q_split_k_i8<type, mmq_x, mmq_y_i8, nwarps_i8, false, split_k_factor, min_blocks_per_sm_i8>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_i8));
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    mul_mat_q_split_k_i8<type, mmq_x, mmq_y_i8, nwarps_i8, true,  split_k_factor, min_blocks_per_sm_i8>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_i8));
+                split_k_i8_shmem_raised[id] = true;
+            }
+
+            const int nty_i8 = (args.ne01 + mmq_y_i8 - 1) / mmq_y_i8;
+            const dim3 block_dims_i8(WARP_SIZE, nwarps_i8, 1);
+            const dim3 block_nums_split_k_i8(nty_i8, ntx, split_k_factor);
+            const dim3 block_nums_fixup_i8(nty_i8, ntx, 1);
+
+            const int64_t tmp_fixup_size_i8 =
+                (int64_t)(split_k_factor - 1) * nty_i8 * ntx * mmq_x * mmq_y_i8;
+            ggml_cuda_pool_alloc<float> tmp_fixup_i8(ctx.pool(id), tmp_fixup_size_i8);
+
+            if (args.ne01 % mmq_y_i8 == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q_split_k_i8<type, mmq_x, mmq_y_i8, nwarps_i8, need_check, split_k_factor, min_blocks_per_sm_i8>
+                    <<<block_nums_split_k_i8, block_dims_i8, shmem_i8, stream>>>
+                    (args.x, args.y, args.dst, tmp_fixup_i8.ptr,
+                     args.ne00, args.ne01, args.stride01,
+                     args.ne10, args.ne11, args.stride11, args.ne0);
+                mul_mat_q_split_k_fixup_i8<mmq_x, mmq_y_i8, nwarps_i8, need_check, split_k_factor>
+                    <<<block_nums_fixup_i8, block_dims_i8, 0, stream>>>
+                    (args.dst, tmp_fixup_i8.ptr, args.ne01, args.ne11, args.ne0);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q_split_k_i8<type, mmq_x, mmq_y_i8, nwarps_i8, need_check, split_k_factor, min_blocks_per_sm_i8>
+                    <<<block_nums_split_k_i8, block_dims_i8, shmem_i8, stream>>>
+                    (args.x, args.y, args.dst, tmp_fixup_i8.ptr,
+                     args.ne00, args.ne01, args.stride01,
+                     args.ne10, args.ne11, args.stride11, args.ne0);
+                mul_mat_q_split_k_fixup_i8<mmq_x, mmq_y_i8, nwarps_i8, need_check, split_k_factor>
+                    <<<block_nums_fixup_i8, block_dims_i8, 0, stream>>>
+                    (args.dst, tmp_fixup_i8.ptr, args.ne01, args.ne11, args.ne0);
+            }
+            return;
         }
     }
 #endif

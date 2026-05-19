@@ -148,6 +148,73 @@ struct mma_int_B_J8K8 {
     }
 };
 
+// I=8 fragments — sm_75 m8n8k16 single-call PTX. Halves per-warp register
+// footprint vs the I=16 fragments above, lets us run shorter-tile MMQ kernels
+// (mmq_y=16 nwarps=2 / mmq_y=32 nwarps=4) within sm_75's 64 KB/SM shmem cap.
+// See PHASE_TU102_SPECIALIZATION.md target #1 (shmem-reduction ground-up).
+
+struct mma_int_A_I8K4 {
+    static constexpr int I  = 8;
+    static constexpr int K  = 4;
+    static constexpr int ne = 1;
+
+    int x[ne] = {0};
+
+    static __device__ __forceinline__ int get_i(const int /* l */) {
+        const int ret = threadIdx.x / 4;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  I);
+        return ret;
+    }
+
+    static __device__ __forceinline__ int get_k(const int /* l */) {
+        const int ret = threadIdx.x % 4;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  K);
+        return ret;
+    }
+
+    __device__ __forceinline__ void load(const int * __restrict__ xs0, const int & stride) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            x[l] = xs0[get_i(l)*stride + get_k(l)];
+        }
+    }
+};
+
+struct mma_int_A_I8K8 {
+    static constexpr int I  = 8;
+    static constexpr int K  = 8;
+    static constexpr int ne = 2;
+
+    int x[ne] = {0};
+
+    static __device__ __forceinline__ int get_i(const int /* l */) {
+        const int ret = threadIdx.x / 4;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  I);
+        return ret;
+    }
+
+    static __device__ __forceinline__ int get_k(const int l) {
+        const int ret = l * (K/2) + threadIdx.x % 4;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  K);
+        return ret;
+    }
+
+    __device__ __forceinline__ void load(const int * __restrict__ xs0, const int & stride) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            x[l] = xs0[get_i(l)*stride + get_k(l)];
+        }
+    }
+
+    __device__ __forceinline__ void load_low(const int * __restrict__ xs0, const int & stride) {
+        ((mma_int_A_I8K4 *) x)[0].load(xs0, stride);
+    }
+};
+
 struct mma_int_C_I16J8 {
     static constexpr int I  = 16;
     static constexpr int J  = 8;
@@ -217,5 +284,58 @@ struct mma_int_C_I16J8 {
         GGML_UNUSED(mma_B);
         NO_DEVICE_CODE;
 #endif // INT8_MMA_AVAILABLE
+    }
+};
+
+// I=8 J=8 accumulator — 2 fp32 per lane (vs 4 for I=16). Direct m8n8k16 PTX on
+// sm_75 without doubled-row dispatch.
+struct mma_int_C_I8J8 {
+    static constexpr int I  = 8;
+    static constexpr int J  = 8;
+    static constexpr int ne = 2;
+
+    int x[ne] = {0};
+
+    static __device__ __forceinline__ int get_i(const int /* l */) {
+        const int ret = threadIdx.x / 4;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  I);
+        return ret;
+    }
+
+    static __device__ __forceinline__ int get_j(const int l) {
+        const int ret = 2 * (threadIdx.x % 4) + l;
+        GGML_CUDA_ASSUME(ret >= 0);
+        GGML_CUDA_ASSUME(ret <  J);
+        return ret;
+    }
+
+    __device__ __forceinline__ void mma_K4(const mma_int_A_I8K4 & mma_A, const mma_int_B_J8K4 & mma_B) {
+#ifdef INT8_MMA_AVAILABLE
+        // Single m8n8k16 PTX op: I=8 × J=8 × K=16 s8 (= K=4 ints).
+        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+            : "+r"(x[0]), "+r"(x[1])
+            : "r"(mma_A.x[0]), "r"(mma_B.x[0]));
+#else
+        GGML_UNUSED(mma_A);
+        GGML_UNUSED(mma_B);
+        NO_DEVICE_CODE;
+#endif
+    }
+
+    __device__ __forceinline__ void mma_K8(const mma_int_A_I8K8 & mma_A, const mma_int_B_J8K8 & mma_B) {
+#ifdef INT8_MMA_AVAILABLE
+        // K=8 ints = K=32 s8 = 2 m8n8k16 PTX ops on K dim.
+        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+            : "+r"(x[0]), "+r"(x[1])
+            : "r"(mma_A.x[0]), "r"(mma_B.x[0]));
+        asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%0, %1};"
+            : "+r"(x[0]), "+r"(x[1])
+            : "r"(mma_A.x[1]), "r"(mma_B.x[1]));
+#else
+        GGML_UNUSED(mma_A);
+        GGML_UNUSED(mma_B);
+        NO_DEVICE_CODE;
+#endif
     }
 };
