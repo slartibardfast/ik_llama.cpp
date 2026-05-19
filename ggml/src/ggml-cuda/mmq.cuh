@@ -4375,11 +4375,11 @@ template <ggml_type type, int mmq_x, int nwarps, bool need_check, int split_k>
     __launch_bounds__(WARP_SIZE*nwarps, 2)
 #endif
 #else
-#if __CUDA_ARCH__ >= CC_VOLTA
-    __launch_bounds__(WARP_SIZE*nwarps, 1)
-#else
+    // Volta+ minBlocksPerSM=2: caps regs/thread ~128 to allow 2 blocks/SM
+    // → 50% theoretical occupancy (vs 25% at minBlocksPerSM=1). Lever A
+    // stacked on split-K. Gated on 0 register spills per
+    // [feedback_launch_bounds_non_monotonic] — see PHASE_TU102_SPECIALIZATION.md.
     __launch_bounds__(WARP_SIZE*nwarps, 2)
-#endif
 #endif
 static __global__ void mul_mat_q_split_k(
     const char * __restrict__ x, const char * __restrict__ yc,
