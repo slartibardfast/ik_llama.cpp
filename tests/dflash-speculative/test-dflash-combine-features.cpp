@@ -1,6 +1,6 @@
 // test-dflash-combine-features.cpp
 //
-// Byte-identity unit test: fused CUDA combine_features kernel vs the
+// Unit test: combine_features kernel (pinned-HMMA FC + RMSNorm) vs the
 // fp32 scalar reference, exercised across a (N_slots × MAL_anchors × seed)
 // sweep. This is the T3 closure binding for combine_features per
 // kernel-design.md §10 step 3.
@@ -10,14 +10,13 @@
 // @witnesses: CombineOrderFCThenHiddenNorm
 // @witnesses: ContextStatesAnchorLevel
 //
-// PASS criterion per sub-run: byte-identical OR every disagreement is
-// exactly 1 fp16 ULP AND rate ≤ 1 % of output cells. Rationale: byte-
-// identity is unachievable when one side does serial-order fp32 reduction
-// (scalar ref's RMSNorm sum_sq) and the other does parallel-tree fp32
-// reduction (kernel's warp-shuffle + SMEM tree). fp32 add is non-
-// associative; reduction-order LSB noise propagates through rsqrt to a
-// 1-ULP fp16 output difference at < 1 % of positions. > 1 ULP at any
-// position is a real kernel bug.
+// PASS criterion (revised 2026-05-19 post §6.6.A pinned-HMMA dispatch):
+// byte-identical OR NMSE ≤ 1e-5 AND cos_sim ≥ 0.99999. Rationale:
+// pinned-HMMA m16n8k16 fragment reduction tree does not match a serial-
+// fp32 scalar K-loop reduction, so byte-identity rate drops; numerics
+// class is unchanged. The closure binding vs vLLM (test-dflash-closure)
+// is the production-correctness gate; this unit test guards against
+// gross kernel bugs at NMSE ≤ 1e-5.
 
 #include "dflash-combine-features-reference.h"
 #include "ggml-cuda/dflash/dflash-combine-features.cuh"
@@ -25,6 +24,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -109,23 +109,33 @@ int run_one(int N_slots, int MAL_anchors, uint32_t seed) {
         return 77;
     }
 
-    int n_diff = 0, n_1ulp = 0, max_ulp = 0;
+    int n_eq = 0;
+    double sum_sq_err = 0.0;
+    double sum_sq_ref = 0.0;
+    double sum_ref_dev = 0.0;
+    double sum_sq_dev = 0.0;
     for (std::size_t i = 0; i < n_out; ++i) {
         uint16_t a, b;
         std::memcpy(&a, &kern_h[i], sizeof(uint16_t));
         std::memcpy(&b, &ref_h[i],  sizeof(uint16_t));
-        if (a == b) continue;
-        ++n_diff;
-        int d = std::abs(static_cast<int>(a) - static_cast<int>(b));
-        if (d == 1) ++n_1ulp;
-        if (d > max_ulp) max_ulp = d;
+        if (a == b) ++n_eq;
+        const double r = static_cast<double>(__half2float(ref_h[i]));
+        const double k = static_cast<double>(__half2float(kern_h[i]));
+        const double diff = r - k;
+        sum_sq_err  += diff * diff;
+        sum_sq_ref  += r * r;
+        sum_ref_dev += r * k;
+        sum_sq_dev  += k * k;
     }
+    const double nmse = sum_sq_err / (sum_sq_ref + 1e-30);
+    const double cos  = sum_ref_dev / (std::sqrt(sum_sq_ref) * std::sqrt(sum_sq_dev) + 1e-30);
+    const double bid  = static_cast<double>(n_eq) / static_cast<double>(n_out);
 
-    const bool pass =
-        (n_diff == 0) ||
-        (max_ulp <= 1 && n_diff * 100 <= (int) n_out);
-    std::printf("  [N=%d MAL=%d seed=%u]  diff=%d/%zu (1ULP=%d, max=%d)  %s\n",
-                N_slots, MAL_anchors, seed, n_diff, n_out, n_1ulp, max_ulp,
+    // PASS gate: byte-identical OR NMSE ≤ 1e-5 AND cos ≥ 0.99999.
+    const bool pass = (n_eq == (int) n_out) || (nmse <= 1e-5 && cos >= 0.99999);
+    std::printf("  [N=%d MAL=%d seed=%u]  bid=%.3f%%  NMSE=%.3e  cos=%.6f  %s\n",
+                N_slots, MAL_anchors, seed,
+                bid * 100.0, nmse, cos,
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
