@@ -2,7 +2,9 @@
 //
 // Loads the SHARED-with-drafter tensors from the production target GGUF:
 //   - token_embd.weight   F16  [vocab, hidden]   — anchor + mask embeddings
-//   - output.weight       BF16 [vocab, hidden]   — drafter lm_head
+//   - output.weight       F16  [vocab, hidden]   — drafter lm_head (T1-recast
+//                                                  from BF16 2026-05-18; absmax=0.36
+//                                                  Band-A, mantissa-improving cast)
 //   - output_norm.weight  F32  [hidden]          — drafter pre-lm_head norm
 //
 // Per @SharedEmbedAndLMHead, these three tensors are read once at server
@@ -33,9 +35,9 @@
 namespace dflash_reference {
 
 struct TargetSharedWeights {
-    const __half        * token_embd  = nullptr;  // F16  [vocab, hidden]
-    const __nv_bfloat16 * lm_head     = nullptr;  // BF16 [vocab, hidden]
-    const float         * output_norm = nullptr;  // F32  [hidden]
+    const __half * token_embd  = nullptr;  // F16  [vocab, hidden]
+    const __half * lm_head     = nullptr;  // F16  [vocab, hidden] (T1-recast)
+    const float  * output_norm = nullptr;  // F32  [hidden]
     int vocab_size  = 0;
     int hidden_size = 0;
 
@@ -83,7 +85,7 @@ inline bool load_target_shared(const char * gguf_path, TargetSharedWeights & t) 
     auto p_lh = upload("output.weight");      if (!p_lh.first)  return false;
     auto p_on = upload("output_norm.weight"); if (!p_on.first)  return false;
     t.token_embd  = static_cast<const __half *>(p_te.first);
-    t.lm_head     = static_cast<const __nv_bfloat16 *>(p_lh.first);
+    t.lm_head     = static_cast<const __half *>(p_lh.first);
     t.output_norm = static_cast<const float *>(p_on.first);
 
     // Verify dtypes match what we expect.
@@ -97,8 +99,9 @@ inline bool load_target_shared(const char * gguf_path, TargetSharedWeights & t) 
     }
     {
         struct ggml_tensor * tn = ggml_get_tensor(t.ggml_ctx, "output.weight");
-        if (tn->type != GGML_TYPE_BF16) {
-            std::fprintf(stderr, "load_target_shared: output.weight is %s, expected BF16\n",
+        if (tn->type != GGML_TYPE_F16) {
+            std::fprintf(stderr, "load_target_shared: output.weight is %s, expected F16 "
+                         "(use the lm_head-f16 recast target — scripts/recast_bf16_to_fp16.py T1)\n",
                          ggml_type_name(tn->type));
             return false;
         }

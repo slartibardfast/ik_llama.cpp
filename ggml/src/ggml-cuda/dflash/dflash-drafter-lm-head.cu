@@ -1,6 +1,6 @@
 // dflash-drafter-lm-head.cu
 //
-// BF16 GEMV against target's shared `output.weight`. Produces drafter
+// F16 GEMV against target's shared `output.weight`. Produces drafter
 // logits for argmax_match (next kernel in the pipeline).
 //
 // Spec: kernel-design.md §6.1 "Kernel boundary — lm_head".
@@ -10,17 +10,19 @@
 //   - Block: 256 threads (8 warps).
 //   - Stage hidden[row, :] into SMEM as fp32 (D_emb=5120 × 4B = 20 KiB).
 //   - Each thread strides across output columns; per column does a
-//     scalar fp32 dot product over D_emb against the BF16 weight row.
+//     scalar fp32 dot product over D_emb against the F16 weight row.
 //
-// Numerics (locked at Q&A 2026-05-13):
+// Numerics (locked at Q&A 2026-05-13; lm_head recast 2026-05-18):
 //   - fp32 accumulator throughout.
 //   - F16 hidden → fp32 via __half2float.
-//   - BF16 weight → fp32 via __bfloat162float.
+//   - F16 weight → fp32 via __half2float (was BF16 pre-recast; T1 cast
+//     is a precision improvement for the Band-A absmax=0.36 weight —
+//     fp16 has 10 mantissa bits vs bf16's 7 at this magnitude).
 //   - Output fp32 (no fp16 cast — preserves precision for the 1e-5 NMSE
 //     closure binding vs vLLM).
 //
 // Allium witness: SharedEmbedAndLMHead (load-time pointer equality
-// asserted in the loader; kernel just reads the BF16 buffer).
+// asserted in the loader; kernel just reads the F16 buffer).
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -35,11 +37,11 @@ namespace {
 constexpr int LM_HEAD_THREADS = 256;
 
 __global__ void dflash_drafter_lm_head_kernel(
-    const __half        * __restrict__ hidden,      // [n_rows, D_emb]
-    const __nv_bfloat16 * __restrict__ lm_head_w,   // [V, D_emb]
-    float               * __restrict__ logits,      // [n_rows, V]
-    int                                D_emb,
-    int                                V)
+    const __half * __restrict__ hidden,      // [n_rows, D_emb]
+    const __half * __restrict__ lm_head_w,   // [V, D_emb] — F16
+    float        * __restrict__ logits,      // [n_rows, V]
+    int                         D_emb,
+    int                         V)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -54,10 +56,10 @@ __global__ void dflash_drafter_lm_head_kernel(
 
     float * row_o = logits + static_cast<std::size_t>(row) * V;
     for (int col = tid; col < V; col += blockDim.x) {
-        const __nv_bfloat16 * row_w = lm_head_w + static_cast<std::size_t>(col) * D_emb;
+        const __half * row_w = lm_head_w + static_cast<std::size_t>(col) * D_emb;
         float acc = 0.0f;
         for (int k = 0; k < D_emb; ++k) {
-            acc += hidden_smem[k] * __bfloat162float(row_w[k]);
+            acc += hidden_smem[k] * __half2float(row_w[k]);
         }
         row_o[col] = acc;
     }
@@ -66,8 +68,8 @@ __global__ void dflash_drafter_lm_head_kernel(
 } // anonymous namespace
 
 extern "C" void dflash_drafter_lm_head_launch(
-    const __half        * d_hidden,
-    const __nv_bfloat16 * d_lm_head_w,
+    const __half * d_hidden,
+    const __half * d_lm_head_w,
     float               * d_logits,
     int                   n_rows,
     int                   D_emb,

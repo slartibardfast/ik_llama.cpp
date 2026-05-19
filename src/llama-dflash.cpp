@@ -107,7 +107,7 @@ struct llama_dflash_ctx_state {
 
     // Shared tensor pointers (target-owned; do not free).
     const __half        * target_token_embd = nullptr;   // F16
-    const __nv_bfloat16 * target_lm_head    = nullptr;   // BF16
+    const __half        * target_lm_head    = nullptr;   // F16 (target must use lm_head-f16 recast — see scripts/recast_bf16_to_fp16.py T1)
     int                   target_vocab_size = 0;
 
     // Drafter KV cache: L_d * N_slots_cap * SeqLen * H_kv * D_h * 2 (K and V).
@@ -435,9 +435,25 @@ int32_t llama_set_dflash(
     st->drafter = drafter;
 
     // Resolve shared embed + lm_head from target.
+    // Both must be F16 — if the target's output.weight is still BF16, reject
+    // loudly. Use the T1-recast target variant (V-F1.T1.lm_head-f16.gguf).
+    {
+        struct ggml_tensor * te = llama_get_model_tensor(model, "token_embd.weight");
+        struct ggml_tensor * oe = llama_get_model_tensor(model, "output.weight");
+        if (!te || !oe) { delete st; return LLAMA_DFLASH_INVALID_DRAFTER; }
+        if (te->type != GGML_TYPE_F16 || oe->type != GGML_TYPE_F16) {
+            std::fprintf(stderr,
+                "[%s] target token_embd / output.weight must both be F16 — got %s / %s. "
+                "Use the lm_head-f16 recast target variant.\n",
+                MODULE,
+                ggml_type_name(te->type), ggml_type_name(oe->type));
+            delete st;
+            return LLAMA_DFLASH_INVALID_DRAFTER;
+        }
+    }
     st->target_token_embd = static_cast<const __half *>(
         find_target_tensor_data(model, "token_embd.weight"));
-    st->target_lm_head = static_cast<const __nv_bfloat16 *>(
+    st->target_lm_head = static_cast<const __half *>(
         find_target_tensor_data(model, "output.weight"));
     if (!st->target_token_embd || !st->target_lm_head) {
         delete st;
