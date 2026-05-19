@@ -1,8 +1,8 @@
 // test-dflash-drafter-lm-head.cpp
 //
-// Byte-identity / NMSE unit test for dflash_drafter_lm_head — the BF16
-// GEMV against target's shared `output.weight`. Kernel output vs CPU
-// scalar fp32 reference across a (n_rows × V × D_emb × seed) sweep.
+// Byte-identity / NMSE unit test for dflash_drafter_lm_head — the F16
+// GEMV against target's shared `output.weight` (T1-recast). Kernel output
+// vs CPU scalar fp32 reference across a (n_rows × V × D_emb × seed) sweep.
 //
 // @witnesses: SharedEmbedAndLMHead
 //
@@ -18,7 +18,6 @@
 
 #include "ggml-cuda/dflash/dflash-drafter-lm-head.cuh"
 
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -44,11 +43,11 @@ namespace {
 
 // CPU scalar reference. Per-cell serial fp32 dot product over D_emb.
 // Mirrors the kernel's accumulation order exactly: hidden lifted to
-// fp32 via __half2float, BF16 weight lifted to fp32, serial K-loop sum.
+// fp32 via __half2float, F16 weight lifted to fp32, serial K-loop sum.
 void lm_head_scalar_ref(
-    const __half        * hidden,       // [n_rows, D_emb]
-    const __nv_bfloat16 * lm_head_w,    // [V, D_emb]
-    float               * logits,       // [n_rows, V]
+    const __half * hidden,       // [n_rows, D_emb]
+    const __half * lm_head_w,    // [V, D_emb]
+    float        * logits,       // [n_rows, V]
     int n_rows, int D_emb, int V)
 {
     std::vector<float> hidden_f32(D_emb);
@@ -60,7 +59,7 @@ void lm_head_scalar_ref(
             float acc = 0.0f;
             for (int k = 0; k < D_emb; ++k) {
                 acc += hidden_f32[k] *
-                       __bfloat162float(lm_head_w[static_cast<std::size_t>(col) * D_emb + k]);
+                       __half2float(lm_head_w[static_cast<std::size_t>(col) * D_emb + k]);
             }
             logits[static_cast<std::size_t>(row) * V + col] = acc;
         }
@@ -78,9 +77,9 @@ int run_one(int n_rows, int D_emb, int V, uint32_t seed) {
     const std::size_t n_o = static_cast<std::size_t>(n_rows) * V;
 
     std::vector<__half> hidden_h(n_h);
-    std::vector<__nv_bfloat16> lm_head_w_h(n_w);
+    std::vector<__half> lm_head_w_h(n_w);
     for (auto & x : hidden_h) x = __float2half(dist(rng));
-    for (auto & x : lm_head_w_h) x = __float2bfloat16(dist(rng) * 0.05f);
+    for (auto & x : lm_head_w_h) x = __float2half(dist(rng) * 0.05f);
 
     // CPU reference
     std::vector<float> ref_logits(n_o);
@@ -89,14 +88,14 @@ int run_one(int n_rows, int D_emb, int V, uint32_t seed) {
         n_rows, D_emb, V);
 
     // GPU kernel
-    __half        * d_hidden = nullptr;
-    __nv_bfloat16 * d_lm    = nullptr;
-    float         * d_out   = nullptr;
+    __half * d_hidden = nullptr;
+    __half * d_lm     = nullptr;
+    float  * d_out    = nullptr;
     CUDA_CHECK(cudaMalloc(&d_hidden, n_h * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_lm,     n_w * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&d_lm,     n_w * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_out,    n_o * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_hidden, hidden_h.data(), n_h * sizeof(__half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_lm,     lm_head_w_h.data(), n_w * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hidden, hidden_h.data(),    n_h * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_lm,     lm_head_w_h.data(), n_w * sizeof(__half), cudaMemcpyHostToDevice));
 
     dflash_drafter_lm_head_launch(
         d_hidden, d_lm, d_out, n_rows, D_emb, V, 0);
