@@ -4345,6 +4345,13 @@ static __device__ void mul_mat_q_process_tile_i8(
     constexpr int y_block_ints     = sizeof(block_q8_1_mmq) / sizeof(int);
     constexpr int y_blocks_per_kb0 = MMQ_ITER_K / (4*QK8_1);
     constexpr int y_ints_per_kb0   = y_blocks_per_kb0 * y_block_ints;
+    // Z2-narrow defensive guard: mmq_x*MMQ_TILE_Y_K = 288 (for mmq_x=8) is
+    // not a multiple of nwarps*WARP_SIZE = 64. The final l0=256 iter has
+    // threadIdx.y=1 lanes computing l ∈ [288, 319], which reads past the
+    // activation tensor allocation (uninitialized __global__ memory per
+    // compute-sanitizer initcheck at mmq.cuh:4358). Bound `l` to the actual
+    // tile_y extent so no thread reads past it.
+    constexpr int tile_y_extent = mmq_x * MMQ_TILE_Y_K;
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x + int64_t(stride01)*it*mmq_y, tile_x, kb0, tile_x_max_i, stride01);
 
@@ -4353,9 +4360,11 @@ static __device__ void mul_mat_q_process_tile_i8(
         {
             const int * by0 = y + stride11*(kb_iter*y_ints_per_kb0 + 0*y_block_ints);
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
+            for (int l0 = 0; l0 < tile_y_extent; l0 += nwarps*WARP_SIZE) {
                 int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
-                tile_y[l] = by0[l];
+                if (l < tile_y_extent) {
+                    tile_y[l] = by0[l];
+                }
             }
         }
         __syncthreads();
@@ -4365,9 +4374,11 @@ static __device__ void mul_mat_q_process_tile_i8(
         {
             const int * by0 = y + stride11*(kb_iter*y_ints_per_kb0 + 1*y_block_ints);
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
+            for (int l0 = 0; l0 < tile_y_extent; l0 += nwarps*WARP_SIZE) {
                 int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
-                tile_y[l] = by0[l];
+                if (l < tile_y_extent) {
+                    tile_y[l] = by0[l];
+                }
             }
         }
         __syncthreads();
