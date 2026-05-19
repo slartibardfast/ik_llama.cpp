@@ -25,6 +25,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -51,20 +52,35 @@ constexpr int   D_d       = 5120;
 constexpr float rope_base = 1.0e7f;
 constexpr float norm_eps  = 1.0e-6f;
 
-// Counts mismatch bins for byte / 1ULP / >2ULP buckets in fp16.
+// Counts mismatch bins for byte / 1ULP / >2ULP buckets in fp16 (kept for
+// the WORST-cell diagnostic) plus NMSE / cos similarity (the actual gate
+// post the §6.2.A pinned-HMMA dispatch — same precedent as lm_head test).
 void count_diffs(const __half* a, const __half* b, std::size_t n,
-                 int& n_diff, int& n_1ulp, int& max_ulp) {
+                 int& n_diff, int& n_1ulp, int& max_ulp,
+                 double& nmse, double& cos_sim) {
     n_diff = n_1ulp = max_ulp = 0;
+    double sum_sq_err = 0.0, sum_sq_ref = 0.0;
+    double sum_ad = 0.0, sum_sq_dev = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
         uint16_t ab, bb;
         std::memcpy(&ab, &a[i], sizeof(uint16_t));
         std::memcpy(&bb, &b[i], sizeof(uint16_t));
-        if (ab == bb) continue;
-        ++n_diff;
-        int d = std::abs(static_cast<int>(ab) - static_cast<int>(bb));
-        if (d == 1) ++n_1ulp;
-        if (d > max_ulp) max_ulp = d;
+        if (ab != bb) {
+            ++n_diff;
+            int d = std::abs(static_cast<int>(ab) - static_cast<int>(bb));
+            if (d == 1) ++n_1ulp;
+            if (d > max_ulp) max_ulp = d;
+        }
+        const double ar = static_cast<double>(__half2float(a[i]));
+        const double br = static_cast<double>(__half2float(b[i]));
+        const double diff = ar - br;
+        sum_sq_err  += diff * diff;
+        sum_sq_ref  += br * br;
+        sum_ad      += ar * br;
+        sum_sq_dev  += ar * ar;
     }
+    nmse    = sum_sq_err / (sum_sq_ref + 1e-30);
+    cos_sim = sum_ad / (std::sqrt(sum_sq_ref) * std::sqrt(sum_sq_dev) + 1e-30);
 }
 
 int run_one(int N_slots, int MAL_anchors, int SeqLen, uint32_t seed) {
@@ -198,8 +214,9 @@ int run_one(int N_slots, int MAL_anchors, int SeqLen, uint32_t seed) {
 
     int k_diff, k_1ulp, k_max;
     int v_diff, v_1ulp, v_max;
-    count_diffs(kern_k_h.data(), ref_k_h.data(), n_cache, k_diff, k_1ulp, k_max);
-    count_diffs(kern_v_h.data(), ref_v_h.data(), n_cache, v_diff, v_1ulp, v_max);
+    double k_nmse, k_cos, v_nmse, v_cos;
+    count_diffs(kern_k_h.data(), ref_k_h.data(), n_cache, k_diff, k_1ulp, k_max, k_nmse, k_cos);
+    count_diffs(kern_v_h.data(), ref_v_h.data(), n_cache, v_diff, v_1ulp, v_max, v_nmse, v_cos);
 
     // Diagnostic: if any K cell exceeds the 2-ULP gate, surface the WORST
     // cell's (layer, slot, position, head, dim) coords + the kernel/ref
@@ -231,21 +248,20 @@ int run_one(int N_slots, int MAL_anchors, int SeqLen, uint32_t seed) {
                     __half2float(ref_k_h[worst_idx]), worst_d);
     }
 
-    const std::size_t n_written =
-        (std::size_t) L_d * N_slots * MAL_anchors * H_kv * D;
-
-    auto judge = [&](int diff, int max_ulp, int allowed_ulp) -> bool {
-        if (diff == 0) return true;
-        return max_ulp <= allowed_ulp && diff * 100 <= (int) n_written;
-    };
-    const bool k_pass = judge(k_diff, k_max, /*K allowed*/ 2);
-    const bool v_pass = judge(v_diff, v_max, /*V allowed*/ 1);
+    // PASS gate (revised 2026-05-19 post §6.2.A pinned-HMMA dispatch):
+    // byte-identical OR NMSE ≤ 1e-5 AND cos ≥ 0.99999 (same precedent as
+    // post-S59 lm_head test). HMMA fragment reduction tree differs from
+    // serial-fp32 reference's K-loop reduction; numerics class unchanged.
+    const bool k_pass = (k_diff == 0) || (k_nmse <= 1e-5 && k_cos >= 0.99999);
+    const bool v_pass = (v_diff == 0) || (v_nmse <= 1e-5 && v_cos >= 0.99999);
     const bool pass = k_pass && v_pass;
 
-    std::printf("  [N=%d MAL=%d seed=%u]  K=%d/%zu (max %d)  V=%d/%zu (max %d)  %s\n",
+    std::printf("  [N=%d MAL=%d seed=%u]  "
+                "K: NMSE=%.3e cos=%.6f (bid=%d/%zu, max_ulp=%d)  "
+                "V: NMSE=%.3e cos=%.6f (bid=%d/%zu, max_ulp=%d)  %s\n",
                 N_slots, MAL_anchors, seed,
-                k_diff, n_cache, k_max,
-                v_diff, n_cache, v_max,
+                k_nmse, k_cos, (int)(n_cache - (std::size_t)k_diff), n_cache, k_max,
+                v_nmse, v_cos, (int)(n_cache - (std::size_t)v_diff), n_cache, v_max,
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
