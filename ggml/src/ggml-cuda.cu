@@ -1682,18 +1682,15 @@ static void ggml_cuda_op_mul_mat_cublas(
     GGML_ASSERT(src1_ddf_i != nullptr);
     GGML_ASSERT(dst_dd_i   != nullptr);
 
-    // Determinism gate: under LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1, pin a
-    // fixed cuBLAS gemm algorithm so cuBLAS doesn't pick different algos at
-    // different (M, N, K) shapes — different algos can produce different fp
-    // accumulator orders → different bytes. ALGO0_TENSOR_OP is the conservative
-    // choice that runs on every Turing+ device; cuBLAS will fall back if a TC
+    // Determinism: always pin a fixed cuBLAS gemm algorithm so cuBLAS doesn't
+    // pick different algos at different (M, N, K) shapes — different algos
+    // produce different fp accumulator orders → byte divergence at certain
+    // batch shapes (NP=2/4 cluster partition signature, 2026-05-19 audit).
+    // ALGO0_TENSOR_OP runs on every Turing+ device; cuBLAS falls back if a TC
     // algo isn't supported for the requested compute/data type combination.
-    static const cublasGemmAlgo_t s_cublas_algo = []() {
-        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
-        return (e && e[0] == '1' && e[1] == '\0')
-            ? CUBLAS_GEMM_ALGO0_TENSOR_OP
-            : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    }();
+    // The accompanying env knob still controls the pinned-HMMA replacement
+    // path; this algo pin is independent and always-on.
+    static const cublasGemmAlgo_t s_cublas_algo = CUBLAS_GEMM_ALGO0_TENSOR_OP;
     static const bool s_force_sid_cublas = []() {
         const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
         return e && e[0] == '1' && e[1] == '\0';
@@ -2410,13 +2407,10 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     using traits = batched_mul_mat_traits<src0_type>;
     using cuda_t = typename traits::cuda_type;
 
-    // Determinism: pin a fixed cuBLAS algo when LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH=1.
-    static const cublasGemmAlgo_t s_cublas_algo_b = []() {
-        const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
-        return (e && e[0] == '1' && e[1] == '\0')
-            ? CUBLAS_GEMM_ALGO0_TENSOR_OP
-            : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    }();
+    // Determinism: same algo pin as ggml_cuda_op_mul_mat_cublas above —
+    // ALGO0_TENSOR_OP unconditional to defeat the batch-shape-adaptive
+    // algo selection that breaks NPC at NP cluster boundaries.
+    static const cublasGemmAlgo_t s_cublas_algo_b = CUBLAS_GEMM_ALGO0_TENSOR_OP;
 
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
