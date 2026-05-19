@@ -4346,6 +4346,162 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+// Split-K MMQ — NPC-by-construction alternative to stream-K for small-mmq_x
+// (decode-dominant) shapes where the existing xy-tiling fallback gives only
+// ~14% of TU102 peak compute (0.56 waves × 25% occupancy per 2026-05-19 ncu).
+//
+// Design:
+//   - Each output tile (it, jt) is split across `split_k` CTAs in the K dim.
+//     CTA (blockIdx.x=it, blockIdx.y=jt, blockIdx.z=k_slice) processes
+//     k-iterations [k_slice*blocks/F, (k_slice+1)*blocks/F).
+//   - Slice 0 writes directly to dst (fixup=false).
+//   - Slices 1..F-1 write partial sums to tmp_fixup at a fixed deterministic
+//     offset, then a fixup kernel reduces them into dst in canonical order
+//     (slice 1, then 2, ..., then F-1).
+//
+// NPC contract: per-tile reduction is over a fixed number of partials
+// (split_k - 1) in canonical order. The k-range each slice processes depends
+// only on (blocks_per_ne00, split_k, k_slice) — NOT on ne11 (M), so cross-NP
+// byte-identity holds by construction at any batch shape.
+//
+// Stream-K's bidx_start/stop in mul_mat_q_stream_k_fixup depends on ntx (=
+// ceil(ne11/mmq_x)), which is M-dependent and was the source of the
+// "NP-cluster partition signature" NPC failure mode (see 2026-05-19 audit).
+// Split-K's per-tile fixup is M-independent by design.
+
+template <ggml_type type, int mmq_x, int nwarps, bool need_check, int split_k>
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+#if defined(RDNA3) || defined(RDNA2)
+    __launch_bounds__(WARP_SIZE*nwarps, 2)
+#endif
+#else
+#if __CUDA_ARCH__ >= CC_VOLTA
+    __launch_bounds__(WARP_SIZE*nwarps, 1)
+#else
+    __launch_bounds__(WARP_SIZE*nwarps, 2)
+#endif
+#endif
+static __global__ void mul_mat_q_split_k(
+    const char * __restrict__ x, const char * __restrict__ yc,
+    float * __restrict__ dst, float * __restrict__ tmp_fixup,
+    const int ne00, const int ne01, const int stride01,
+    const int ne10, const int ne11, const int stride11, const int ne0) {
+
+    // Skip unused template specializations for faster compilation:
+    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    const     int blocks_per_ne00 = ne00 / qk;
+
+    const int it      = blockIdx.x;
+    const int jt      = blockIdx.y;
+    const int k_slice = blockIdx.z;
+
+    // Per-slice K range, aligned down to blocks_per_iter granularity. Last
+    // slice extends to blocks_per_ne00 so the full K dim is covered.
+    int kb0_start = (blocks_per_ne00 * k_slice)       / split_k;
+    int kb0_stop  = (blocks_per_ne00 * (k_slice + 1)) / split_k;
+    kb0_start -= kb0_start % blocks_per_iter;
+    kb0_stop  -= kb0_stop  % blocks_per_iter;
+    if (k_slice == split_k - 1) {
+        // Pick up any trailing blocks_per_iter chunks; the per-iteration loop
+        // inside process_tile only advances in blocks_per_iter steps, so the
+        // final tail (blocks_per_ne00 % blocks_per_iter) is dropped — same
+        // behavior as the existing kernel (it never touches that tail either).
+        kb0_stop = blocks_per_ne00 - (blocks_per_ne00 % blocks_per_iter);
+    }
+
+    if (kb0_start >= kb0_stop) {
+        return;
+    }
+
+    if (k_slice == 0) {
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, nwarps, need_check, fixup>(
+            x, yc, dst, nullptr,
+            ne00, ne01, stride01, ne10, ne11, stride11, ne0,
+            it, jt, kb0_start, kb0_stop);
+    } else {
+        // Slot index in tmp_fixup: organized as [slice-1][jt][it] row-major.
+        // process_tile's fixup writeback uses `tmp_fixup + blockIdx.x*(mmq_x*mmq_y)`,
+        // so we pre-offset the pointer to land at our slot.
+        const int slot = (k_slice - 1) * gridDim.x * gridDim.y
+                       + jt * gridDim.x
+                       + it;
+        float * fixup_ptr = tmp_fixup + (slot - blockIdx.x) * (mmq_x * get_mmq_y_device());
+
+        constexpr bool fixup = true;
+        mul_mat_q_process_tile<type, mmq_x, nwarps, need_check, fixup>(
+            x, yc, dst, fixup_ptr,
+            ne00, ne01, stride01, ne10, ne11, stride11, ne0,
+            it, jt, kb0_start, kb0_stop);
+    }
+}
+
+template <int mmq_x, int nwarps, bool need_check, int split_k>
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+    __launch_bounds__(WARP_SIZE*nwarps, 2)
+#else
+    __launch_bounds__(WARP_SIZE*nwarps, 2)
+#endif
+static __global__ void mul_mat_q_split_k_fixup(
+    float * __restrict__ dst, const float * __restrict__ tmp_fixup,
+    const int ne01, const int ne11, const int ne0) {
+
+    constexpr int mmq_y = get_mmq_y_device();
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+
+    constexpr int sum_per_thread = mmq_x * mmq_y / (nwarps * WARP_SIZE);
+    float sum[sum_per_thread] = {0.0f};
+
+    // Reduce partials from slices 1..split_k-1 in canonical (ascending) order.
+    // The loop count is a compile-time constant — same on every NP value —
+    // so the per-tile reduction order is M-independent by construction.
+    #pragma unroll
+    for (int slice_m1 = 0; slice_m1 < split_k - 1; ++slice_m1) {
+        const int slot = slice_m1 * gridDim.x * gridDim.y + jt * gridDim.x + it;
+        const float * tile_partial = tmp_fixup + slot * (mmq_x * mmq_y);
+
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+            #pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+                sum[(j0/nwarps) * (mmq_y/WARP_SIZE) + i0/WARP_SIZE] +=
+                    tile_partial[j * mmq_y + i];
+            }
+        }
+    }
+
+    // Add accumulated partials into dst (which already has slice 0's value).
+    dst += jt * mmq_x * ne0 + it * mmq_y;
+    const int i_max = ne01 - it * mmq_y - 1;
+    const int j_max = ne11 - jt * mmq_x - 1;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+        if (j > j_max) {
+            break;
+        }
+        #pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+            const int i = i0 + threadIdx.x;
+            if (need_check && i > i_max) {
+                continue;
+            }
+            dst[j * ne0 + i] += sum[(j0/nwarps) * (mmq_y/WARP_SIZE) + i0/WARP_SIZE];
+        }
+    }
+}
+
 struct mmq_args {
     const char * x; const char * y; float * dst;
     int64_t ne00; int64_t ne01; int64_t stride01;
@@ -4393,6 +4549,67 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // needs the perf back.
     static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
     const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
+
+    // Split-K MMQ — NPC-by-construction K-dim split for decode-dominant
+    // shapes (small mmq_x). The existing xy-tiling fallback produces only
+    // ~0.56 SM waves × 25% occupancy at decode (40 CTAs on 72 SMs); split-K
+    // with F=4 brings grid to 160 CTAs ≥ 2 SM waves. See 2026-05-19 ncu
+    // probe and PHASE_TU102_SPECIALIZATION.md target #1 for evidence.
+    //
+    // Engaged only on Turing+ (Volta+ in code) when stream-K is off and
+    // mmq_x ≤ 16 (decode-like dispatch tiles). For mmq_x ≥ 24 (prefill
+    // big-tile) the xy-tiling fallback already produces grids ≥ NSM.
+    constexpr int split_k_factor = (mmq_x <= 16) ? 4 : 1;
+    const bool use_split_k = !use_stream_k && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD) && (split_k_factor > 1);
+
+#if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
+    if (use_split_k) {
+        // Raise shmem limit for the split-K main kernel too.
+        static bool split_k_shmem_raised[GGML_CUDA_MAX_DEVICES] = {false};
+        if (!split_k_shmem_raised[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                mul_mat_q_split_k<type, mmq_x, MMQ_NWARPS, false, split_k_factor>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+            CUDA_CHECK(cudaFuncSetAttribute(
+                mul_mat_q_split_k<type, mmq_x, MMQ_NWARPS, true,  split_k_factor>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+            split_k_shmem_raised[id] = true;
+        }
+    }
+#endif
+
+    if (use_split_k) {
+        const dim3 block_nums_split_k(nty, ntx, split_k_factor);
+        const dim3 block_nums_fixup(nty, ntx, 1);
+
+        const int64_t tmp_fixup_size =
+            (int64_t)(split_k_factor - 1) * nty * ntx * mmq_x * mmq_y;
+        ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id), tmp_fixup_size);
+
+        if (args.ne01 % mmq_y == 0) {
+            constexpr bool need_check = false;
+            mul_mat_q_split_k<type, mmq_x, MMQ_NWARPS, need_check, split_k_factor>
+                <<<block_nums_split_k, block_dims, shmem, stream>>>
+                (args.x, args.y, args.dst, tmp_fixup.ptr,
+                 args.ne00, args.ne01, args.stride01,
+                 args.ne10, args.ne11, args.stride11, args.ne0);
+            mul_mat_q_split_k_fixup<mmq_x, MMQ_NWARPS, need_check, split_k_factor>
+                <<<block_nums_fixup, block_dims, 0, stream>>>
+                (args.dst, tmp_fixup.ptr, args.ne01, args.ne11, args.ne0);
+        } else {
+            constexpr bool need_check = true;
+            mul_mat_q_split_k<type, mmq_x, MMQ_NWARPS, need_check, split_k_factor>
+                <<<block_nums_split_k, block_dims, shmem, stream>>>
+                (args.x, args.y, args.dst, tmp_fixup.ptr,
+                 args.ne00, args.ne01, args.stride01,
+                 args.ne10, args.ne11, args.stride11, args.ne0);
+            mul_mat_q_split_k_fixup<mmq_x, MMQ_NWARPS, need_check, split_k_factor>
+                <<<block_nums_fixup, block_dims, 0, stream>>>
+                (args.dst, tmp_fixup.ptr, args.ne01, args.ne11, args.ne0);
+        }
+        return;
+    }
+
     if (!use_stream_k) {
         if (args.ne01 % mmq_y == 0) {
             constexpr bool need_check = false;
