@@ -2,6 +2,7 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-trace-ndjson.h"
 
 #include "common.h"
 #include "llama.h"
@@ -4626,6 +4627,44 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             batch.logits + i,
             0, 0, 0, // unused
         };
+
+        // S5 — emit one NDJSON TickDispatch line per dispatched batch when
+        // LLAMA_TRACE_NDJSON_DIR is set. Walks the per-slot state at
+        // dispatch time to derive {prefill_slots, decode_slots,
+        // loading_prompt_set_at_start_of_tick} approximations:
+        //   prefill_slots   — slots whose seq_ids appear in this batch_view
+        //                     AND have command == LOAD_PROMPT
+        //   decode_slots    — slots whose seq_ids appear in this batch_view
+        //                     AND have state == PROCESSING AND command == NONE
+        //   loading_prompt_set — slots in command == LOAD_PROMPT at dispatch
+        // Cross-referenced against the Bug C invariants by
+        // /home/llm/yarn-agentic/scripts/validate-batch-composition-trace.py.
+        if (server_trace_ndjson::enabled()) {
+            std::set<int> batch_seqs;
+            for (int j = 0; j < n_tokens; ++j) {
+                if (batch_view.n_seq_id && batch_view.n_seq_id[j] > 0
+                    && batch_view.seq_id && batch_view.seq_id[j]) {
+                    batch_seqs.insert(batch_view.seq_id[j][0]);
+                }
+            }
+            std::vector<int> prefill_slots;
+            std::vector<int> decode_slots;
+            std::vector<int> loading_prompt_set;
+            for (const auto & s : slots) {
+                if (s.command == SLOT_COMMAND_LOAD_PROMPT) {
+                    loading_prompt_set.push_back(s.id);
+                    if (batch_seqs.count(s.id)) prefill_slots.push_back(s.id);
+                } else if (s.state == SLOT_STATE_PROCESSING
+                           && s.command == SLOT_COMMAND_NONE
+                           && batch_seqs.count(s.id)) {
+                    decode_slots.push_back(s.id);
+                }
+            }
+            static int _trace_tick_counter = 0;
+            server_trace_ndjson::emit_tick_dispatch(
+                _trace_tick_counter++, prefill_slots, decode_slots,
+                loading_prompt_set);
+        }
 
         // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
         // when off. Per-batch-shape histogram dumped every 100 decodes. Used
