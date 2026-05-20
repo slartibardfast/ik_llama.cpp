@@ -124,6 +124,12 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
     GGML_ASSERT(kv_self.size == n_ctx);
+    // PHASE_NSTREAM_KV_4D N2.b: K-shift not yet rewritten for the
+    // per-stream 4D layout. Production decode path (Qwen3.6 with
+    // --fa on, ctx_shift off) does not exercise K-shift. Gate to
+    // n_stream==1 until a per-stream K-shift is implemented.
+    GGML_ASSERT(kv_self.n_stream == 1 &&
+            "build_k_shift not yet stream-aware; requires n_stream==1");
 
     const auto & rope_type_shift = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
         // @ngxson : this is a workaround
@@ -226,6 +232,13 @@ ggml_cgraph * llm_build_context::build_s_copy() {
 
 ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
+
+    // PHASE_NSTREAM_KV_4D N2.b: defrag not yet rewritten for the
+    // per-stream 4D layout. Production usage does not trigger
+    // defrag in normal decode. Gate to n_stream==1 until per-stream
+    // defrag is implemented.
+    GGML_ASSERT(kv_self.n_stream == 1 &&
+            "build_defrag not yet stream-aware; requires n_stream==1");
 
     for (uint32_t i = 0; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
@@ -2759,12 +2772,30 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
 
                 auto idx = 2*wq->n_device*il + 2*id;
                 GGML_ASSERT(idx+1 < (int)lctx.cache_copies.size());
-                auto k_row_size = ggml_row_size(split_kl->type, n_embd_head_k);
-                ggml_tensor * k_cache_view = ggml_view_2d(ctx0, split_kl, n_embd_head_k, n_tokens*n_head_kv,
-                        k_row_size, k_row_size*n_head_kv*kv_head_eff);
+
+                // PHASE_NSTREAM_KV_4D N2.b: multi-device split per-stream
+                // K/V store + view. The split tensors are 4D
+                // [head_dim, kvps, n_head_kv_split, n_stream] (same axis
+                // order as the primary K/V). Decompose kv_head_eff into
+                // (stream_id, p_local) and offset views by
+                // p_local*nb[1] + stream_id*nb[3].
+                const uint32_t _ms_kvps = kv_self.kv_size_per_stream;
+                const uint32_t _ms_stream_id =
+                    (_ms_kvps > 0) ? (uint32_t)kv_head_eff / _ms_kvps : 0u;
+                const uint32_t _ms_p_local =
+                    (_ms_kvps > 0) ? (uint32_t)kv_head_eff % _ms_kvps : (uint32_t)kv_head_eff;
+
+                const size_t k_pos_stride    = split_kl->nb[1];
+                const size_t k_head_stride   = split_kl->nb[2];
+                const size_t k_stream_stride = split_kl->nb[3];
+
+                ggml_tensor * k_cache_view = ggml_view_3d(ctx0, split_kl,
+                        n_embd_head_k, n_head_kv, n_tokens,
+                        k_head_stride, k_pos_stride,
+                        (size_t)_ms_p_local * k_pos_stride + (size_t)_ms_stream_id * k_stream_stride);
 
                 lctx.cache_copies[idx+0].cpy  = ggml_cpy(ctx0, Kcur, k_cache_view);
-                lctx.cache_copies[idx+0].step = k_row_size*n_head_kv;
+                lctx.cache_copies[idx+0].step = k_pos_stride;
 
                 // note: storing RoPE-ed version of K in the KV cache
                 ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
@@ -2772,11 +2803,27 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 struct ggml_tensor * v_cache_view = nullptr;
 
                 if (cparams.flash_attn) {
-                    v_cache_view = ggml_view_1d(ctx0, split_vl, n_tokens*split_wv->ne[1],
-                            kv_head_eff*ggml_row_size(split_vl->type, split_wv->ne[1]));
-                    lctx.cache_copies[idx+1].step = ggml_row_size(split_vl->type, split_wv->ne[1]);
+                    // V mirrors K under the new 4D layout
+                    const size_t v_pos_stride    = split_vl->nb[1];
+                    const size_t v_head_stride   = split_vl->nb[2];
+                    const size_t v_stream_stride = split_vl->nb[3];
+
+                    v_cache_view = ggml_view_3d(ctx0, split_vl,
+                            n_embd_head_v, n_head_kv, n_tokens,
+                            v_head_stride, v_pos_stride,
+                            (size_t)_ms_p_local * v_pos_stride + (size_t)_ms_stream_id * v_stream_stride);
+
+                    if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
+                        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
+                    }
+
+                    lctx.cache_copies[idx+1].step = v_pos_stride;
                 } else {
-                    // note: the V cache is transposed when not using flash attention
+                    // note: the V cache is transposed when not using flash attention.
+                    // v_trans non-FA path NOT updated for the new layout;
+                    // gated on n_stream == 1.
+                    GGML_ASSERT(kv_self.n_stream == 1 &&
+                            "v_trans non-FA multi-device V layout requires n_stream==1; use --fa on");
                     v_cache_view = ggml_view_2d(ctx0, split_vl, n_tokens, split_wv->ne[1],
                             (  n_ctx)*ggml_element_size(split_vl),
                             (kv_head_eff)*ggml_element_size(split_vl));
@@ -2792,14 +2839,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 auto q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
                 cb(q, "q", il_cb);
 
-                auto k = ggml_view_3d(ctx0, split_kl, n_embd_head_k, n_kv, n_head_kv,
-                             ggml_row_size(split_kl->type, n_embd_head_k)*n_head_kv, //n_embd_k_gqa),
-                             ggml_row_size(split_kl->type, n_embd_head_k), 0);
+                // Stream-aware K/V READ views for attention compute.
+                auto k = ggml_view_3d(ctx0, split_kl,
+                            n_embd_head_k, n_kv, n_head_kv,
+                            split_kl->nb[1],  // position stride within stream
+                            split_kl->nb[2],  // head stride within stream
+                            (size_t)_ms_stream_id * split_kl->nb[3]);
                 cb(k, "k", il_cb);
 
-                auto v = ggml_view_3d(ctx0, split_vl, n_embd_head_v, n_kv, n_head_kv,
-                             ggml_row_size(split_vl->type, split_wv->ne[1]),
-                             ggml_row_size(split_vl->type, n_embd_head_v), 0);
+                auto v = ggml_view_3d(ctx0, split_vl,
+                            n_embd_head_v, n_kv, n_head_kv,
+                            split_vl->nb[1],
+                            split_vl->nb[2],
+                            (size_t)_ms_stream_id * split_vl->nb[3]);
                 cb(v, "v", il_cb);
 
                 // Route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV at the
