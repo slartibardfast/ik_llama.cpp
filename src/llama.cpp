@@ -823,10 +823,18 @@ static bool llama_kv_cache_init(
     cache.size = kv_size;
     cache.used = 0;
 
-    // Foundation for the n_stream KV port (PHASE_NSTREAM_KV.md). v_heads
-    // shadows `head` for now and is unused by the allocator; later phases
-    // route per-stream allocation through it.
+    // n_stream KV layout (PHASE_NSTREAM_KV_4D.md). K/V become 4D
+    // [head_dim, kv_size_per_stream, n_head_kv, n_stream]. Round kv_size
+    // UP to a multiple of n_stream so per-stream slices are equal-sized
+    // and contiguous; this is consistent with cparams.n_ctx being the
+    // per-stream context budget.
     cache.n_stream = std::max<uint32_t>(1u, cparams.n_seq_max);
+    if (kv_size % cache.n_stream != 0) {
+        const uint32_t per_stream = (kv_size + cache.n_stream - 1) / cache.n_stream;
+        kv_size                   = per_stream * cache.n_stream;
+        cache.size                = kv_size;
+    }
+    cache.kv_size_per_stream = kv_size / cache.n_stream;
     cache.v_heads.assign(cache.n_stream, 0u);
 
     cache.type_k  = type_k;
@@ -836,7 +844,7 @@ static bool llama_kv_cache_init(
     cache.cells.resize(kv_size);
 
     if (cache.recurrent || llm_arch_is_hybrid(model.arch)) {
-        // init state copy sources
+        // init state copy sources for recurrent / hybrid models
         for (uint32_t i = 0; i < cache.size; ++i) {
             cache.cells[i].src = i;
         }
@@ -1039,9 +1047,17 @@ static bool llama_kv_cache_init(
             if (this_type_k != type_k) {
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
-            k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*kv_size);
+            // PHASE_NSTREAM_KV_4D N1: 4D K shape
+            // [head_dim, kv_size_per_stream, n_head_kv, n_stream]. At
+            // n_stream==1 this is byte-equivalent to the legacy 2D shape
+            // [head_dim, n_head_kv*kv_size]; the position-of-head h is at
+            // the same byte offset under either layout.
+            k = ggml_new_tensor_4d(ctx, this_type_k,
+                                   n_embd_head_k,
+                                   cache.kv_size_per_stream,
+                                   n_head_kv,
+                                   cache.n_stream);
 
-            int64_t v_ne = int64_t(n_embd_v_row)*kv_size;
             auto this_type_v = type_v;
             if (type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
                 this_type_v = type_v_first;
@@ -1052,7 +1068,33 @@ static bool llama_kv_cache_init(
             if (this_type_v != type_v) {
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
-            v = ggml_new_tensor_1d(ctx, this_type_v, v_ne);
+            // V 4D shape [head_dim_v, kv_size_per_stream, n_head_kv_v,
+            // n_stream] when n_embd_v_row factors cleanly into
+            // n_head_kv*n_embd_head_v. Hybrid/recurrent V tails may not;
+            // fall back to a 1D layout that exposes the n_stream axis at
+            // ne[3] so per-stream slicing still works at the byte level.
+            // n_embd_head_v is already declared above as `int`; reuse it.
+            const bool v_factors_4d = (n_embd_v_row != 0) &&
+                                      (n_embd_head_v != 0) &&
+                                      (n_head_kv != 0) &&
+                                      ((uint32_t)n_embd_v_row == (uint32_t)n_embd_head_v * (uint32_t)n_head_kv);
+            if (v_factors_4d) {
+                v = ggml_new_tensor_4d(ctx, this_type_v,
+                                       (int64_t)n_embd_head_v,
+                                       cache.kv_size_per_stream,
+                                       n_head_kv,
+                                       cache.n_stream);
+            } else {
+                // Hybrid V: keep flat row layout but partition rows into
+                // n_stream contiguous blocks. Logical 4D
+                // [n_embd_v_row, kv_size_per_stream, 1, n_stream] keeps
+                // the n_stream axis discoverable for downstream views.
+                v = ggml_new_tensor_4d(ctx, this_type_v,
+                                       n_embd_v_row,
+                                       cache.kv_size_per_stream,
+                                       1u,
+                                       cache.n_stream);
+            }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
             auto v_name = std::string{"cache_v_l"} + std::to_string(i);
@@ -1155,10 +1197,21 @@ static bool llama_kv_cache_init(
     return true;
 }
 
-// find an empty slot of size "n_tokens" in the cache
-// updates the cache head
-// Note: On success, it's important that cache.head points
-// to the first cell of the slot.
+// find an empty slot of size "n_tokens" in the cache.
+//
+// PHASE_NSTREAM_KV_4D N1 — per-stream allocator. At n_stream > 1 the
+// scan is scoped to the target stream's range
+// [stream_id*kv_size_per_stream, (stream_id+1)*kv_size_per_stream),
+// using v_heads[stream_id] as the stream-local cursor. The legacy
+// `head` field is mirrored to the global flat index so call-sites
+// that have not yet migrated keep working.
+//
+// At n_stream == 1, kvps == kv_size, base == 0, and the path is
+// byte-identical to the legacy single-arena allocator.
+//
+// Note: On success, cache.head points to the first cell of the slot
+// (legacy single-stream invariant) AND cache.v_heads[stream_id] is
+// the per-stream cursor for the next allocation.
 static bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
         const struct llama_batch & batch) {
@@ -1212,25 +1265,47 @@ static bool llama_kv_cache_find_slot(
     }
     // otherwise, one cell per token.
 
-    if (n_tokens > cache.size) {
-        LLAMA_LOG_ERROR("%s: n_tokens=%d > cache.size=%d\n", __func__, n_tokens, cache.size);
+    // Determine target stream from the first token's primary seq_id.
+    // PerStreamDispatch (specs/kv-cache/n_stream_layer.allium): every
+    // token in a single decode batch shares the same seq_id (==
+    // stream_id). At n_stream == 1 this collapses to stream_id == 0
+    // and the path below is byte-identical to the legacy allocator.
+    uint32_t stream_id = 0;
+    if (cache.n_stream > 1 && batch.n_seq_id && batch.seq_id &&
+        batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
+        const llama_seq_id sid = batch.seq_id[0][0];
+        if (sid < 0 || (uint32_t)sid >= cache.n_stream) {
+            LLAMA_LOG_ERROR("%s: seq_id=%d out of range [0,%u)\n",
+                            __func__, sid, cache.n_stream);
+            return false;
+        }
+        stream_id = (uint32_t)sid;
+    }
+
+    const uint32_t kvps = cache.kv_size_per_stream;
+    const uint32_t base = stream_id * kvps;
+
+    if (n_tokens > kvps) {
+        LLAMA_LOG_ERROR("%s: n_tokens=%d > kv_size_per_stream=%d\n",
+                        __func__, n_tokens, kvps);
         return false;
     }
 
     uint32_t n_tested = 0;
+    uint32_t head_local = cache.v_heads[stream_id];
 
     while (true) {
-        if (cache.head + n_tokens > cache.size) {
-            n_tested += cache.size - cache.head;
-            cache.head = 0;
+        if (head_local + n_tokens > kvps) {
+            n_tested  += kvps - head_local;
+            head_local = 0;
             continue;
         }
 
         bool found = true;
         for (uint32_t i = 0; i < n_tokens; i++) {
-            if (cache.cells[cache.head + i].pos >= 0) {
-                found = false;
-                cache.head += i + 1;
+            if (cache.cells[base + head_local + i].pos >= 0) {
+                found       = false;
+                head_local += i + 1;
                 n_tested   += i + 1;
                 break;
             }
@@ -1240,21 +1315,23 @@ static bool llama_kv_cache_find_slot(
             break;
         }
 
-        if (n_tested >= cache.size) {
+        if (n_tested >= kvps) {
             //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
             return false;
         }
     }
 
     for (uint32_t i = 0; i < n_tokens; i++) {
-        cache.cells[cache.head + i].pos = batch.pos[i];
+        cache.cells[base + head_local + i].pos = batch.pos[i];
 
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
-            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
+            cache.cells[base + head_local + i].seq_id.insert(batch.seq_id[i][j]);
         }
     }
 
-    cache.used += n_tokens;
+    cache.v_heads[stream_id] = head_local;
+    cache.head               = base + head_local;
+    cache.used              += n_tokens;
 
     return true;
 }
@@ -1953,6 +2030,10 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    // PHASE_NSTREAM_KV_4D N1: also reset per-stream heads.
+    for (uint32_t s = 0; s < cache.n_stream; ++s) {
+        cache.v_heads[s] = 0;
+    }
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
@@ -1965,6 +2046,11 @@ static bool llama_kv_cache_seq_rm(
                     llama_pos   p0,
                     llama_pos   p1) {
     uint32_t new_head = cache.size;
+    // PHASE_NSTREAM_KV_4D N1: per-stream earliest-free tracker.
+    // new_head_local[s] = smallest stream-local index freed in stream s,
+    // or kv_size_per_stream if no cell was freed in that stream.
+    const uint32_t kvps = cache.kv_size_per_stream;
+    std::vector<uint32_t> new_head_local(cache.n_stream, kvps);
 
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
@@ -2008,12 +2094,24 @@ static bool llama_kv_cache_seq_rm(
                     cache.cells[i].src = i;
                 }
                 if (new_head == cache.size) new_head = i;
+                // PHASE_NSTREAM_KV_4D N1: per-stream tracker.
+                if (cache.n_stream > 1) {
+                    const uint32_t s = i / kvps;
+                    const uint32_t p = i % kvps;
+                    if (p < new_head_local[s]) new_head_local[s] = p;
+                }
             }
         }
     }
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+    // PHASE_NSTREAM_KV_4D N1: also update per-stream v_heads.
+    for (uint32_t s = 0; s < cache.n_stream; ++s) {
+        if (new_head_local[s] != kvps && new_head_local[s] < cache.v_heads[s]) {
+            cache.v_heads[s] = new_head_local[s];
+        }
+    }
 
     return true;
 }
@@ -2077,6 +2175,9 @@ static void llama_kv_cache_seq_cp(
 static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id seq_id) {
     uint32_t new_head = cache.size;
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
+    // PHASE_NSTREAM_KV_4D N1: per-stream earliest-free tracker.
+    const uint32_t kvps = cache.kv_size_per_stream;
+    std::vector<uint32_t> new_head_local(cache.n_stream, kvps);
 
     for (uint32_t i = 0; i < cache.size; ++i) {
         if (!cache.cells[i].has_seq_id(seq_id)) {
@@ -2087,6 +2188,11 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
             }
             cache.cells[i].seq_id.clear();
             if (new_head == cache.size) new_head = i;
+            if (cache.n_stream > 1) {
+                const uint32_t s = i / kvps;
+                const uint32_t p = i % kvps;
+                if (p < new_head_local[s]) new_head_local[s] = p;
+            }
         } else {
             cache.cells[i].seq_id.clear();
             cache.cells[i].seq_id.insert(seq_id);
@@ -2095,6 +2201,11 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+    for (uint32_t s = 0; s < cache.n_stream; ++s) {
+        if (new_head_local[s] != kvps && new_head_local[s] < cache.v_heads[s]) {
+            cache.v_heads[s] = new_head_local[s];
+        }
+    }
 }
 
 static void llama_kv_cache_seq_add(
@@ -2104,6 +2215,9 @@ static void llama_kv_cache_seq_add(
                     llama_pos   p1,
                     llama_pos   delta) {
     uint32_t new_head = cache.size;
+    // PHASE_NSTREAM_KV_4D N1: per-stream earliest-free tracker.
+    const uint32_t kvps = cache.kv_size_per_stream;
+    std::vector<uint32_t> new_head_local(cache.n_stream, kvps);
 
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
@@ -2136,6 +2250,11 @@ static void llama_kv_cache_seq_add(
                 if (new_head == cache.size) {
                     new_head = i;
                 }
+                if (cache.n_stream > 1) {
+                    const uint32_t s = i / kvps;
+                    const uint32_t p = i % kvps;
+                    if (p < new_head_local[s]) new_head_local[s] = p;
+                }
             }
         }
     }
@@ -2143,6 +2262,22 @@ static void llama_kv_cache_seq_add(
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     cache.head = new_head != cache.size ? new_head : 0;
+    // PHASE_NSTREAM_KV_4D N1: update per-stream v_heads.
+    if (cache.n_stream > 1) {
+        for (uint32_t s = 0; s < cache.n_stream; ++s) {
+            if (new_head_local[s] != kvps) {
+                // We freed a cell in stream s — reset its head to that
+                // earliest free local index.
+                cache.v_heads[s] = new_head_local[s];
+            } else if (new_head == cache.size) {
+                // No frees in this stream: leave head; if seq_add
+                // caused a wrap-out, reset to 0 alongside legacy head.
+                cache.v_heads[s] = 0;
+            }
+        }
+    } else {
+        cache.v_heads[0] = cache.head;
+    }
 }
 
 static void llama_kv_cache_seq_div(

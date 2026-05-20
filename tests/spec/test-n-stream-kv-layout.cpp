@@ -115,21 +115,30 @@ void test_kv_tensors_have_n_stream_axis(const llama_kv_cache & cache) {
 
 // StreamPartition's structural form: the per-stream slice size is
 // kv_size / n_stream. Today the tensor's row dimension carries the
-// full kv_size. Will pass when N1 reshapes the allocation.
+// full kv_size. Will pass when N1 reshapes the allocation. Some models
+// expose null k_l entries for non-attention layers (recurrent, MTP head,
+// has_kv=false), so this asserts against the FIRST non-null tensor
+// rather than k_l[0] specifically.
 void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
-    if (cache.k_l.empty() || !cache.k_l[0]) FAIL_AT("no k_l[0] tensor");
-    const ggml_tensor * k0 = cache.k_l[0];
+    const ggml_tensor * k_probe = nullptr;
+    size_t              k_probe_il = 0;
+    for (size_t il = 0; il < cache.k_l.size(); ++il) {
+        if (cache.k_l[il]) { k_probe = cache.k_l[il]; k_probe_il = il; break; }
+    }
+    if (!k_probe) FAIL_AT("no non-null k_l[il] tensor in any layer");
+
     const int64_t expected_per_stream = cache.size / cache.n_stream;
-    const int64_t actual = k0->ne[1];
+    const int64_t actual = k_probe->ne[1];
     if (actual != expected_per_stream) {
         FAIL_AT(
-            "expected k_l[0]->ne[1] == kv_size/n_stream (%lld), got %lld "
+            "expected k_l[%zu]->ne[1] == kv_size/n_stream (%lld), got %lld "
             "— StreamPartition row dimension not yet per-stream",
+            k_probe_il,
             static_cast<long long>(expected_per_stream),
             static_cast<long long>(actual));
     }
-    std::fprintf(stdout, "StreamPartition: k_l[0]->ne[1] == %lld (=kv_size/n_stream)\n",
-                static_cast<long long>(actual));
+    std::fprintf(stdout, "StreamPartition: k_l[%zu]->ne[1] == %lld (=kv_size/n_stream)\n",
+                k_probe_il, static_cast<long long>(actual));
 }
 
 }  // namespace

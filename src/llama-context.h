@@ -49,14 +49,23 @@ struct llama_kv_cache {
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
-    // Per-stream allocator state for the future n_stream KV port.
-    // Today n_stream is initialised to max(1, n_seq_max) and v_heads
-    // shadows the legacy `head` field; allocator logic still uses
-    // `head` directly. Later phases of the n_stream port will route
-    // allocator + view sites through v_heads[stream_id]. See
-    // PHASE_NSTREAM_KV.md.
-    uint32_t n_stream = 1;
-    std::vector<uint32_t> v_heads;
+    // Per-stream allocator state for the n_stream KV layout
+    // (PHASE_NSTREAM_KV_4D.md). K/V tensors are 4D
+    // [head_dim, kv_size_per_stream, n_head_kv, n_stream].
+    //
+    // Each stream owns the contiguous range
+    //   [s * kv_size_per_stream, (s + 1) * kv_size_per_stream)
+    // within `cells`. `v_heads[s]` is the per-stream next-free cursor
+    // expressed as a STREAM-LOCAL index in [0, kv_size_per_stream); the
+    // flat (global) index is `s * kv_size_per_stream + v_heads[s]`.
+    //
+    // At n_stream == 1, the layout collapses to the legacy single-arena
+    // model byte-for-byte: kv_size_per_stream == kv_size, v_heads[0]
+    // mirrors `head`, K/V's ne[3] == 1 and ne[1] == kv_size so views
+    // into 4D coincide with views into the legacy 2D shape.
+    uint32_t n_stream            = 1;
+    uint32_t kv_size_per_stream  = 0;
+    std::vector<uint32_t>        v_heads;
 
     // computed before each graph build
     uint32_t n = 0;
