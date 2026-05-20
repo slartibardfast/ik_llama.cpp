@@ -13,9 +13,11 @@
 //   2. KVTensorIsFourD: every layer's k_l[il] and v_l[il] tensors have
 //      ne[3] == n_stream. (FAIL on HEAD — K/V are still 3D with
 //      ne[3] == 1. PASS after N1 lands.)
-//   3. StreamPartition (kv_size_per_stream): k_l[il]->ne[1] equals
-//      kv_size / n_stream, not the full kv_size. (FAIL on HEAD — the
-//      tensor's row count is the global kv_size.)
+//   3. StreamPartition (kv_size_per_stream): k_l[il]->ne[2] equals
+//      kv_size / n_stream. The chosen axis order is
+//      [head_dim, n_head_kv, kv_size_per_stream, n_stream]; ne[2] is
+//      the per-stream position-count axis. (FAIL on HEAD — the legacy
+//      2D K does not carry a per-stream axis.)
 //
 // Behaves as the binding "RED test" for N1: it FAILS today, will PASS
 // when the 4D port lands. Per
@@ -113,12 +115,12 @@ void test_kv_tensors_have_n_stream_axis(const llama_kv_cache & cache) {
                 cache.k_l.size(), cache.n_stream);
 }
 
-// StreamPartition's structural form: the per-stream slice size is
-// kv_size / n_stream. Today the tensor's row dimension carries the
-// full kv_size. Will pass when N1 reshapes the allocation. Some models
-// expose null k_l entries for non-attention layers (recurrent, MTP head,
-// has_kv=false), so this asserts against the FIRST non-null tensor
-// rather than k_l[0] specifically.
+// StreamPartition's structural form: the per-stream position-count is
+// kv_size / n_stream. The chosen 4D axis order is
+// [head_dim, n_head_kv, kv_size_per_stream, n_stream] so ne[2] carries
+// the per-stream row dim. Some models expose null k_l entries for
+// non-attention layers (recurrent, MTP head, has_kv=false), so this
+// asserts against the FIRST non-null tensor rather than k_l[0].
 void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
     const ggml_tensor * k_probe = nullptr;
     size_t              k_probe_il = 0;
@@ -128,16 +130,16 @@ void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
     if (!k_probe) FAIL_AT("no non-null k_l[il] tensor in any layer");
 
     const int64_t expected_per_stream = cache.size / cache.n_stream;
-    const int64_t actual = k_probe->ne[1];
+    const int64_t actual = k_probe->ne[2];
     if (actual != expected_per_stream) {
         FAIL_AT(
-            "expected k_l[%zu]->ne[1] == kv_size/n_stream (%lld), got %lld "
-            "— StreamPartition row dimension not yet per-stream",
+            "expected k_l[%zu]->ne[2] == kv_size/n_stream (%lld), got %lld "
+            "— StreamPartition position-count axis not yet per-stream",
             k_probe_il,
             static_cast<long long>(expected_per_stream),
             static_cast<long long>(actual));
     }
-    std::fprintf(stdout, "StreamPartition: k_l[%zu]->ne[1] == %lld (=kv_size/n_stream)\n",
+    std::fprintf(stdout, "StreamPartition: k_l[%zu]->ne[2] == %lld (=kv_size/n_stream)\n",
                 k_probe_il, static_cast<long long>(actual));
 }
 

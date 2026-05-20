@@ -1048,14 +1048,25 @@ static bool llama_kv_cache_init(
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
             // PHASE_NSTREAM_KV_4D N1: 4D K shape
-            // [head_dim, kv_size_per_stream, n_head_kv, n_stream]. At
-            // n_stream==1 this is byte-equivalent to the legacy 2D shape
-            // [head_dim, n_head_kv*kv_size]; the position-of-head h is at
-            // the same byte offset under either layout.
+            // [head_dim, n_head_kv, kv_size_per_stream, n_stream].
+            //
+            // Axis order is chosen so the byte layout is identical to
+            // the legacy 2D shape [head_dim, n_head_kv*kv_size] at all
+            // n_stream values, just partitioned by the n_stream axis:
+            //   element [d, h, p, s] at byte offset
+            //     d*ts + h*head_dim*ts + p*head_dim*n_head_kv*ts
+            //          + s*head_dim*n_head_kv*kv_size_per_stream*ts
+            // which matches the legacy 2D K layout where column index
+            // c = p*n_head_kv + h is at offset (d + c*head_dim)*ts and
+            // stream s contributes a base offset s*kvps*n_head_kv*head_dim
+            // bytes. Stream stride nb[3] = n_head_kv * kvps * head_dim *
+            // sizeof(elem) — the per-stream offset graph builders add
+            // for a stream's K slice. At n_stream==1 the per-stream
+            // offset is zero and graph builders need no changes.
             k = ggml_new_tensor_4d(ctx, this_type_k,
                                    n_embd_head_k,
-                                   cache.kv_size_per_stream,
                                    n_head_kv,
+                                   cache.kv_size_per_stream,
                                    cache.n_stream);
 
             auto this_type_v = type_v;
@@ -1068,11 +1079,12 @@ static bool llama_kv_cache_init(
             if (this_type_v != type_v) {
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
-            // V 4D shape [head_dim_v, kv_size_per_stream, n_head_kv_v,
-            // n_stream] when n_embd_v_row factors cleanly into
-            // n_head_kv*n_embd_head_v. Hybrid/recurrent V tails may not;
-            // fall back to a 1D layout that exposes the n_stream axis at
-            // ne[3] so per-stream slicing still works at the byte level.
+            // V 4D shape mirrors K's [head_dim_v, n_head_kv_v,
+            // kv_size_per_stream, n_stream] when n_embd_v_row factors
+            // cleanly into n_head_kv*n_embd_head_v. Hybrid/recurrent V
+            // tails may not; fall back to a 2D-flat shape that still
+            // exposes the n_stream axis at ne[3] so per-stream slicing
+            // works at the byte level.
             // n_embd_head_v is already declared above as `int`; reuse it.
             const bool v_factors_4d = (n_embd_v_row != 0) &&
                                       (n_embd_head_v != 0) &&
@@ -1081,18 +1093,18 @@ static bool llama_kv_cache_init(
             if (v_factors_4d) {
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        (int64_t)n_embd_head_v,
-                                       cache.kv_size_per_stream,
                                        n_head_kv,
+                                       cache.kv_size_per_stream,
                                        cache.n_stream);
             } else {
-                // Hybrid V: keep flat row layout but partition rows into
-                // n_stream contiguous blocks. Logical 4D
-                // [n_embd_v_row, kv_size_per_stream, 1, n_stream] keeps
-                // the n_stream axis discoverable for downstream views.
+                // Hybrid V tail: keep flat row layout but partition into
+                // n_stream contiguous blocks. Logical
+                // [n_embd_v_row, 1, kv_size_per_stream, n_stream] keeps
+                // the n_stream axis at ne[3] for downstream views.
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        n_embd_v_row,
-                                       cache.kv_size_per_stream,
                                        1u,
+                                       cache.kv_size_per_stream,
                                        cache.n_stream);
             }
 
