@@ -3199,6 +3199,22 @@ void server_context::context_shift() {
 }
 
 void server_context::add_sampled_tokens() {
+    // Hold decode tokens for THIS tick if any slot has a prefill pending.
+    // Without this, the v1 PP-serialisation in batch_pending_prompt
+    // (single active prefill slot per tick) ends up landing prefill
+    // tokens in the same batch as another slot's decode tokens — a
+    // mixed prefill+decode batch which triggers a downstream kernel/
+    // graph bug (slot's decode output collapses to garbage / re-emits
+    // input prompt). Pairing v1 with this decode-side gate makes every
+    // batch either pure-prefill or pure-decode. TG latency cost: decode
+    // for any active slot stalls while another slot prefills (bounded
+    // by one prefill duration). See PHASE_NSTREAM_KV.md update (e).
+    for (const auto & s : slots) {
+        if (s.state == SLOT_STATE_IDLE && s.command == SLOT_COMMAND_LOAD_PROMPT) {
+            return;
+        }
+    }
+
     // PHASE45 D10.b: collect MTP-eligible slots so we can issue ONE batched
     // draft forward per step instead of N sequential per-slot forwards. M=1
     // takes the existing single-slot path (LLAMA_MTP_FUSED still applies);
