@@ -5453,10 +5453,19 @@ static int llama_decode_internal(
             std::vector<qnext_seq_block> blocks;
             const auto pattern = qnext_analyze_seq_pattern(ubatch_view, blocks);
 
-            if (pattern == QNEXT_SEQ_INTERLEAVED) {
-                // Truly interleaved (e.g. [A,B,A,B]): the unique-seq-map
-                // fast path rejects, contiguous-block dispatch can't cover
-                // it. Fall back to the longest single-seq run.
+            // PHASE_NSTREAM_KV_4D N2: when n_stream > 1, any multi-seq
+            // batch must be sub-batched into single-seq runs because
+            // llama_kv_cache_find_slot derives stream_id from seq_id[0][0]
+            // and allocates contiguously within that one stream. A
+            // CONTIGUOUS_BLOCKS batch with seq_ids spanning multiple
+            // streams would corrupt stream 0's slice. INTERLEAVED is
+            // already sub-batched below for unrelated reasons (qnext
+            // recurrent-state mixing).
+            const bool nstream_demands_subbatch =
+                lctx.transformer_kv.n_stream > 1 &&
+                pattern == QNEXT_SEQ_CONTIGUOUS_BLOCKS;
+            if (pattern == QNEXT_SEQ_INTERLEAVED || nstream_demands_subbatch) {
+                // Take the longest single-seq run starting at cur_token.
                 const uint32_t orig_n_tokens = n_tokens;
                 const llama_seq_id sid0 = batch_all.seq_id[cur_token][0];
                 uint32_t single_seq_run = 1;
@@ -5469,13 +5478,15 @@ static int llama_decode_internal(
                 n_tokens = single_seq_run;
                 lctx.default_decoder.qnext_mixed_seq_fallback_count++;
                 if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next interleaved batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
-                                   __func__, single_seq_run, orig_n_tokens,
+                    const char * reason = (pattern == QNEXT_SEQ_INTERLEAVED) ? "interleaved" : "contiguous-blocks";
+                    LLAMA_LOG_WARN("%s: %s batch — sub-batching by seq_id (first run=%u of %u tokens, count=%llu)\n",
+                                   __func__, reason, single_seq_run, orig_n_tokens,
                                    (unsigned long long) lctx.default_decoder.qnext_mixed_seq_fallback_count);
                     warned_qnext_mixed_repeat = true;
                 }
             }
-            // SINGLE and CONTIGUOUS_BLOCKS: pass through unchanged.
+            // SINGLE: pass through unchanged. CONTIGUOUS_BLOCKS at n_stream==1:
+            // pass through (legacy behaviour preserved).
         }
 
         llama_batch u_batch = {
