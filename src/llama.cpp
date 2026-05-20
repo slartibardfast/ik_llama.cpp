@@ -823,6 +823,12 @@ static bool llama_kv_cache_init(
     cache.size = kv_size;
     cache.used = 0;
 
+    // Foundation for the n_stream KV port (PHASE_NSTREAM_KV.md). v_heads
+    // shadows `head` for now and is unused by the allocator; later phases
+    // route per-stream allocation through it.
+    cache.n_stream = std::max<uint32_t>(1u, cparams.n_seq_max);
+    cache.v_heads.assign(cache.n_stream, 0u);
+
     cache.type_k  = type_k;
     cache.type_v  = type_v;
 

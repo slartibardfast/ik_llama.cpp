@@ -49,6 +49,15 @@ struct llama_kv_cache {
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // Per-stream allocator state for the future n_stream KV port.
+    // Today n_stream is initialised to max(1, n_seq_max) and v_heads
+    // shadows the legacy `head` field; allocator logic still uses
+    // `head` directly. Later phases of the n_stream port will route
+    // allocator + view sites through v_heads[stream_id]. See
+    // PHASE_NSTREAM_KV.md.
+    uint32_t n_stream = 1;
+    std::vector<uint32_t> v_heads;
+
     // computed before each graph build
     uint32_t n = 0;
 
