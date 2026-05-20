@@ -719,6 +719,36 @@ endif()
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
+# S4 — Property tests derived from specs/scheduler/batch_composition.allium
+# and specs/kv-cache/n_stream_layer.allium. See cached-crunching-tiger.md.
+
+# test-batch-composition-gates: pure-logic stub test of the two-gate
+# scheduler that closes Bug C. PASS expected on HEAD — the Bug C
+# closure is already in server-context.cpp.
+set(TEST_TARGET test-batch-composition-gates)
+add_executable(${TEST_TARGET} spec/test-batch-composition-gates.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+# test-n-stream-kv-layout: model-driven test of the 4D per-stream KV
+# layout. FAIL expected on HEAD (K/V tensors are still 3D); PASS after
+# the N1 4D port lands. This is the binding RED test for N1. Requires
+# a model path passed as argv[1]; skipped (exit 77) without one.
+set(TEST_TARGET test-n-stream-kv-layout)
+add_executable(${TEST_TARGET} spec/test-n-stream-kv-layout.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+# CTest label "spec" — default `ctest` runs do not require a model;
+# invoke via `ctest -L spec -V -- MODEL_PATH=...` or run the binary directly.
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
