@@ -3625,50 +3625,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
     }();
     bool added_a_prompt_this_call = false;
 
-    // Global PP serialization. Concurrent multi-slot prefill on this
-    // architecture is measured at 4.8x SLOWER per-sequence than serial
-    // prefill (parallel-prefill attention masking is the dominant cost,
-    // not NCCL contention). To keep throughput optimal: at most ONE slot
-    // may be in the prefill phase at any time. TG-phase slots continue
-    // to run concurrently (the per-slot decode cost overlap is ~7%).
-    //
-    // active_pp_slot_id = slot currently mid-prefill (LOAD_PROMPT command
-    // with progress). If no in-progress prefill exists, pre-select the
-    // first LOAD_PROMPT slot in iteration order so a fresh batch can't
-    // interleave two newly-arrived prompts. Any other slot with
-    // LOAD_PROMPT pending is held until the active slot transitions
-    // to TG (state -> PROCESSING).
-    int active_pp_slot_id = -1;
-    for (const auto& s : slots) {
-        if (s.state == SLOT_STATE_IDLE
-            && s.command == SLOT_COMMAND_LOAD_PROMPT
-            && s.n_prompt_tokens_processed > 0) {
-            active_pp_slot_id = s.id;
-            break;
-        }
-    }
-    if (active_pp_slot_id == -1) {
-        for (const auto& s : slots) {
-            if (s.state == SLOT_STATE_IDLE
-                && s.command == SLOT_COMMAND_LOAD_PROMPT) {
-                active_pp_slot_id = s.id;
-                break;
-            }
-        }
-    }
-
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
             // In strict-sequential mode, only one prompt per batch.
             if (strict_sequential_decode_prompt && added_a_prompt_this_call) {
                 break;
-            }
-            // Global PP serialization: skip this slot if another is
-            // mid-prefill. Once active_pp_slot_id transitions out of
-            // LOAD_PROMPT (prefill done, slot now in TG), the next
-            // update_slots() call will pick up a queued slot here.
-            if (active_pp_slot_id != -1 && slot.id != active_pp_slot_id) {
-                continue;
             }
             const int32_t batch_n_tokens_before = batch.n_tokens;
             // this slot still has a prompt to be processed
