@@ -1149,6 +1149,14 @@ static bool llama_kv_cache_init(
     return true;
 }
 
+// Diagnostic trace gate for concurrent-prefill / decode race investigation.
+// Set LLAMA_KV_CONCURRENT_TRACE=1 to enable. Logs to stderr. Delete after
+// the source of Bug C is confirmed and closed.
+static bool kv_concurrent_trace_enabled() {
+    static const bool enabled = std::getenv("LLAMA_KV_CONCURRENT_TRACE") != nullptr;
+    return enabled;
+}
+
 // find an empty slot of size "n_tokens" in the cache
 // updates the cache head
 // Note: On success, it's important that cache.head points
@@ -1157,6 +1165,20 @@ static bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
         const struct llama_batch & batch) {
     const uint32_t n_tokens = batch.n_tokens;
+
+    if (kv_concurrent_trace_enabled()) {
+        fprintf(stderr, "[kv-trace] find_slot.enter: head=%u size=%u used=%u n_tokens=%u recurrent=%d\n",
+                cache.head, cache.size, cache.used, n_tokens, (int)cache.recurrent);
+        const uint32_t lim = std::min<uint32_t>(n_tokens, 16u);
+        for (uint32_t i = 0; i < lim; ++i) {
+            int s0 = batch.n_seq_id && batch.n_seq_id[i] > 0 ? batch.seq_id[i][0] : -1;
+            fprintf(stderr, "[kv-trace]   batch tok=%u pos=%d seq=%d\n",
+                    i, (int)batch.pos[i], s0);
+        }
+        if (n_tokens > lim) {
+            fprintf(stderr, "[kv-trace]   ... (%u more tokens)\n", n_tokens - lim);
+        }
+    }
 
     if (cache.recurrent) {
         // For recurrent state architectures (like Mamba),
@@ -1249,6 +1271,25 @@ static bool llama_kv_cache_find_slot(
     }
 
     cache.used += n_tokens;
+
+    if (kv_concurrent_trace_enabled()) {
+        fprintf(stderr, "[kv-trace] find_slot.exit: head=%u used=%u; allocated cells:\n",
+                cache.head, cache.used);
+        const uint32_t lim = std::min<uint32_t>(n_tokens, 16u);
+        for (uint32_t i = 0; i < lim; ++i) {
+            const auto & cell = cache.cells[cache.head + i];
+            fprintf(stderr, "[kv-trace]   cell=%u pos=%d seqs={", cache.head + i, (int)cell.pos);
+            bool first = true;
+            for (auto s : cell.seq_id) {
+                fprintf(stderr, "%s%d", first ? "" : ",", (int)s);
+                first = false;
+            }
+            fprintf(stderr, "}\n");
+        }
+        if (n_tokens > lim) {
+            fprintf(stderr, "[kv-trace]   ... (%u more cells)\n", n_tokens - lim);
+        }
+    }
 
     return true;
 }
@@ -4489,6 +4530,38 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
             }
+            }
+            if (kv_concurrent_trace_enabled()) {
+                // Per-batch-token mask visibility summary. For each j: how many
+                // cells does this token's mask actually attend to (non-(-inf))?
+                ggml_half h_inf16 = ggml_fp32_to_fp16(-INFINITY);
+                const ggml_half * mask_f16 = (const ggml_half *) lctx.default_decoder.inp_KQ_mask->data;
+                const float     * mask_f32 = (const float *)     lctx.default_decoder.inp_KQ_mask->data;
+                const bool use_f16 = cparams.flash_attn;
+                const int64_t n_kv_t = transformer_kv.n;
+                const uint32_t jlim = std::min<uint32_t>((uint32_t)batch.n_tokens, 16u);
+                for (uint32_t j = 0; j < jlim; ++j) {
+                    int visible = 0;
+                    int first_visible = -1;
+                    int last_visible = -1;
+                    for (int64_t i = 0; i < n_kv_t; ++i) {
+                        bool vis;
+                        if (use_f16) vis = mask_f16[j*n_kv_t + i] != h_inf16;
+                        else         vis = mask_f32[j*n_kv_t + i] > -1e30f;
+                        if (vis) {
+                            ++visible;
+                            if (first_visible < 0) first_visible = (int)i;
+                            last_visible = (int)i;
+                        }
+                    }
+                    int s0 = batch.n_seq_id && batch.n_seq_id[j] > 0 ? batch.seq_id[j][0] : -1;
+                    fprintf(stderr, "[kv-trace] mask: tok=%u pos=%d seq=%d visible=%d range=[%d..%d] n_kv=%lld\n",
+                            j, (int)batch.pos[j], s0, visible, first_visible, last_visible, (long long)n_kv_t);
+                }
+                if ((uint32_t)batch.n_tokens > jlim) {
+                    fprintf(stderr, "[kv-trace] mask: ... (%u more tokens)\n",
+                            (uint32_t)batch.n_tokens - jlim);
+                }
             }
 #if IK_PRINT_TIMING == 2
             auto tim2 = ggml_time_us();
