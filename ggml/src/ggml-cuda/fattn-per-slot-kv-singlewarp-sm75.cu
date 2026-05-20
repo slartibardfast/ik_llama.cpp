@@ -367,34 +367,6 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
         ? (const int *) per_row_k_bound->data
         : nullptr;
 
-    // CY.F.17 trace: dump tensor layout when LLAMA_SINGLEWARP_TRACE=1.
-    // Prints Q, K, V shapes + strides to verify whether nb13/nb23 represent
-    // per-slot regions (correct) or off-by-one cell strides (bug).
-    static const bool trace = std::getenv("LLAMA_SINGLEWARP_TRACE") != nullptr;
-    if (trace) {
-        fprintf(stderr, "[singlewarp] dst=%s\n", dst->name);
-        fprintf(stderr, "  Q ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] type=%s\n",
-                (long long)Q->ne[0], (long long)Q->ne[1], (long long)Q->ne[2], (long long)Q->ne[3],
-                (long long)Q->nb[0], (long long)Q->nb[1], (long long)Q->nb[2], (long long)Q->nb[3],
-                ggml_type_name(Q->type));
-        fprintf(stderr, "  K ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] type=%s data=%p\n",
-                (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2], (long long)K->ne[3],
-                (long long)K->nb[0], (long long)K->nb[1], (long long)K->nb[2], (long long)K->nb[3],
-                ggml_type_name(K->type), K->data);
-        fprintf(stderr, "  V ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] type=%s data=%p\n",
-                (long long)V->ne[0], (long long)V->ne[1], (long long)V->ne[2], (long long)V->ne[3],
-                (long long)V->nb[0], (long long)V->nb[1], (long long)V->nb[2], (long long)V->nb[3],
-                ggml_type_name(V->type), V->data);
-        fprintf(stderr, "  mask ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]\n",
-                (long long)mask->ne[0], (long long)mask->ne[1], (long long)mask->ne[2], (long long)mask->ne[3],
-                (long long)mask->nb[0], (long long)mask->nb[1], (long long)mask->nb[2], (long long)mask->nb[3]);
-        fprintf(stderr, "  grid=(%u,%u,%u)\n", grid.x, grid.y, grid.z);
-        if (per_row_k_bound) {
-            fprintf(stderr, "  per_row_k_bound ne=[%lld] (only when LLAMA_TEST has bound)\n",
-                    (long long)per_row_k_bound->ne[0]);
-        }
-    }
-
     auto launch_kernel = [&](auto kernel) {
         kernel<<<grid, block, 0, ctx.stream()>>>(
             (const char *) Q->data,

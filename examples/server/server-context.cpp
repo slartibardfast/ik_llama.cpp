@@ -2,7 +2,6 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
-#include "server-capture.h"
 
 #include "common.h"
 #include "llama.h"
@@ -117,12 +116,6 @@ server_context::~server_context() {
 
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
-
-    // R5 diagnostic (task #95): install tensor-dump cb_eval if
-    // LLAMA_SERVER_CAPTURE_DIR is set in the environment. Output format
-    // matches examples/llama-state-capture/ so compare-intra-layer.py
-    // consumes it directly. DELETE after R5 closure.
-    server_capture::install_from_env(params_base);
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
@@ -4642,17 +4635,6 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         static std::map<int, decode_stat> _prof_stats;
         std::chrono::high_resolution_clock::time_point _prof_t0;
         if (_prof_decode) _prof_t0 = std::chrono::high_resolution_clock::now();
-
-        // R5 diagnostic (task #95): label this decode call with a unique
-        // monotonic tick id + n_tokens, so cb_eval captures land in a
-        // unique per-decode subdirectory. DELETE after R5 closure.
-        if (server_capture::active()) {
-            static int _capture_tick = 0;
-            char _capture_label[64];
-            std::snprintf(_capture_label, sizeof(_capture_label),
-                          "decode-%05d-t%d", _capture_tick++, (int) n_tokens);
-            server_capture::set_phase(_capture_label);
-        }
 
         const int ret = llama_decode(ctx, batch_view);
 
