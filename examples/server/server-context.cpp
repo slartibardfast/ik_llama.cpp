@@ -3203,6 +3203,17 @@ void server_context::add_sampled_tokens() {
     // batch either pure-prefill or pure-decode. TG latency cost: decode
     // for any active slot stalls while another slot prefills (bounded
     // by one prefill duration). See PHASE_NSTREAM_KV.md update (e).
+    //
+    // PHASE_NSTREAM_KV_4D N3 closure note: gate kept in place. The
+    // structural removal path (per-stream dispatch in
+    // process_batch_tokens + gate removal here) requires the FULL
+    // upstream-aligned non-byte-compatible 4D K/V layout with
+    // matching graph-builder offset rewrites (~30-40 view/copy sites).
+    // The N1 fixup in this branch took a byte-compatible axis order to
+    // avoid graph-builder churn, which is incompatible with per-stream
+    // dispatch (legacy graph builders treat the cells array as flat
+    // and re-mix per-stream data on lookup). The gate continues to be
+    // load-bearing until N2's full graph builder rewrite lands.
     for (const auto & s : slots) {
         if (s.state == SLOT_STATE_IDLE && s.command == SLOT_COMMAND_LOAD_PROMPT) {
             return;

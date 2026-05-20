@@ -1276,75 +1276,52 @@ static bool llama_kv_cache_find_slot(
         return max >= min;
     }
     // otherwise, one cell per token.
-
-    // Determine target stream from the first token's primary seq_id.
-    // PerStreamDispatch (specs/kv-cache/n_stream_layer.allium): every
-    // token in a single decode batch shares the same seq_id (==
-    // stream_id). At n_stream == 1 this collapses to stream_id == 0
-    // and the path below is byte-identical to the legacy allocator.
-    uint32_t stream_id = 0;
-    if (cache.n_stream > 1 && batch.n_seq_id && batch.seq_id &&
-        batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
-        const llama_seq_id sid = batch.seq_id[0][0];
-        if (sid < 0 || (uint32_t)sid >= cache.n_stream) {
-            LLAMA_LOG_ERROR("%s: seq_id=%d out of range [0,%u)\n",
-                            __func__, sid, cache.n_stream);
-            return false;
-        }
-        stream_id = (uint32_t)sid;
-    }
-
-    const uint32_t kvps = cache.kv_size_per_stream;
-    const uint32_t base = stream_id * kvps;
-
-    if (n_tokens > kvps) {
-        LLAMA_LOG_ERROR("%s: n_tokens=%d > kv_size_per_stream=%d\n",
-                        __func__, n_tokens, kvps);
+    //
+    // PHASE_NSTREAM_KV_4D N1 closure note: this allocator stays in the
+    // legacy global-flat-scan form. The byte-compatible 4D K/V layout
+    // chosen for N1's tensor reshape means slot N's KV bytes are
+    // addressable as flat-index (s*kvps + p_local), so the legacy
+    // contiguous scan still produces correct K-store offsets. The
+    // per-stream allocator (one scan range per stream) only becomes
+    // meaningful with the upstream-aligned non-byte-compatible 4D
+    // layout and matching graph-builder offset rewrites — that pairing
+    // is the open N2 work. See PHASE_NSTREAM_KV_4D.md.
+    if (n_tokens > cache.size) {
+        LLAMA_LOG_ERROR("%s: n_tokens=%d > cache.size=%d\n", __func__, n_tokens, cache.size);
         return false;
     }
 
     uint32_t n_tested = 0;
-    uint32_t head_local = cache.v_heads[stream_id];
-
     while (true) {
-        if (head_local + n_tokens > kvps) {
-            n_tested  += kvps - head_local;
-            head_local = 0;
+        if (cache.head + n_tokens > cache.size) {
+            n_tested += cache.size - cache.head;
+            cache.head = 0;
             continue;
         }
-
         bool found = true;
         for (uint32_t i = 0; i < n_tokens; i++) {
-            if (cache.cells[base + head_local + i].pos >= 0) {
-                found       = false;
-                head_local += i + 1;
+            if (cache.cells[cache.head + i].pos >= 0) {
+                found = false;
+                cache.head += i + 1;
                 n_tested   += i + 1;
                 break;
             }
         }
-
-        if (found) {
-            break;
-        }
-
-        if (n_tested >= kvps) {
-            //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
-            return false;
-        }
+        if (found) break;
+        if (n_tested >= cache.size) return false;
     }
 
     for (uint32_t i = 0; i < n_tokens; i++) {
-        cache.cells[base + head_local + i].pos = batch.pos[i];
-
+        cache.cells[cache.head + i].pos = batch.pos[i];
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
-            cache.cells[base + head_local + i].seq_id.insert(batch.seq_id[i][j]);
+            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
         }
     }
-
-    cache.v_heads[stream_id] = head_local;
-    cache.head               = base + head_local;
-    cache.used              += n_tokens;
-
+    cache.used += n_tokens;
+    // Keep v_heads[0] mirror updated for any callers that read it.
+    if (cache.n_stream == 1) {
+        cache.v_heads[0] = cache.head;
+    }
     return true;
 }
 
