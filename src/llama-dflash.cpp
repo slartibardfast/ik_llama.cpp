@@ -597,25 +597,21 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
                          MODULE, i, il, (int) seq_id, buf.size() / (std::size_t) D_emb, mal_anchors);
             return false;
         }
-        // MAL is capped at swa_window+block_size+headroom (see seq_len_cap
-        // in llama_set_dflash). When the extract buffer has accumulated more
-        // rows than mal_anchors (e.g. after a long-prompt prefill), the
-        // drafter must see the MOST RECENT mal_anchors target hiddens, not
-        // the oldest. Read from the buffer tail and trim the head so
-        // subsequent cycles' cb_eval appends keep the window bounded.
-        const std::size_t buf_rows  = buf.size() / (std::size_t) D_emb;
-        const std::size_t row_start = (buf_rows > (std::size_t) mal_anchors)
-                                          ? (buf_rows - (std::size_t) mal_anchors)
-                                          : 0;
         for (int a = 0; a < mal_anchors; ++a) {
-            const float * row = buf.data() + (row_start + (std::size_t) a) * D_emb;
+            const float * row = buf.data() + (std::size_t) a * D_emb;
             for (int d = 0; d < D_emb; ++d) {
                 h_stage[((std::size_t) a * L_src + i) * D_emb + d] = __float2half(row[d]);
             }
         }
-        if (row_start > 0) {
-            buf.erase(buf.begin(), buf.begin() + (std::ptrdiff_t)(row_start * D_emb));
-        }
+        // Trim to mal_anchors rows for next cycle. This removes the
+        // rejected-draft hiddens that the previous cycle's verify decode
+        // appended past the (capped) anchor_pos count — the next cycle's
+        // mal_anchors equals the post-accept cache_tokens.size() (capped
+        // at MAL_max in common/speculative.cpp), so any rows beyond that
+        // are stale and must not be fed to the drafter. Without this trim
+        // the drafter sees stale rejected hiddens and produces wrong
+        // predictions, visible as token duplication in the output stream.
+        buf.resize((std::size_t) mal_anchors * D_emb);
         ctx->default_decoder.dflash_extract_n[i][seq_id] = buf.size();
     }
 
