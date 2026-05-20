@@ -560,21 +560,52 @@ void llm_build_context::llm_build_kv_store(
 
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+    const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
 
     GGML_ASSERT(kv.size == n_ctx);
 
-    //struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
-    //        (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
-    //cb(k_cache_view, "k_cache_view", il);
+    // PHASE_NSTREAM_KV_4D N2.b: per-stream K/V store offsets.
+    //
+    // K/V are 4D [head_dim, kv_size_per_stream, n_head_kv, n_stream]
+    // with default contig strides:
+    //   nb[0] = type_size                 (element)
+    //   nb[1] = head_dim * type_size       (position)
+    //   nb[2] = head_dim * kvps * type_size (head, within stream)
+    //   nb[3] = head_dim * kvps * n_head_kv * type_size (stream)
+    //
+    // The legacy flat `kv_head` index decomposes as
+    //   stream_id = kv_head / kvps
+    //   p_local   = kv_head % kvps
+    // and the byte offset of the FIRST destination cell becomes
+    //   view_offs = p_local * nb[1] + stream_id * nb[3]
+    //
+    // The destination view shape is 3D [head_dim, n_head_kv, n_tokens]
+    // with the parent's nb[2] for the head axis and nb[1] for the
+    // position axis (the position axis steps token-by-token starting
+    // at p_local). Source k_cur arrives 3D
+    // [head_dim, n_head_kv, n_tokens] from the RoPE/projection chain.
+    const uint32_t kvps = kv.kv_size_per_stream;
+    const uint32_t stream_id =
+        (kvps > 0) ? (uint32_t)kv_head / kvps : 0u;
+    const uint32_t p_local =
+        (kvps > 0) ? (uint32_t)kv_head % kvps : (uint32_t)kv_head;
 
     if (k_cur) {
         GGML_ASSERT(2*il+1 < (int)lctx.cache_copies.size());
-        auto k_row_size = ggml_row_size(kv.k_l[il]->type, n_embd_head_k);
-        ggml_tensor * k_cache_view = ggml_view_2d(ctx, kv.k_l[il], n_embd_head_k, n_tokens*n_head_kv,
-                k_row_size, k_row_size*n_head_kv*kv_head);
+        const size_t k_pos_stride    = kv.k_l[il]->nb[1];
+        const size_t k_head_stride   = kv.k_l[il]->nb[2];
+        const size_t k_stream_stride = kv.k_l[il]->nb[3];
+
+        ggml_tensor * k_cache_view = ggml_view_3d(ctx, kv.k_l[il],
+                n_embd_head_k, n_head_kv, n_tokens,
+                k_head_stride, k_pos_stride,
+                (size_t)p_local * k_pos_stride + (size_t)stream_id * k_stream_stride);
 
         lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
-        lctx.cache_copies[2*il+0].step = k_row_size*n_head_kv;
+        // step is per-position in the byte sense; update_cache_copies
+        // recomputes the full view_offs from cache.head when the graph
+        // is reused.
+        lctx.cache_copies[2*il+0].step = k_pos_stride;
 
         // note: storing RoPE-ed version of K in the KV cache
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
@@ -583,11 +614,35 @@ void llm_build_context::llm_build_kv_store(
     if (v_cur) {
         ggml_tensor * v_cache_view = nullptr;
         if (!kv.v_trans) {
-            v_cache_view = ggml_view_1d(ctx, kv.v_l[il], n_tokens*n_embd_v_gqa,
-                    (kv_head)*ggml_row_size(kv.v_l[il]->type, n_embd_v_gqa));
-            lctx.cache_copies[2*il+1].step = ggml_row_size(kv.v_l[il]->type, n_embd_v_gqa);
+            // FA path: V mirrors K's per-stream offset math. Source
+            // v_cur arrives 2D [n_embd_v_gqa, n_tokens] from the
+            // V-projection; reshape it to 3D [head_dim_v, n_head_kv,
+            // n_tokens] (no data movement — same bytes, just labels)
+            // so cpy aligns dim-by-dim with the 3D destination view.
+            const size_t v_pos_stride    = kv.v_l[il]->nb[1];
+            const size_t v_head_stride   = kv.v_l[il]->nb[2];
+            const size_t v_stream_stride = kv.v_l[il]->nb[3];
+
+            v_cache_view = ggml_view_3d(ctx, kv.v_l[il],
+                    n_embd_head_v, n_head_kv, n_tokens,
+                    v_head_stride, v_pos_stride,
+                    (size_t)p_local * v_pos_stride + (size_t)stream_id * v_stream_stride);
+
+            if (v_cur->ne[1] == n_tokens && ggml_n_dims(v_cur) == 2) {
+                v_cur = ggml_reshape_3d(ctx, v_cur, n_embd_head_v, n_head_kv, n_tokens);
+            }
+
+            lctx.cache_copies[2*il+1].step = v_pos_stride;
         } else {
-            // note: the V cache is transposed for legacy non-FA layouts
+            // note: the V cache is transposed for legacy non-FA
+            // layouts. The v_trans non-FA path is NOT updated for the
+            // new per-stream 4D layout — it would need a separate
+            // re-derivation. Falling through under v_trans currently
+            // produces wrong bytes for n_stream > 1; the FA path is
+            // production. Document and gate.
+            GGML_ASSERT(kv.n_stream == 1 &&
+                    "v_trans non-FA V layout requires n_stream==1 under N2.b; "
+                    "use --fa on for n_stream > 1");
             v_cache_view = ggml_view_2d(ctx, kv.v_l[il], n_tokens, n_embd_v_gqa,
                     (  n_ctx)*ggml_element_size(kv.v_l[il]),
                     (kv_head)*ggml_element_size(kv.v_l[il]));
@@ -1560,12 +1615,37 @@ static ggml_tensor * llm_build_kqv(
     GGML_ASSERT(k_cache != nullptr && "k_cache is null in llm_build_kqv");
     GGML_ASSERT(v_cache != nullptr && "v_cache is null in llm_build_kqv");
 
+    // PHASE_NSTREAM_KV_4D N2.b: per-stream K view.
+    //
+    // The K cache is 4D [head_dim, kv_size_per_stream, n_head_kv,
+    // n_stream]. For per-stream attention, view shape [head_dim,
+    // n_kv, n_head_kv] starts at the stream's slice base. nb[1] of
+    // the parent steps token-by-token within the stream's slice;
+    // nb[2] steps head-by-head. The legacy formula
+    // (nb1 = head_dim*n_head_kv*ts, nb2 = head_dim*ts) flipped the
+    // axis semantics — under the new layout, position is the
+    // SECOND axis (ne[1]) and head is the THIRD (ne[2]), so the
+    // view's nb1 = parent's nb[1] and view's nb2 = parent's nb[2].
+    //
+    // stream_id is derived from the batch's primary seq_id (== the
+    // slot id under per-stream dispatch); for an n_stream == 1
+    // build it is always 0 and the offset collapses to 0.
+    const uint32_t kqv_kvps = kv.kv_size_per_stream;
+    uint32_t kqv_stream_id = 0;
+    if (kqv_kvps > 0 && kv.n_stream > 1 && lctx.decoder_ref &&
+            // batch is read from llm_build_context's member, available via lctx
+            // here we approximate via cache.head / kvps (set by find_slot
+            // for the current decode call).
+            true) {
+        kqv_stream_id = (uint32_t)(kv.head / kqv_kvps);
+    }
+
     struct ggml_tensor * k =
         ggml_view_3d(ctx, k_cache,
                 n_embd_head_k, n_kv, n_head_kv,
-                ggml_row_size(k_cache->type, n_embd_head_k)*n_head_kv, //n_embd_k_gqa),
-                ggml_row_size(k_cache->type, n_embd_head_k),
-                0);
+                k_cache->nb[1],  // position stride within stream
+                k_cache->nb[2],  // head stride within stream
+                (size_t)kqv_stream_id * k_cache->nb[3]);
     cb(k, "k", il);
 
 #ifdef GGML_USE_VULKAN
@@ -1592,13 +1672,16 @@ static ggml_tensor * llm_build_kqv(
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
-        // split cached v into n_head heads (not transposed)
+        // PHASE_NSTREAM_KV_4D N2.b: per-stream V view (FA path).
+        // Same stride pattern as the K view above — parent's nb[1]
+        // steps token-by-token within stream, parent's nb[2] steps
+        // head-by-head, offset = stream_id * parent's nb[3].
         struct ggml_tensor * v =
             ggml_view_3d(ctx, v_cache,
                     n_embd_head_v, n_kv, n_head_kv,
-                    ggml_row_size(v_cache->type, n_embd_v_gqa),
-                    ggml_row_size(v_cache->type, n_embd_head_v),
-                    0);
+                    v_cache->nb[1],
+                    v_cache->nb[2],
+                    (size_t)kqv_stream_id * v_cache->nb[3]);
         cb(v, "v", il);
 
         // NPC.4 fix: route to the per-slot-kv FA variant on the single-device

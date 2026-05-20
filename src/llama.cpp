@@ -607,6 +607,13 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
+    // PHASE_NSTREAM_KV_4D N2.b: read views in llm_build_kqv bake a
+    // stream_id-derived offset; reusing a graph across stream
+    // boundaries would read from the wrong stream's slice. Disable
+    // reuse under n_stream > 1 until a stream-aware reuse check
+    // lands. At n_stream == 1, stream_id is always 0 and reuse is
+    // safe — falls through to the existing path.
+    if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
     // graph. The cudaGraphExecUpdate path patches per-call ne/nb so
@@ -645,7 +652,22 @@ bool llama_context::update_cache_copies() {
                 if (!kl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 0];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) return false;
-                c.cpy->view_offs = transformer_kv.head*c.step;
+                // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
+                // c.step was set to the parent's nb[1] (= head_dim * ts)
+                // in llm_build_kv_store. For the new 4D K/V layout the
+                // first-byte offset for flat cell `head` is
+                //   (head % kvps) * c.step + (head / kvps) * nb[3]
+                // where the parent tensor carries nb[3] (the stream
+                // stride).
+                {
+                    const uint32_t _kvps = transformer_kv.kv_size_per_stream;
+                    const uint32_t _p = (_kvps > 0) ? (transformer_kv.head % _kvps)
+                                                    : transformer_kv.head;
+                    const uint32_t _s = (_kvps > 0) ? (transformer_kv.head / _kvps) : 0u;
+                    const ggml_tensor * _parent = c.cpy->view_src;
+                    const size_t _stream_stride = _parent ? _parent->nb[3] : 0;
+                    c.cpy->view_offs = (size_t)_p * c.step + (size_t)_s * _stream_stride;
+                }
                 c.cpy->src[1]->data = (char *)kl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -654,7 +676,22 @@ bool llama_context::update_cache_copies() {
                 if (!vl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 1];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) return false;
-                c.cpy->view_offs = transformer_kv.head*c.step;
+                // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
+                // c.step was set to the parent's nb[1] (= head_dim * ts)
+                // in llm_build_kv_store. For the new 4D K/V layout the
+                // first-byte offset for flat cell `head` is
+                //   (head % kvps) * c.step + (head / kvps) * nb[3]
+                // where the parent tensor carries nb[3] (the stream
+                // stride).
+                {
+                    const uint32_t _kvps = transformer_kv.kv_size_per_stream;
+                    const uint32_t _p = (_kvps > 0) ? (transformer_kv.head % _kvps)
+                                                    : transformer_kv.head;
+                    const uint32_t _s = (_kvps > 0) ? (transformer_kv.head / _kvps) : 0u;
+                    const ggml_tensor * _parent = c.cpy->view_src;
+                    const size_t _stream_stride = _parent ? _parent->nb[3] : 0;
+                    c.cpy->view_offs = (size_t)_p * c.step + (size_t)_s * _stream_stride;
+                }
                 c.cpy->src[1]->data = (char *)vl->splits[id]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -665,7 +702,22 @@ bool llama_context::update_cache_copies() {
                 }
                 auto& c = cache_copies[2*il+0];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.k_l[il]) return false;
-                c.cpy->view_offs = transformer_kv.head*c.step;
+                // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
+                // c.step was set to the parent's nb[1] (= head_dim * ts)
+                // in llm_build_kv_store. For the new 4D K/V layout the
+                // first-byte offset for flat cell `head` is
+                //   (head % kvps) * c.step + (head / kvps) * nb[3]
+                // where the parent tensor carries nb[3] (the stream
+                // stride).
+                {
+                    const uint32_t _kvps = transformer_kv.kv_size_per_stream;
+                    const uint32_t _p = (_kvps > 0) ? (transformer_kv.head % _kvps)
+                                                    : transformer_kv.head;
+                    const uint32_t _s = (_kvps > 0) ? (transformer_kv.head / _kvps) : 0u;
+                    const ggml_tensor * _parent = c.cpy->view_src;
+                    const size_t _stream_stride = _parent ? _parent->nb[3] : 0;
+                    c.cpy->view_offs = (size_t)_p * c.step + (size_t)_s * _stream_stride;
+                }
                 c.cpy->src[1]->data = (char *)transformer_kv.k_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -676,7 +728,22 @@ bool llama_context::update_cache_copies() {
                 }
                 auto& c = cache_copies[2*il+1];
                 if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.v_l[il]) return false;
-                c.cpy->view_offs = transformer_kv.head*c.step;
+                // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
+                // c.step was set to the parent's nb[1] (= head_dim * ts)
+                // in llm_build_kv_store. For the new 4D K/V layout the
+                // first-byte offset for flat cell `head` is
+                //   (head % kvps) * c.step + (head / kvps) * nb[3]
+                // where the parent tensor carries nb[3] (the stream
+                // stride).
+                {
+                    const uint32_t _kvps = transformer_kv.kv_size_per_stream;
+                    const uint32_t _p = (_kvps > 0) ? (transformer_kv.head % _kvps)
+                                                    : transformer_kv.head;
+                    const uint32_t _s = (_kvps > 0) ? (transformer_kv.head / _kvps) : 0u;
+                    const ggml_tensor * _parent = c.cpy->view_src;
+                    const size_t _stream_stride = _parent ? _parent->nb[3] : 0;
+                    c.cpy->view_offs = (size_t)_p * c.step + (size_t)_s * _stream_stride;
+                }
                 c.cpy->src[1]->data = (char *)transformer_kv.v_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
@@ -1047,26 +1114,28 @@ static bool llama_kv_cache_init(
             if (this_type_k != type_k) {
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
-            // PHASE_NSTREAM_KV_4D N1: 4D K shape
-            // [head_dim, n_head_kv, kv_size_per_stream, n_stream].
+            // PHASE_NSTREAM_KV_4D N2.a: 4D K shape
+            // [head_dim, kv_size_per_stream, n_head_kv, n_stream].
             //
-            // Axis order is chosen so the byte layout is identical to
-            // the legacy 2D shape [head_dim, n_head_kv*kv_size] at all
-            // n_stream values, just partitioned by the n_stream axis:
-            //   element [d, h, p, s] at byte offset
-            //     d*ts + h*head_dim*ts + p*head_dim*n_head_kv*ts
-            //          + s*head_dim*n_head_kv*kv_size_per_stream*ts
-            // which matches the legacy 2D K layout where column index
-            // c = p*n_head_kv + h is at offset (d + c*head_dim)*ts and
-            // stream s contributes a base offset s*kvps*n_head_kv*head_dim
-            // bytes. Stream stride nb[3] = n_head_kv * kvps * head_dim *
-            // sizeof(elem) — the per-stream offset graph builders add
-            // for a stream's K slice. At n_stream==1 the per-stream
-            // offset is zero and graph builders need no changes.
+            // This is the upstream-aligned axis order — positions
+            // inner per stream, heads outer per stream, streams
+            // outermost. The byte layout is NOT byte-identical to the
+            // legacy 2D K. Default contig strides give
+            //   nb[0] = type_size
+            //   nb[1] = head_dim * type_size
+            //   nb[2] = head_dim * kvps * type_size  (head stride within a stream)
+            //   nb[3] = head_dim * kvps * n_head_kv * type_size  (stream stride)
+            // Stream s's slice spans bytes [s*nb[3], (s+1)*nb[3]).
+            // Graph builders read/write per-stream by adding s*nb[3]
+            // to their view offsets. Per-stream allocator and
+            // per-stream dispatch (N2.c, N2.d) become correct under
+            // this layout because cells[s*kvps+p_local] addresses the
+            // byte range where stream s's local position p_local is
+            // stored.
             k = ggml_new_tensor_4d(ctx, this_type_k,
                                    n_embd_head_k,
-                                   n_head_kv,
                                    cache.kv_size_per_stream,
+                                   n_head_kv,
                                    cache.n_stream);
 
             auto this_type_v = type_v;
@@ -1079,12 +1148,12 @@ static bool llama_kv_cache_init(
             if (this_type_v != type_v) {
                 LLAMA_LOG_INFO("================= Setting V-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_v));
             }
-            // V 4D shape mirrors K's [head_dim_v, n_head_kv_v,
-            // kv_size_per_stream, n_stream] when n_embd_v_row factors
-            // cleanly into n_head_kv*n_embd_head_v. Hybrid/recurrent V
-            // tails may not; fall back to a 2D-flat shape that still
-            // exposes the n_stream axis at ne[3] so per-stream slicing
-            // works at the byte level.
+            // V 4D shape mirrors K's [head_dim_v, kv_size_per_stream,
+            // n_head_kv_v, n_stream] when n_embd_v_row factors cleanly
+            // into n_head_kv * n_embd_head_v. Hybrid/recurrent V tails
+            // may not; fall back to a [n_embd_v_row, kvps, 1, n_stream]
+            // layout that keeps the n_stream axis at ne[3] for the
+            // per-stream slicing.
             // n_embd_head_v is already declared above as `int`; reuse it.
             const bool v_factors_4d = (n_embd_v_row != 0) &&
                                       (n_embd_head_v != 0) &&
@@ -1093,18 +1162,17 @@ static bool llama_kv_cache_init(
             if (v_factors_4d) {
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        (int64_t)n_embd_head_v,
-                                       n_head_kv,
                                        cache.kv_size_per_stream,
+                                       n_head_kv,
                                        cache.n_stream);
             } else {
-                // Hybrid V tail: keep flat row layout but partition into
-                // n_stream contiguous blocks. Logical
-                // [n_embd_v_row, 1, kv_size_per_stream, n_stream] keeps
-                // the n_stream axis at ne[3] for downstream views.
+                // Hybrid V tail: per-stream contiguous block of flat
+                // rows. ne[1] carries kvps so per-stream slicing matches
+                // the regular path even when head factoring fails.
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        n_embd_v_row,
-                                       1u,
                                        cache.kv_size_per_stream,
+                                       1u,
                                        cache.n_stream);
             }
 
@@ -1121,6 +1189,12 @@ static bool llama_kv_cache_init(
                 auto & split_v_l = cache.split_v_l.emplace_back();
                 split_k_l.tensor_splits.resize(extra_K->n_device, nullptr);
                 split_v_l.tensor_splits.resize(extra_V->n_device, nullptr);
+                // PHASE_NSTREAM_KV_4D N2.a: per-device split tensors
+                // adopt the same 4D shape as the primary K/V
+                //   [head_dim, kv_size_per_stream, nhead_kv_split, n_stream]
+                // so the multi-device split path uses the same
+                // s*nb[3] stream offset formula as the single-device
+                // path in build_std_attention.
                 for (int is = 0; is < extra_K->n_device; ++is) {
                     auto split = use_V_for_K ? extra_V->splits[is] : extra_K->splits[is];
                     if (!split) continue;
@@ -1129,7 +1203,11 @@ static bool llama_kv_cache_init(
                         LLAMA_LOG_DEBUG("K_cache(%d, %d): using %d instead of %ld heads\n",
                                 i, is, nhead_kv, extra_K->splits[is]->ne[1]/n_embd_head_k);
                     }
-                    split_k_l.tensor_splits[is] = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, nhead_kv * kv_size);
+                    split_k_l.tensor_splits[is] = ggml_new_tensor_4d(ctx, this_type_k,
+                            n_embd_head_k,
+                            cache.kv_size_per_stream,
+                            nhead_kv,
+                            cache.n_stream);
                     auto split_name = k_name + '.' + std::to_string(is);
                     ggml_set_name(split_k_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_k_l.tensor_splits[is]);
@@ -1140,7 +1218,14 @@ static bool llama_kv_cache_init(
                 for (int is = 0; is < extra_V->n_device; ++is) {
                     auto split = extra_V->splits[is];
                     if (!split) continue;
-                    split_v_l.tensor_splits[is] = ggml_new_tensor_1d(ctx, this_type_v, split->ne[1] * kv_size);
+                    // V split row count = split->ne[1] (n_embd_v per device).
+                    // Same 4D shape as the primary V: split into per-stream
+                    // contiguous blocks via ne[3]=n_stream.
+                    split_v_l.tensor_splits[is] = ggml_new_tensor_4d(ctx, this_type_v,
+                            split->ne[1],
+                            cache.kv_size_per_stream,
+                            1,
+                            cache.n_stream);
                     auto split_name = v_name + '.' + std::to_string(is);
                     ggml_set_name(split_v_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_v_l.tensor_splits[is]);
@@ -1277,51 +1362,66 @@ static bool llama_kv_cache_find_slot(
     }
     // otherwise, one cell per token.
     //
-    // PHASE_NSTREAM_KV_4D N1 closure note: this allocator stays in the
-    // legacy global-flat-scan form. The byte-compatible 4D K/V layout
-    // chosen for N1's tensor reshape means slot N's KV bytes are
-    // addressable as flat-index (s*kvps + p_local), so the legacy
-    // contiguous scan still produces correct K-store offsets. The
-    // per-stream allocator (one scan range per stream) only becomes
-    // meaningful with the upstream-aligned non-byte-compatible 4D
-    // layout and matching graph-builder offset rewrites — that pairing
-    // is the open N2 work. See PHASE_NSTREAM_KV_4D.md.
-    if (n_tokens > cache.size) {
-        LLAMA_LOG_ERROR("%s: n_tokens=%d > cache.size=%d\n", __func__, n_tokens, cache.size);
+    // PHASE_NSTREAM_KV_4D N2.c: per-stream allocator. The batch's
+    // primary seq_id selects a stream; the scan is scoped to the
+    // stream's range [stream*kvps, (stream+1)*kvps). v_heads[stream]
+    // is the stream-local cursor. cache.head mirrors the flat global
+    // index for legacy reads. At n_stream==1 the path collapses to
+    // the legacy single-arena scan byte-identically.
+    uint32_t stream_id = 0;
+    if (cache.n_stream > 1 && batch.n_seq_id && batch.seq_id &&
+        batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
+        const llama_seq_id sid = batch.seq_id[0][0];
+        if (sid < 0 || (uint32_t)sid >= cache.n_stream) {
+            LLAMA_LOG_ERROR("%s: seq_id=%d out of range [0,%u)\n",
+                            __func__, sid, cache.n_stream);
+            return false;
+        }
+        stream_id = (uint32_t)sid;
+    }
+
+    const uint32_t kvps = cache.kv_size_per_stream;
+    const uint32_t base = stream_id * kvps;
+
+    if (n_tokens > kvps) {
+        LLAMA_LOG_ERROR("%s: n_tokens=%d > kv_size_per_stream=%d\n",
+                        __func__, n_tokens, kvps);
         return false;
     }
 
     uint32_t n_tested = 0;
+    uint32_t head_local = cache.v_heads[stream_id];
+
     while (true) {
-        if (cache.head + n_tokens > cache.size) {
-            n_tested += cache.size - cache.head;
-            cache.head = 0;
+        if (head_local + n_tokens > kvps) {
+            n_tested  += kvps - head_local;
+            head_local = 0;
             continue;
         }
         bool found = true;
         for (uint32_t i = 0; i < n_tokens; i++) {
-            if (cache.cells[cache.head + i].pos >= 0) {
-                found = false;
-                cache.head += i + 1;
+            if (cache.cells[base + head_local + i].pos >= 0) {
+                found       = false;
+                head_local += i + 1;
                 n_tested   += i + 1;
                 break;
             }
         }
         if (found) break;
-        if (n_tested >= cache.size) return false;
+        if (n_tested >= kvps) return false;
     }
 
     for (uint32_t i = 0; i < n_tokens; i++) {
-        cache.cells[cache.head + i].pos = batch.pos[i];
+        cache.cells[base + head_local + i].pos = batch.pos[i];
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
-            cache.cells[cache.head + i].seq_id.insert(batch.seq_id[i][j]);
+            cache.cells[base + head_local + i].seq_id.insert(batch.seq_id[i][j]);
         }
     }
-    cache.used += n_tokens;
-    // Keep v_heads[0] mirror updated for any callers that read it.
-    if (cache.n_stream == 1) {
-        cache.v_heads[0] = cache.head;
-    }
+
+    cache.v_heads[stream_id] = head_local;
+    cache.head               = base + head_local;
+    cache.used              += n_tokens;
+
     return true;
 }
 
@@ -4439,21 +4539,36 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
 
-            auto noalibi_f16 = [&lctx, &hparams, n_kv, data_f16, data_swa_f16] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
+            // PHASE_NSTREAM_KV_4D N2.b: per-stream mask base. At
+            // n_stream>1 the cells[] array is logically partitioned
+            // by stream; the mask iteration `i in [first, last)`
+            // refers to stream-local indices, but cells[] is flat —
+            // so we index cells[base + i] where base = stream_id*kvps.
+            // stream_id is derived from cache.head (set by find_slot
+            // for the current decode's stream); under per-stream
+            // dispatch all queries share the same seq_id, so a single
+            // base applies to the whole mask build.
+            const uint32_t _kv_mask_kvps = lctx.transformer_kv.kv_size_per_stream;
+            const uint32_t _kv_mask_base = (lctx.transformer_kv.n_stream > 1 && _kv_mask_kvps > 0)
+                ? (lctx.transformer_kv.head / _kv_mask_kvps) * _kv_mask_kvps
+                : 0u;
+
+            auto noalibi_f16 = [&lctx, &hparams, n_kv, data_f16, data_swa_f16, _kv_mask_base] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
                 ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
                 ggml_half h_zero = ggml_fp32_to_fp16(0.f);
                 for (int i = first; i < last; ++i) {
-                    ggml_half h = !lctx.transformer_kv.cells[i].has_seq_id(seq_id) || lctx.transformer_kv.cells[i].pos > pos ? h_inf : h_zero;
+                    const llama_kv_cell & cell = lctx.transformer_kv.cells[_kv_mask_base + i];
+                    ggml_half h = !cell.has_seq_id(seq_id) || cell.pos > pos ? h_inf : h_zero;
                     if (data_f16) data_f16[j*n_kv + i] = h;
                     if (data_swa_f16) {
                         if (h != h_inf) {
                             if (hparams.n_attn_chunk) {
                                 llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                if (cell.pos < pos_chunk_start || pos < pos_chunk_start) {
                                     h = h_inf;
                                 }
                             } else {
-                                if (pos - lctx.transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                if (pos - cell.pos >= (int32_t)hparams.n_swa) {
                                     h = h_inf;
                                 }
                             }
@@ -4550,6 +4665,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             // For causal attention, use only the previous KV cells
             // of the correct sequence for each token of the batch.
             // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
+            // PHASE_NSTREAM_KV_4D N2.b: under per-stream dispatch,
+            // mask iteration is stream-local. cells[_kv_mask_base + i]
+            // indexes the current stream's cell at stream-local index i.
             for (int h = 0; h < 1; ++h) {
                 for (int j = 0; j < n_tokens; ++j) {
                     const llama_pos    pos    = batch.pos[j];
@@ -4561,12 +4679,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
 
                     for (int i = 0; i < n_kv; ++i) {
+                        const llama_kv_cell & cell = lctx.transformer_kv.cells[_kv_mask_base + i];
                         float f;
-                        if (!lctx.transformer_kv.cells[i].has_seq_id(seq_id) || lctx.transformer_kv.cells[i].pos > pos) {
+                        if (!cell.has_seq_id(seq_id) || cell.pos > pos) {
                             f = -INFINITY;
                         } else {
                             if (hparams.use_alibi) {
-                                f = -std::abs(lctx.transformer_kv.cells[i].pos - pos);
+                                f = -std::abs(cell.pos - pos);
                             } else {
                                 f = 0.0f;
                             }
@@ -4583,11 +4702,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                         if (data_swa || data_swa_f16) {
                             if (hparams.n_attn_chunk) {
                                 llama_pos pos_chunk_start = (pos / hparams.n_attn_chunk) * hparams.n_attn_chunk;
-                                if (lctx.transformer_kv.cells[i].pos < pos_chunk_start || pos < pos_chunk_start) {
+                                if (cell.pos < pos_chunk_start || pos < pos_chunk_start) {
                                     f = -INFINITY;
                                 }
                             } else {
-                                if (pos - transformer_kv.cells[i].pos >= (int32_t)hparams.n_swa) {
+                                if (pos - cell.pos >= (int32_t)hparams.n_swa) {
                                     f = -INFINITY;
                                 }
                             }
@@ -5453,8 +5572,33 @@ static int llama_decode_internal(
                 // after enough generations, the benefit from this heuristic disappears
                 // if we start defragmenting the cache, the benefit from this will be more important
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
-                auto max_cell = llama_kv_cache_cell_max(transformer_kv, pad);
-                transformer_kv.n = std::min(transformer_kv.size, std::max(pad, GGML_PAD(max_cell, pad)));
+                if (transformer_kv.n_stream > 1) {
+                    // PHASE_NSTREAM_KV_4D N2.b: scope cache.n to the
+                    // CURRENT stream's local active range. The K/V
+                    // views in llm_build_kqv read [0..n_kv) positions
+                    // at offset stream_id*nb[3] — n_kv must be
+                    // stream-local so the read stays inside the
+                    // stream's kvps-cell slice.
+                    const uint32_t kvps = transformer_kv.kv_size_per_stream;
+                    const uint32_t s    = transformer_kv.head / kvps;
+                    const uint32_t base = s * kvps;
+                    uint32_t max_local = 0;
+                    for (uint32_t i = kvps; i > 0; i -= pad) {
+                        const llama_kv_cell & c = transformer_kv.cells[base + i - 1];
+                        if (c.pos >= 0 && !c.is_empty()) {
+                            for (uint32_t j = kvps; j > i; --j) {
+                                const llama_kv_cell & cj = transformer_kv.cells[base + j - 1];
+                                if (cj.pos >= 0 && !cj.is_empty()) { max_local = j; break; }
+                            }
+                            if (max_local == 0) max_local = i;
+                            break;
+                        }
+                    }
+                    transformer_kv.n = std::min(kvps, std::max(pad, GGML_PAD(max_local, pad)));
+                } else {
+                    auto max_cell = llama_kv_cache_cell_max(transformer_kv, pad);
+                    transformer_kv.n = std::min(transformer_kv.size, std::max(pad, GGML_PAD(max_cell, pad)));
+                }
             }
         }
         if (stop_internal_decode) {

@@ -3193,32 +3193,16 @@ void server_context::context_shift() {
 }
 
 void server_context::add_sampled_tokens() {
-    // Hold decode tokens for THIS tick if any slot has a prefill pending.
-    // Without this, the v1 PP-serialisation in batch_pending_prompt
-    // (single active prefill slot per tick) ends up landing prefill
-    // tokens in the same batch as another slot's decode tokens — a
-    // mixed prefill+decode batch which triggers a downstream kernel/
-    // graph bug (slot's decode output collapses to garbage / re-emits
-    // input prompt). Pairing v1 with this decode-side gate makes every
-    // batch either pure-prefill or pure-decode. TG latency cost: decode
-    // for any active slot stalls while another slot prefills (bounded
-    // by one prefill duration). See PHASE_NSTREAM_KV.md update (e).
-    //
-    // PHASE_NSTREAM_KV_4D N3 closure note: gate kept in place. The
-    // structural removal path (per-stream dispatch in
-    // process_batch_tokens + gate removal here) requires the FULL
-    // upstream-aligned non-byte-compatible 4D K/V layout with
-    // matching graph-builder offset rewrites (~30-40 view/copy sites).
-    // The N1 fixup in this branch took a byte-compatible axis order to
-    // avoid graph-builder churn, which is incompatible with per-stream
-    // dispatch (legacy graph builders treat the cells array as flat
-    // and re-mix per-stream data on lookup). The gate continues to be
-    // load-bearing until N2's full graph builder rewrite lands.
-    for (const auto & s : slots) {
-        if (s.state == SLOT_STATE_IDLE && s.command == SLOT_COMMAND_LOAD_PROMPT) {
-            return;
-        }
-    }
+    // PHASE_NSTREAM_KV_4D N3: decode-side prefill gate REMOVED. Bug C
+    // (mixed prefill+decode producing GEMM-vs-GEMV accumulation
+    // divergence in a single mul_mat call) is now closed structurally
+    // by N2's per-stream dispatch in process_batch_tokens: each
+    // llama_decode call sees a uniform single-seq batch, and its
+    // graph build addresses only the current stream's K/V slice.
+    // No mixed shapes can reach the same mul_mat call, so the gate is
+    // no longer load-bearing. Removing it recovers v1's TG-overlap
+    // goal — a slot's decode token continues producing while another
+    // slot is mid-prefill, in their own per-stream llama_decode calls.
 
     // PHASE45 D10.b: collect MTP-eligible slots so we can issue ONE batched
     // draft forward per step instead of N sequential per-slot forwards. M=1
@@ -4624,8 +4608,31 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
-    for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
-        const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+    // PHASE_NSTREAM_KV_4D N2.d: per-stream dispatch. The assembled
+    // `batch` groups each slot's tokens contiguously (add_sampled_tokens
+    // / batch_pending_prompt walk slots in order). Never cross a
+    // primary seq_id boundary within a single llama_decode call — each
+    // llama_decode then sees a uniform single-seq batch, and the K/V
+    // graph build addresses the correct stream's slice via stream_id =
+    // batch.seq_id[0][0]. At n_seq_max==1 batches are single-seq by
+    // construction and the run-detection collapses to the legacy
+    // single-dispatch path.
+    for (int32_t i = 0; i < batch.n_tokens; /* i advances inside */) {
+        // Identify the contiguous primary-seq_id run starting at i.
+        const int run_seq_id =
+            (batch.n_seq_id && batch.seq_id &&
+             batch.n_seq_id[i] > 0 && batch.seq_id[i])
+                ? batch.seq_id[i][0] : 0;
+        int32_t run_end = i + 1;
+        while (run_end < batch.n_tokens) {
+            const int next_sid =
+                (batch.n_seq_id[run_end] > 0 && batch.seq_id[run_end])
+                    ? batch.seq_id[run_end][0] : 0;
+            if (next_sid != run_seq_id) break;
+            ++run_end;
+        }
+
+        const int32_t n_tokens = std::min(n_batch, run_end - i);
         extend_context(n_tokens);
 
         llama_batch batch_view = {
@@ -4752,9 +4759,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 }
                 break; // break loop of n_batch
             }
-            // retry with half the batch size to try to find a free slot in the KV cache
+            // retry with half the batch size to try to find a free slot in the KV cache.
+            // Per-stream dispatch (this loop) does not advance i on
+            // the continue path, so dropping `i -= n_batch` keeps the
+            // retry correct: the next iteration replays from the same
+            // start with smaller n_batch.
             n_batch /= 2;
-            i -= n_batch;
 
             LOG_WARNING("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation", {
                 {"i",   i},
@@ -4907,6 +4917,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
         // speculative decoding - main model sample and accept
         speculative_decoding_accept();
+
+        // PHASE_NSTREAM_KV_4D N2.d: advance to the next per-stream
+        // chunk. n_tokens is bounded by both n_batch and the current
+        // seq-id run's remaining length.
+        i += n_tokens;
     }
 }
 
