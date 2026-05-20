@@ -1052,12 +1052,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
         result.assign(block_size, 0);
         // anchor_pos = prompt_tgt.size() — the seq position where id_last
         // sits when fed into the target verify decode for this cycle.
+        // Capped at swa_window+block_size+16 so the drafter's K/V cache
+        // (sized to this same bound in llama_set_dflash) is not overrun
+        // and the kernel's anchor_pos validation passes. The drafter
+        // sees the MOST RECENT MAL_max target hiddens
+        // (stage_target_hiddens reads from the extract-buffer tail).
         // Route through the multi-slot entrypoint at n_slots=1 so that
         // the single-slot and multi-slot dispatch paths share regression
         // coverage (the n_slots=1 trampoline is byte-identical to the
         // legacy llama_dflash_draft).
         const llama_token   anchor_id  = id_last;
-        const int32_t       anchor_pos = (int32_t) prompt_tgt.size();
+        const int32_t       swa_window = llama_dflash_swa_window(drafter, 0);
+        const int32_t       MAL_max    = (swa_window > 0 ? swa_window : 1)
+                                              + block_size + 16;
+        const int32_t       anchor_pos = std::min<int32_t>(
+                                              (int32_t) prompt_tgt.size(), MAL_max);
         const llama_seq_id  s_id       = seq_id;
         const int32_t rc = llama_dflash_draft_batch(
                 ctx_tgt, /*n_slots*/ 1,
@@ -1565,7 +1574,18 @@ std::vector<llama_tokens> common_speculative_draft_batched(
             std::vector<llama_seq_id> seq_ids   ((size_t) N);
             for (size_t i = 0; i < N; ++i) {
                 anchor_ids[i] = inputs[i].id_last;
-                anchor_ps[i]  = (int32_t) inputs[i].prompt_tgt.size();
+                // Cap anchor_pos at swa_window+block_size+16 (the cache
+                // depth set in llama_set_dflash). The drafter consumes
+                // the MOST RECENT MAL_max target hiddens via the
+                // tail-read in stage_target_hiddens; passing the full
+                // prompt_tgt.size() would (a) overrun the kernel cache
+                // and (b) trigger the anchor_pos validation reject.
+                const int32_t swa_i = llama_dflash_swa_window(df_states[i]->drafter, 0);
+                const int32_t MAL_max_i = (swa_i > 0 ? swa_i : 1)
+                                                + df_states[i]->block_size + 16;
+                anchor_ps[i]  = std::min<int32_t>(
+                                    (int32_t) inputs[i].prompt_tgt.size(),
+                                    MAL_max_i);
                 seq_ids[i]    = df_states[i]->seq_id;
             }
             std::vector<llama_token> flat_out((size_t) N * (size_t) drafter_BS, 0);

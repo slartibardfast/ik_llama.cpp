@@ -467,12 +467,23 @@ int32_t llama_set_dflash(
         st->target_vocab_size = (int) te->ne[1];
     }
 
-    // Allocate scratch. seq_len_cap = ctx size; mal_cap = same (we may
-    // combine over the entire seen context). n_slots_cap captured from
-    // the target context's parallel-sequence cap so multi-slot dispatch
-    // (Phase 4) has room without re-allocating.
-    const int seq_len_cap = (int) ctx_tgt->cparams.n_ctx;
-    const int mal_cap     = seq_len_cap;
+    // Allocate scratch. seq_len_cap bounds the drafter's per-slot K/V
+    // cache depth AND the MAL (max anchor positions combined per cycle).
+    // Bound = swa_window + block_size + headroom: SWA layers only attend
+    // within swa_window of the current position, and the drafter writes
+    // K/V for Q = 1 + block_size query positions in cache_write_kv during
+    // forward. With MAL capped to this, the full-attention layer also
+    // operates within the same window (an explicit consequence of the
+    // cap; revisit if drafter quality at production-scale context shows
+    // measurable regression). Caller capping anchor_pos at this bound
+    // (common/speculative.cpp) prevents the validation reject at draft
+    // time; stage_target_hiddens reads from the extract-buf tail so the
+    // drafter sees the most recent MAL_max target positions.
+    const int swa_window  = std::max(1, drafter->sliding_window);
+    const int block_size  = std::max(1, drafter->block_size);
+    const int MAL_max     = swa_window + block_size + 16;
+    const int seq_len_cap = MAL_max;
+    const int mal_cap     = MAL_max;
     const int n_slots_cap = (int) std::max<uint32_t>(ctx_tgt->cparams.n_seq_max, 1u);
     if (!allocate_ctx_scratch(*st, *drafter, seq_len_cap, mal_cap, n_slots_cap)) {
         free_ctx_scratch(*st);
@@ -586,14 +597,25 @@ bool stage_target_hiddens(llama_dflash_ctx_state & st,
                          MODULE, i, il, (int) seq_id, buf.size() / (std::size_t) D_emb, mal_anchors);
             return false;
         }
+        // MAL is capped at swa_window+block_size+headroom (see seq_len_cap
+        // in llama_set_dflash). When the extract buffer has accumulated more
+        // rows than mal_anchors (e.g. after a long-prompt prefill), the
+        // drafter must see the MOST RECENT mal_anchors target hiddens, not
+        // the oldest. Read from the buffer tail and trim the head so
+        // subsequent cycles' cb_eval appends keep the window bounded.
+        const std::size_t buf_rows  = buf.size() / (std::size_t) D_emb;
+        const std::size_t row_start = (buf_rows > (std::size_t) mal_anchors)
+                                          ? (buf_rows - (std::size_t) mal_anchors)
+                                          : 0;
         for (int a = 0; a < mal_anchors; ++a) {
-            const float * row = buf.data() + (std::size_t) a * D_emb;
+            const float * row = buf.data() + (row_start + (std::size_t) a) * D_emb;
             for (int d = 0; d < D_emb; ++d) {
                 h_stage[((std::size_t) a * L_src + i) * D_emb + d] = __float2half(row[d]);
             }
         }
-        // Trim to mal_anchors rows for next cycle.
-        buf.resize((std::size_t) mal_anchors * D_emb);
+        if (row_start > 0) {
+            buf.erase(buf.begin(), buf.begin() + (std::ptrdiff_t)(row_start * D_emb));
+        }
         ctx->default_decoder.dflash_extract_n[i][seq_id] = buf.size();
     }
 
