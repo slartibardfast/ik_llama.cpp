@@ -1218,13 +1218,16 @@ static bool llama_kv_cache_init(
                 for (int is = 0; is < extra_V->n_device; ++is) {
                     auto split = extra_V->splits[is];
                     if (!split) continue;
-                    // V split row count = split->ne[1] (n_embd_v per device).
-                    // Same 4D shape as the primary V: split into per-stream
-                    // contiguous blocks via ne[3]=n_stream.
+                    // V split: factor split->ne[1] = n_embd_v per device
+                    // into (head_dim_v, n_head_kv_split) so the layout is
+                    // symmetric with the K split. Required by
+                    // build_std_attention's stream-aware K/V view path.
+                    const int64_t nh_v_split = split->ne[1] / n_embd_head_v;
+                    GGML_ASSERT(nh_v_split > 0 && (int64_t)n_embd_head_v * nh_v_split == split->ne[1]);
                     split_v_l.tensor_splits[is] = ggml_new_tensor_4d(ctx, this_type_v,
-                            split->ne[1],
+                            n_embd_head_v,
                             cache.kv_size_per_stream,
-                            1,
+                            nh_v_split,
                             cache.n_stream);
                     auto split_name = v_name + '.' + std::to_string(is);
                     ggml_set_name(split_v_l.tensor_splits[is], split_name.c_str());
