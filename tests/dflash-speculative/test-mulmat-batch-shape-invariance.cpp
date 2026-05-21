@@ -123,63 +123,113 @@ int main() {
     }
     fprintf(stderr, "[L5] quantised %d-row × %d-col weight to Q4_0\n", N_OUT, K);
 
-    // Synthesise a 2-column F32 input. We will compare row 1 of the
-    // 2-column result to row 0 of a separate 1-column result that uses
-    // the SAME column-1 vector.
-    std::vector<float> x_n2((size_t) K * 2);
+    // Synthesise an 8-column F32 input. Compare:
+    //   y_n1 = w @ x_n1 where x_n1 = column 1 of x_n8 (single col)
+    //   y_n2 col 1 = w @ x_n2 col 1 where x_n2 = first 2 cols of x_n8
+    //   y_n8 col 1 = w @ x_n8 col 1
+    // All three should produce IDENTICAL bytes at col 1 of the result
+    // if the kernel is batch-shape invariant.
+    std::vector<float> x_n8((size_t) K * 8);
     {
         std::mt19937_64 rng(0xF2ULL);
-        for (size_t i = 0; i < x_n2.size(); ++i) {
+        for (size_t i = 0; i < x_n8.size(); ++i) {
             const uint32_t r = (uint32_t)(rng() & 0xffffffffULL);
-            x_n2[i] = ((int32_t)(r & 0xffff) - 32768) / 32768.0f * 1.0f;
+            x_n8[i] = ((int32_t)(r & 0xffff) - 32768) / 32768.0f * 1.0f;
         }
     }
-    // x_n1 is just column 1 of x_n2.
-    std::vector<float> x_n1(x_n2.begin() + K, x_n2.begin() + 2 * K);
+    std::vector<float> x_n1(x_n8.begin() + K, x_n8.begin() + 2 * K);
+    std::vector<float> x_n2(x_n8.begin(),     x_n8.begin() + 2 * K);
 
-    // Run mul_mat with n_tokens=1 and n_tokens=2.
-    std::vector<float> y_n1, y_n2;
+    std::vector<float> y_n1, y_n2, y_n8;
     if (!run_mul_mat(backend, 1, w_q4_0, x_n1, y_n1)) { ggml_backend_free(backend); return 1; }
     if (!run_mul_mat(backend, 2, w_q4_0, x_n2, y_n2)) { ggml_backend_free(backend); return 1; }
+    if (!run_mul_mat(backend, 8, w_q4_0, x_n8, y_n8)) { ggml_backend_free(backend); return 1; }
     ggml_backend_free(backend);
 
-    // Compare y_n2's column 1 (size N_OUT, at offset N_OUT) to y_n1's column 0 (size N_OUT, at offset 0).
-    if ((int) y_n1.size() != N_OUT || (int) y_n2.size() != 2 * N_OUT) {
-        fprintf(stderr, "[FAIL] unexpected y sizes: y_n1=%zu y_n2=%zu\n",
-                y_n1.size(), y_n2.size());
+    if ((int) y_n1.size() != N_OUT || (int) y_n2.size() != 2 * N_OUT ||
+        (int) y_n8.size() != 8 * N_OUT) {
+        fprintf(stderr, "[FAIL] unexpected y sizes: y_n1=%zu y_n2=%zu y_n8=%zu\n",
+                y_n1.size(), y_n2.size(), y_n8.size());
         return 1;
     }
-    const float * a = y_n1.data();
-    const float * b = y_n2.data() + N_OUT;  // column 1 of n=2
-    int n_diff = 0;
-    int first_diff = -1;
-    float max_abs = 0.0f;
-    for (int i = 0; i < N_OUT; ++i) {
-        uint32_t ai, bi;
-        std::memcpy(&ai, &a[i], 4); std::memcpy(&bi, &b[i], 4);
-        if (ai != bi) {
-            if (first_diff < 0) first_diff = i;
-            ++n_diff;
-            const float d = std::abs(a[i] - b[i]);
-            if (d > max_abs) max_abs = d;
-        }
-    }
-    fprintf(stderr, "first 8 floats of y_n1: ");
-    for (int i = 0; i < 8; ++i) fprintf(stderr, " %+10.6f", a[i]);
-    fprintf(stderr, "\nfirst 8 floats of y_n2 col 1: ");
-    for (int i = 0; i < 8; ++i) fprintf(stderr, " %+10.6f", b[i]);
-    fprintf(stderr, "\n");
 
-    if (n_diff == 0) {
-        printf("[PASS] mul_mat(Q4_0 weight) is byte-shape-invariant: y_n1 == y_n2 col 1, "
-               "%d fp32 floats byte-identical. The L4 layer 0 divergence is NOT caused "
-               "by the q4_0 mul_mat kernel.\n", N_OUT);
+    auto count_diffs = [](const float * a, const float * b, int n, int & first_diff, float & max_abs) {
+        int n_diff = 0;
+        first_diff = -1;
+        max_abs = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            uint32_t ai, bi;
+            std::memcpy(&ai, &a[i], 4); std::memcpy(&bi, &b[i], 4);
+            if (ai != bi) {
+                if (first_diff < 0) first_diff = i;
+                ++n_diff;
+                const float d = std::abs(a[i] - b[i]);
+                if (d > max_abs) max_abs = d;
+            }
+        }
+        return n_diff;
+    };
+
+    // Run y_n1' = w @ col_0_of_x_n8 separately to test the existing
+    // FATTN_SHAPE_INVARIANT claim of "row-0 (= col-0) invariance".
+    std::vector<float> x_n1_c0(x_n8.begin(), x_n8.begin() + K);
+
+    int first_diff_ab, first_diff_ac, first_diff_bc;
+    float max_abs_ab, max_abs_ac, max_abs_bc;
+
+    // col 1 comparison (path A's input).
+    const float * a = y_n1.data();
+    const float * b = y_n2.data() + N_OUT;       // col 1 of n=2
+    const float * c = y_n8.data() + N_OUT;       // col 1 of n=8
+    const int diff_ab = count_diffs(a, b, N_OUT, first_diff_ab, max_abs_ab);
+    const int diff_ac = count_diffs(a, c, N_OUT, first_diff_ac, max_abs_ac);
+    const int diff_bc = count_diffs(b, c, N_OUT, first_diff_bc, max_abs_bc);
+    fprintf(stderr, "y_n1(col1) vs y_n2 col 1: diff=%d/%d max|Δ|=%.3e\n",
+            diff_ab, N_OUT, max_abs_ab);
+    fprintf(stderr, "y_n1(col1) vs y_n8 col 1: diff=%d/%d max|Δ|=%.3e\n",
+            diff_ac, N_OUT, max_abs_ac);
+    fprintf(stderr, "y_n2 col 1 vs y_n8 col 1: diff=%d/%d max|Δ|=%.3e\n",
+            diff_bc, N_OUT, max_abs_bc);
+
+    // col 0 comparison — the FATTN_SHAPE_INVARIANT-guaranteed case.
+    std::vector<float> y_n1_c0;
+    {
+        ggml_backend_t backend2 = ggml_backend_cuda_init(0, nullptr);
+        run_mul_mat(backend2, 1, w_q4_0, x_n1_c0, y_n1_c0);
+        ggml_backend_free(backend2);
+    }
+    const float * d = y_n1_c0.data();
+    const float * e = y_n2.data();       // col 0 of n=2
+    const float * f = y_n8.data();       // col 0 of n=8
+    int first_diff_de, first_diff_df, first_diff_ef;
+    float max_abs_de, max_abs_df, max_abs_ef;
+    const int diff_de = count_diffs(d, e, N_OUT, first_diff_de, max_abs_de);
+    const int diff_df = count_diffs(d, f, N_OUT, first_diff_df, max_abs_df);
+    const int diff_ef = count_diffs(e, f, N_OUT, first_diff_ef, max_abs_ef);
+    fprintf(stderr, "y_n1(col0) vs y_n2 col 0: diff=%d/%d max|Δ|=%.3e\n",
+            diff_de, N_OUT, max_abs_de);
+    fprintf(stderr, "y_n1(col0) vs y_n8 col 0: diff=%d/%d max|Δ|=%.3e\n",
+            diff_df, N_OUT, max_abs_df);
+    fprintf(stderr, "y_n2 col 0 vs y_n8 col 0: diff=%d/%d max|Δ|=%.3e\n",
+            diff_ef, N_OUT, max_abs_ef);
+
+    const bool col0_invariant = (diff_de == 0 && diff_df == 0 && diff_ef == 0);
+    const bool col1_invariant = (diff_ab == 0 && diff_ac == 0 && diff_bc == 0);
+
+    if (col0_invariant && col1_invariant) {
+        printf("[PASS] mul_mat(Q4_0) fully batch-shape-invariant across all columns.\n");
         return 0;
     }
-    printf("[FAIL] mul_mat(Q4_0 weight) DIFFERS between n_tokens=1 and n_tokens=2 col 1: "
-           "%d/%d floats differ (max |Δ|=%.3e, first diff at idx %d: %+.6f vs %+.6f). "
-           "MMQ kernel introduces batch-shape variance — this is the L4 layer 0 root "
-           "cause.\n",
-           n_diff, N_OUT, max_abs, first_diff, a[first_diff], b[first_diff]);
+    if (col0_invariant && !col1_invariant) {
+        printf("[FAIL-COL1] mul_mat(Q4_0) is shape-invariant ONLY at column 0 (the "
+               "existing FATTN_SHAPE_INVARIANT guarantee). Columns > 0 diverge — this "
+               "explains why NPC concurrent-multi-slot-single-token passes but "
+               "single-slot-multi-token does NOT. The verify-batch decoder needs "
+               "ALL columns invariant.\n");
+        return 1;
+    }
+    printf("[FAIL] mul_mat(Q4_0) batch-shape-variant at multiple columns. "
+           "col1: diff_ab=%d diff_bc=%d. col0: diff_de=%d diff_ef=%d.\n",
+           diff_ab, diff_bc, diff_de, diff_ef);
     return 1;
 }
