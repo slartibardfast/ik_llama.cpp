@@ -76,7 +76,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         const uint32_t n_head_log2,
         const int ne00, const int ne01, const int ne02, const int ne03,
         const int ne10, const int ne11, const int ne12, const int ne13,
-        const int ne31, const int nb31,
+        const int ne31, const int nb31, const int nb33,
         const int nb01, const int nb02, const int nb03,
         const int nb11, const int nb12, const int nb13,
         const int nb21, const int nb22, const int nb23,
@@ -97,7 +97,11 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
 
     // Q row pointer (F32 input).
     const float * Q_f = (const float *) (Q + nb03*seq + nb02*head + nb01*tok);
-    const half  * maskh = (const half  *) (mask + nb31*tok);  // [ne11] per token
+    // PHASE_NSTREAM_KV_PERF Tier 3: mask is 4D [n_kv, n_tok_per_seq, 1, n_seq].
+    // At ne[3]=1 (Tier 2 and prior) seq=0 and nb33*0=0 so this matches the
+    // legacy per-seq mask addressing. At ne[3]>1 (Tier 3 unified dispatch)
+    // each seq's mask block lives at offset nb33*seq.
+    const half  * maskh = (const half  *) (mask + nb33*seq + nb31*tok);
     const float  slope  = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
     // PHASE_NSTREAM_KV_PERF Tier 2: resolve K and V pointers through
@@ -437,7 +441,7 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
             scale, max_bias, m0, m1, softcap, n_head_log2,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            (int)mask->ne[1], (int)mask->nb[1],
+            (int)mask->ne[1], (int)mask->nb[1], (int)mask->nb[3],
             (int)Q->nb[1], (int)Q->nb[2], (int)Q->nb[3],
             (int)K->nb[1], (int)K->nb[2], (int)K->nb[3],
             (int)V->nb[1], (int)V->nb[2], (int)V->nb[3],
