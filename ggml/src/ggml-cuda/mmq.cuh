@@ -4983,7 +4983,33 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     constexpr int  nwarps_i8          = 2;   // mmq_y_i8 / mma_C::I = 16/8 = 2
     constexpr int  min_blocks_per_sm_i8 = 16; // launch_bounds bid (HW caps by shmem)
     constexpr bool i8_type_supported  = (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_0_AR16);
-    constexpr bool i8_shape_supported = (mmq_x <= 16);
+    // 2026-05-21: I=8 path DISABLED for batch-shape invariance.
+    //
+    // The I=8 split-K kernel (mul_mat_q_split_k_i8 with mma_int_C_I8J8
+    // fragment) is byte-shape-invariant for OUTPUT column 0 only —
+    // verified by the original NPC-byte-identity tests that compared
+    // dst col 0 across NP={1,2,4,8} concurrent multi-slot single-token
+    // dispatches. Columns >= 1 in a multi-token same-slot batch produce
+    // different fp32 bits than the same input vector would produce as
+    // col 0 of a single-token dispatch, with max |Δ| ≈ 0.36 at
+    // production K=5120, N=8192. The variance arises from the per-warp
+    // FMA accumulator ordering for off-diagonal cells in the
+    // mma_int_C_I8J8 fragment.
+    //
+    // Without this disable, DFlash CLI verify-batches (n_tokens=5 same
+    // slot) and any other same-slot multi-token decode produce
+    // argmaxes that diverge from autoregressive 1-token-at-a-time
+    // decode at the same effective context, drifting through 60+
+    // transformer layers into incoherent output. See L3', L4, L5
+    // regression tests in tests/dflash-speculative/ and
+    // PHASE_NSTREAM_KV_PERF.md "P0.A.3 L4 / L5 result".
+    //
+    // The regular MMQ path (without I=8) is fully batch-shape
+    // invariant across all output columns; falling back to it costs
+    // some decode TG perf on TU102 but restores correctness for
+    // speculative-decoding verify batches. Re-enabling I=8 requires
+    // fixing the col-j>0 FMA reduction to match col-0's order.
+    constexpr bool i8_shape_supported = false;
     const bool use_split_k_i8 = use_split_k
         && i8_type_supported
         && i8_shape_supported
