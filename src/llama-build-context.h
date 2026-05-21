@@ -74,6 +74,21 @@ struct llm_build_context {
     const int32_t kv_head;  // index of where we store new KV data in the cache
     const int32_t n_ctx_orig;
 
+    // PHASE_NSTREAM_KV_PERF T3.3 unified-stream build state.
+    //   is_multi_seq_n_stream — true when n_stream > 1 AND this batch has
+    //     tokens with multiple distinct primary seq_ids
+    //     (contiguous-per-seq per OpenQ-A resolution + split_equal).
+    //   n_seq_in_batch       — distinct primary-seq count; 1 in legacy path.
+    //   n_tok_per_seq        — n_tokens / n_seq_in_batch; equals n_tokens
+    //     in the legacy path.
+    // The K/V/mask/Q build paths route to a 4D layout
+    //   [head_dim, n_kv, n_head_kv, n_seq_in_batch]
+    // when is_multi_seq_n_stream is true; otherwise the legacy 3D
+    // per-stream-offset path runs unchanged.
+    const bool    is_multi_seq_n_stream;
+    const int32_t n_seq_in_batch;
+    const int32_t n_tok_per_seq;
+
     const bool flash_attn;
     const int  mla_attn;
     const int  attn_max_batch;
@@ -326,7 +341,11 @@ struct llm_build_context {
          int32_t   kv_head,
          const llm_build_cb & cb, int64_t il);
 
-    static struct ggml_tensor * llm_build_kv(ggml_context * ctx, llama_context & lctx,
+    // PHASE_NSTREAM_KV_PERF T3.3: instance method (was static) so it
+    // can route to the unified-stream 4D K/V/Q build under
+    // is_multi_seq_n_stream. Graph builders call it from member-
+    // function contexts so the implicit `this->` works unchanged.
+    struct ggml_tensor * llm_build_kv(ggml_context * ctx, llama_context & lctx,
        const llama_kv_cache & kv,
          ggml_cgraph * graph,
          ggml_tensor * wo,

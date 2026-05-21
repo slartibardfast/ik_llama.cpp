@@ -27,6 +27,42 @@ uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv
     return n_slots;
 }
 
+namespace {
+// PHASE_NSTREAM_KV_PERF T3.3: scan a batch for contiguous-per-seq runs and
+// derive (is_multi_seq, n_seq, n_tok_per_seq). Token order is locked
+// contiguous-per-seq per OpenQ-A (split_equal semantics). The caller
+// guarantees uniform n_tok_per_seq across runs (split_equal upstream).
+struct multi_seq_probe {
+    bool    is_multi = false;
+    int32_t n_seq    = 1;
+    int32_t n_tok_per_seq;
+};
+multi_seq_probe probe_multi_seq(const llama_batch & batch,
+                                const llama_kv_cache & kv) {
+    multi_seq_probe p;
+    p.n_tok_per_seq = batch.n_tokens;
+    if (kv.n_stream <= 1 || batch.n_tokens <= 0 || !batch.n_seq_id || !batch.seq_id) {
+        return p;
+    }
+    if (batch.n_seq_id[0] <= 0 || !batch.seq_id[0]) {
+        return p;
+    }
+    llama_seq_id last_sid = batch.seq_id[0][0];
+    int32_t n_seq = 1;
+    for (int32_t i = 1; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] <= 0 || !batch.seq_id[i]) continue;
+        const llama_seq_id sid = batch.seq_id[i][0];
+        if (sid != last_sid) { ++n_seq; last_sid = sid; }
+    }
+    p.n_seq = n_seq;
+    p.is_multi = n_seq > 1;
+    if (p.is_multi) {
+        p.n_tok_per_seq = batch.n_tokens / n_seq;
+    }
+    return p;
+}
+} // namespace
+
 llm_build_context::llm_build_context(
         llama_context  & lctx,
     const llama_batch  & batch,
@@ -73,6 +109,9 @@ llm_build_context::llm_build_context(
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
+        is_multi_seq_n_stream(probe_multi_seq(batch, lctx.transformer_kv).is_multi),
+        n_seq_in_batch   (probe_multi_seq(batch, lctx.transformer_kv).n_seq),
+        n_tok_per_seq    (probe_multi_seq(batch, lctx.transformer_kv).n_tok_per_seq),
         flash_attn       (cparams.flash_attn),
         mla_attn         (cparams.mla_attn),
         attn_max_batch   (cparams.attn_max_batch),
@@ -382,7 +421,19 @@ ggml_tensor * llm_build_context::build_inp_out_ids() {
 
 ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
     if (causal && flash_attn) {
-        lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        if (is_multi_seq_n_stream) {
+            // PHASE_NSTREAM_KV_PERF T3.3: 4D mask for unified-stream FA.
+            // Shape [n_kv, n_tok_per_seq, 1, n_seq_in_batch] is consumed
+            // by the PSKV kernel via mask + nb33*seq + nb31*tok (T3.1
+            // nb33 mask addressing). At n_seq_in_batch=1 collapses to
+            // legacy 2D byte-identically.
+            lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_4d(
+                ctx0, GGML_TYPE_F16,
+                n_kv, GGML_PAD(n_tok_per_seq, GGML_KQ_MASK_PAD),
+                1, n_seq_in_batch);
+        } else {
+            lctx.default_decoder.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        }
         cb(lctx.default_decoder.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.default_decoder.inp_KQ_mask);
         return lctx.default_decoder.inp_KQ_mask;
@@ -1611,7 +1662,14 @@ static ggml_tensor * llm_build_kqv(
                     float     kq_scale,
          const llm_build_cb & cb,
                     int       il,
-                ggml_tensor * sinks = nullptr, int n_swa = 0) {
+                ggml_tensor * sinks = nullptr, int n_swa = 0,
+                // PHASE_NSTREAM_KV_PERF T3.3 unified-stream build state.
+                // is_multi_seq && kv.n_stream>1 selects the 4D K/V/Q +
+                // ne[3]=n_seq_in_batch PSKV dispatch; otherwise the
+                // legacy 3D per-stream-offset path runs unchanged.
+                bool      is_multi_seq    = false,
+                int32_t   n_seq_in_batch  = 1,
+                int32_t   n_tok_per_seq_in = 0) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -1624,7 +1682,23 @@ static ggml_tensor * llm_build_kqv(
     const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
     const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
 
-    struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
+    // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream dispatch the
+    // multi-seq build reshapes q_cur into a 4D Q
+    //   [head_dim, n_head, n_tok_per_seq, n_seq_in_batch]
+    // then permutes to PSKV's expected layout
+    //   [head_dim, n_tok_per_seq, n_head, n_seq_in_batch].
+    // Single-seq path is byte-identical to HEAD.
+    struct ggml_tensor * q;
+    if (is_multi_seq && kv.n_stream > 1) {
+        GGML_ASSERT(n_tok_per_seq_in > 0 && "T3.3: missing n_tok_per_seq");
+        GGML_ASSERT(n_tok_per_seq_in * n_seq_in_batch == n_tokens &&
+                    "T3.3: contiguous-per-seq batch must have uniform shape");
+        auto q_4d = ggml_reshape_4d(ctx, q_cur, n_embd_head_k, n_head,
+                                    n_tok_per_seq_in, n_seq_in_batch);
+        q = ggml_permute(ctx, q_4d, 0, 2, 1, 3);
+    } else {
+        q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
+    }
     cb(q, "q", il);
 
     auto k_cache = lctx.model.hparams.has_kv(il) ? kv.k_l[il]
@@ -1649,18 +1723,32 @@ static ggml_tensor * llm_build_kqv(
     // n_stream > 1 the can_reuse_graph bailout forces a fresh graph
     // build per decode, so the per-call stream offset is correct by
     // construction.
+    //
+    // PHASE_NSTREAM_KV_PERF T3.3: when is_multi_seq is on, the K/V
+    // views become 4D over the whole [..., n_stream] span — no
+    // per-stream offset, ne[3]=n_seq_in_batch ≤ kv.n_stream. PSKV
+    // (T3.1 nb33 mask addressing) dispatches per (tok, head, seq).
     const uint32_t kqv_kvps = kv.kv_size_per_stream;
     uint32_t kqv_stream_id = 0;
     if (kqv_kvps > 0 && kv.n_stream > 1) {
         kqv_stream_id = (uint32_t)(kv.head / kqv_kvps);
     }
 
-    struct ggml_tensor * k =
-        ggml_view_3d(ctx, k_cache,
+    struct ggml_tensor * k;
+    if (is_multi_seq && kv.n_stream > 1) {
+        GGML_ASSERT((int)kv.n_stream == n_seq_in_batch &&
+                    "T3.3: expect n_seq_in_batch == kv.n_stream "
+                    "(split_equal yields one stream per active slot)");
+        k = ggml_view_4d(ctx, k_cache,
+                n_embd_head_k, n_kv, n_head_kv, kv.n_stream,
+                k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], 0);
+    } else {
+        k = ggml_view_3d(ctx, k_cache,
                 n_embd_head_k, n_kv, n_head_kv,
                 k_cache->nb[1],  // position stride within stream
                 k_cache->nb[2],  // head stride within stream
                 (size_t)kqv_stream_id * k_cache->nb[3]);
+    }
     cb(k, "k", il);
 
 #ifdef GGML_USE_VULKAN
@@ -1691,12 +1779,19 @@ static ggml_tensor * llm_build_kqv(
         // Same stride pattern as the K view above — parent's nb[1]
         // steps token-by-token within stream, parent's nb[2] steps
         // head-by-head, offset = stream_id * parent's nb[3].
-        struct ggml_tensor * v =
-            ggml_view_3d(ctx, v_cache,
+        // T3.3: under multi-seq, V also widens to 4D ne[3]=n_stream.
+        struct ggml_tensor * v;
+        if (is_multi_seq && kv.n_stream > 1) {
+            v = ggml_view_4d(ctx, v_cache,
+                    n_embd_head_v, n_kv, n_head_kv, kv.n_stream,
+                    v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], 0);
+        } else {
+            v = ggml_view_3d(ctx, v_cache,
                     n_embd_head_v, n_kv, n_head_kv,
                     v_cache->nb[1],
                     v_cache->nb[2],
                     (size_t)kqv_stream_id * v_cache->nb[3]);
+        }
         cb(v, "v", il);
 
         // NPC.4 fix: route to the per-slot-kv FA variant on the single-device
@@ -1929,7 +2024,8 @@ ggml_tensor * llm_build_context::llm_build_kv(
         llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
     }
 
-    auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks, n_swa);
+    auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks, n_swa,
+            is_multi_seq_n_stream, n_seq_in_batch, n_tok_per_seq);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -2838,7 +2934,21 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
                 ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
 
-                auto q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream
+                // dispatch, Q reshapes to 4D
+                //   [head_dim, n_head, n_tok_per_seq, n_seq_in_batch]
+                // then permutes to PSKV layout
+                //   [head_dim, n_tok_per_seq, n_head, n_seq_in_batch].
+                ggml_tensor * q;
+                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
+                    GGML_ASSERT(n_tok_per_seq > 0);
+                    GGML_ASSERT(n_tok_per_seq * n_seq_in_batch == n_tokens);
+                    auto q_4d = ggml_reshape_4d(ctx0, Qcur,
+                            n_embd_head_k, n_head, n_tok_per_seq, n_seq_in_batch);
+                    q = ggml_permute(ctx0, q_4d, 0, 2, 1, 3);
+                } else {
+                    q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                }
                 cb(q, "q", il_cb);
 
                 // Stream-aware K/V READ views for attention compute.
@@ -2847,18 +2957,33 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 // The per-stream offset is encoded at build time; the
                 // n_stream > 1 can_reuse_graph bailout forces a fresh
                 // build per decode so the offset is correct by call.
-                auto k = ggml_view_3d(ctx0, split_kl,
+                //
+                // T3.3 multi-seq: K and V widen to 4D over the full
+                // ne[3]=n_stream span — no per-stream offset, PSKV's
+                // ne[3]>1 dispatch picks each (tok, head, seq).
+                ggml_tensor * k;
+                ggml_tensor * v;
+                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
+                    GGML_ASSERT((int)kv_self.n_stream == n_seq_in_batch);
+                    k = ggml_view_4d(ctx0, split_kl,
+                            n_embd_head_k, n_kv, n_head_kv, kv_self.n_stream,
+                            split_kl->nb[1], split_kl->nb[2], split_kl->nb[3], 0);
+                    v = ggml_view_4d(ctx0, split_vl,
+                            n_embd_head_v, n_kv, n_head_kv, kv_self.n_stream,
+                            split_vl->nb[1], split_vl->nb[2], split_vl->nb[3], 0);
+                } else {
+                    k = ggml_view_3d(ctx0, split_kl,
                             n_embd_head_k, n_kv, n_head_kv,
                             split_kl->nb[1],  // position stride within stream
                             split_kl->nb[2],  // head stride within stream
                             (size_t)_ms_stream_id * split_kl->nb[3]);
-                cb(k, "k", il_cb);
-
-                auto v = ggml_view_3d(ctx0, split_vl,
+                    v = ggml_view_3d(ctx0, split_vl,
                             n_embd_head_v, n_kv, n_head_kv,
                             split_vl->nb[1],
                             split_vl->nb[2],
                             (size_t)_ms_stream_id * split_vl->nb[3]);
+                }
+                cb(k, "k", il_cb);
                 cb(v, "v", il_cb);
 
                 // Route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV at the
