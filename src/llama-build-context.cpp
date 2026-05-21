@@ -1673,9 +1673,11 @@ static ggml_tensor * llm_build_kqv(
                 (size_t)kqv_stream_id * k_cache->nb[3]);
     cb(k, "k", il);
     // Register K read view for per-tick patching. Indexed
-    // 2*il + 0 in the non-split layout.
+    // 2*il + 0 in the non-split layout. The op_params slot binds the
+    // view to the cuda-backend indirection table at the same index.
     if (2*il + 1 < (int)lctx.cache_read_views.size()) {
         lctx.cache_read_views[2*il + 0].view = k;
+        ggml_set_read_view_indirect_slot(k, 2*il + 0);
     }
 
 #ifdef GGML_USE_VULKAN
@@ -1720,6 +1722,7 @@ static ggml_tensor * llm_build_kqv(
         // Register V read view for per-tick patching.
         if (2*il + 1 < (int)lctx.cache_read_views.size()) {
             lctx.cache_read_views[2*il + 1].view = v;
+            ggml_set_read_view_indirect_slot(v, 2*il + 1);
         }
 
         // NPC.4 fix: route to the per-slot-kv FA variant on the single-device
@@ -1746,6 +1749,11 @@ static ggml_tensor * llm_build_kqv(
                     kq_scale, hparams.f_max_alibi_bias,
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "fa", il);
+            // PHASE_NSTREAM_KV_PERF Tier 2: bind K/V indirection slots
+            // on the FA op (see split-path equivalent for rationale).
+            if (2*il + 1 < (int)lctx.cache_read_views.size()) {
+                ggml_set_fa_indirect_slots(cur, 2*il + 0, 2*il + 1);
+            }
             // PSKV op does not take sinks (predicate requires sinks==nullptr).
         } else {
             cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
@@ -2880,6 +2888,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cb(k, "k", il_cb);
                 if (idx + 1 < (int)lctx.cache_read_views.size()) {
                     lctx.cache_read_views[idx + 0].view = k;
+                    ggml_set_read_view_indirect_slot(k, idx + 0);
                 }
 
                 auto v = ggml_view_3d(ctx0, split_vl,
@@ -2890,6 +2899,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cb(v, "v", il_cb);
                 if (idx + 1 < (int)lctx.cache_read_views.size()) {
                     lctx.cache_read_views[idx + 1].view = v;
+                    ggml_set_read_view_indirect_slot(v, idx + 1);
                 }
 
                 // Route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV at the
@@ -2930,6 +2940,14 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                             KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
                     cb(cur, "flash_attn_per_slot_kv", il_cb);
+                    // PHASE_NSTREAM_KV_PERF Tier 2: bind K/V indirection
+                    // slots on the FA op itself. ggml-backend-sched may copy
+                    // VIEW tensors across subgraph boundaries (losing
+                    // op_params on K/V views) but does NOT copy FA op
+                    // tensors — making the FA op the load-bearing carrier.
+                    if (idx + 1 < (int)lctx.cache_read_views.size()) {
+                        ggml_set_fa_indirect_slots(cur, idx + 0, idx + 1);
+                    }
                 } else {
                     cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

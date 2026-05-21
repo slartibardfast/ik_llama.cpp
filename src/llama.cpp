@@ -607,32 +607,17 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    // PHASE_NSTREAM_KV_PERF Tier 2 [INSUFFICIENT — see investigation
-    // 2026-05-21]. The n_stream > 1 bailout is RESTORED. Read-view
-    // registration in llm_build_kqv + the patch loop in
-    // update_cache_copies are kept as a benign no-op (no functional
-    // effect when bailout is active); they document the contract from
-    // specs/kv-cache/per_stream_read_view_patching.allium.
-    //
-    // Empirical finding: simply patching view->data is insufficient to
-    // unlock cross-stream graph reuse. The WRITE-side cache_copies
-    // patching works because ggml-cuda.cu uses a cpy_dest_ptrs
-    // indirection table (check_node_graph_compatibility_and_refresh_-
-    // copy_ops:4647-4666 + ggml_cuda_cpy_dest_ptrs_copy) — the CPY
-    // kernel reads its dest pointer through this table at execution,
-    // not from a captured kernel arg. The READ side has no equivalent
-    // indirection: FA / per-slot-kv / mul_mat kernels read view->data
-    // as a direct kernel arg, captured at graph capture time. The
-    // address tolerance at ggml-cuda.cu:4690 means
-    // is_cuda_graph_update_required returns "no update" for a VIEW
-    // data change → cudaGraphExecUpdate never fires → kernel arg
-    // stays stale.
-    //
-    // Tier 2 design needs to extend the indirection mechanism to read
-    // views (e.g. a read_view_src_ptrs table parallel to
-    // cpy_dest_ptrs) and modify FA / mul_mat to dereference through
-    // it. Tracked as a structural reshape — see investigation log in
-    // PHASE_NSTREAM_KV_PERF.md.
+    // PHASE_NSTREAM_KV_PERF Tier 2 [WIP — bailout RESTORED]. The
+    // indirection mechanism is in place (PSKV kernel takes
+    // src_ptr_table + K_slot/V_slot; ggml-cuda hook populates the
+    // GPU table per tick from FA op's src[1]/src[2] data) but does
+    // not produce byte-identical output across cross-stream graph
+    // reuse. Empirically NP={2,4,8} multi-GPU diverge with sensible-
+    // but-wrong tokens. Same divergent text across all indirection
+    // attempts → suggests the kernel argument capture path may not
+    // be reaching the kernel as expected, or there's another
+    // op-level read of K/V cache that bypasses the indirection.
+    // Holding for further investigation.
     if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached

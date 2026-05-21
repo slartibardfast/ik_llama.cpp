@@ -10,6 +10,13 @@ void* ggml_cuda_cpy_fn(const ggml_tensor * src0, ggml_tensor * src1);
 
 void ggml_cuda_cpy_dest_ptrs_copy(ggml_cuda_graph * cuda_graph, char ** host_dest_ptrs, const int host_dest_ptrs_size, cudaStream_t stream);
 
+// PHASE_NSTREAM_KV_PERF Tier 2: read-view source-pointer indirection
+// refresh. See cpy.cu for full contract.
+void ggml_cuda_read_view_src_ptrs_copy(ggml_cuda_graph * cuda_graph,
+                                       void ** host_src_ptrs,
+                                       const int host_src_ptrs_size,
+                                       cudaStream_t stream);
+
 bool ggml_cuda_cpy_2(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst1, ggml_tensor * dst2, bool disable_indirection = false);
 

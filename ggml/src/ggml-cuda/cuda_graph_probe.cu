@@ -399,6 +399,14 @@ ggml_cuda_graph::~ggml_cuda_graph() {
     if (graph != nullptr) {
         CUDA_CHECK(cudaGraphDestroy(graph));
     }
+    // PHASE_NSTREAM_KV_PERF Tier 2: free the read-view indirection
+    // table. (The existing dest_ptrs_d allocation has its own
+    // realloc-on-grow path in cpy.cu but no destructor cleanup; we
+    // do not touch that here per §3 surgical-changes.)
+    if (read_view_src_ptrs_d != nullptr) {
+        CUDA_CHECK(cudaFree(read_view_src_ptrs_d));
+        read_view_src_ptrs_d = nullptr;
+    }
     if (sample) {
         size_t f = 0, t = 0;
         cudaDeviceSynchronize();

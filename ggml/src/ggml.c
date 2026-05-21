@@ -6016,6 +6016,45 @@ struct ggml_tensor * ggml_format_name(struct ggml_tensor * tensor, const char * 
     return tensor;
 }
 
+// PHASE_NSTREAM_KV_PERF Tier 2: read-view indirection slot accessor.
+// Stored at op_params[GGML_MAX_OP_PARAMS/sizeof(int32_t) - 1] (the last
+// int32 of op_params) as (slot + 1) to use 0 as the "unset" sentinel.
+// See ggml.h for the contract.
+#define GGML_READ_VIEW_INDIRECT_SLOT_IDX (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
+
+void ggml_set_read_view_indirect_slot(struct ggml_tensor * tensor, int32_t slot) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(slot >= 0);
+    ((int32_t *)(tensor->op_params))[GGML_READ_VIEW_INDIRECT_SLOT_IDX] = slot + 1;
+}
+
+int32_t ggml_get_read_view_indirect_slot(const struct ggml_tensor * tensor) {
+    if (tensor == NULL) return -1;
+    const int32_t stored = ((const int32_t *)(tensor->op_params))[GGML_READ_VIEW_INDIRECT_SLOT_IDX];
+    return stored - 1;  // 0 (unset) -> -1; (slot+1) -> slot
+}
+
+// FA op slots are at op_params[14] = K_slot+1 and op_params[15] = V_slot+1.
+#define GGML_FA_K_INDIRECT_SLOT_IDX (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2)
+#define GGML_FA_V_INDIRECT_SLOT_IDX (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
+
+void ggml_set_fa_indirect_slots(struct ggml_tensor * fa_op, int32_t K_slot, int32_t V_slot) {
+    GGML_ASSERT(fa_op != NULL);
+    GGML_ASSERT(K_slot >= 0 && V_slot >= 0);
+    ((int32_t *)(fa_op->op_params))[GGML_FA_K_INDIRECT_SLOT_IDX] = K_slot + 1;
+    ((int32_t *)(fa_op->op_params))[GGML_FA_V_INDIRECT_SLOT_IDX] = V_slot + 1;
+}
+
+int32_t ggml_get_fa_K_indirect_slot(const struct ggml_tensor * fa_op) {
+    if (fa_op == NULL) return -1;
+    return ((const int32_t *)(fa_op->op_params))[GGML_FA_K_INDIRECT_SLOT_IDX] - 1;
+}
+
+int32_t ggml_get_fa_V_indirect_slot(const struct ggml_tensor * fa_op) {
+    if (fa_op == NULL) return -1;
+    return ((const int32_t *)(fa_op->op_params))[GGML_FA_V_INDIRECT_SLOT_IDX] - 1;
+}
+
 static inline void ggml_format_name_fast(const char * name, const char * suffix, int suffix_len, char * new_name) {
     int j = 0;
     for (; j < GGML_MAX_NAME-1; ++j) {
