@@ -4669,22 +4669,72 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             // by stream; the mask iteration `i in [first, last)`
             // refers to stream-local indices, but cells[] is flat —
             // so we index cells[base + i] where base = stream_id*kvps.
-            // stream_id is derived from cache.head (set by find_slot
-            // for the current decode's stream); under per-stream
-            // dispatch all queries share the same seq_id, so a single
-            // base applies to the whole mask build.
+            //
+            // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream dispatch
+            // (multi-seq + n_stream>1) each query row's base depends
+            // on its primary seq_id. The mask is 4D
+            //   [n_kv, pad(n_tok_per_seq), 1, n_seq_in_batch]
+            // and offset = seq * (n_kv*pad_tps) + tok_in_seq * n_kv.
+            // Single-seq path keeps the legacy 2D shape and offset.
             const uint32_t _kv_mask_kvps = lctx.transformer_kv.kv_size_per_stream;
             const uint32_t _kv_mask_base = (lctx.transformer_kv.n_stream > 1 && _kv_mask_kvps > 0)
                 ? (lctx.transformer_kv.head / _kv_mask_kvps) * _kv_mask_kvps
                 : 0u;
 
-            auto noalibi_f16 = [&lctx, &hparams, n_kv, data_f16, data_swa_f16, _kv_mask_base] (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
+            // T3.3 multi-seq probe (mirror of probe_multi_seq in
+            // llama-build-context.cpp).
+            bool         _kv_mask_multi_seq = false;
+            int32_t      _kv_mask_n_seq     = 1;
+            int32_t      _kv_mask_n_tps     = (int32_t)n_tokens;
+            if (lctx.transformer_kv.n_stream > 1 && _kv_mask_kvps > 0 &&
+                batch.n_seq_id && batch.seq_id && n_tokens > 0 &&
+                batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
+                llama_seq_id last = batch.seq_id[0][0];
+                int32_t seqs = 1;
+                for (int64_t i = 1; i < n_tokens; ++i) {
+                    if (batch.n_seq_id[i] <= 0 || !batch.seq_id[i]) continue;
+                    if (batch.seq_id[i][0] != last) { ++seqs; last = batch.seq_id[i][0]; }
+                }
+                _kv_mask_n_seq = seqs;
+                if (seqs > 1) {
+                    _kv_mask_multi_seq = true;
+                    _kv_mask_n_tps = (int32_t)n_tokens / seqs;
+                }
+            }
+            const int64_t _kv_mask_pad_tps = GGML_PAD(_kv_mask_n_tps, GGML_KQ_MASK_PAD);
+
+            // T3.3 mask fill currently routes multi-seq writes only
+            // through the FA-no-ALiBi-no-SWA path (noalibi_f16). If the
+            // model uses ALiBi we'd need to widen the ALiBi inner loops
+            // to 4D offsets, which is out of scope. Production models
+            // (Qwen 3.5/3.6) have ALiBi off.
+            GGML_ASSERT((!_kv_mask_multi_seq || (!hparams.use_alibi && cparams.flash_attn)) &&
+                        "T3.3 multi-seq mask fill requires FA-on and ALiBi-off");
+
+            auto noalibi_f16 = [&lctx, &hparams, n_kv, data_f16, data_swa_f16,
+                                _kv_mask_base, _kv_mask_kvps,
+                                _kv_mask_multi_seq, _kv_mask_n_tps, _kv_mask_pad_tps]
+                               (int j, llama_pos pos, llama_seq_id seq_id, int first, int last) {
                 ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
                 ggml_half h_zero = ggml_fp32_to_fp16(0.f);
+
+                uint32_t cells_base;
+                int64_t  row_off;
+                if (_kv_mask_multi_seq) {
+                    const int seq_idx    = j / _kv_mask_n_tps;
+                    const int tok_in_seq = j % _kv_mask_n_tps;
+                    cells_base = (uint32_t)seq_idx * _kv_mask_kvps;
+                    row_off    = (int64_t)seq_idx * _kv_mask_pad_tps * n_kv +
+                                 (int64_t)tok_in_seq * n_kv;
+                } else {
+                    cells_base = _kv_mask_base;
+                    row_off    = (int64_t)j * n_kv;
+                }
+
                 for (int i = first; i < last; ++i) {
-                    const llama_kv_cell & cell = lctx.transformer_kv.cells[_kv_mask_base + i];
+                    const llama_kv_cell & cell = lctx.transformer_kv.cells[cells_base + i];
                     ggml_half h = !cell.has_seq_id(seq_id) || cell.pos > pos ? h_inf : h_zero;
-                    if (data_f16) data_f16[j*n_kv + i] = h;
+                    if (data_f16) data_f16[row_off + i] = h;
                     if (data_swa_f16) {
                         if (h != h_inf) {
                             if (hparams.n_attn_chunk) {
@@ -4698,7 +4748,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                                 }
                             }
                         }
-                        data_swa_f16[j*n_kv + i] = h;
+                        data_swa_f16[row_off + i] = h;
                     }
                 }
             };
@@ -4767,21 +4817,38 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 for (auto& w : workers) w = std::thread(compute, it++);
                 compute(it);
                 for (auto& w : workers) w.join();
-                int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
-                if (n_tokens_padded > n_tokens) {
-                    if (data) {
-                        std::fill(data + int64_t(n_tokens)*n_kv, data + n_tokens_padded*n_kv, -INFINITY);
-                    }
-                    if (data_f16) {
+                // PHASE_NSTREAM_KV_PERF T3.3: under multi-seq the mask
+                // is 4D [n_kv, pad_tps, 1, n_seq] and the padding rows
+                // live per-seq at tok_in_seq ∈ [n_tok_per_seq, pad_tps).
+                // Legacy path keeps the contiguous trailing-pad fill.
+                if (_kv_mask_multi_seq) {
+                    const int64_t pad_block = (_kv_mask_pad_tps - _kv_mask_n_tps) * n_kv;
+                    if (pad_block > 0 && data_f16) {
                         ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
-                        std::fill(data_f16 + int64_t(n_tokens)*n_kv, data_f16 + n_tokens_padded*n_kv, h_inf);
+                        for (int32_t s = 0; s < _kv_mask_n_seq; ++s) {
+                            const int64_t seq_off  = (int64_t)s * _kv_mask_pad_tps * n_kv;
+                            const int64_t pad_off  = seq_off + (int64_t)_kv_mask_n_tps * n_kv;
+                            std::fill(data_f16 + pad_off,
+                                      data_f16 + pad_off + pad_block, h_inf);
+                        }
                     }
-                    if (data_swa) {
-                        std::fill(data_swa + int64_t(n_tokens)*n_kv, data_swa + n_tokens_padded*n_kv, -INFINITY);
-                    }
-                    if (data_swa_f16) {
-                        ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
-                        std::fill(data_swa_f16 + int64_t(n_tokens)*n_kv, data_swa_f16 + n_tokens_padded*n_kv, h_inf);
+                } else {
+                    int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+                    if (n_tokens_padded > n_tokens) {
+                        if (data) {
+                            std::fill(data + int64_t(n_tokens)*n_kv, data + n_tokens_padded*n_kv, -INFINITY);
+                        }
+                        if (data_f16) {
+                            ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                            std::fill(data_f16 + int64_t(n_tokens)*n_kv, data_f16 + n_tokens_padded*n_kv, h_inf);
+                        }
+                        if (data_swa) {
+                            std::fill(data_swa + int64_t(n_tokens)*n_kv, data_swa + n_tokens_padded*n_kv, -INFINITY);
+                        }
+                        if (data_swa_f16) {
+                            ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                            std::fill(data_swa_f16 + int64_t(n_tokens)*n_kv, data_swa_f16 + n_tokens_padded*n_kv, h_inf);
+                        }
                     }
                 }
             }
@@ -4845,21 +4912,36 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
 
-                int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
-                if (n_tokens_padded > n_tokens) {
-                    if (data) {
-                        std::fill(data + int64_t(n_tokens)*n_kv, data + n_tokens_padded*n_kv, -INFINITY);
-                    }
-                    if (data_f16) {
+                // PHASE_NSTREAM_KV_PERF T3.3: per-seq padding under
+                // multi-seq (same shape as the threaded path above).
+                if (_kv_mask_multi_seq) {
+                    const int64_t pad_block = (_kv_mask_pad_tps - _kv_mask_n_tps) * n_kv;
+                    if (pad_block > 0 && data_f16) {
                         ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
-                        std::fill(data_f16 + int64_t(n_tokens)*n_kv, data_f16 + n_tokens_padded*n_kv, h_inf);
+                        for (int32_t s = 0; s < _kv_mask_n_seq; ++s) {
+                            const int64_t seq_off  = (int64_t)s * _kv_mask_pad_tps * n_kv;
+                            const int64_t pad_off  = seq_off + (int64_t)_kv_mask_n_tps * n_kv;
+                            std::fill(data_f16 + pad_off,
+                                      data_f16 + pad_off + pad_block, h_inf);
+                        }
                     }
-                    if (data_swa) {
-                        std::fill(data_swa + int64_t(n_tokens)*n_kv, data_swa + n_tokens_padded*n_kv, -INFINITY);
-                    }
-                    if (data_swa_f16) {
-                        ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
-                        std::fill(data_swa_f16 + int64_t(n_tokens)*n_kv, data_swa_f16 + n_tokens_padded*n_kv, h_inf);
+                } else {
+                    int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+                    if (n_tokens_padded > n_tokens) {
+                        if (data) {
+                            std::fill(data + int64_t(n_tokens)*n_kv, data + n_tokens_padded*n_kv, -INFINITY);
+                        }
+                        if (data_f16) {
+                            ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                            std::fill(data_f16 + int64_t(n_tokens)*n_kv, data_f16 + n_tokens_padded*n_kv, h_inf);
+                        }
+                        if (data_swa) {
+                            std::fill(data_swa + int64_t(n_tokens)*n_kv, data_swa + n_tokens_padded*n_kv, -INFINITY);
+                        }
+                        if (data_swa_f16) {
+                            ggml_half h_inf = ggml_fp32_to_fp16(-INFINITY);
+                            std::fill(data_swa_f16 + int64_t(n_tokens)*n_kv, data_swa_f16 + n_tokens_padded*n_kv, h_inf);
+                        }
                     }
                 }
             }
@@ -5583,9 +5665,18 @@ static int llama_decode_internal(
             // streams would corrupt stream 0's slice. INTERLEAVED is
             // already sub-batched below for unrelated reasons (qnext
             // recurrent-state mixing).
+            //
+            // PHASE_NSTREAM_KV_PERF T3.4: under FA-on, the unified-stream
+            // build (T3.3) consumes contiguous-per-seq multi-seq batches
+            // directly as a 4D K/V/mask/Q dispatch. find_slot's T3.2
+            // multi-seq path allocates each run into its own stream's
+            // slice. The sub-batching is only still required when FA is
+            // off (the non-FA mul_mat + softmax path does not understand
+            // the 4D mask layout).
             const bool nstream_demands_subbatch =
                 lctx.transformer_kv.n_stream > 1 &&
-                pattern == QNEXT_SEQ_CONTIGUOUS_BLOCKS;
+                pattern == QNEXT_SEQ_CONTIGUOUS_BLOCKS &&
+                !cparams.flash_attn;
             if (pattern == QNEXT_SEQ_INTERLEAVED || nstream_demands_subbatch) {
                 // Take the longest single-seq run starting at cur_token.
                 const uint32_t orig_n_tokens = n_tokens;
