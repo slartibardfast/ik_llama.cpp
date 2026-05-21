@@ -400,13 +400,26 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
-    # L3 — multi-cycle save→restore drift. Identity drafter, no DFlash
-    # pipeline. Verifies that running the spec_ckpt save→verify→restore
-    # loop for N cycles produces a token sequence byte-identical to
-    # spec-none autoregressive over the same range.
+    # L3 — verify-batch vs autoregressive batch-shape invariance probe.
+    # Single 5-token verify decode (no spec_ckpt, no DFlash pipeline)
+    # compared row-by-row to spec-none 1-token autoregressive at the
+    # same effective context. Test stays FAIL on HEAD as a regression
+    # gate until the variance is fixed.
     set(TEST_TARGET test-dflash-multi-cycle-restore-drift)
     add_executable(${TEST_TARGET}
         dflash-speculative/test-dflash-multi-cycle-restore-drift.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # L3' — verify-batch width sweep. For each verify_bs ∈ {1..8},
+    # compare per-row argmax of one batch to spec-none autoregressive.
+    # Localises the smallest n_tokens at which batch-shape variance
+    # first appears.
+    set(TEST_TARGET test-dflash-verify-batch-width-sweep)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-verify-batch-width-sweep.cpp)
     target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
     install(TARGETS ${TEST_TARGET} RUNTIME)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
