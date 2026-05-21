@@ -184,43 +184,6 @@ void ggml_cuda_cpy_dest_ptrs_copy(ggml_cuda_graph * cuda_graph, char ** host_des
 #endif
 }
 
-// PHASE_NSTREAM_KV_PERF Tier 2: read-view source-pointer indirection
-// refresh. Mirrors ggml_cuda_cpy_dest_ptrs_copy but populates the
-// read_view_src_ptrs_d GPU table from a host-side array. The
-// consumer kernels (currently only PSKV singlewarp;
-// fattn-per-slot-kv-singlewarp-sm75.cu) read K/V data pointers
-// through this table at execution.
-//
-// The table size grows monotonically (realloc on growth, never
-// shrink) for the lifetime of this cuda_graph. Slot index 0 is the
-// first registered view; subsequent views fill consecutive slots.
-// Slots with nullptr indicate "no view registered at this slot for
-// this tick" — kernels reading those slots must guard against it
-// (via the K_idx >= 0 check).
-void ggml_cuda_read_view_src_ptrs_copy(ggml_cuda_graph * cuda_graph,
-                                       void ** host_src_ptrs,
-                                       const int host_src_ptrs_size,
-                                       cudaStream_t stream) {
-#if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
-    if (cuda_graph->read_view_src_ptrs_capacity < host_src_ptrs_size) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (cuda_graph->read_view_src_ptrs_d != nullptr) {
-            CUDA_CHECK(cudaFree(cuda_graph->read_view_src_ptrs_d));
-        }
-        CUDA_CHECK(cudaMalloc(&cuda_graph->read_view_src_ptrs_d,
-                              host_src_ptrs_size * sizeof(void *)));
-        cuda_graph->read_view_src_ptrs_capacity = host_src_ptrs_size;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(cuda_graph->read_view_src_ptrs_d,
-                               host_src_ptrs,
-                               host_src_ptrs_size * sizeof(void *),
-                               cudaMemcpyHostToDevice, stream));
-#else
-    GGML_UNUSED(cuda_graph); GGML_UNUSED(host_src_ptrs);
-    GGML_UNUSED(host_src_ptrs_size); GGML_UNUSED(stream);
-#endif
-}
-
 template<typename src_t, typename dst_t>
 static void ggml_cpy_flt_cuda(
     const char * cx, char * cdst, const int ne,

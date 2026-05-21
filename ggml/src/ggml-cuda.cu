@@ -4664,60 +4664,6 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         graph->use_cpy_indirection = true;
         // copy pointers to GPU so they can be accessed via indirection within CUDA graph
         ggml_cuda_cpy_dest_ptrs_copy(graph, graph->cpy_dest_ptrs.data(), graph->cpy_dest_ptrs.size(), stream);
-
-        // PHASE_NSTREAM_KV_PERF Tier 2: read-view src-pointer
-        // indirection refresh. Walk cgraph nodes, find each VIEW with
-        // a read-view-slot bound (set by llama-build-context.cpp at
-        // view registration), and populate the host staging buffer at
-        // slot index with the view's CURRENT data pointer. Then copy
-        // the buffer to GPU. The consumer kernels (currently PSKV
-        // singlewarp) dereference K/V through this table at
-        // execution time, sidestepping the cuda-graph stale-arg
-        // problem for VIEW src addresses.
-        //
-        // Slot indices are assigned at build time
-        // (ggml_set_read_view_indirect_slot in build_std_attention /
-        // llm_build_kqv) and match the cache_read_views array index
-        // on the llama side. Max slot index determines the table
-        // size; unused intermediate slots stay at nullptr (kernels
-        // gate the indirection on K_idx >= 0).
-        //
-        // Slots live on the FA op tensor itself (op_params[14] = K_slot,
-        // op_params[15] = V_slot). The FA op is in cgraph->nodes and is
-        // not affected by ggml-backend-sched's VIEW tensor copies. Pull
-        // the current K/V data from FA's src[1] / src[2] respectively.
-        int max_slot = -1;
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            const ggml_tensor * node = cgraph->nodes[i];
-            if (node->op != GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV) continue;
-            const int32_t K_slot = ggml_get_fa_K_indirect_slot(node);
-            const int32_t V_slot = ggml_get_fa_V_indirect_slot(node);
-            if (K_slot > max_slot) max_slot = K_slot;
-            if (V_slot > max_slot) max_slot = V_slot;
-        }
-        if (max_slot >= 0) {
-            const int n_slots = max_slot + 1;
-            graph->read_view_src_ptrs.assign(n_slots, nullptr);
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                const ggml_tensor * node = cgraph->nodes[i];
-                if (node->op != GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV) continue;
-                const int32_t K_slot = ggml_get_fa_K_indirect_slot(node);
-                const int32_t V_slot = ggml_get_fa_V_indirect_slot(node);
-                if (K_slot >= 0 && K_slot < n_slots && node->src[1]) {
-                    graph->read_view_src_ptrs[K_slot] = node->src[1]->data;
-                }
-                if (V_slot >= 0 && V_slot < n_slots && node->src[2]) {
-                    graph->read_view_src_ptrs[V_slot] = node->src[2]->data;
-                }
-            }
-            ggml_cuda_read_view_src_ptrs_copy(graph,
-                                              graph->read_view_src_ptrs.data(),
-                                              (int) graph->read_view_src_ptrs.size(),
-                                              stream);
-            graph->use_read_view_indirection = true;
-        } else {
-            graph->use_read_view_indirection = false;
-        }
     }
 
     return use_cuda_graph;
@@ -5146,7 +5092,6 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     if (graph && !use_cuda_graph) {
         graph->use_cpy_indirection = false;
-        graph->use_read_view_indirection = false;
     }
 
 #else

@@ -904,22 +904,6 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
-# test-per-stream-read-view-patching: model-driven test of the Tier 2
-# read-view per-stream patching contract. FAIL expected on HEAD (read
-# views aren't per-stream patched); PASS after Tier 2 lands. Requires
-# a model path passed as argv[1]; skipped (exit 77) without one.
-set(TEST_TARGET test-per-stream-read-view-patching)
-add_executable(${TEST_TARGET} spec/test-per-stream-read-view-patching.cpp)
-target_include_directories(${TEST_TARGET} PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/ggml/include
-    ${CMAKE_SOURCE_DIR}/ggml/src)
-target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
-install(TARGETS ${TEST_TARGET} RUNTIME)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
-
-
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

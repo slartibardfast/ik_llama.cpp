@@ -1061,40 +1061,6 @@ extern "C" {
     GGML_ATTRIBUTE_FORMAT(2, 3)
     GGML_API struct ggml_tensor * ggml_format_name(      struct ggml_tensor * tensor, const char * fmt, ...);
 
-    // PHASE_NSTREAM_KV_PERF Tier 2: read-view indirection slot.
-    // Marks a VIEW tensor as having a slot in a per-tick read-view
-    // pointer indirection table managed by the backend (ggml-cuda).
-    // The CUDA backend uses this slot to redirect K/V data-pointer
-    // reads through a GPU-resident lookup table populated each tick.
-    //
-    // Storage: int32 at op_params[15] (last int32 slot of the
-    // tensor's 64-byte op_params buffer). Default 0 (unset) is the
-    // sentinel for "no indirection bound"; the stored value is
-    // (slot + 1), and ggml_get_read_view_indirect_slot subtracts 1
-    // to return -1 when unset.
-    //
-    // Companion: specs/kv-cache/per_stream_read_view_patching.allium
-    // (ReadViewPatchedByUpdate contract).
-    GGML_API void ggml_set_read_view_indirect_slot(struct ggml_tensor * tensor, int32_t slot);
-    GGML_API int32_t ggml_get_read_view_indirect_slot(const struct ggml_tensor * tensor);
-
-    // PHASE_NSTREAM_KV_PERF Tier 2: flash-attention K/V indirection slots.
-    // Stored on the FA op tensor itself (not on K/V view tensors) because
-    // ggml-backend-sched copies VIEW tensors across subgraph boundaries,
-    // losing op_params. The FA op tensor is in cgraph->nodes and is not
-    // copied — making it the load-bearing carrier of these slot indices.
-    //
-    // Storage:
-    //   op_params[14] = K_slot + 1  (0 means unset)
-    //   op_params[15] = V_slot + 1
-    // Note: op_params[15] collides with ggml_set_read_view_indirect_slot
-    // for VIEW tensors, but FA ops are never VIEW ops so the encoding
-    // is unambiguous per-tensor.
-    GGML_API void    ggml_set_fa_indirect_slots(struct ggml_tensor * fa_op,
-                                                int32_t K_slot, int32_t V_slot);
-    GGML_API int32_t ggml_get_fa_K_indirect_slot(const struct ggml_tensor * fa_op);
-    GGML_API int32_t ggml_get_fa_V_indirect_slot(const struct ggml_tensor * fa_op);
-
     //
     // operations on tensors with backpropagation
     //

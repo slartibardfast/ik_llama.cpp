@@ -59,15 +59,6 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         const int  * __restrict__ per_row_k_bound,
         float      * __restrict__ dst,
         float2     * __restrict__ /*dst_meta*/,
-        // PHASE_NSTREAM_KV_PERF Tier 2: read-view indirection.
-        // When src_ptr_table != nullptr AND a slot idx >= 0, redirect
-        // K/V pointer reads through the GPU table. Sidesteps the cuda-
-        // graph stale-arg problem for VIEW src addresses across
-        // cross-stream graph reuse. See
-        // specs/kv-cache/per_stream_read_view_patching.allium.
-        const void * const * __restrict__ src_ptr_table,
-        const int K_slot_idx,
-        const int V_slot_idx,
         const float scale,
         const float max_bias,
         const float m0,
@@ -104,23 +95,9 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
     const half  * maskh = (const half  *) (mask + nb33*seq + nb31*tok);
     const float  slope  = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
-    // PHASE_NSTREAM_KV_PERF Tier 2: resolve K and V pointers through
-    // the indirection table if it's active. The captured cuda graph
-    // kernel arg `src_ptr_table` is stable across ticks (its CONTENTS
-    // are refreshed on host before stream capture); K_slot_idx and
-    // V_slot_idx are stable per layer×device. When the table is
-    // inactive (Tier 3 unified-stream, or n_stream==1 paths that
-    // don't register views), the kernel falls back to K_direct/V_direct.
-    const char * const K = (src_ptr_table != nullptr && K_slot_idx >= 0)
-        ? (const char *) src_ptr_table[K_slot_idx]
-        : K_direct;
-    const char * const V = (src_ptr_table != nullptr && V_slot_idx >= 0)
-        ? (const char *) src_ptr_table[V_slot_idx]
-        : V_direct;
-
     // K and V base pointers for this (seq, head_kv).
-    const char * K_base = K + nb13*seq + nb12*head_kv;
-    const char * V_base = V + nb23*seq + nb22*head_kv;
+    const char * K_base = K_direct + nb13*seq + nb12*head_kv;
+    const char * V_base = V_direct + nb23*seq + nb22*head_kv;
 
     // Q load into registers. Each thread holds 8 fp32 elements.
     float Q_reg[Q_PER_THREAD];
@@ -339,7 +316,6 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
 #else
     NO_DEVICE_CODE;
     (void)Q; (void)K_direct; (void)V_direct; (void)mask; (void)dst;
-    (void)src_ptr_table; (void)K_slot_idx; (void)V_slot_idx;
     (void)scale; (void)max_bias; (void)m0; (void)m1; (void)n_head_log2;
     (void)ne00; (void)ne01; (void)ne02; (void)ne03;
     (void)ne10; (void)ne11; (void)ne12; (void)ne13;
@@ -396,37 +372,6 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
         ? (const int *) per_row_k_bound->data
         : nullptr;
 
-    // PHASE_NSTREAM_KV_PERF Tier 2: resolve read-view indirection
-    // bindings. K and V are VIEW tensors registered by
-    // build_std_attention / llm_build_kqv with slot indices stored in
-    // op_params[15]. When ctx.cur_graph->use_read_view_indirection is
-    // true, the per-tick refresh has populated
-    // read_view_src_ptrs_d[slot] with each view's CURRENT data
-    // pointer. The captured kernel arg (the table pointer + the slot
-    // indices) is stable across ticks; the table CONTENTS change but
-    // are read by the kernel at execution.
-    //
-    // Both K and V must be bound for indirection to fire. If either
-    // is unbound (e.g. test path that doesn't register), the
-    // launcher passes nullptr and the kernel falls back to direct
-    // pointers.
-    // Slots live on the FA op (dst) itself, set by the builder. The
-    // hook in check_node_graph_compatibility_and_refresh_copy_ops
-    // walks cgraph->nodes for FA ops and populates the table from
-    // their src[1]/src[2] data.
-    const int K_slot = ggml_get_fa_K_indirect_slot(dst);
-    const int V_slot = ggml_get_fa_V_indirect_slot(dst);
-    const void * const * src_ptr_table = nullptr;
-    int K_slot_idx = -1;
-    int V_slot_idx = -1;
-    if (ctx.cur_graph && ctx.cur_graph->use_read_view_indirection
-        && K_slot >= 0 && V_slot >= 0
-        && ctx.cur_graph->read_view_src_ptrs_d != nullptr) {
-        src_ptr_table = (const void * const *) ctx.cur_graph->read_view_src_ptrs_d;
-        K_slot_idx = K_slot;
-        V_slot_idx = V_slot;
-    }
-
     auto launch_kernel = [&](auto kernel) {
         kernel<<<grid, block, 0, ctx.stream()>>>(
             (const char *) Q->data,
@@ -437,7 +382,6 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
             per_row_k_bound_dev,
             (float *) dst->data,
             nullptr,
-            src_ptr_table, K_slot_idx, V_slot_idx,
             scale, max_bias, m0, m1, softcap, n_head_log2,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,

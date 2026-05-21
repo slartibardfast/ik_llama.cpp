@@ -607,26 +607,11 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    // PHASE_NSTREAM_KV_PERF Tier 2 [PARKED 2026-05-21]. Bailout RESTORED.
-    // Investigation summary: indirection mechanism wired end-to-end
-    // (FA op carries K/V slot in op_params[14]/[15], ggml-cuda hook
-    // populates GPU table from FA->src[1]/src[2] data per tick,
-    // kernel reads via slot). Empirical state:
-    //   * Bailout active   → NPC GREEN at NP={1,2,4,8} multi-GPU.
-    //   * Bailout dropped  → NPC FAIL at NP>1 with identical divergent
-    //                        text in all 3 wiring variants AND with
-    //                        cuda graphs disabled.
-    // Launcher diag (LLAMA_T2_LAUNCH_DEBUG=1) confirms K_data
-    // alternates between stream bases correctly via the patch loop
-    // (so K_view->data IS being patched per-tick). Failure persists
-    // even in non-graph mode where kernel arg = current K_view->data.
-    // Root cause not localised — neither cuda graph capture (since
-    // GGML_CUDA_DISABLE_GRAPHS=1 also fails), nor the simple
-    // ne[1]/per_row_k_bound theory (bucketing keeps n_kv constant
-    // within reuse window). Pivoting to Tier 3 (unified-stream
-    // dispatch via PSKV ne[3] packing) which is the structurally-
-    // correct path; the simple read-view patching of Tier 2 is
-    // insufficient.
+    // n_stream > 1 forces a fresh graph build per decode. The per-stream
+    // K/V read view offsets are baked into the graph at build time;
+    // reusing a graph captured for stream A against stream B's decode
+    // would read from the wrong slice. T3 unified-stream dispatch
+    // removes this bailout by making one decode cover all streams.
     if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
@@ -764,36 +749,6 @@ bool llama_context::update_cache_copies() {
         }
     }
 
-    // PHASE_NSTREAM_KV_PERF Tier 2: per-stream READ view patch loop.
-    //
-    // The read views were registered by llm_build_kqv with stream_id=0
-    // at build time. Per-tick, rewrite each registered view's view_offs
-    // and data to point at the current stream's slice base. The
-    // graph cache check at ggml-cuda.cu:4687-4738 tolerates VIEW data
-    // mismatch via cudaGraphExecUpdate, so this composes with graph
-    // reuse across stream boundaries.
-    //
-    // Read view offset = stream_id * parent->nb[3]. There is no
-    // per-token offset (unlike the WRITE-side CPY which advances by
-    // p_local * step) — the read view starts at the stream's slice
-    // base and spans [0, n_kv) positions from there.
-    //
-    // Source: specs/kv-cache/per_stream_read_view_patching.allium.
-    {
-        const uint32_t _rv_kvps = transformer_kv.kv_size_per_stream;
-        const uint32_t _rv_s = (_rv_kvps > 0) ? (transformer_kv.head / _rv_kvps) : 0u;
-        for (size_t i = 0; i < cache_read_views.size(); ++i) {
-            auto& rv = cache_read_views[i];
-            if (!rv.view) continue;
-            if (rv.view->op != GGML_OP_VIEW) return false;
-            ggml_tensor * parent = rv.view->view_src;
-            if (!parent) return false;
-            const size_t stream_stride = parent->nb[3];
-            rv.view->view_offs = (size_t)_rv_s * stream_stride;
-            rv.view->data = (char *)parent->data + rv.view->view_offs;
-        }
-    }
-
     return true;
 }
 
@@ -802,10 +757,8 @@ llama_context::llama_context(const llama_model & model)
     const auto & hparams = model.hparams;
     if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
         cache_copies.resize(2*model.splits.size()*hparams.n_layer);
-        cache_read_views.resize(2*model.splits.size()*hparams.n_layer);
     } else {
         cache_copies.resize(2*hparams.n_layer);
-        cache_read_views.resize(2*hparams.n_layer);
     }
     // PHASE45 D9.6b: every ctx has a decoder_ref from construction onward.
     // Warmup decode runs against default_decoder; llama_decoder_create
