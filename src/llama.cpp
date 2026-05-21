@@ -607,17 +607,26 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    // PHASE_NSTREAM_KV_PERF Tier 2 [WIP — bailout RESTORED]. The
-    // indirection mechanism is in place (PSKV kernel takes
-    // src_ptr_table + K_slot/V_slot; ggml-cuda hook populates the
-    // GPU table per tick from FA op's src[1]/src[2] data) but does
-    // not produce byte-identical output across cross-stream graph
-    // reuse. Empirically NP={2,4,8} multi-GPU diverge with sensible-
-    // but-wrong tokens. Same divergent text across all indirection
-    // attempts → suggests the kernel argument capture path may not
-    // be reaching the kernel as expected, or there's another
-    // op-level read of K/V cache that bypasses the indirection.
-    // Holding for further investigation.
+    // PHASE_NSTREAM_KV_PERF Tier 2 [PARKED 2026-05-21]. Bailout RESTORED.
+    // Investigation summary: indirection mechanism wired end-to-end
+    // (FA op carries K/V slot in op_params[14]/[15], ggml-cuda hook
+    // populates GPU table from FA->src[1]/src[2] data per tick,
+    // kernel reads via slot). Empirical state:
+    //   * Bailout active   → NPC GREEN at NP={1,2,4,8} multi-GPU.
+    //   * Bailout dropped  → NPC FAIL at NP>1 with identical divergent
+    //                        text in all 3 wiring variants AND with
+    //                        cuda graphs disabled.
+    // Launcher diag (LLAMA_T2_LAUNCH_DEBUG=1) confirms K_data
+    // alternates between stream bases correctly via the patch loop
+    // (so K_view->data IS being patched per-tick). Failure persists
+    // even in non-graph mode where kernel arg = current K_view->data.
+    // Root cause not localised — neither cuda graph capture (since
+    // GGML_CUDA_DISABLE_GRAPHS=1 also fails), nor the simple
+    // ne[1]/per_row_k_bound theory (bucketing keeps n_kv constant
+    // within reuse window). Pivoting to Tier 3 (unified-stream
+    // dispatch via PSKV ne[3] packing) which is the structurally-
+    // correct path; the simple read-view patching of Tier 2 is
+    // insufficient.
     if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
