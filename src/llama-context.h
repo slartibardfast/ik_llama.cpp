@@ -364,3 +364,12 @@ struct llama_context {
     // Spec: specs/dflash/dflash.allium.
     struct llama_dflash_ctx_state * dflash_state = nullptr;
 };
+
+// PHASE_NSTREAM_KV_PERF T3.2: internal helper exposed for property
+// tests. Allocates n_tokens cells in the cache. At n_stream > 1 with
+// multi-seq batches (contiguous-per-seq tokens, per split_equal
+// convention) allocates each run into its own stream's slice in a
+// two-phase scan-then-commit.
+bool llama_kv_cache_find_slot(
+        struct llama_kv_cache & cache,
+        const struct llama_batch & batch);

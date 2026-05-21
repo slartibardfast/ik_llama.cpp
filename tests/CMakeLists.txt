@@ -858,6 +858,7 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 # invoke via `ctest -L spec -V -- MODEL_PATH=...` or run the binary directly.
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
 
 # P0.B.S4 property tests — derived from the five new Allium specs in
 # specs/{graphs,kv-cache,dispatch,dflash,composition}/ (PHASE_NSTREAM_KV_PERF.md).

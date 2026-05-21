@@ -5,25 +5,20 @@
 // /home/llm/yarn-agentic/specs/multislot/StreamIsolation.tla.
 //
 // Verifies the structural invariants the 4D port (PHASE_NSTREAM_KV_4D.md
-// N1+N2) will deliver:
+// N1+N2) and the T3.2 multi-seq allocator deliver:
 //
 //   1. Foundation: llama_kv_cache::n_stream is initialised to
 //      max(1, n_seq_max); v_heads is sized to n_stream. (PASS on HEAD —
 //      this slice landed in submodule commit 969d156e.)
 //   2. KVTensorIsFourD: every layer's k_l[il] and v_l[il] tensors have
-//      ne[3] == n_stream. (FAIL on HEAD — K/V are still 3D with
-//      ne[3] == 1. PASS after N1 lands.)
+//      ne[3] == n_stream. (PASS after N1; PASS on HEAD now.)
 //   3. StreamPartition (kv_size_per_stream): k_l[il]->ne[1] equals
-//      kv_size / n_stream. The N2.a axis order is
-//      [head_dim, kv_size_per_stream, n_head_kv, n_stream]; ne[1] is
-//      the per-stream position-count axis. (FAIL on HEAD — the legacy
-//      2D K does not carry a per-stream axis.)
-//
-// Behaves as the binding "RED test" for N1: it FAILS today, will PASS
-// when the 4D port lands. Per
-// /home/llm/.claude/projects/-home-llm-yarn-agentic/memory/feedback_verify_test_mechanism_before_trusting.md,
-// failure today is the proof that the test binds on what N1 delivers,
-// not on a tautology.
+//      kv_size / n_stream. (PASS after N1; PASS on HEAD now.)
+//   4. PHASE_NSTREAM_KV_PERF T3.2 — multi-seq find_slot: when called
+//      with a multi-seq batch (contiguous-per-seq tokens covering
+//      multiple distinct seq_ids), each run is allocated into its own
+//      stream's slice. Cells in stream s carry the expected pos and
+//      seq_id; cells outside stream s are untouched.
 //
 // Returns: 0 = PASS, 1 = FAIL, 77 = SKIP (no model path supplied).
 //
@@ -143,6 +138,125 @@ void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
                 k_probe_il, static_cast<long long>(actual));
 }
 
+// PHASE_NSTREAM_KV_PERF T3.2: drive llama_kv_cache_find_slot with a
+// synthetic contiguous-per-seq multi-seq batch and assert per-stream
+// allocation. Snapshots v_heads/cells before the call, asserts the
+// expected (pos, seq_id) at each allocated cell, and asserts cells in
+// non-active streams are untouched.
+void test_multi_seq_find_slot(llama_kv_cache & cache) {
+    if (cache.n_stream < 2) {
+        std::fprintf(stdout, "multi_seq_find_slot: n_stream<2, skipping\n");
+        return;
+    }
+
+    // Build a synthetic batch with two seqs, each with n_tok_per_seq=4
+    // contiguous tokens. Seq 0 at positions [10..13], seq 1 at [20..23].
+    constexpr uint32_t n_seqs        = 2;
+    constexpr uint32_t n_tok_per_seq = 4;
+    constexpr uint32_t n_tokens      = n_seqs * n_tok_per_seq;
+
+    std::vector<llama_pos>           pos(n_tokens);
+    std::vector<int32_t>             n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id>        seq_id_buf(n_tokens);
+    std::vector<llama_seq_id *>      seq_id_ptr(n_tokens);
+    std::vector<int8_t>              logits(n_tokens, 0);
+
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        for (uint32_t t = 0; t < n_tok_per_seq; ++t) {
+            const uint32_t i = s * n_tok_per_seq + t;
+            pos[i]        = (llama_pos)(10 + s*10 + t);
+            seq_id_buf[i] = (llama_seq_id)s;
+            seq_id_ptr[i] = &seq_id_buf[i];
+        }
+    }
+
+    llama_batch batch = {};
+    batch.n_tokens = (int32_t) n_tokens;
+    batch.token    = nullptr;  // not used by find_slot
+    batch.embd     = nullptr;
+    batch.pos      = pos.data();
+    batch.n_seq_id = n_seq_id.data();
+    batch.seq_id   = seq_id_ptr.data();
+    batch.logits   = logits.data();
+    batch.all_pos_0  = 0;
+    batch.all_pos_1  = 0;
+    batch.all_seq_id = 0;
+
+    // Snapshot cursors per-stream before allocation.
+    std::vector<uint32_t> v_heads_before = cache.v_heads;
+    const uint32_t        used_before    = cache.used;
+
+    if (!llama_kv_cache_find_slot(cache, batch)) {
+        FAIL_AT("multi-seq find_slot returned false on an empty cache");
+    }
+
+    const uint32_t kvps = cache.kv_size_per_stream;
+
+    // Assert each seq's allocation went into its own stream's slice
+    // and that v_heads advanced by n_tok_per_seq for each (since the
+    // cache was empty, both seqs allocate at their starting cursor).
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t base = s * kvps;
+        const uint32_t head_local_after  = cache.v_heads[s];
+        const uint32_t head_local_before = v_heads_before[s];
+        const uint32_t expect_after = head_local_before;  // pre-advance start
+        if (head_local_after != expect_after) {
+            FAIL_AT(
+                "v_heads[%u] expected to point at allocation start "
+                "(%u) post-find_slot, got %u",
+                s, expect_after, head_local_after);
+        }
+        for (uint32_t t = 0; t < n_tok_per_seq; ++t) {
+            const uint32_t cell_idx = base + head_local_after + t;
+            const llama_kv_cell & c = cache.cells[cell_idx];
+            const llama_pos    expect_pos = (llama_pos)(10 + s*10 + t);
+            const llama_seq_id expect_sid = (llama_seq_id)s;
+            if (c.pos != expect_pos) {
+                FAIL_AT(
+                    "stream %u cell %u: expected pos=%d got %d",
+                    s, cell_idx, expect_pos, c.pos);
+            }
+            if (!c.has_seq_id(expect_sid)) {
+                FAIL_AT(
+                    "stream %u cell %u: missing seq_id=%d",
+                    s, cell_idx, expect_sid);
+            }
+            // Stream isolation: the cell's seq_id set must not contain
+            // any other seq_id from this batch.
+            for (uint32_t other = 0; other < n_seqs; ++other) {
+                if (other == s) continue;
+                if (c.has_seq_id((llama_seq_id)other)) {
+                    FAIL_AT(
+                        "stream %u cell %u carries unexpected seq_id=%u "
+                        "— cross-stream contamination",
+                        s, cell_idx, other);
+                }
+            }
+        }
+    }
+
+    // Total cells used should have grown by n_tokens.
+    if (cache.used != used_before + n_tokens) {
+        FAIL_AT(
+            "cache.used did not advance by n_tokens (%u): before=%u after=%u",
+            n_tokens, used_before, cache.used);
+    }
+
+    // cache.head invariant: points at seq-0's slot's first cell.
+    const uint32_t expect_head = v_heads_before[0];  // seq-0's pre-allocation cursor
+    if (cache.head != expect_head) {
+        FAIL_AT(
+            "cache.head expected to point at seq-0 slot's first cell "
+            "(stream-local %u), got %u",
+            expect_head, cache.head);
+    }
+
+    std::fprintf(stdout,
+        "multi_seq_find_slot: n_seqs=%u n_tok_per_seq=%u — per-stream "
+        "allocation + isolation OK; cache.head=%u v_heads={ %u, %u }\n",
+        n_seqs, n_tok_per_seq, cache.head, cache.v_heads[0], cache.v_heads[1]);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,11 +286,12 @@ int main(int argc, char** argv) {
         FAIL_AT("failed to allocate llama_context");
     }
 
-    const llama_kv_cache & cache = ctx->transformer_kv;
+    llama_kv_cache & cache = ctx->transformer_kv;
 
     test_foundation_n_stream_and_v_heads(cache, args.n_parallel);
-    test_kv_tensors_have_n_stream_axis(cache);   // RED today
-    test_per_stream_slice_dimension(cache);       // RED today
+    test_kv_tensors_have_n_stream_axis(cache);
+    test_per_stream_slice_dimension(cache);
+    test_multi_seq_find_slot(cache);
 
     llama_free(ctx);
     llama_free_model(model);

@@ -1306,13 +1306,28 @@ static bool llama_kv_cache_init(
 // `head` field is mirrored to the global flat index so call-sites
 // that have not yet migrated keep working.
 //
+// PHASE_NSTREAM_KV_PERF T3.2 — multi-seq allocation. At n_stream > 1
+// AND when the batch carries multiple distinct seq_ids across tokens,
+// each contiguous-per-seq run is allocated into its own stream's
+// slice. Token order convention (locked 2026-05-21 per OpenQ-A,
+// matching upstream PR #14363 split_equal semantics) is
+// tokens-per-seq contiguous: seq 0's tokens first, then seq 1's, ...
+// All runs in one batch share a uniform n_tok_per_seq (split_equal
+// gives shape-uniform ubatches).
+//
+// Allocation is two-phase: first scan each run's stream for an empty
+// slot (no cells modified), then on full success commit cells for
+// every run and advance v_heads. If any run fails, no cells are
+// modified.
+//
 // At n_stream == 1, kvps == kv_size, base == 0, and the path is
 // byte-identical to the legacy single-arena allocator.
 //
 // Note: On success, cache.head points to the first cell of the slot
-// (legacy single-stream invariant) AND cache.v_heads[stream_id] is
-// the per-stream cursor for the next allocation.
-static bool llama_kv_cache_find_slot(
+// (legacy single-stream invariant); under multi-seq it points to
+// seq 0's slot first cell — downstream multi-seq build code uses
+// v_heads[s] per stream rather than cache.head.
+bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
         const struct llama_batch & batch) {
     const uint32_t n_tokens = batch.n_tokens;
@@ -1371,10 +1386,117 @@ static bool llama_kv_cache_find_slot(
     // is the stream-local cursor. cache.head mirrors the flat global
     // index for legacy reads. At n_stream==1 the path collapses to
     // the legacy single-arena scan byte-identically.
-    uint32_t stream_id = 0;
+
+    // Detect multi-seq batch (n_stream > 1 with multiple distinct
+    // seq_ids across tokens). Tokens are contiguous-per-seq per the
+    // T3 token ordering convention.
+    struct seq_run {
+        uint32_t tok_start;
+        uint32_t n_tok;
+        llama_seq_id sid;
+    };
+    std::vector<seq_run> seq_runs;
     if (cache.n_stream > 1 && batch.n_seq_id && batch.seq_id &&
-        batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
-        const llama_seq_id sid = batch.seq_id[0][0];
+        n_tokens > 0 && batch.n_seq_id[0] > 0 && batch.seq_id[0]) {
+        llama_seq_id cur_sid = batch.seq_id[0][0];
+        uint32_t cur_start = 0;
+        for (uint32_t i = 1; i < n_tokens; ++i) {
+            const bool valid = batch.n_seq_id[i] > 0 && batch.seq_id[i] != nullptr;
+            const llama_seq_id sid_i = valid ? batch.seq_id[i][0] : cur_sid;
+            if (sid_i != cur_sid) {
+                seq_runs.push_back({cur_start, i - cur_start, cur_sid});
+                cur_start = i;
+                cur_sid = sid_i;
+            }
+        }
+        seq_runs.push_back({cur_start, n_tokens - cur_start, cur_sid});
+    }
+
+    const bool is_multi_seq = seq_runs.size() > 1;
+
+    if (is_multi_seq) {
+        // PHASE_NSTREAM_KV_PERF T3.2 multi-seq path.
+        // Two-phase: scan all runs for empty slots in their stream
+        // slices, then commit cells + v_heads on full success.
+        const uint32_t kvps = cache.kv_size_per_stream;
+
+        struct scan_result {
+            uint32_t stream_id;
+            uint32_t base;
+            uint32_t head_local;
+        };
+        std::vector<scan_result> scans;
+        scans.reserve(seq_runs.size());
+
+        for (const auto & run : seq_runs) {
+            if (run.sid < 0 || (uint32_t)run.sid >= cache.n_stream) {
+                LLAMA_LOG_ERROR("%s: seq_id=%d out of range [0,%u)\n",
+                                __func__, run.sid, cache.n_stream);
+                return false;
+            }
+            const uint32_t stream_id = (uint32_t)run.sid;
+            const uint32_t base = stream_id * kvps;
+            if (run.n_tok > kvps) {
+                LLAMA_LOG_ERROR("%s: n_tok=%u > kv_size_per_stream=%u (stream=%u)\n",
+                                __func__, run.n_tok, kvps, stream_id);
+                return false;
+            }
+
+            uint32_t n_tested = 0;
+            uint32_t head_local = cache.v_heads[stream_id];
+
+            while (true) {
+                if (head_local + run.n_tok > kvps) {
+                    n_tested  += kvps - head_local;
+                    head_local = 0;
+                    continue;
+                }
+                bool found = true;
+                for (uint32_t i = 0; i < run.n_tok; ++i) {
+                    if (cache.cells[base + head_local + i].pos >= 0) {
+                        found       = false;
+                        head_local += i + 1;
+                        n_tested   += i + 1;
+                        break;
+                    }
+                }
+                if (found) break;
+                if (n_tested >= kvps) return false;
+            }
+
+            scans.push_back({stream_id, base, head_local});
+        }
+
+        // Commit phase: write cells and advance v_heads.
+        for (size_t r = 0; r < seq_runs.size(); ++r) {
+            const auto & run = seq_runs[r];
+            const auto & scan = scans[r];
+            for (uint32_t i = 0; i < run.n_tok; ++i) {
+                const uint32_t batch_idx = run.tok_start + i;
+                cache.cells[scan.base + scan.head_local + i].pos = batch.pos[batch_idx];
+                for (int32_t j = 0; j < batch.n_seq_id[batch_idx]; ++j) {
+                    cache.cells[scan.base + scan.head_local + i].seq_id.insert(
+                        batch.seq_id[batch_idx][j]);
+                }
+            }
+            cache.v_heads[scan.stream_id] = scan.head_local;
+            cache.used += run.n_tok;
+        }
+
+        // Legacy cache.head invariant: point at seq-0's slot's first
+        // cell. Multi-seq build paths (T3.3) consume v_heads[s] per
+        // stream rather than cache.head.
+        cache.head = scans[0].base + scans[0].head_local;
+
+        return true;
+    }
+
+    // Single-seq path (n_stream==1 OR n_stream>1 with all tokens
+    // sharing one seq_id). Byte-identical to the legacy single-arena
+    // allocator when n_stream==1.
+    uint32_t stream_id = 0;
+    if (cache.n_stream > 1 && !seq_runs.empty()) {
+        const llama_seq_id sid = seq_runs[0].sid;
         if (sid < 0 || (uint32_t)sid >= cache.n_stream) {
             LLAMA_LOG_ERROR("%s: seq_id=%d out of range [0,%u)\n",
                             __func__, sid, cache.n_stream);
