@@ -376,6 +376,30 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # K1' — DeltaNet save_all_steps intermediate-state equivalence. For
+    # every k ∈ {0..4}, per_step_ssm[k] from an n=5 save_all run must
+    # byte-equal final state from a fresh n=k+1 save=false run. Binds
+    # the source data per_step_restore reads.
+    set(TEST_TARGET test-deltanet-save-all-steps-intermediate)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-deltanet-save-all-steps-intermediate.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # L2 — libllama per_step_restore byte-identity. A fresh 3-token
+    # decode + 1-token bonus must produce byte-identical logits to a
+    # 5-token verify-batch decode under save_per_step_ssm + restore(2)
+    # + 1-token bonus. Binds Suspect 4 (per_step_restore semantics).
+    set(TEST_TARGET test-dflash-per-step-restore-byte-identity)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-per-step-restore-byte-identity.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-2 — intra-layer-3 named captures around full-attn block.
     set(TEST_TARGET test-trace-2-intra-layer-capture)
     add_executable(${TEST_TARGET}
