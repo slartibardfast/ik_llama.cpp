@@ -142,6 +142,17 @@ struct llm_build_context {
 
     ggml_tensor * build_inp_KQ_mask(bool causal = true);
 
+    // PHASE_NSTREAM_KV_PERF T3.3-followup: builds an I32 [n_tokens *
+    // n_head_kv] input tensor carrying per-(token, head) global row
+    // indices into the K/V cache reshaped 2D as
+    // [head_dim, kvps * n_head_kv * n_stream]. Used by the K/V WRITE
+    // ggml_set_rows op under the multi-seq dispatch path. Lazy: returns
+    // existing tensor if already built; otherwise allocates with the
+    // current build context's n_tokens and the given n_head_kv. Asserts
+    // n_head_kv matches across calls within the same build (uniform
+    // GQA across layers).
+    ggml_tensor * build_inp_kv_idxs(int64_t n_head_kv);
+
     ggml_tensor * build_inp_KQ_mask_swa(bool causal = true);
 
     ggml_tensor * build_inp_mean();
@@ -331,6 +342,11 @@ struct llm_build_context {
          llm_norm_type   type,
          const llm_build_cb & cb, int il, float scale_eps = 1);
 
+    // kv_idxs (PHASE_NSTREAM_KV_PERF T3.3-followup): when non-null,
+    // routes the K/V WRITE through ggml_set_rows scatter with the
+    // given per-(token, head) global row indices, supporting multi-seq
+    // dispatch into distinct per-stream slices. When null, uses the
+    // legacy single-base ggml_cpy with a 3D K cache view.
     static void llm_build_kv_store(llama_context & lctx, ggml_context * ctx, const llama_hparams & hparams,
         const llama_cparams & cparams,
        const llama_kv_cache & kv,
@@ -339,7 +355,8 @@ struct llm_build_context {
          ggml_tensor * v_cur,
          int32_t   n_tokens,
          int32_t   kv_head,
-         const llm_build_cb & cb, int64_t il);
+         const llm_build_cb & cb, int64_t il,
+         ggml_tensor * kv_idxs = nullptr);
 
     // PHASE_NSTREAM_KV_PERF T3.3: instance method (was static) so it
     // can route to the unified-stream 4D K/V/Q build under

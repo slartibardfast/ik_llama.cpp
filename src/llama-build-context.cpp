@@ -157,6 +157,7 @@ void llm_build_context::init() {
     lctx.inp_embd_enc      = nullptr;
     lctx.default_decoder.inp_KQ_mask_cross = nullptr;
     lctx.default_decoder.inp_per_row_k_bound = nullptr;
+    lctx.default_decoder.inp_kv_idxs         = nullptr;
 }
 
 void llm_build_context::free() {
@@ -465,6 +466,26 @@ ggml_tensor * llm_build_context::build_inp_KQ_mask_swa(bool causal) {
     return flash_attn ? ggml_cast(ctx0, lctx.default_decoder.inp_KQ_mask_swa, GGML_TYPE_F16) : lctx.default_decoder.inp_KQ_mask_swa;
 }
 
+ggml_tensor * llm_build_context::build_inp_kv_idxs(int64_t n_head_kv) {
+    // PHASE_NSTREAM_KV_PERF T3.3-followup. Created lazily on first call
+    // within a build; subsequent layers re-use the same tensor (uniform
+    // n_head_kv assumed across layers, asserted here). The host fills
+    // [n_tokens * n_head_kv] entries in llama_set_inputs from
+    // batch.seq_id + cache.v_heads. Each entry is the global row index
+    // into the K/V cache viewed as 2D [head_dim, kvps * n_head_kv * n_stream].
+    if (lctx.default_decoder.inp_kv_idxs != nullptr) {
+        GGML_ASSERT(lctx.default_decoder.inp_kv_idxs->ne[0]
+                    == (int64_t)n_tokens * n_head_kv
+                    && "build_inp_kv_idxs: n_head_kv must be uniform across layers");
+        return lctx.default_decoder.inp_kv_idxs;
+    }
+    lctx.default_decoder.inp_kv_idxs = ggml_new_tensor_1d(
+        ctx0, GGML_TYPE_I64, (int64_t)n_tokens * n_head_kv);
+    cb(lctx.default_decoder.inp_kv_idxs, "inp_kv_idxs", -1);
+    ggml_set_input(lctx.default_decoder.inp_kv_idxs);
+    return lctx.default_decoder.inp_kv_idxs;
+}
+
 ggml_tensor * llm_build_context::build_inp_mean() {
     lctx.default_decoder.inp_mean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
     cb(lctx.default_decoder.inp_mean, "inp_mean", -1);
@@ -623,7 +644,8 @@ void llm_build_context::llm_build_kv_store(
                     int32_t   n_tokens,
                     int32_t   kv_head,
          const llm_build_cb & cb,
-                    int64_t   il) {
+                    int64_t   il,
+        struct ggml_tensor * kv_idxs) {
     const int64_t n_ctx = cparams.n_ctx;
 
     //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -667,19 +689,48 @@ void llm_build_context::llm_build_kv_store(
         const size_t k_head_stride   = kv.k_l[il]->nb[2];
         const size_t k_stream_stride = kv.k_l[il]->nb[3];
 
-        ggml_tensor * k_cache_view = ggml_view_3d(ctx, kv.k_l[il],
-                n_embd_head_k, n_head_kv, n_tokens,
-                k_head_stride, k_pos_stride,
-                (size_t)p_local * k_pos_stride + (size_t)stream_id * k_stream_stride);
+        if (kv_idxs != nullptr) {
+            // PHASE_NSTREAM_KV_PERF T3.3-followup: scatter K to per-(token,
+            // head) destination cells across all streams via ggml_set_rows.
+            // K cache is 4D [head_dim, kvps, n_head_kv, n_stream] with
+            // contiguous strides (nb[2] == nb[1]*kvps, nb[3] == nb[2]*n_head_kv);
+            // reshape to 2D [head_dim, kvps*n_head_kv*n_stream] folds those
+            // three dims into one global row dim. k_cur arrives 3D
+            // [head_dim, n_head_kv, n_tokens] from RoPE/projection; reshape
+            // to 2D [head_dim, n_tokens*n_head_kv] (h varies fastest, then t)
+            // matching the index layout in inp_kv_idxs.
+            // Cast to F32 if needed: ggml_set_rows requires src type == F32.
+            ggml_tensor * k_src = k_cur;
+            if (k_src->type != GGML_TYPE_F32) {
+                k_src = ggml_cast(ctx, k_src, GGML_TYPE_F32);
+            }
+            // Flatten K cache to 2D scatter target.
+            const int64_t k_row_total =
+                (int64_t)kv.kv_size_per_stream * n_head_kv * (int64_t)kv.n_stream;
+            ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx, kv.k_l[il],
+                    n_embd_head_k, k_row_total);
+            // Flatten k_cur source rows to [head_dim, n_tokens*n_head_kv].
+            ggml_tensor * k_src_2d = ggml_reshape_2d(ctx, k_src,
+                    n_embd_head_k, (int64_t)n_tokens * n_head_kv);
+            lctx.cache_copies[2*il+0].cpy  = ggml_set_rows(ctx,
+                    k_cache_2d, k_src_2d, kv_idxs);
+            lctx.cache_copies[2*il+0].step = k_pos_stride;
+            ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
+        } else {
+            ggml_tensor * k_cache_view = ggml_view_3d(ctx, kv.k_l[il],
+                    n_embd_head_k, n_head_kv, n_tokens,
+                    k_head_stride, k_pos_stride,
+                    (size_t)p_local * k_pos_stride + (size_t)stream_id * k_stream_stride);
 
-        lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
-        // step is per-position in the byte sense; update_cache_copies
-        // recomputes the full view_offs from cache.head when the graph
-        // is reused.
-        lctx.cache_copies[2*il+0].step = k_pos_stride;
+            lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
+            // step is per-position in the byte sense; update_cache_copies
+            // recomputes the full view_offs from cache.head when the graph
+            // is reused.
+            lctx.cache_copies[2*il+0].step = k_pos_stride;
 
-        // note: storing RoPE-ed version of K in the KV cache
-        ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
+            // note: storing RoPE-ed version of K in the KV cache
+            ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
+        }
     }
 
     if (v_cur) {
@@ -693,6 +744,31 @@ void llm_build_context::llm_build_kv_store(
             const size_t v_pos_stride    = kv.v_l[il]->nb[1];
             const size_t v_head_stride   = kv.v_l[il]->nb[2];
             const size_t v_stream_stride = kv.v_l[il]->nb[3];
+
+            if (kv_idxs != nullptr) {
+                // T3.3-followup scatter path. Same shape transform as K
+                // but for V cache (head_dim_v in place of head_dim_k);
+                // reuse the kv_idxs tensor since head_local/stream/head
+                // indexing is identical to K's.
+                if (v_cur->ne[1] == n_tokens && ggml_n_dims(v_cur) == 2) {
+                    v_cur = ggml_reshape_3d(ctx, v_cur, n_embd_head_v, n_head_kv, n_tokens);
+                }
+                ggml_tensor * v_src = v_cur;
+                if (v_src->type != GGML_TYPE_F32) {
+                    v_src = ggml_cast(ctx, v_src, GGML_TYPE_F32);
+                }
+                const int64_t v_row_total =
+                    (int64_t)kv.kv_size_per_stream * n_head_kv * (int64_t)kv.n_stream;
+                ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx, kv.v_l[il],
+                        n_embd_head_v, v_row_total);
+                ggml_tensor * v_src_2d = ggml_reshape_2d(ctx, v_src,
+                        n_embd_head_v, (int64_t)n_tokens * n_head_kv);
+                lctx.cache_copies[2*il+1].cpy  = ggml_set_rows(ctx,
+                        v_cache_2d, v_src_2d, kv_idxs);
+                lctx.cache_copies[2*il+1].step = v_pos_stride;
+                ggml_build_forward_expand(graph, lctx.cache_copies[2*il+1].cpy);
+                return;
+            }
 
             v_cache_view = ggml_view_3d(ctx, kv.v_l[il],
                     n_embd_head_v, n_head_kv, n_tokens,
@@ -2021,7 +2097,15 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     if (k_cur || v_cur) {
-        llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
+        // PHASE_NSTREAM_KV_PERF T3.3-followup: when the multi-seq build
+        // path is active, construct (or fetch) the per-(token, head)
+        // global row index tensor and route the K/V WRITE through
+        // ggml_set_rows in llm_build_kv_store.
+        ggml_tensor * kv_idxs = nullptr;
+        if (is_multi_seq_n_stream && kv.n_stream > 1) {
+            kv_idxs = build_inp_kv_idxs(hparams.n_head_kv(il));
+        }
+        llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il, kv_idxs);
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks, n_swa,
@@ -2887,35 +2971,87 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 const size_t k_head_stride   = split_kl->nb[2];
                 const size_t k_stream_stride = split_kl->nb[3];
 
-                ggml_tensor * k_cache_view = ggml_view_3d(ctx0, split_kl,
-                        n_embd_head_k, n_head_kv, n_tokens,
-                        k_head_stride, k_pos_stride,
-                        (size_t)_ms_p_local * k_pos_stride + (size_t)_ms_stream_id * k_stream_stride);
+                // PHASE_NSTREAM_KV_PERF T3.3-followup: under multi-seq
+                // dispatch, route K/V WRITE through ggml_set_rows scatter
+                // so each (token, head) lands in its destination stream's
+                // slice. Build the per-(token, head) indices tensor lazily.
+                ggml_tensor * kv_idxs = nullptr;
+                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
+                    kv_idxs = build_inp_kv_idxs(n_head_kv);
+                }
 
-                lctx.cache_copies[idx+0].cpy  = ggml_cpy(ctx0, Kcur, k_cache_view);
-                lctx.cache_copies[idx+0].step = k_pos_stride;
+                if (kv_idxs != nullptr) {
+                    ggml_tensor * k_src = Kcur;
+                    if (k_src->type != GGML_TYPE_F32) {
+                        k_src = ggml_cast(ctx0, k_src, GGML_TYPE_F32);
+                    }
+                    const int64_t k_row_total =
+                        (int64_t)kv_self.kv_size_per_stream * n_head_kv * (int64_t)kv_self.n_stream;
+                    ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx0, split_kl,
+                            n_embd_head_k, k_row_total);
+                    ggml_tensor * k_src_2d = ggml_reshape_2d(ctx0, k_src,
+                            n_embd_head_k, (int64_t)n_tokens * n_head_kv);
+                    lctx.cache_copies[idx+0].cpy  = ggml_set_rows(ctx0,
+                            k_cache_2d, k_src_2d, kv_idxs);
+                    lctx.cache_copies[idx+0].step = k_pos_stride;
+                    ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
+                } else {
+                    ggml_tensor * k_cache_view = ggml_view_3d(ctx0, split_kl,
+                            n_embd_head_k, n_head_kv, n_tokens,
+                            k_head_stride, k_pos_stride,
+                            (size_t)_ms_p_local * k_pos_stride + (size_t)_ms_stream_id * k_stream_stride);
 
-                // note: storing RoPE-ed version of K in the KV cache
-                ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
+                    lctx.cache_copies[idx+0].cpy  = ggml_cpy(ctx0, Kcur, k_cache_view);
+                    lctx.cache_copies[idx+0].step = k_pos_stride;
+
+                    // note: storing RoPE-ed version of K in the KV cache
+                    ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
+                }
 
                 struct ggml_tensor * v_cache_view = nullptr;
 
                 if (cparams.flash_attn) {
                     // V mirrors K under the new 4D layout
                     const size_t v_pos_stride    = split_vl->nb[1];
-                    const size_t v_head_stride   = split_vl->nb[2];
-                    const size_t v_stream_stride = split_vl->nb[3];
 
-                    v_cache_view = ggml_view_3d(ctx0, split_vl,
-                            n_embd_head_v, n_head_kv, n_tokens,
-                            v_head_stride, v_pos_stride,
-                            (size_t)_ms_p_local * v_pos_stride + (size_t)_ms_stream_id * v_stream_stride);
+                    if (kv_idxs != nullptr) {
+                        if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
+                            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
+                        }
+                        ggml_tensor * v_src = Vcur;
+                        if (v_src->type != GGML_TYPE_F32) {
+                            v_src = ggml_cast(ctx0, v_src, GGML_TYPE_F32);
+                        }
+                        const int64_t v_row_total =
+                            (int64_t)kv_self.kv_size_per_stream * n_head_kv * (int64_t)kv_self.n_stream;
+                        ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx0, split_vl,
+                                n_embd_head_v, v_row_total);
+                        ggml_tensor * v_src_2d = ggml_reshape_2d(ctx0, v_src,
+                                n_embd_head_v, (int64_t)n_tokens * n_head_kv);
+                        lctx.cache_copies[idx+1].cpy  = ggml_set_rows(ctx0,
+                                v_cache_2d, v_src_2d, kv_idxs);
+                        lctx.cache_copies[idx+1].step = v_pos_stride;
+                        ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+                        cb(lctx.cache_copies[idx+1].cpy, "v_cache_set_rows", il_cb);
+                    } else {
+                        const size_t v_head_stride   = split_vl->nb[2];
+                        const size_t v_stream_stride = split_vl->nb[3];
 
-                    if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
-                        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
+                        v_cache_view = ggml_view_3d(ctx0, split_vl,
+                                n_embd_head_v, n_head_kv, n_tokens,
+                                v_head_stride, v_pos_stride,
+                                (size_t)_ms_p_local * v_pos_stride + (size_t)_ms_stream_id * v_stream_stride);
+
+                        if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
+                            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
+                        }
+
+                        lctx.cache_copies[idx+1].step = v_pos_stride;
+                        cb(v_cache_view, "v_cache_view", il_cb);
+
+                        lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
+                        ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
                     }
-
-                    lctx.cache_copies[idx+1].step = v_pos_stride;
                 } else {
                     // note: the V cache is transposed when not using flash attention.
                     // v_trans non-FA path NOT updated for the new layout;
@@ -2928,11 +3064,11 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     lctx.cache_copies[idx+1].step = ggml_element_size(split_vl);
 
                     Vcur = ggml_transpose(ctx0, Vcur);
-                }
-                cb(v_cache_view, "v_cache_view", il_cb);
+                    cb(v_cache_view, "v_cache_view", il_cb);
 
-                lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
-                ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+                    lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
+                    ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+                }
 
                 // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream
                 // dispatch, Q reshapes to 4D
@@ -2943,8 +3079,14 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
                     GGML_ASSERT(n_tok_per_seq > 0);
                     GGML_ASSERT(n_tok_per_seq * n_seq_in_batch == n_tokens);
+                    // PHASE_NSTREAM_KV_PERF T3.3-followup: under graph-split
+                    // multi-device build, each device sees only a slice
+                    // of the Q heads (n_head_q_local = split_wq->ne[1] /
+                    // n_embd_head_k). Use the per-device count, NOT the
+                    // full n_head from hparams.
+                    const int64_t n_head_q_local = split_wq->ne[1] / n_embd_head_k;
                     auto q_4d = ggml_reshape_4d(ctx0, Qcur,
-                            n_embd_head_k, n_head, n_tok_per_seq, n_seq_in_batch);
+                            n_embd_head_k, n_head_q_local, n_tok_per_seq, n_seq_in_batch);
                     q = ggml_permute(ctx0, q_4d, 0, 2, 1, 3);
                 } else {
                     q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);

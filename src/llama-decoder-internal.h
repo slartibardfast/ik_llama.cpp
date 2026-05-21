@@ -112,6 +112,13 @@ struct llama_decoder {
     // (kv_self->seq_pos_max(seq_id_of_row_i) + 1). Consumed as src[5] of
     // ggml_flash_attn_ext_per_slot_kv. See specs/deltanet/fattn-per-slot-kv-sm75.md §15.6.
     struct ggml_tensor * inp_per_row_k_bound = nullptr; // I32 [q->ne[1]] (n_tok)
+    // PHASE_NSTREAM_KV_PERF T3.3-followup: per-(token, head) global row
+    // indices into the K/V cache reshaped as 2D
+    // [head_dim, kvps * n_head_kv * n_stream]. Populated per decode by
+    // llama_set_inputs from batch.seq_id + cache.v_heads. Consumed by
+    // ggml_set_rows in the K/V WRITE path. Shape [n_tokens * n_head_kv]
+    // when active; nullptr on legacy single-stream cpy path.
+    struct ggml_tensor * inp_kv_idxs = nullptr; // I32 [n_tokens * n_head_kv]
 
     // PHASE45 D9.6f: per-seq slot allocator for the linear-attn recurrent
     // state buffer (s_l[il]); maps llama_seq_id -> slot index.
