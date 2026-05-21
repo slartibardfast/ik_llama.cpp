@@ -352,6 +352,30 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # K1 — DeltaNet save_all_steps self-consistency at production geometry.
+    # Binds the kernel-side cause narrowed by the P0.A.3 bisect ladder: the
+    # last per-step state (save_all_steps=true) must byte-equal the final
+    # state (save_all_steps=false) for the same inputs and n_tokens.
+    set(TEST_TARGET test-deltanet-save-all-steps-last-state)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-deltanet-save-all-steps-last-state.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # L1 — libllama-level observational test on save_per_step_ssm. Toggling
+    # llama_spec_ckpt_init PER_STEP + save before a verify-style 5-row
+    # decode must not change the per-row argmax sequence. Mirrors the
+    # P0.A.3 bisect ladder run E result.
+    set(TEST_TARGET test-dflash-save-per-step-ssm-observational)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-save-per-step-ssm-observational.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-2 — intra-layer-3 named captures around full-attn block.
     set(TEST_TARGET test-trace-2-intra-layer-capture)
     add_executable(${TEST_TARGET}
