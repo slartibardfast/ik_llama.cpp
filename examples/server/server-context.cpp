@@ -4158,19 +4158,28 @@ static void restore_speculative_checkpoint(
     discard_speculative_checkpoint(slot, decoder);
 }
 
-void server_context::speculative_decoding_accept() {
-    // Two-phase split: at np>=2 with MTP, the per-slot loop's mid-loop
-    // calls into restore_speculative_checkpoint / mtp_accept_tokens
-    // each issue their own llama_decode, which rebuilds lctx.output_ids.
-    // The next slot's read-from-verify-decode (sample_and_accept_n,
-    // get_embeddings_ith) then dereferences clobbered output_ids and
-    // crashes with "invalid logits id N".
+void server_context::speculative_decoding_accept(int32_t batch_offset, int run_seq_id) {
+    // Scoped to the run that the surrounding process_batch_tokens loop
+    // just dispatched. `batch_offset` is the run's start index in the
+    // combined `batch`; `run_seq_id` identifies the single slot whose
+    // tokens were submitted.
     //
-    // The engine's contract is "logits/embeddings valid until next
-    // llama_decode". Honor it by reading across all slots first
-    // (Phase A), then mutating across all slots (Phase B). Phase B's
-    // internal llama_decode calls clobber output_ids freely; Phase A
-    // is finished and no longer reads from it.
+    // Why scope here: at np>=2 the per-stream split in
+    // process_batch_tokens dispatches one llama_decode per slot per
+    // tick. The engine resets `output_ids` on every llama_decode, so
+    // only the most-recently-decoded slot's logits are addressable —
+    // and even then via the LOCAL frame [0..n_tokens) of the dispatched
+    // batch_view, not the GLOBAL `batch` frame. slot.i_batch_dft is
+    // recorded in the global frame; we translate by subtracting
+    // batch_offset before any llama_get_logits_ith / get_embeddings_ith
+    // call.
+    //
+    // Two-phase split (preserved from the np=1 closure): Phase A
+    // reads the verify logits / embeddings for THIS run's slot only,
+    // captures everything the sampler needs into `accepted`; Phase B
+    // then performs the state mutation (restore_speculative_checkpoint,
+    // mtp_accept_tokens, etc.) whose internal llama_decode calls would
+    // clobber output_ids. Phase A is finished by then.
     struct accepted_slot {
         server_slot * slot;
         size_t n_draft_pre;
@@ -4181,9 +4190,18 @@ void server_context::speculative_decoding_accept() {
     std::vector<accepted_slot> accepted;
     accepted.reserve(slots.size());
 
-    // ---- Phase A — read-only across all active slots ----
+    // ---- Phase A — read-only for THIS run's slot ----
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+            continue;
+        }
+        if ((int) slot.id != run_seq_id) {
+            // Another slot's verify tokens belong to a different run;
+            // its decode either hasn't happened yet (output_ids will be
+            // -1 in this run's frame) or already happened earlier (its
+            // output_ids has since been overwritten by THIS run's
+            // decode). Either way, do not read its logits here — its
+            // own run iteration's call sampled it.
             continue;
         }
 
@@ -4193,8 +4211,17 @@ void server_context::speculative_decoding_accept() {
 
         apply_server_biases(slot);
 
+        // Translate i_batch_dft from the global `batch` frame to the
+        // local frame of the per-run batch_view that was just decoded.
+        // The engine's output_ids vector is indexed in that local frame.
+        std::vector<int32_t> idx_local;
+        idx_local.reserve(slot.i_batch_dft.size());
+        for (int32_t g : slot.i_batch_dft) {
+            idx_local.push_back(g - batch_offset);
+        }
+
         // the accepted tokens from the speculation
-        a.ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
+        a.ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, idx_local, slot.drafted);
 
         a.mtp_n_past_base = 0;
         if (slot.has_mtp) {
@@ -4204,7 +4231,7 @@ void server_context::speculative_decoding_accept() {
             if (!a.ids.empty()) {
                 a.mtp_hidden_state_pre.resize(a.ids.size() * n_embd);
                 for (size_t i = 0; i < a.ids.size(); i++) {
-                    const float* emb_i = llama_decoder_get_embeddings_ith(decoder, slot.i_batch_dft[i]);
+                    const float* emb_i = llama_decoder_get_embeddings_ith(decoder, idx_local[i]);
                     if (emb_i) {
                         memcpy(a.mtp_hidden_state_pre.data() + i * n_embd, emb_i, n_embd * sizeof(float));
                     }
@@ -4916,7 +4943,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         }
 
         // speculative decoding - main model sample and accept
-        speculative_decoding_accept();
+        // (scoped to this run's slot — see speculative_decoding_accept comment)
+        speculative_decoding_accept(i, run_seq_id);
 
         // PHASE_NSTREAM_KV_4D N2.d: advance to the next per-stream
         // chunk. n_tokens is bounded by both n_batch and the current

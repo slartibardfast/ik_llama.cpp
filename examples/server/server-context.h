@@ -409,7 +409,7 @@ struct server_context {
 
     void extend_context(const int32_t n_tokens);
 
-    void speculative_decoding_accept();
+    void speculative_decoding_accept(int32_t batch_offset, int run_seq_id);
 
     bool accept_special_token(const server_slot& slot, const llama_token token);
 
