@@ -859,6 +859,66 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# P0.B.S4 property tests — derived from the five new Allium specs in
+# specs/{graphs,kv-cache,dispatch,dflash,composition}/ (PHASE_NSTREAM_KV_PERF.md).
+
+# test-cuda-graph-reuse: stub-style mirror of the CUDA graph cache state
+# machine (cuda_graph_reuse.allium / CUDAGraphReuse.tla). PASS on HEAD.
+set(TEST_TARGET test-cuda-graph-reuse)
+add_executable(${TEST_TARGET} spec/test-cuda-graph-reuse.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+# test-unified-stream-dispatch: stub-style mirror of the Tier 3
+# dispatch contract (unified_stream_dispatch.allium /
+# UnifiedStreamDispatch.tla). PASS on HEAD — documents the Tier 3
+# contract algebraically and explicitly asserts that HEAD per-stream
+# dispatch VIOLATES UnifiedUbatchInvariant (the binding RED).
+set(TEST_TARGET test-unified-stream-dispatch)
+add_executable(${TEST_TARGET} spec/test-unified-stream-dispatch.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+# test-mtp-x-n-stream: stub-style mirror of the MTP fused × n_stream
+# composition (mtp_fused_x_n_stream.allium / MTPxNStream.tla). PASS
+# on HEAD — verifies the structural opt-out at multi-slot dispatch
+# (server-context.cpp:3427-3430).
+set(TEST_TARGET test-mtp-x-n-stream)
+add_executable(${TEST_TARGET} spec/test-mtp-x-n-stream.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+# test-dflash-server-cli: stub-style mirror of the --spec-type dflash
+# server wiring (dflash_server_cli.allium). PASS on HEAD post-P0.A.4.
+# End-to-end coverage at scripts/test-server-multi-slot-dflash.sh.
+set(TEST_TARGET test-dflash-server-cli)
+add_executable(${TEST_TARGET} spec/test-dflash-server-cli.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+# test-per-stream-read-view-patching: model-driven test of the Tier 2
+# read-view per-stream patching contract. FAIL expected on HEAD (read
+# views aren't per-stream patched); PASS after Tier 2 lands. Requires
+# a model path passed as argv[1]; skipped (exit 77) without one.
+set(TEST_TARGET test-per-stream-read-view-patching)
+add_executable(${TEST_TARGET} spec/test-per-stream-read-view-patching.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
