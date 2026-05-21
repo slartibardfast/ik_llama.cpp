@@ -1641,22 +1641,27 @@ static ggml_tensor * llm_build_kqv(
     // n_stream]. For per-stream attention, view shape [head_dim,
     // n_kv, n_head_kv] starts at the stream's slice base. nb[1] of
     // the parent steps token-by-token within the stream's slice;
-    // nb[2] steps head-by-head. The legacy formula
-    // (nb1 = head_dim*n_head_kv*ts, nb2 = head_dim*ts) flipped the
-    // axis semantics — under the new layout, position is the
-    // SECOND axis (ne[1]) and head is the THIRD (ne[2]), so the
-    // view's nb1 = parent's nb[1] and view's nb2 = parent's nb[2].
+    // nb[2] steps head-by-head.
     //
     // stream_id is derived from the batch's primary seq_id (== the
     // slot id under per-stream dispatch); for an n_stream == 1
     // build it is always 0 and the offset collapses to 0.
+    //
+    // PHASE_NSTREAM_KV_PERF Tier 2: build with the CURRENT stream's
+    // offset (preserves the existing bailout-fallback path that
+    // rebuilds the graph fresh per-decode at n_stream > 1) AND
+    // register the resulting view in cache_read_views so
+    // update_cache_copies() can rewrite view->data per-tick. When
+    // reuse fires across stream boundaries, the patching rewrites
+    // the view's data pointer to the current stream's slice; the
+    // cuda graph cache tolerates VIEW data mismatch
+    // (ggml-cuda.cu:4690), so cudaGraphExecUpdate propagates the
+    // patched pointer to the FA / per-slot-kv / mul_mat kernel param.
+    // See specs/kv-cache/per_stream_read_view_patching.allium for
+    // the ReadViewPatchedByUpdate contract.
     const uint32_t kqv_kvps = kv.kv_size_per_stream;
     uint32_t kqv_stream_id = 0;
-    if (kqv_kvps > 0 && kv.n_stream > 1 && lctx.decoder_ref &&
-            // batch is read from llm_build_context's member, available via lctx
-            // here we approximate via cache.head / kvps (set by find_slot
-            // for the current decode call).
-            true) {
+    if (kqv_kvps > 0 && kv.n_stream > 1) {
         kqv_stream_id = (uint32_t)(kv.head / kqv_kvps);
     }
 
@@ -1667,6 +1672,11 @@ static ggml_tensor * llm_build_kqv(
                 k_cache->nb[2],  // head stride within stream
                 (size_t)kqv_stream_id * k_cache->nb[3]);
     cb(k, "k", il);
+    // Register K read view for per-tick patching. Indexed
+    // 2*il + 0 in the non-split layout.
+    if (2*il + 1 < (int)lctx.cache_read_views.size()) {
+        lctx.cache_read_views[2*il + 0].view = k;
+    }
 
 #ifdef GGML_USE_VULKAN
     constexpr bool use_f32_precision = true;
@@ -1696,6 +1706,10 @@ static ggml_tensor * llm_build_kqv(
         // Same stride pattern as the K view above — parent's nb[1]
         // steps token-by-token within stream, parent's nb[2] steps
         // head-by-head, offset = stream_id * parent's nb[3].
+        //
+        // PHASE_NSTREAM_KV_PERF Tier 2: build with current stream's
+        // offset AND register for per-tick patching. See K view above
+        // for the contract.
         struct ggml_tensor * v =
             ggml_view_3d(ctx, v_cache,
                     n_embd_head_v, n_kv, n_head_kv,
@@ -1703,6 +1717,10 @@ static ggml_tensor * llm_build_kqv(
                     v_cache->nb[2],
                     (size_t)kqv_stream_id * v_cache->nb[3]);
         cb(v, "v", il);
+        // Register V read view for per-tick patching.
+        if (2*il + 1 < (int)lctx.cache_read_views.size()) {
+            lctx.cache_read_views[2*il + 1].view = v;
+        }
 
         // NPC.4 fix: route to the per-slot-kv FA variant on the single-device
         // path when the PSKV predicate holds (same predicate as the multi-
@@ -2847,12 +2865,22 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cb(q, "q", il_cb);
 
                 // Stream-aware K/V READ views for attention compute.
+                //
+                // PHASE_NSTREAM_KV_PERF Tier 2: build with CURRENT
+                // stream's offset (preserves bailout-fallback path)
+                // AND register in cache_read_views for per-tick
+                // patching by update_cache_copies(). Same indexing
+                // convention as cache_copies: split-mode uses
+                // 2*wq->n_device*il + 2*id + 0/1 for K/V per device.
                 auto k = ggml_view_3d(ctx0, split_kl,
                             n_embd_head_k, n_kv, n_head_kv,
                             split_kl->nb[1],  // position stride within stream
                             split_kl->nb[2],  // head stride within stream
                             (size_t)_ms_stream_id * split_kl->nb[3]);
                 cb(k, "k", il_cb);
+                if (idx + 1 < (int)lctx.cache_read_views.size()) {
+                    lctx.cache_read_views[idx + 0].view = k;
+                }
 
                 auto v = ggml_view_3d(ctx0, split_vl,
                             n_embd_head_v, n_kv, n_head_kv,
@@ -2860,6 +2888,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                             split_vl->nb[2],
                             (size_t)_ms_stream_id * split_vl->nb[3]);
                 cb(v, "v", il_cb);
+                if (idx + 1 < (int)lctx.cache_read_views.size()) {
+                    lctx.cache_read_views[idx + 1].view = v;
+                }
 
                 // Route to GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV at the
                 // Qwen 3.5/3.6 production shape (Dq=Dv=256, gqa <= 16).

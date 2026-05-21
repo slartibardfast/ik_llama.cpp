@@ -352,6 +352,29 @@ struct llama_context {
     };
     std::vector<CacheCopy> cache_copies;
 
+    // PHASE_NSTREAM_KV_PERF Tier 2: per-stream K/V READ view registry.
+    //
+    // Companion to specs/kv-cache/per_stream_read_view_patching.allium.
+    // Parallels cache_copies (which patches the WRITE-side CPY nodes
+    // per stream every tick). The READ views are the K/V slices in
+    // llm_build_kqv that flash-attention / per-slot-kv / mul_mat read
+    // from. At graph-build time these are constructed with stream_id=0
+    // so the captured cuda graph's view->data points at the K/V base;
+    // update_cache_copies() rewrites view->data per-tick to the current
+    // stream's slice.
+    //
+    // Indexing convention: cache_read_views[2*il + 0] is the K read
+    // view at layer il; cache_read_views[2*il + 1] is the V read view.
+    // Under split-mode (ATTN/GRAPH), entries are per device: index
+    // is 2*splits.size()*il + 2*device + 0/1.
+    //
+    // Sized in the llama_context constructor (same layout as
+    // cache_copies). Populated by llm_build_kqv during graph build.
+    struct CacheReadView {
+        ggml_tensor * view = nullptr;
+    };
+    std::vector<CacheReadView> cache_read_views;
+
     bool update_cache_copies();
 
     bool prepare_mtp_graph_inputs(

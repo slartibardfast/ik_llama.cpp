@@ -607,12 +607,32 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    // PHASE_NSTREAM_KV_4D N2.b: read views in llm_build_kqv bake a
-    // stream_id-derived offset; reusing a graph across stream
-    // boundaries would read from the wrong stream's slice. Disable
-    // reuse under n_stream > 1 until a stream-aware reuse check
-    // lands. At n_stream == 1, stream_id is always 0 and reuse is
-    // safe — falls through to the existing path.
+    // PHASE_NSTREAM_KV_PERF Tier 2 [INSUFFICIENT — see investigation
+    // 2026-05-21]. The n_stream > 1 bailout is RESTORED. Read-view
+    // registration in llm_build_kqv + the patch loop in
+    // update_cache_copies are kept as a benign no-op (no functional
+    // effect when bailout is active); they document the contract from
+    // specs/kv-cache/per_stream_read_view_patching.allium.
+    //
+    // Empirical finding: simply patching view->data is insufficient to
+    // unlock cross-stream graph reuse. The WRITE-side cache_copies
+    // patching works because ggml-cuda.cu uses a cpy_dest_ptrs
+    // indirection table (check_node_graph_compatibility_and_refresh_-
+    // copy_ops:4647-4666 + ggml_cuda_cpy_dest_ptrs_copy) — the CPY
+    // kernel reads its dest pointer through this table at execution,
+    // not from a captured kernel arg. The READ side has no equivalent
+    // indirection: FA / per-slot-kv / mul_mat kernels read view->data
+    // as a direct kernel arg, captured at graph capture time. The
+    // address tolerance at ggml-cuda.cu:4690 means
+    // is_cuda_graph_update_required returns "no update" for a VIEW
+    // data change → cudaGraphExecUpdate never fires → kernel arg
+    // stays stale.
+    //
+    // Tier 2 design needs to extend the indirection mechanism to read
+    // views (e.g. a read_view_src_ptrs table parallel to
+    // cpy_dest_ptrs) and modify FA / mul_mat to dereference through
+    // it. Tracked as a structural reshape — see investigation log in
+    // PHASE_NSTREAM_KV_PERF.md.
     if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
@@ -749,6 +769,37 @@ bool llama_context::update_cache_copies() {
             }
         }
     }
+
+    // PHASE_NSTREAM_KV_PERF Tier 2: per-stream READ view patch loop.
+    //
+    // The read views were registered by llm_build_kqv with stream_id=0
+    // at build time. Per-tick, rewrite each registered view's view_offs
+    // and data to point at the current stream's slice base. The
+    // graph cache check at ggml-cuda.cu:4687-4738 tolerates VIEW data
+    // mismatch via cudaGraphExecUpdate, so this composes with graph
+    // reuse across stream boundaries.
+    //
+    // Read view offset = stream_id * parent->nb[3]. There is no
+    // per-token offset (unlike the WRITE-side CPY which advances by
+    // p_local * step) — the read view starts at the stream's slice
+    // base and spans [0, n_kv) positions from there.
+    //
+    // Source: specs/kv-cache/per_stream_read_view_patching.allium.
+    {
+        const uint32_t _rv_kvps = transformer_kv.kv_size_per_stream;
+        const uint32_t _rv_s = (_rv_kvps > 0) ? (transformer_kv.head / _rv_kvps) : 0u;
+        for (size_t i = 0; i < cache_read_views.size(); ++i) {
+            auto& rv = cache_read_views[i];
+            if (!rv.view) continue;
+            if (rv.view->op != GGML_OP_VIEW) return false;
+            ggml_tensor * parent = rv.view->view_src;
+            if (!parent) return false;
+            const size_t stream_stride = parent->nb[3];
+            rv.view->view_offs = (size_t)_rv_s * stream_stride;
+            rv.view->data = (char *)parent->data + rv.view->view_offs;
+        }
+    }
+
     return true;
 }
 
@@ -757,8 +808,10 @@ llama_context::llama_context(const llama_model & model)
     const auto & hparams = model.hparams;
     if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
         cache_copies.resize(2*model.splits.size()*hparams.n_layer);
+        cache_read_views.resize(2*model.splits.size()*hparams.n_layer);
     } else {
         cache_copies.resize(2*hparams.n_layer);
+        cache_read_views.resize(2*hparams.n_layer);
     }
     // PHASE45 D9.6b: every ctx has a decoder_ref from construction onward.
     // Warmup decode runs against default_decoder; llama_decoder_create
