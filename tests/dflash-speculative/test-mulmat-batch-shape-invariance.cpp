@@ -1,19 +1,30 @@
 // test-mulmat-batch-shape-invariance.cpp
 //
-// L5 — kernel-direct test that ggml_mul_mat with a quantised weight
-// (Q4_0 / Q4_0_AR16) and F32 input produces a byte-identical row 1
-// at n_tokens=2 to a separate run at n_tokens=1 with the same input
-// vector. If this FAILS, MMQ kernel dispatch (mmq_x tile size or
-// internal K-reduction) introduces batch-shape variance — explains
-// the layer 0 row 1 divergence bound by L4.
+// Cross-shape MMQ byte-invariance regression gate.
 //
-// Setup: synthesise a small quantised weight matrix [K, N_OUT] of
-// type Q4_0 (block_q4_0 = 32 weights per block), pack it on device.
-// Generate F32 input of [K, n_tokens]. Run mul_mat for n_tokens=1
-// and n_tokens=2, then compare result row 1 of n=2 to row 0 of n=1
-// (both should be weight @ input_col_1).
+// Asserts that for ggml_mul_mat(Q4_0 weight [K, N], F32 input [K, ne11])
+// the output dst[:, j] is byte-identical to dst[:, 0] of a separate
+// mul_mat with the same input column at ne11=1. Asserts this at every
+// j ∈ [0..ne11) and for several (K, N) shape pairs that fire different
+// MMQ tile dispatches (I=8 path vs general path).
 //
-// We use a single-CUDA-device backend, no model load.
+// Background — why this test exists:
+// The MMQ I=8 split-K kernel (mul_mat_q_split_k_i8 with mma_int_C_I8J8
+// fragment) was byte-shape-invariant for OUTPUT column 0 only. Cols
+// j>=1 in a multi-token same-slot batch produced different fp32 bits
+// than the same input vector would produce as col 0 of a single-token
+// dispatch. The kernel's NPC verification compared col 0 across
+// concurrent multi-slot single-token dispatches — every slot was col 0
+// of its own n=1 call, so the col-j>0 path was structurally untested.
+// This test exercises that axis directly.
+//
+// Production crashed visibly with P0.A.3: DFlash CLI verify-batches at
+// n_tokens=5 same-slot produced incoherent text. Fixed at mmq.cuh:5012
+// by setting i8_shape_supported = false.
+//
+// If a future kernel re-enables I=8 or introduces an analogous
+// fragment-FMA-order bug in a sibling MMQ tile, this test catches it
+// before it ships.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -28,18 +39,11 @@
 #include <random>
 #include <vector>
 
-// Production-ish dims: K = 5120 (n_embd of Qwen 3.6 27B), N_OUT = 8192
-// (qkv combined). Q4_0 block size = 32.
-static constexpr int K     = 5120;
-static constexpr int N_OUT = 8192;
-static constexpr int QK    = 32;  // Q4_0 block elements
-static constexpr int N_BLOCKS_PER_ROW = K / QK;
-static_assert(K % QK == 0, "K must be multiple of QK");
+static constexpr int QK = 32;  // Q4_0 block elements
 
-// Run mul_mat(weight[N_OUT, K] Q4_0, input[K, n_tokens] F32) -> dst[N_OUT, n_tokens] F32.
-// Returns true on success and writes the full dst into `out_dst`.
+// Run mul_mat(weight[N, K] Q4_0, input[K, n_tokens] F32) -> dst[N, n_tokens] F32.
 static bool run_mul_mat(ggml_backend_t backend,
-                        int n_tokens,
+                        int K, int N, int n_tokens,
                         const std::vector<uint8_t> & weight_q4_0_bytes,
                         const std::vector<float> & input_f32,
                         std::vector<float> & out_dst) {
@@ -48,14 +52,9 @@ static bool run_mul_mat(ggml_backend_t backend,
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return false;
 
-    // Weight as Q4_0: ne=[K, N_OUT], rows are N_OUT, cols are K.
-    // In ggml convention, src0 has ne[0]=K (inner), ne[1]=N_OUT (outer).
-    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N_OUT);
-    // Input as F32: ne=[K, n_tokens].
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
-    // dst = w @ x  →  ne=[N_OUT, n_tokens].
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
-    ggml_set_name(y, n_tokens == 1 ? "mul_mat_n1" : "mul_mat_nN");
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
@@ -68,20 +67,65 @@ static bool run_mul_mat(ggml_backend_t backend,
 
     const auto status = ggml_backend_graph_compute(backend, gf);
     if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "graph_compute failed status=%d at n_tokens=%d\n", (int) status, n_tokens);
+        fprintf(stderr, "graph_compute failed status=%d at K=%d N=%d n_tokens=%d\n",
+                (int) status, K, N, n_tokens);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return false;
     }
 
-    const size_t n_floats = (size_t) ggml_nelements(y);
-    out_dst.assign(n_floats, 0.0f);
-    ggml_backend_tensor_get(y, out_dst.data(), 0, n_floats * sizeof(float));
+    out_dst.assign((size_t) ggml_nelements(y), 0.0f);
+    ggml_backend_tensor_get(y, out_dst.data(), 0, out_dst.size() * sizeof(float));
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return true;
 }
+
+// Quantise a row-major F32 weight matrix [N, K] to Q4_0.
+static bool quantise_q4_0(int K, int N,
+                          const std::vector<float> & w_f32,
+                          std::vector<uint8_t> & w_q4_0) {
+    const size_t row_bytes = (size_t)(K / ggml_blck_size(GGML_TYPE_Q4_0))
+                              * ggml_type_size(GGML_TYPE_Q4_0);
+    w_q4_0.assign((size_t) N * row_bytes, 0);
+    for (int r = 0; r < N; ++r) {
+        const int64_t produced = ggml_quantize_chunk(
+            GGML_TYPE_Q4_0,
+            w_f32.data() + (size_t) r * K,
+            w_q4_0.data() + (size_t) r * row_bytes,
+            /*start_row=*/0, /*nrows=*/1, /*n_per_row=*/K,
+            /*imatrix=*/nullptr,
+            /*user_data=*/nullptr);
+        if (produced <= 0) {
+            fprintf(stderr, "ggml_quantize_chunk failed at row=%d (K=%d N=%d)\n", r, K, N);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Count fp32-bit differences between two N-length vectors.
+static int count_bit_diffs(const float * a, const float * b, int n, float & max_abs) {
+    int n_diff = 0;
+    max_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        uint32_t ai, bi;
+        std::memcpy(&ai, &a[i], 4); std::memcpy(&bi, &b[i], 4);
+        if (ai != bi) {
+            ++n_diff;
+            const float d = std::abs(a[i] - b[i]);
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    return n_diff;
+}
+
+struct ShapeCase {
+    int K;
+    int N;
+    const char * label;
+};
 
 int main() {
     ggml_backend_t backend = ggml_backend_cuda_init(0, nullptr);
@@ -90,146 +134,142 @@ int main() {
         return 77;
     }
 
-    // Synthesise a deterministic F32 weight matrix and quantise to Q4_0.
-    std::vector<float> w_f32((size_t) K * N_OUT);
-    {
-        std::mt19937_64 rng(0xF1ULL);
+    // Shape sweep. The K=5120 N=8192 pair is the production qkv-combined
+    // shape that surfaced P0.A.3; the smaller pair sweeps cheap variants
+    // to catch tile-boundary regressions in sibling MMQ paths.
+    const std::vector<ShapeCase> shapes = {
+        { 5120, 8192, "prod-qkv-combined" },
+        { 5120, 5120, "prod-model-dim" },
+        { 2048, 2048, "small-square" },
+    };
+
+    // ne11 sweep — binding region. Production decode uses ne11 = 1
+    // (greedy decode per slot) and ne11 in {2..8} for DFlash verify-batches.
+    // ne11 = 16 is included as a margin above the production max. The
+    // MMQ I=8 path fires for mmq_x <= 16, so this range binds the I=8
+    // disable AND the general MMQ tile at the production hot shapes.
+    //
+    // ne11 >= 32 (prefill / ubatch-region) shows ULP-magnitude variance
+    // (~5e-6) across columns that doesn't affect text output because
+    // argmax dampens fp32-ULP noise. It's a separate (pre-existing)
+    // gap from the P0.A.3 I=8 bug — that bug had ~0.36 magnitude that
+    // compounded through 60+ layers. We run ne11 = 32 here for
+    // visibility but do NOT fail the test on it.
+    const std::vector<int> ne11_binding_sweep    = { 1, 2, 5, 8, 16 };
+    const std::vector<int> ne11_informational    = { 32 };
+    constexpr int N_INPUT_COLS = 32;
+    static_assert(N_INPUT_COLS >= 32, "input cols must cover ne11_max");
+
+    int total_fails = 0;
+    int total_passes = 0;
+
+    for (const auto & shape : shapes) {
+        const int K = shape.K;
+        const int N = shape.N;
+        if (K % QK != 0) {
+            fprintf(stderr, "[SKIP] K=%d not multiple of QK=%d for shape '%s'\n",
+                    K, QK, shape.label);
+            continue;
+        }
+
+        // Synthesise + quantise the weight matrix for this shape.
+        std::vector<float> w_f32((size_t) K * N);
+        std::mt19937_64 rng_w((uint64_t) 0xF1ULL ^ ((uint64_t) K << 16) ^ (uint64_t) N);
         for (size_t i = 0; i < w_f32.size(); ++i) {
-            const uint32_t r = (uint32_t)(rng() & 0xffffffffULL);
+            const uint32_t r = (uint32_t)(rng_w() & 0xffffffffULL);
             w_f32[i] = ((int32_t)(r & 0xffff) - 32768) / 32768.0f * 0.1f;
         }
-    }
-    // Quantise to Q4_0. Use the host-side quantizer; compute row size
-    // via ggml_type_size / ggml_blck_size to avoid pulling in the
-    // internal block struct header.
-    const size_t row_bytes = (size_t)(K / ggml_blck_size(GGML_TYPE_Q4_0))
-                              * ggml_type_size(GGML_TYPE_Q4_0);
-    std::vector<uint8_t> w_q4_0((size_t) N_OUT * row_bytes, 0);
-    for (int r = 0; r < N_OUT; ++r) {
-        const size_t off_in  = (size_t) r * K;
-        const size_t off_out = (size_t) r * row_bytes;
-        const int64_t produced = ggml_quantize_chunk(
-            GGML_TYPE_Q4_0,
-            w_f32.data() + off_in,
-            w_q4_0.data() + off_out,
-            /*start_row=*/0, /*nrows=*/1, /*n_per_row=*/K,
-            /*imatrix=*/nullptr,
-            /*user_data=*/nullptr);
-        if (produced <= 0) {
-            fprintf(stderr, "ggml_quantize_chunk failed row=%d\n", r);
+        std::vector<uint8_t> w_q4_0;
+        if (!quantise_q4_0(K, N, w_f32, w_q4_0)) {
+            fprintf(stderr, "[FAIL] quantise failed for shape '%s'\n", shape.label);
             ggml_backend_free(backend);
             return 1;
         }
-    }
-    fprintf(stderr, "[L5] quantised %d-row × %d-col weight to Q4_0\n", N_OUT, K);
 
-    // Synthesise an 8-column F32 input. Compare:
-    //   y_n1 = w @ x_n1 where x_n1 = column 1 of x_n8 (single col)
-    //   y_n2 col 1 = w @ x_n2 col 1 where x_n2 = first 2 cols of x_n8
-    //   y_n8 col 1 = w @ x_n8 col 1
-    // All three should produce IDENTICAL bytes at col 1 of the result
-    // if the kernel is batch-shape invariant.
-    std::vector<float> x_n8((size_t) K * 8);
-    {
-        std::mt19937_64 rng(0xF2ULL);
-        for (size_t i = 0; i < x_n8.size(); ++i) {
-            const uint32_t r = (uint32_t)(rng() & 0xffffffffULL);
-            x_n8[i] = ((int32_t)(r & 0xffff) - 32768) / 32768.0f * 1.0f;
+        // Synthesise N_INPUT_COLS independent input columns.
+        std::vector<float> x_full((size_t) K * N_INPUT_COLS);
+        std::mt19937_64 rng_x((uint64_t) 0xF2ULL ^ ((uint64_t) K << 16) ^ (uint64_t) N);
+        for (size_t i = 0; i < x_full.size(); ++i) {
+            const uint32_t r = (uint32_t)(rng_x() & 0xffffffffULL);
+            x_full[i] = ((int32_t)(r & 0xffff) - 32768) / 32768.0f * 1.0f;
         }
-    }
-    std::vector<float> x_n1(x_n8.begin() + K, x_n8.begin() + 2 * K);
-    std::vector<float> x_n2(x_n8.begin(),     x_n8.begin() + 2 * K);
 
-    std::vector<float> y_n1, y_n2, y_n8;
-    if (!run_mul_mat(backend, 1, w_q4_0, x_n1, y_n1)) { ggml_backend_free(backend); return 1; }
-    if (!run_mul_mat(backend, 2, w_q4_0, x_n2, y_n2)) { ggml_backend_free(backend); return 1; }
-    if (!run_mul_mat(backend, 8, w_q4_0, x_n8, y_n8)) { ggml_backend_free(backend); return 1; }
-    ggml_backend_free(backend);
-
-    if ((int) y_n1.size() != N_OUT || (int) y_n2.size() != 2 * N_OUT ||
-        (int) y_n8.size() != 8 * N_OUT) {
-        fprintf(stderr, "[FAIL] unexpected y sizes: y_n1=%zu y_n2=%zu y_n8=%zu\n",
-                y_n1.size(), y_n2.size(), y_n8.size());
-        return 1;
-    }
-
-    auto count_diffs = [](const float * a, const float * b, int n, int & first_diff, float & max_abs) {
-        int n_diff = 0;
-        first_diff = -1;
-        max_abs = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            uint32_t ai, bi;
-            std::memcpy(&ai, &a[i], 4); std::memcpy(&bi, &b[i], 4);
-            if (ai != bi) {
-                if (first_diff < 0) first_diff = i;
-                ++n_diff;
-                const float d = std::abs(a[i] - b[i]);
-                if (d > max_abs) max_abs = d;
+        // Reference dispatch: run mul_mat at ne11=1 once per input column
+        // we care about. Output col is the ground-truth for that input.
+        std::vector<std::vector<float>> ref_per_col(N_INPUT_COLS);
+        for (int c = 0; c < N_INPUT_COLS; ++c) {
+            std::vector<float> x_one(x_full.begin() + (size_t) c * K,
+                                     x_full.begin() + (size_t) (c + 1) * K);
+            if (!run_mul_mat(backend, K, N, 1, w_q4_0, x_one, ref_per_col[c])) {
+                fprintf(stderr, "[FAIL] reference n=1 dispatch failed for col=%d shape='%s'\n",
+                        c, shape.label);
+                ggml_backend_free(backend);
+                return 1;
             }
         }
-        return n_diff;
-    };
 
-    // Run y_n1' = w @ col_0_of_x_n8 separately to test the existing
-    // FATTN_SHAPE_INVARIANT claim of "row-0 (= col-0) invariance".
-    std::vector<float> x_n1_c0(x_n8.begin(), x_n8.begin() + K);
+        auto run_and_compare = [&](int ne11, bool binding) {
+            if (ne11 > N_INPUT_COLS) return;
+            std::vector<float> x_batch(x_full.begin(),
+                                       x_full.begin() + (size_t) ne11 * K);
+            std::vector<float> y_batch;
+            if (!run_mul_mat(backend, K, N, ne11, w_q4_0, x_batch, y_batch)) {
+                fprintf(stderr, "[FAIL] dispatch failed for shape='%s' ne11=%d\n",
+                        shape.label, ne11);
+                if (binding) ++total_fails;
+                return;
+            }
+            if ((int) y_batch.size() != ne11 * N) {
+                fprintf(stderr, "[FAIL] y_batch size %zu != ne11*N = %d\n",
+                        y_batch.size(), ne11 * N);
+                if (binding) ++total_fails;
+                return;
+            }
 
-    int first_diff_ab, first_diff_ac, first_diff_bc;
-    float max_abs_ab, max_abs_ac, max_abs_bc;
+            int n_cols_bad = 0;
+            int n_cols_ok  = 0;
+            float worst_abs = 0.0f;
+            int worst_col = -1;
+            for (int j = 0; j < ne11; ++j) {
+                float max_abs = 0.0f;
+                const int diffs = count_bit_diffs(ref_per_col[j].data(),
+                                                  y_batch.data() + (size_t) j * N,
+                                                  N, max_abs);
+                if (diffs == 0) {
+                    ++n_cols_ok;
+                } else {
+                    ++n_cols_bad;
+                    if (max_abs > worst_abs) { worst_abs = max_abs; worst_col = j; }
+                }
+            }
+            const char * tag = binding ? "binding" : "info   ";
+            if (n_cols_bad == 0) {
+                fprintf(stderr, "  [%s ok]   shape='%s' ne11=%2d : all %d cols byte-identical\n",
+                        tag, shape.label, ne11, n_cols_ok);
+                if (binding) ++total_passes;
+            } else {
+                fprintf(stderr, "  [%s %s] shape='%s' ne11=%2d : %d/%d cols diverge, worst col=%d max|Δ|=%.3e\n",
+                        tag, binding ? "FAIL" : "diff", shape.label, ne11,
+                        n_cols_bad, ne11, worst_col, worst_abs);
+                if (binding) ++total_fails;
+            }
+        };
 
-    // col 1 comparison (path A's input).
-    const float * a = y_n1.data();
-    const float * b = y_n2.data() + N_OUT;       // col 1 of n=2
-    const float * c = y_n8.data() + N_OUT;       // col 1 of n=8
-    const int diff_ab = count_diffs(a, b, N_OUT, first_diff_ab, max_abs_ab);
-    const int diff_ac = count_diffs(a, c, N_OUT, first_diff_ac, max_abs_ac);
-    const int diff_bc = count_diffs(b, c, N_OUT, first_diff_bc, max_abs_bc);
-    fprintf(stderr, "y_n1(col1) vs y_n2 col 1: diff=%d/%d max|Δ|=%.3e\n",
-            diff_ab, N_OUT, max_abs_ab);
-    fprintf(stderr, "y_n1(col1) vs y_n8 col 1: diff=%d/%d max|Δ|=%.3e\n",
-            diff_ac, N_OUT, max_abs_ac);
-    fprintf(stderr, "y_n2 col 1 vs y_n8 col 1: diff=%d/%d max|Δ|=%.3e\n",
-            diff_bc, N_OUT, max_abs_bc);
-
-    // col 0 comparison — the FATTN_SHAPE_INVARIANT-guaranteed case.
-    std::vector<float> y_n1_c0;
-    {
-        ggml_backend_t backend2 = ggml_backend_cuda_init(0, nullptr);
-        run_mul_mat(backend2, 1, w_q4_0, x_n1_c0, y_n1_c0);
-        ggml_backend_free(backend2);
+        for (int ne11 : ne11_binding_sweep)   run_and_compare(ne11, /*binding=*/true);
+        for (int ne11 : ne11_informational)   run_and_compare(ne11, /*binding=*/false);
     }
-    const float * d = y_n1_c0.data();
-    const float * e = y_n2.data();       // col 0 of n=2
-    const float * f = y_n8.data();       // col 0 of n=8
-    int first_diff_de, first_diff_df, first_diff_ef;
-    float max_abs_de, max_abs_df, max_abs_ef;
-    const int diff_de = count_diffs(d, e, N_OUT, first_diff_de, max_abs_de);
-    const int diff_df = count_diffs(d, f, N_OUT, first_diff_df, max_abs_df);
-    const int diff_ef = count_diffs(e, f, N_OUT, first_diff_ef, max_abs_ef);
-    fprintf(stderr, "y_n1(col0) vs y_n2 col 0: diff=%d/%d max|Δ|=%.3e\n",
-            diff_de, N_OUT, max_abs_de);
-    fprintf(stderr, "y_n1(col0) vs y_n8 col 0: diff=%d/%d max|Δ|=%.3e\n",
-            diff_df, N_OUT, max_abs_df);
-    fprintf(stderr, "y_n2 col 0 vs y_n8 col 0: diff=%d/%d max|Δ|=%.3e\n",
-            diff_ef, N_OUT, max_abs_ef);
 
-    const bool col0_invariant = (diff_de == 0 && diff_df == 0 && diff_ef == 0);
-    const bool col1_invariant = (diff_ab == 0 && diff_ac == 0 && diff_bc == 0);
+    ggml_backend_free(backend);
 
-    if (col0_invariant && col1_invariant) {
-        printf("[PASS] mul_mat(Q4_0) fully batch-shape-invariant across all columns.\n");
+    fprintf(stderr, "\n[summary] binding region (ne11 <= 16): %d/%d shape×ne11 cases pass\n",
+            total_passes, total_passes + total_fails);
+    fprintf(stderr, "          ne11 = 32 results are informational only (see stderr above).\n");
+    if (total_fails == 0) {
+        printf("[PASS] mul_mat(Q4_0) batch-shape-invariant across the production decode region "
+               "(ne11 in {1,2,5,8,16}) for all swept shapes.\n");
         return 0;
     }
-    if (col0_invariant && !col1_invariant) {
-        printf("[FAIL-COL1] mul_mat(Q4_0) is shape-invariant ONLY at column 0 (the "
-               "existing FATTN_SHAPE_INVARIANT guarantee). Columns > 0 diverge — this "
-               "explains why NPC concurrent-multi-slot-single-token passes but "
-               "single-slot-multi-token does NOT. The verify-batch decoder needs "
-               "ALL columns invariant.\n");
-        return 1;
-    }
-    printf("[FAIL] mul_mat(Q4_0) batch-shape-variant at multiple columns. "
-           "col1: diff_ab=%d diff_bc=%d. col0: diff_de=%d diff_ef=%d.\n",
-           diff_ab, diff_bc, diff_de, diff_ef);
+    printf("[FAIL] mul_mat(Q4_0) batch-shape-variant in %d case(s) of the production decode "
+           "region. MMQ kernel regression — see stderr.\n", total_fails);
     return 1;
 }
