@@ -425,6 +425,31 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # L4 — per-layer batch-shape divergence localiser. Capture
+    # l_out-<il> for every Nth layer across two paths (path A = two
+    # sequential 1-token decodes; path B = one 2-token batch).
+    # First divergent layer points at which transformer block
+    # introduces batch-shape variance.
+    set(TEST_TARGET test-dflash-per-layer-batch-shape-diff)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-per-layer-batch-shape-diff.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # L5 — kernel-direct mul_mat(Q4_0 weight, F32 input) batch-shape
+    # invariance test. Compares y_n1 row 0 to y_n2 col 1 with same
+    # input vector. Tests whether MMQ kernel introduces batch-shape
+    # variance.
+    set(TEST_TARGET test-mulmat-batch-shape-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-mulmat-batch-shape-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-2 — intra-layer-3 named captures around full-attn block.
     set(TEST_TARGET test-trace-2-intra-layer-capture)
     add_executable(${TEST_TARGET}
