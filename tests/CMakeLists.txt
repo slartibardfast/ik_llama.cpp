@@ -450,6 +450,18 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # Cross-mmq_x dispatch byte-invariance — asserts that mul_mat output
+    # for the SAME input column is byte-identical across every ne11 in
+    # the dispatcher's tile sweep. Catches reduction-order divergence
+    # between split-K (mmq_x ≤ 16) and non-split-K (mmq_x > 16) paths.
+    set(TEST_TARGET test-mulmat-mmq_x-dispatch-invariance)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-mulmat-mmq_x-dispatch-invariance.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-2 — intra-layer-3 named captures around full-attn block.
     set(TEST_TARGET test-trace-2-intra-layer-capture)
     add_executable(${TEST_TARGET}

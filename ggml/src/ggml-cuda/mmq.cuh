@@ -4962,16 +4962,32 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
     const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
 
-    // Split-K MMQ — NPC-by-construction K-dim split for decode-dominant
-    // shapes (small mmq_x). The existing xy-tiling fallback produces only
-    // ~0.56 SM waves × 25% occupancy at decode (40 CTAs on 72 SMs); split-K
-    // with F=4 brings grid to 160 CTAs ≥ 2 SM waves. See 2026-05-19 ncu
-    // probe and PHASE_TU102_SPECIALIZATION.md target #1 for evidence.
+    // Split-K MMQ — NPC-by-construction K-dim split with a uniform
+    // factor across all mmq_x tile sizes. Originally introduced for
+    // decode-dominant shapes (mmq_x ≤ 16) to lift the ~0.56 SM-wave
+    // 25% occupancy ceiling (40 CTAs on 72 SMs) up to ≥ 2 SM waves at
+    // F=4 (160 CTAs). See 2026-05-19 ncu probe and
+    // PHASE_TU102_SPECIALIZATION.md target #1.
     //
-    // Engaged only on Turing+ (Volta+ in code) when stream-K is off and
-    // mmq_x ≤ 16 (decode-like dispatch tiles). For mmq_x ≥ 24 (prefill
-    // big-tile) the xy-tiling fallback already produces grids ≥ NSM.
-    constexpr int split_k_factor = (mmq_x <= 16) ? 4 : 1;
+    // 2026-05-21: extended to ALL mmq_x for cross-dispatch byte
+    // invariance. Production NPC at n_tokens=1-per-slot only exercised
+    // the split-K path; ne11 > 16 (prefill chunks, large speculative
+    // batches) routed through the non-split kernel which has a
+    // different fp32 K-axis reduction order — same operands summed in
+    // single-pass vs 4-chunk-fixup produce ULP-magnitude bit
+    // divergence (~5e-6 at K=5120). Uniform factor=4 ensures every
+    // (i,j) output element accumulates via identical chunk-reduction
+    // structure regardless of mmq_x. See tests/dflash-speculative/
+    // test-mulmat-mmq_x-dispatch-invariance.cpp for the binding gate.
+    //
+    // Engaged on Turing+ when stream-K is off (i.e. for any production
+    // dispatch). Factor=4 was kept rather than tuning per-tile because
+    // (a) decode hot path was already factor=4 and unchanged; (b)
+    // prefill small-batch (mmq_x=24..56) benefits from the same SM
+    // occupancy lift; (c) the fixup overhead at very-large-batch
+    // prefill (mmq_x=128, ne11=512) is a small fp32-add-per-element
+    // pass, dominated by the K-reduction work it parallelises.
+    constexpr int split_k_factor = 4;
     const bool use_split_k = !use_stream_k && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD) && (split_k_factor > 1);
 
     // I=8 fragment path — sm_75-only ground-up shmem-reduction kernel for the

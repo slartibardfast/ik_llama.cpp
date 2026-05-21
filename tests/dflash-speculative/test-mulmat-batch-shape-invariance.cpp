@@ -144,19 +144,14 @@ int main() {
     };
 
     // ne11 sweep — binding region. Production decode uses ne11 = 1
-    // (greedy decode per slot) and ne11 in {2..8} for DFlash verify-batches.
-    // ne11 = 16 is included as a margin above the production max. The
-    // MMQ I=8 path fires for mmq_x <= 16, so this range binds the I=8
-    // disable AND the general MMQ tile at the production hot shapes.
-    //
-    // ne11 >= 32 (prefill / ubatch-region) shows ULP-magnitude variance
-    // (~5e-6) across columns that doesn't affect text output because
-    // argmax dampens fp32-ULP noise. It's a separate (pre-existing)
-    // gap from the P0.A.3 I=8 bug — that bug had ~0.36 magnitude that
-    // compounded through 60+ layers. We run ne11 = 32 here for
-    // visibility but do NOT fail the test on it.
-    const std::vector<int> ne11_binding_sweep    = { 1, 2, 5, 8, 16 };
-    const std::vector<int> ne11_informational    = { 32 };
+    // (greedy decode per slot) and ne11 in {2..8} for DFlash
+    // verify-batches. ne11 = 16 is a margin above the production max.
+    // ne11 = 32 was originally informational (the cross-mmq_x dispatch
+    // bug produced ULP variance there) but became binding 2026-05-21
+    // after split_k_factor was unified across all mmq_x — see
+    // test-mulmat-mmq_x-dispatch-invariance.cpp for the dedicated
+    // cross-tile gate.
+    const std::vector<int> ne11_binding_sweep    = { 1, 2, 5, 8, 16, 32 };
     constexpr int N_INPUT_COLS = 32;
     static_assert(N_INPUT_COLS >= 32, "input cols must cover ne11_max");
 
@@ -256,20 +251,18 @@ int main() {
         };
 
         for (int ne11 : ne11_binding_sweep)   run_and_compare(ne11, /*binding=*/true);
-        for (int ne11 : ne11_informational)   run_and_compare(ne11, /*binding=*/false);
     }
 
     ggml_backend_free(backend);
 
-    fprintf(stderr, "\n[summary] binding region (ne11 <= 16): %d/%d shape×ne11 cases pass\n",
+    fprintf(stderr, "\n[summary] %d/%d shape×ne11 cases pass\n",
             total_passes, total_passes + total_fails);
-    fprintf(stderr, "          ne11 = 32 results are informational only (see stderr above).\n");
     if (total_fails == 0) {
-        printf("[PASS] mul_mat(Q4_0) batch-shape-invariant across the production decode region "
-               "(ne11 in {1,2,5,8,16}) for all swept shapes.\n");
+        printf("[PASS] mul_mat(Q4_0) batch-shape-invariant across all swept shapes "
+               "and ne11 in {1,2,5,8,16,32}.\n");
         return 0;
     }
-    printf("[FAIL] mul_mat(Q4_0) batch-shape-variant in %d case(s) of the production decode "
-           "region. MMQ kernel regression — see stderr.\n", total_fails);
+    printf("[FAIL] mul_mat(Q4_0) batch-shape-variant in %d case(s). "
+           "MMQ kernel regression — see stderr.\n", total_fails);
     return 1;
 }
