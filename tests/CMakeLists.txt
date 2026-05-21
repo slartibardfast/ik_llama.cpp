@@ -400,6 +400,18 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # L3 — multi-cycle save→restore drift. Identity drafter, no DFlash
+    # pipeline. Verifies that running the spec_ckpt save→verify→restore
+    # loop for N cycles produces a token sequence byte-identical to
+    # spec-none autoregressive over the same range.
+    set(TEST_TARGET test-dflash-multi-cycle-restore-drift)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-multi-cycle-restore-drift.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # TRACE-2 — intra-layer-3 named captures around full-attn block.
     set(TEST_TARGET test-trace-2-intra-layer-capture)
     add_executable(${TEST_TARGET}
