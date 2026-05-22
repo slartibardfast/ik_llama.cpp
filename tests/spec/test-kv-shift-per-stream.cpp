@@ -20,16 +20,11 @@
 // Defensive coverage: runs the K-shift binding under BOTH
 //   - LAYER split (single-device per layer), and
 //   - GRAPH split (CUDA_Split per-device row-distributed K/V cache).
-//
-// LAYER asserts the full K-shift binding (isolation + per-cell
-// rotation). GRAPH asserts the documented graceful rc=1 — a
-// regression that lifts the get_can_shift gate without first fixing
-// the ggml-scheduler-level leaf-input allocation bug (see comment in
-// src/llama.cpp:get_can_shift) would fail this branch (process abort,
-// exit code != 0). The T3.6.I.c1.x input-layer restructure ruled out
-// view-aliasing as the underlying cause; the remaining gap is in
-// ggml_backend_sched_split_graph's handling of fresh-graph leaf
-// inputs on a reset scheduler under multi-device split.
+// Both modes assert the full K-shift binding (isolation + per-cell
+// rotation). The T3.6.I.c1.x2 input-layer restructure (per-(device,
+// stream) inputs pinned to their consuming backends) made GRAPH
+// split fully supported by eliminating the cross-device input cpy
+// path entirely; each rope op reads its local-device input.
 //
 // Returns: 0 = PASS, 1 = FAIL, 77 = SKIP (no model path supplied).
 //
@@ -167,52 +162,32 @@ bool run_binding(const std::string & model_path, llama_split_mode split_mode,
     llama_kv_cache_seq_add(ctx, SHIFT_SEQ, 0, (llama_pos)tokens.size(), DELTA);
 
     const int rc = llama_kv_cache_update(ctx);
-    const bool expect_supported = (split_mode == LLAMA_SPLIT_MODE_LAYER);
+    if (rc != 0) FAIL_AT("[%s] llama_kv_cache_update rc=%d (expected 0)",
+                         split_label, rc);
 
-    if (expect_supported) {
-        if (rc != 0) FAIL_AT("[%s] llama_kv_cache_update rc=%d (expected 0)",
-                             split_label, rc);
+    std::vector<llama_pos> pos_max_post(N_PARALLEL);
+    for (int s = 0; s < N_PARALLEL; ++s) {
+        pos_max_post[s] = llama_kv_cache_seq_pos_max(ctx, (llama_seq_id)s);
+    }
+    std::fprintf(stdout, "[%s] post-shift pos_max:", split_label);
+    for (int s = 0; s < N_PARALLEL; ++s) {
+        std::fprintf(stdout, " seq%d=%d", s, pos_max_post[s]);
+    }
+    std::fprintf(stdout, "\n");
 
-        std::vector<llama_pos> pos_max_post(N_PARALLEL);
-        for (int s = 0; s < N_PARALLEL; ++s) {
-            pos_max_post[s] = llama_kv_cache_seq_pos_max(ctx, (llama_seq_id)s);
+    if (pos_max_post[SHIFT_SEQ] != pos_max_pre[SHIFT_SEQ] + DELTA) {
+        FAIL_AT("[%s] seq %d pos_max: pre=%d post=%d expected post=%d",
+                split_label, SHIFT_SEQ, pos_max_pre[SHIFT_SEQ],
+                pos_max_post[SHIFT_SEQ], pos_max_pre[SHIFT_SEQ] + DELTA);
+    }
+    for (int s = 0; s < N_PARALLEL; ++s) {
+        if (s == SHIFT_SEQ) continue;
+        if (pos_max_post[s] != pos_max_pre[s]) {
+            FAIL_AT(
+                "[%s] stream %d pos_max changed under shift of seq %d: "
+                "pre=%d post=%d (cross-stream contamination — F2)",
+                split_label, s, SHIFT_SEQ, pos_max_pre[s], pos_max_post[s]);
         }
-        std::fprintf(stdout, "[%s] post-shift pos_max:", split_label);
-        for (int s = 0; s < N_PARALLEL; ++s) {
-            std::fprintf(stdout, " seq%d=%d", s, pos_max_post[s]);
-        }
-        std::fprintf(stdout, "\n");
-
-        if (pos_max_post[SHIFT_SEQ] != pos_max_pre[SHIFT_SEQ] + DELTA) {
-            FAIL_AT("[%s] seq %d pos_max: pre=%d post=%d expected post=%d",
-                    split_label, SHIFT_SEQ, pos_max_pre[SHIFT_SEQ],
-                    pos_max_post[SHIFT_SEQ], pos_max_pre[SHIFT_SEQ] + DELTA);
-        }
-        for (int s = 0; s < N_PARALLEL; ++s) {
-            if (s == SHIFT_SEQ) continue;
-            if (pos_max_post[s] != pos_max_pre[s]) {
-                FAIL_AT(
-                    "[%s] stream %d pos_max changed under shift of seq %d: "
-                    "pre=%d post=%d (cross-stream contamination — F2)",
-                    split_label, s, SHIFT_SEQ, pos_max_pre[s], pos_max_post[s]);
-            }
-        }
-    } else {
-        // GRAPH split: documented limitation. Expect rc=1 (graceful
-        // can_shift=false gate) — NOT a crash. The defensive assertion:
-        // a future regression that lets K-shift run through and CUDA-
-        // crash under graph-split would fail this branch.
-        if (rc != 1) {
-            FAIL_AT("[%s] llama_kv_cache_update rc=%d (expected 1 — "
-                    "graph-split + n_stream>1 is gated off in "
-                    "get_can_shift; see src/llama.cpp comment). A change "
-                    "of behavior here means the ggml-scheduler leaf-input "
-                    "allocation under multi-device split was fixed and "
-                    "the gate can be lifted.", split_label, rc);
-        }
-        std::fprintf(stdout, "[%s] documented graceful rc=1 (K-shift "
-                     "gated off under graph-split — see "
-                     "src/llama.cpp:get_can_shift)\n", split_label);
     }
 
     llama_free(ctx);

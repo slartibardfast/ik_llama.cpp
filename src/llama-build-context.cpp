@@ -184,13 +184,12 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
         : cparams.yarn_attn_factor;
 
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 input-layer restructure:
-    // allocate n_stream separate I32 1D input tensors of size kvps.
-    // Each per-stream rope reads from its dedicated input — no view-
-    // slicing of a shared parent tensor (which broke the scheduler's
-    // cross-device input distribution under graph-split). Each tensor
-    // is independently scheduler-allocated and host-populated, so
-    // cross-device cpy uses each tensor's own data pointer.
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1.x2 input-layer restructure:
+    // allocate per-(device, stream) I32 1D input tensors. Each
+    // input is pinned to its consuming backend via
+    // ggml_backend_sched_set_tensor_backend — the rope op for
+    // (device d, stream s) reads inp_K_shift_per_stream[d][s] which
+    // lives on device d's buffer. No cross-device cpy of inputs.
     //
     // Under the 4D KV layout [head_dim, kvps, n_head_kv, n_stream],
     // ggml_rope_ext requires b 1D with size a->ne[2] (the position
@@ -203,34 +202,63 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     // kv_self.k_l[il] is a stub; the real per-device tensors live at
     // kv_self.k_l[il]->extra as `ggml_split_tensor_t::splits[id]`.
     // Each device's split tensor is itself 4D
-    // [head_dim, kvps, nhead_per_device, n_stream]. We loop devices
-    // first, then streams within each device's split tensor.
+    // [head_dim, kvps, nhead_per_device, n_stream].
     const uint32_t n_stream = std::max<uint32_t>(1, kv_self.n_stream);
     const uint32_t kvps =
         kv_self.kv_size_per_stream > 0 ? kv_self.kv_size_per_stream : n_ctx;
 
-    lctx.default_decoder.inp_K_shift_per_stream.clear();
-    lctx.default_decoder.inp_K_shift_per_stream.reserve(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)kvps);
-        std::string name = std::string("K_shift_s") + std::to_string(s);
-        cb(t, name.c_str(), -1);
-        ggml_set_input(t);
-        lctx.default_decoder.inp_K_shift_per_stream.push_back(t);
+    // Determine n_device: under GRAPH split, model.splits.size(); else 1.
+    const uint32_t n_device =
+        (lctx.model.split_mode == LLAMA_SPLIT_MODE_GRAPH && !lctx.model.splits.empty())
+            ? (uint32_t)lctx.model.splits.size()
+            : 1u;
+
+    lctx.default_decoder.inp_K_shift_per_stream.assign(
+        n_device, std::vector<ggml_tensor *>(n_stream, nullptr));
+    for (uint32_t d = 0; d < n_device; ++d) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)kvps);
+            std::string name = std::string("K_shift_d") + std::to_string(d) +
+                               "_s" + std::to_string(s);
+            ggml_set_name(t, name.c_str());
+            cb(t, name.c_str(), -1);
+            ggml_set_input(t);
+            // Pin to the consuming backend for this device. Under
+            // graph-split, lctx.backends is ordered [CUDA0, CUDA1, ...,
+            // CPU]; the first n_device entries are the per-device
+            // CUDA backends in cparams.devices order, matching
+            // model.splits' per-device index.
+            if (n_device > 1 && d < lctx.backends.size()) {
+                ggml_backend_sched_set_tensor_backend(
+                    lctx.default_decoder.sched, t, lctx.backends[d]);
+            }
+            lctx.default_decoder.inp_K_shift_per_stream[d][s] = t;
+        }
     }
 
+    // build_one_rope: emit cast → rope_inplace → cpy_back for one
+    // K view + one b vector. backend_override (nullable) pins the
+    // intermediate F32 tmp tensor to a specific backend; under graph
+    // split this MUST be the backend that owns the K view's split,
+    // otherwise the cpy back to k_view becomes cross-device.
     auto build_one_rope = [&](ggml_tensor * k_view,
                               ggml_tensor * b_view,
                               ggml_tensor * rope_factors,
-                              int il_for_cb) -> ggml_tensor * {
+                              int il_for_cb,
+                              ggml_backend_t backend_override) -> ggml_tensor * {
         ggml_tensor * tmp;
         if (ggml_is_quantized(k_view->type)) {
             tmp = ggml_cast(ctx0, k_view, GGML_TYPE_F32);
             cb(tmp, "K_f32", il_for_cb);
-            for (auto * backend : lctx.backends) {
-                if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il_for_cb].buft)) {
-                    ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, tmp, backend);
-                    break;
+            if (backend_override != nullptr) {
+                ggml_backend_sched_set_tensor_backend(
+                    lctx.default_decoder.sched, tmp, backend_override);
+            } else {
+                for (auto * backend : lctx.backends) {
+                    if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il_for_cb].buft)) {
+                        ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, tmp, backend);
+                        break;
+                    }
                 }
             }
             tmp = ggml_rope_ext_inplace(ctx0, tmp,
@@ -284,15 +312,22 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                             n_embd_head_k, nhead_split, (int64_t)kvps,
                             head_stride, pos_stride, stream_offs);
 
+                    // Pin intermediate tmp F32 tensor to this split's
+                    // device backend so cast/rope/cpy stay on one GPU
+                    // (matches where k_view's underlying storage lives).
+                    ggml_backend_t split_backend = (id < (int)lctx.backends.size())
+                        ? lctx.backends[id]
+                        : nullptr;
                     ggml_tensor * tmp = build_one_rope(k_view,
-                            lctx.default_decoder.inp_K_shift_per_stream[s],
-                            rope_factors_split, il);
+                            lctx.default_decoder.inp_K_shift_per_stream[id][s],
+                            rope_factors_split, il, split_backend);
                     ggml_build_forward_expand(gf, tmp);
                 }
             }
         } else {
             // Non-split (layer-split or single-device): operate on
-            // the parent tensor directly.
+            // the parent tensor directly. n_device == 1 in this branch
+            // so the inputs live at inp_K_shift_per_stream[0][s].
             const int64_t n_head_kv = hparams.n_head_kv(il);
             for (uint32_t s = 0; s < n_stream; ++s) {
                 const size_t head_stride = kv_self.k_l[il]->nb[2];
@@ -304,8 +339,8 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                         head_stride, pos_stride, stream_offs);
 
                 ggml_tensor * tmp = build_one_rope(k_view,
-                        lctx.default_decoder.inp_K_shift_per_stream[s],
-                        rope_factors, il);
+                        lctx.default_decoder.inp_K_shift_per_stream[0][s],
+                        rope_factors, il, nullptr);
                 ggml_build_forward_expand(gf, tmp);
             }
         }

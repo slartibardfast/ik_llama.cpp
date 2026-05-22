@@ -4382,31 +4382,40 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 //
 
 static void llama_set_k_shift(llama_context & lctx) {
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 input-layer restructure:
-    // populate n_stream separate I32 input tensors, one per stream's
-    // kvps cells. Each tensor receives its own slice of the flat
-    // cells[] delta array: stream s gets cells[s*kvps .. (s+1)*kvps).
-    // This replaces the legacy single-tensor + per-stream-view path
-    // that broke ggml_backend_sched_copy_inputs under graph-split.
-    const auto & per_stream = lctx.default_decoder.inp_K_shift_per_stream;
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1.x2 input-layer restructure:
+    // populate per-(device, stream) I32 input tensors. Each device's
+    // copy of stream s receives the same kvps-element slice of the
+    // flat cells[] delta array. Under LAYER split mode n_device == 1
+    // so this reduces to a single per-stream allocation.
+    const auto & per_dev_stream = lctx.default_decoder.inp_K_shift_per_stream;
     const uint32_t n_stream = std::max<uint32_t>(1, lctx.transformer_kv.n_stream);
     const uint32_t kvps =
         lctx.transformer_kv.kv_size_per_stream > 0
             ? lctx.transformer_kv.kv_size_per_stream
             : (uint32_t)lctx.transformer_kv.size;
 
-    GGML_ASSERT(per_stream.size() == n_stream &&
+    GGML_ASSERT(!per_dev_stream.empty() &&
                 "inp_K_shift_per_stream not allocated; build_k_shift must run first");
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        ggml_tensor * t = per_stream[s];
-        GGML_ASSERT(t != nullptr);
-        assert(ggml_backend_buffer_is_host(t->buffer));
-        GGML_ASSERT(t->ne[0] == (int64_t)kvps);
-        int32_t * data = (int32_t *) t->data;
-        for (uint32_t p = 0; p < kvps; ++p) {
-            const uint32_t flat = s * kvps + p;
-            data[p] = lctx.transformer_kv.cells[flat].delta;
+    for (size_t d = 0; d < per_dev_stream.size(); ++d) {
+        const auto & per_stream = per_dev_stream[d];
+        GGML_ASSERT(per_stream.size() == n_stream);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            ggml_tensor * t = per_stream[s];
+            GGML_ASSERT(t != nullptr);
+            GGML_ASSERT(t->ne[0] == (int64_t)kvps);
+            // Use ggml_backend_tensor_set which handles host-staging
+            // for device-resident input tensors. The per-device input
+            // may live on a CUDA backend buffer (not host-staging);
+            // direct memcpy via t->data would be wrong in that case.
+            // Build a staging buffer once per stream and push to each
+            // device.
+            std::vector<int32_t> staging(kvps);
+            for (uint32_t p = 0; p < kvps; ++p) {
+                staging[p] = lctx.transformer_kv.cells[s * kvps + p].delta;
+            }
+            ggml_backend_tensor_set(t, staging.data(), 0,
+                                    (size_t)kvps * sizeof(int32_t));
         }
     }
 }
@@ -6907,27 +6916,15 @@ static bool get_can_shift(struct llama_context & lctx) {
     // See upstream src/llama-kv-cache.cpp:1306-1310 (commit b768f0843f),
     // and the matching workaround at upstream src/llama-kv-cache.cpp:2571.
     no_shift = no_shift || lctx.model.hparams.rope_type == LLAMA_ROPE_TYPE_MROPE;
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c1.x — graceful gate under
-    // split_mode=GRAPH + n_stream>1. The view-aliasing hypothesis from
-    // T3.6.I.c1 was ruled out by restructuring inp_K_shift into
-    // n_stream separate input tensors (decoder.inp_K_shift_per_stream);
-    // GRAPH-split K-shift STILL fails with "invalid argument" in
-    // ggml_backend_sched_copy_inputs -> ggml_backend_cuda_cpy_tensor_async
-    // -> cudaMemcpyPeerAsync. Scheduler debug shows per-stream input
-    // tensors appearing as graph leaves on CUDA0/CUDA1 with [NULL]
-    // buffer (CUDA1#leaf_X#0 size 1K, buffer NULL); the scheduler
-    // creates per-device copies but the source-side allocation isn't
-    // happening for fresh-graph leaves under multi-device split.
-    // This is a ggml-scheduler-level bug, not a build_k_shift issue;
-    // fixing it requires understanding ggml_backend_sched_split_graph's
-    // leaf-input handling for newly-built graphs on a reset scheduler.
-    // Out of T3.6 scope. Gate K-shift OFF under graph-split + n_stream>1
-    // with a clean rc=1; production uses --no-context-shift so the
-    // steady decode path is unaffected.
-    if (lctx.model.split_mode == LLAMA_SPLIT_MODE_GRAPH &&
-        lctx.transformer_kv.n_stream > 1) {
-        no_shift = true;
-    }
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1.x2 — GRAPH-split + n_stream>1
+    // K-shift now works end-to-end. The input-layer restructure
+    // (decoder.inp_K_shift_per_stream as a 2D [device][stream] vector
+    // of input tensors, each pinned to its consuming backend via
+    // ggml_backend_sched_set_tensor_backend) eliminates the cross-
+    // device cpy_tensor_async path entirely — each rope op reads from
+    // its own local-device input. Defensive both-mode test-kv-shift-
+    // per-stream binds full K-shift correctness under both LAYER and
+    // GRAPH split.
     return !no_shift;
 }
 

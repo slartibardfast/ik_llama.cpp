@@ -96,17 +96,29 @@ struct llama_decoder {
     struct ggml_tensor * inp_out_ids     = nullptr; // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask     = nullptr; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa = nullptr; // F32 [kv_size, n_batch]
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 input-layer restructure:
-    // K-shift deltas are now n_stream separate I32 input tensors, each
-    // of size kvps (= kv_size_per_stream). The previous single 1D tensor
-    // of size kv_size combined with per-stream view-slicing in
-    // build_k_shift broke under graph-split: the scheduler's cross-
-    // device input distribution used view->data pointers established
-    // at view-creation time, before the parent input was allocated on
-    // the host staging buffer (resulted in CUDA illegal-memory-access).
-    // With n_stream separate inputs each gets its own scheduler-managed
-    // allocation, no view-slicing required.
-    std::vector<struct ggml_tensor *> inp_K_shift_per_stream; // n_stream × I32[kvps]
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1.x2 input-layer restructure:
+    // K-shift deltas are stored as per-(device, stream) I32 input
+    // tensors. Outer dim is the device that consumes the input
+    // (the per-device K-cache split lives there); inner dim is the
+    // stream id. Under LAYER split mode the outer dim is 1 and this
+    // reduces to a per-stream vector.
+    //
+    // Why per-device: under GRAPH split (CUDA_Split buffer type) each
+    // layer's K cache is sharded across devices by head. Build_k_shift
+    // emits rope ops on EVERY device per layer per stream — each needs
+    // the deltas locally. A single cross-device input with copies in
+    // the scheduler hits cudaMemcpyPeerAsync with "invalid argument"
+    // (sched leaf-copy allocation path doesn't survive fresh-graph
+    // reset cleanly under multi-device). Pinning each input to its
+    // consuming backend eliminates the cross-device cpy entirely;
+    // each rope reads from a local-device tensor.
+    //
+    // Populator writes the same per-stream deltas to every device's
+    // copy of that stream (so device-replicated content, per-stream
+    // distinct content).
+    //
+    // Indexing: inp_K_shift_per_stream[device_id][stream_id].
+    std::vector<std::vector<struct ggml_tensor *>> inp_K_shift_per_stream;
     struct ggml_tensor * inp_mean        = nullptr; // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls         = nullptr; // I32 [n_batch]
     struct ggml_tensor * inp_s_copy      = nullptr; // I32 [kv_size]
