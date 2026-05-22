@@ -6889,6 +6889,21 @@ static bool get_can_shift(struct llama_context & lctx) {
     // See upstream src/llama-kv-cache.cpp:1306-1310 (commit b768f0843f),
     // and the matching workaround at upstream src/llama-kv-cache.cpp:2571.
     no_shift = no_shift || lctx.model.hparams.rope_type == LLAMA_ROPE_TYPE_MROPE;
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 known limitation (graceful
+    // gate, not silent crash): under split_mode == GRAPH the
+    // CUDA_Split buffer type for the KV cache + the per-stream
+    // input-view-of-inp_K_shift pattern triggers an illegal-memory-
+    // access in ggml_backend_sched_copy_inputs when distributing the
+    // input view across devices. Until the input-population layer is
+    // restructured to emit one inp_K_shift per stream (which would
+    // sidestep the view-cross-device path), report can_shift = false
+    // under graph-split so callers get a clean rc=1 from
+    // llama_kv_cache_update instead of a CUDA crash. Production uses
+    // --no-context-shift so the steady decode path is unaffected.
+    if (lctx.model.split_mode == LLAMA_SPLIT_MODE_GRAPH &&
+        lctx.transformer_kv.n_stream > 1) {
+        no_shift = true;
+    }
     return !no_shift;
 }
 
