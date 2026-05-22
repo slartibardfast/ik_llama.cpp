@@ -6691,9 +6691,8 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     const uint32_t n_layer = hparams.n_layer;
 
     const uint32_t n_kv   = llama_kv_cache_cell_max(transformer_kv);
-    const uint32_t n_used = transformer_kv.used;
 
-    assert(n_used <= n_kv);
+    assert(transformer_kv.used <= n_kv);
 
     //const int64_t t_start = ggml_time_us();
 
@@ -6713,101 +6712,135 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     //
     //  if ids[i] == i || ids[i] == n_kv, then cell i is not moved
     //
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c2: per-stream outer loop. The
+    // hole-fill scan is scoped to each stream's slice
+    // [s*kvps, (s+1)*kvps) so cells never cross stream boundaries
+    // (DefragNoCrossStream from specs/kv-cache/defrag_per_stream.allium).
+    // Under n_stream == 1 (single-stream / non-split context) the outer
+    // loop runs once and the per-stream scan covers the full cache,
+    // matching the legacy behaviour byte-for-byte.
     std::vector<uint32_t> ids(n_kv, n_kv);
 
-    for (uint32_t i0 = 0; i0 < n_used; ++i0) {
-        const auto & cell0 = transformer_kv.cells[i0];
+    const uint32_t n_stream = std::max<uint32_t>(1, transformer_kv.n_stream);
+    const uint32_t kvps     =
+        (transformer_kv.kv_size_per_stream > 0)
+            ? transformer_kv.kv_size_per_stream
+            : n_kv;
 
-        if (!cell0.is_empty()) {
-            ids[i0] = i0;
+    bool yielded = false;
 
-            continue;
+    for (uint32_t s = 0; s < n_stream && !yielded; ++s) {
+        const uint32_t s_base = s * kvps;
+
+        // per-stream n_used: count occupied cells in this stream's slice
+        uint32_t n_used_s = 0;
+        for (uint32_t k = 0; k < kvps; ++k) {
+            if (!transformer_kv.cells[s_base + k].is_empty()) {
+                n_used_s++;
+            }
         }
 
-        // found a hole - fill it with data from the end of the cache
+        for (uint32_t k0 = 0; k0 < n_used_s; ++k0) {
+            const uint32_t i0 = s_base + k0;
+            const auto & cell0 = transformer_kv.cells[i0];
 
-        uint32_t nh = 1;
-
-        // determine the size of the hole
-        while (i0 + nh < n_used && transformer_kv.cells[i0 + nh].is_empty()) {
-            nh++;
-        }
-
-        uint32_t nf = 0;
-        uint32_t is = n_kv - 1;
-
-        // starting from the end, find nh non-empty cells
-        for (; is > i0; --is) {
-            const auto & cell1 = transformer_kv.cells[is];
-
-            if (cell1.is_empty() || ids[is] != n_kv) {
+            if (!cell0.is_empty()) {
+                ids[i0] = i0;
                 continue;
             }
 
-            // non-empty cell which is not yet moved
-            nf++;
+            // found a hole - fill it with data from the end of THIS STREAM's
+            // slice (never cross into another stream).
 
-            if (nf == nh) {
-                break;
+            uint32_t nh = 1;
+            while (k0 + nh < n_used_s && transformer_kv.cells[s_base + k0 + nh].is_empty()) {
+                nh++;
             }
-        }
 
-        // this can only happen if `n_used` is not accurate, which would be a bug
-        GGML_ASSERT(nf == nh && "KV defrag bug: nf != nh");
+            uint32_t nf = 0;
+            // backward scan ONLY within [s_base + k0, s_base + kvps).
+            uint32_t ks = kvps - 1;
+            uint32_t is = s_base + ks;
+            for (; ks > k0; --ks) {
+                is = s_base + ks;
+                const auto & cell1 = transformer_kv.cells[is];
 
-        nf = 0;
-
-        uint32_t i1 = is;
-
-        // are we moving a continuous block of memory?
-        bool cont = false;
-
-        // should we stop searching for the next move?
-        bool stop = false;
-
-        // go back and move the nf cells to the hole
-        for (; i1 < n_kv; ++i1) {
-            auto & cell1 = transformer_kv.cells[i1];
-
-            if (cell1.is_empty() || ids[i1] != n_kv) {
-                if (n_moves == max_moves) {
-                    stop = true;
-                    break;
+                if (cell1.is_empty() || ids[is] != n_kv) {
+                    continue;
                 }
 
-                cont = false;
-                continue;
+                nf++;
+                if (nf == nh) {
+                    break;
+                }
             }
 
-            // this cell goes to (i0 + nf)
-            ids[i1] = i0 + nf;
+            GGML_ASSERT(nf == nh && "KV defrag bug: nf != nh");
 
-            // move the cell meta data
-            transformer_kv.cells[i0 + nf] = cell1;
+            nf = 0;
+            uint32_t k1 = ks;
+            bool cont = false;
+            bool stop = false;
 
-            // clear the old cell and move the head there
-            cell1 = llama_kv_cell();
-            transformer_kv.head = n_used;
+            // forward move scan within stream's [k1, kvps).
+            for (; k1 < kvps; ++k1) {
+                const uint32_t i1 = s_base + k1;
+                auto & cell1 = transformer_kv.cells[i1];
 
-            if (!cont) {
-                n_moves++;
-                cont = true;
+                if (cell1.is_empty() || ids[i1] != n_kv) {
+                    if (n_moves == max_moves) {
+                        stop = true;
+                        break;
+                    }
+                    cont = false;
+                    continue;
+                }
+
+                ids[i1] = i0 + nf;
+                transformer_kv.cells[i0 + nf] = cell1;
+                cell1 = llama_kv_cell();
+
+                if (!cont) {
+                    n_moves++;
+                    cont = true;
+                }
+
+                nf++;
+                if (nf == nh) {
+                    break;
+                }
             }
 
-            nf++;
-
-            if (nf == nh) {
+            if (stop || n_moves == max_moves) {
+                yielded = true;
                 break;
             }
+
+            k0 += nh - 1;
         }
+    }
 
-        if (stop || n_moves == max_moves) {
-            break;
+    // Per-stream v_heads update + global head reset. After defrag each
+    // stream's occupied cells sit in [s*kvps, s*kvps + used_per_stream(s));
+    // v_heads[s] tracks the per-stream cursor.
+    if (!transformer_kv.v_heads.empty()) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const uint32_t s_base = s * kvps;
+            uint32_t used_s = 0;
+            for (uint32_t k = 0; k < kvps; ++k) {
+                if (!transformer_kv.cells[s_base + k].is_empty()) {
+                    used_s++;
+                }
+            }
+            if (s < transformer_kv.v_heads.size()) {
+                transformer_kv.v_heads[s] = used_s;
+            }
         }
-
-        //LLAMA_LOG_INFO("(tmp log) KV defrag: move [%u, %u) to [%u, %u)\n", is, i1 + 1, i0, i0 + nh);
-
-        i0 += nh - 1;
+    }
+    // Legacy global head: 0 (compacted-from-front in every stream;
+    // single-stream callers still see the head at the slot's start).
+    if (n_moves > 0) {
+        transformer_kv.head = 0;
     }
 
     if (n_moves == 0) {

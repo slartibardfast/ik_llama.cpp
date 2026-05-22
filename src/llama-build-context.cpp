@@ -388,12 +388,37 @@ ggml_cgraph * llm_build_context::build_s_copy() {
 ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
-    // PHASE_NSTREAM_KV_4D N2.b: defrag not yet rewritten for the
-    // per-stream 4D layout. Production usage does not trigger
-    // defrag in normal decode. Gate to n_stream==1 until per-stream
-    // defrag is implemented.
-    GGML_ASSERT(kv_self.n_stream == 1 &&
-            "build_defrag not yet stream-aware; requires n_stream==1");
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c2: per-(device, stream) defrag with
+    // 3D-per-stream views.
+    //
+    // Cell-metadata moves are already restricted to a single stream by
+    // llama_kv_cache_defrag_internal (per-stream outer loop). This
+    // builder consumes the flat `ids` array — for each contiguous run
+    // (dst=i, src=ids[i], length nm), both i and ids[i] are guaranteed
+    // to be within the SAME stream s = i / kvps. We add a defensive
+    // stream-boundary check to break batched runs that would otherwise
+    // span streams.
+    //
+    // Under the 4D KV layout [head_dim, kvps, n_head_kv, n_stream]:
+    //   nb[1] = head_dim*ts            (per-position stride)
+    //   nb[2] = head_dim*kvps*ts       (per-head stride within stream)
+    //   nb[3] = head_dim*kvps*nhead*ts (stream stride)
+    // The legacy 2D [n_embd_k_gqa, nm] view collapsed head_dim and
+    // n_head_kv into one dim — INCORRECT under 4D because head_dim is
+    // contiguous but n_head_kv is separated by kvps positions. The new
+    // 3D-per-stream view is [head_dim, n_head_kv, nm] with
+    //   nb_view[1] = parent->nb[2]
+    //   nb_view[2] = parent->nb[1]
+    //   offset     = s * parent->nb[3] + p_local * parent->nb[1]
+    //
+    // Under split_mode == GRAPH the parent kv_self.k_l[il] is a stub;
+    // we iterate per-device on kl_extra->splits[id]. Same for V.
+    // (See specs/kv-cache/defrag_per_stream.allium DefragViewIs3DPerStream
+    //  and the T3.6.I.c1.x2 pattern in build_k_shift.)
+    const uint32_t kvps =
+        (kv_self.kv_size_per_stream > 0)
+            ? kv_self.kv_size_per_stream
+            : (uint32_t)kv_self.size;
 
     for (uint32_t i = 0; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
@@ -403,10 +428,21 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
         }
 
         uint32_t nm = 1;
-
-        while (i + nm < ids.size() && ids[i + nm] == id + nm) {
+        // Per-stream batching: stay within stream of `i`. Both i and
+        // ids[i+nm-1] must share the same s = i / kvps. The dispatcher
+        // guarantees ids[i] is in the same stream as i, but contracts
+        // across stream boundaries (i transitioning to the next stream)
+        // are not allowed to merge.
+        const uint32_t s = (kvps > 0) ? (i / kvps) : 0u;
+        while (i + nm < ids.size()
+                && ids[i + nm] == id + nm
+                && (kvps == 0 || ((i + nm) / kvps == s))
+                && (kvps == 0 || ((id + nm) / kvps == s))) {
             nm++;
         }
+
+        const uint32_t p_dst = (kvps > 0) ? (i  % kvps) : i;
+        const uint32_t p_src = (kvps > 0) ? (id % kvps) : id;
 
         for (int il = 0; il < n_layer; ++il) {
             if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
@@ -415,58 +451,95 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             if (kv_self.k_l[il] == nullptr) {
                 continue;
             }
-            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
-            ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*i));
+            // ---- K side ----
+            // Emit per-(device) cpy. Under graph-split (kl_extra != null)
+            // we iterate splits; otherwise operate on the parent k_l[il]
+            // directly (n_device == 1).
+            auto * kl_extra = (ggml_split_tensor_t *)kv_self.k_l[il]->extra;
+            const int n_dev_k = kl_extra ? kl_extra->n_device : 1;
+            for (int d = 0; d < n_dev_k; ++d) {
+                ggml_tensor * parent_k = kl_extra ? kl_extra->splits[d]
+                                                  : kv_self.k_l[il];
+                if (!parent_k) continue;
 
-            ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
-                    n_embd_k_gqa, nm,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*id));
+                const int64_t head_dim_k    = parent_k->ne[0];
+                const int64_t nhead_k_split = parent_k->ne[2];
+                const size_t  k_head_stride = parent_k->nb[2];
+                const size_t  k_pos_stride  = parent_k->nb[1];
+                const size_t  k_stream_offs = (size_t)s * parent_k->nb[3];
 
-            ggml_tensor * view_v_src = nullptr;
-            ggml_tensor * view_v_dst = nullptr;
+                ggml_tensor * view_k_src = ggml_view_3d(ctx0, parent_k,
+                        head_dim_k, nhead_k_split, (int64_t)nm,
+                        k_head_stride, k_pos_stride,
+                        k_stream_offs + (size_t)p_src * k_pos_stride);
 
-            if (kv_self.v_l.size() > il && kv_self.v_l[il] != nullptr) {
-                // Note: with MLA the V cache may not be present.
+                ggml_tensor * view_k_dst = ggml_view_3d(ctx0, parent_k,
+                        head_dim_k, nhead_k_split, (int64_t)nm,
+                        k_head_stride, k_pos_stride,
+                        k_stream_offs + (size_t)p_dst * k_pos_stride);
+
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
+            }
+
+            // ---- V side ----
+            if ((int)kv_self.v_l.size() > il && kv_self.v_l[il] != nullptr) {
                 if (flash_attn) {
-                    // NOTE: the V cache is not transposed when using flash attention
-                    view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
-                            n_embd_v_gqa, nm,
-                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa),
-                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*i));
+                    // v_trans == false (production --fa on). V layout
+                    // mirrors K: [head_dim_v, kvps, n_head_kv_v, n_stream]
+                    // (or [n_embd_v_row, kvps, 1, n_stream] for the
+                    //  hybrid V tail fallback). Same 3D-per-stream view
+                    // pattern; the per-stream slice has ne[2] = v's ne[2].
+                    auto * vl_extra = (ggml_split_tensor_t *)kv_self.v_l[il]->extra;
+                    const int n_dev_v = vl_extra ? vl_extra->n_device : 1;
+                    for (int d = 0; d < n_dev_v; ++d) {
+                        ggml_tensor * parent_v = vl_extra ? vl_extra->splits[d]
+                                                          : kv_self.v_l[il];
+                        if (!parent_v) continue;
 
-                    view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
-                            n_embd_v_gqa, nm,
-                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa),
-                            ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*id));
+                        const int64_t v_dim0       = parent_v->ne[0];
+                        const int64_t v_nhead      = parent_v->ne[2];
+                        const size_t  v_head_stride = parent_v->nb[2];
+                        const size_t  v_pos_stride  = parent_v->nb[1];
+                        const size_t  v_stream_offs = (size_t)s * parent_v->nb[3];
+
+                        ggml_tensor * view_v_src = ggml_view_3d(ctx0, parent_v,
+                                v_dim0, v_nhead, (int64_t)nm,
+                                v_head_stride, v_pos_stride,
+                                v_stream_offs + (size_t)p_src * v_pos_stride);
+
+                        ggml_tensor * view_v_dst = ggml_view_3d(ctx0, parent_v,
+                                v_dim0, v_nhead, (int64_t)nm,
+                                v_head_stride, v_pos_stride,
+                                v_stream_offs + (size_t)p_dst * v_pos_stride);
+
+                        ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
+                    }
                 } else {
-                    view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+                    // v_trans == true path: V is transposed
+                    // [kv_size, n_embd_v_gqa]; not compatible with the 4D
+                    // per-stream layout. Production uses --fa on (this
+                    // branch not reached). Spec excludes; see
+                    // specs/kv-cache/defrag_per_stream.allium OQ-3.
+                    GGML_ASSERT(kv_self.n_stream == 1 &&
+                        "build_defrag v_trans=true path requires n_stream==1; "
+                        "production uses --fa on which keeps v_trans=false.");
+                    const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+                    ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
                             nm, n_embd_v_gqa,
                             ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
                             ggml_row_size(kv_self.v_l[il]->type, i));
-
-                    view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+                    ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
                             nm, n_embd_v_gqa,
                             ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
                             ggml_row_size(kv_self.v_l[il]->type, id));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
                 }
-            }
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
-            if (view_v_src && view_v_dst) {
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
             }
         }
 
         i += nm - 1;
     }
-
-    //LLAMA_LOG_INFO("gf->n_nodes = %d\n", gf->n_nodes);
 
     return gf;
 }

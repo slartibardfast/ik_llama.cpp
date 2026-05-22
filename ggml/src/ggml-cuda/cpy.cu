@@ -163,6 +163,66 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst_direct, const int 
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+// PHASE_NSTREAM_KV_PERF T3.6.I.c2: Q -> Q same-type non-contiguous
+// copy. Used by KV cache defrag under the per-stream 4D layout where
+// strided 3D views into a Q4_0 / Q4_0_AR16 / Q8_0 / etc. cache must
+// be moved cell-by-cell WITHOUT requantization. block_bytes and qk
+// are runtime parameters so a single kernel covers every quant type
+// (Q4_0=18/32, Q4_0_AR16=10/16, Q4_1=20/32, Q5_0=22/32, Q5_1=24/32,
+//  Q6_0/Q8_0=34/32, IQ4_NL=18/32, ...).
+//
+// Each CUDA thread copies exactly one quant block (block_bytes bytes,
+// block-aligned at both src and dst via ggml's nb[] block strides).
+static __global__ void cpy_q_q_same_type(
+        const char * cx, char * cdst_direct, const int ne,
+        const int ne00, const int ne01, const int ne02,
+        const int nb00, const int nb01, const int nb02, const int nb03,
+        const int ne10, const int ne11, const int ne12,
+        const int nb10, const int nb11, const int nb12, const int nb13,
+        const int qk, const int block_bytes,
+        char ** cdst_indirect, int graph_cpynode_index) {
+    const int i = (blockDim.x*blockIdx.x + threadIdx.x) * qk;
+    if (i >= ne) return;
+
+    char * cdst = (cdst_indirect != nullptr) ? cdst_indirect[graph_cpynode_index] : cdst_direct;
+
+    const int i03 = i/(ne00 * ne01 * ne02);
+    const int i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int x_offset = (i00/qk)*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+    const int i13 = i/(ne10 * ne11 * ne12);
+    const int i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int dst_offset = (i10/qk)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    const char * src = cx + x_offset;
+    char * dst = cdst + dst_offset;
+
+    for (int b = 0; b < block_bytes; b++) {
+        dst[b] = src[b];
+    }
+}
+
+static void ggml_cpy_q_q_same_type_cuda(
+        const char * cx, char * cdst, const int ne,
+        const int ne00, const int ne01, const int ne02,
+        const int nb00, const int nb01, const int nb02, const int nb03,
+        const int ne10, const int ne11, const int ne12,
+        const int nb10, const int nb11, const int nb12, const int nb13,
+        const int qk, const int block_bytes,
+        cudaStream_t stream, char ** cdst_indirect, int & graph_cpynode_index) {
+    GGML_ASSERT(ne % qk == 0);
+    const int num_blocks = ne / qk;
+    cpy_q_q_same_type<<<num_blocks, 1, 0, stream>>>(
+            cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+            ne10, ne11, ne12, nb10, nb11, nb12, nb13,
+            qk, block_bytes,
+            cdst_indirect, graph_cpynode_index++);
+}
+
 // Copy destination pointers to GPU to be available when pointer indirection is in use
 
 void ggml_cuda_cpy_dest_ptrs_copy(ggml_cuda_graph * cuda_graph, char ** host_dest_ptrs, const int host_dest_ptrs_size, cudaStream_t stream) {
@@ -643,9 +703,28 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_cpy_flt_cuda<float, int32_t> (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_flt_cuda<int32_t, float> (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream, dest_ptrs_d, graph_cpynode_index);
-    } else if (ggml_are_same_shape(src0, src1) && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
+    } else if (ggml_are_same_shape(src0, src1) && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0 &&
+               (ggml_is_transposed(src0) || ggml_is_transposed(src1))) {
         // This is needed for MLA with mla=2 when using q8_0 cache.
+        // Specifically the transposed case (one of src0/src1 is the
+        // transpose of the other); requires requantization.
         transpose_q8_0(ctx, src0, src1);
+    } else if (ggml_are_same_shape(src0, src1) && src0->type == src1->type
+               && ggml_is_quantized(src0->type)
+               && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+        // PHASE_NSTREAM_KV_PERF T3.6.I.c2: same-type quantized copy
+        // with arbitrary (non-contiguous) strides — block-aligned
+        // byte move with no requantization. Used by KV cache defrag
+        // under the 4D per-stream layout where 3D views into the
+        // K/V cache need to be moved cell-by-cell.
+        const int qk = ggml_blck_size(src0->type);
+        const int block_bytes = (int)ggml_type_size(src0->type);
+        ggml_cpy_q_q_same_type_cuda(
+                src0_ddc, src1_ddc, ne, ne00, ne01, ne02,
+                nb00, nb01, nb02, nb03,
+                ne10, ne11, ne12, nb10, nb11, nb12, nb13,
+                qk, block_bytes,
+                main_stream, dest_ptrs_d, graph_cpynode_index);
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
@@ -740,8 +819,16 @@ void* ggml_cuda_cpy_fn(const ggml_tensor * src0, ggml_tensor * src1) {
         return (void*) cpy_flt<cpy_1_flt<float, int32_t>>;
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_F32) {
         return (void*) cpy_flt<cpy_1_flt<int32_t, float>>;
-    } else if (ggml_are_same_shape(src0, src1) && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
+    } else if (ggml_are_same_shape(src0, src1) && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0 &&
+               (ggml_is_transposed(src0) || ggml_is_transposed(src1))) {
         return (void *)transpose_q8_0;
+    } else if (ggml_are_same_shape(src0, src1) && src0->type == src1->type
+               && ggml_is_quantized(src0->type)
+               && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+        // PHASE_NSTREAM_KV_PERF T3.6.I.c2: same-type quantized block
+        // copy (defrag of strided 4D KV views). Runtime-parameterized
+        // by qk + block_bytes; one kernel covers all quant types.
+        return (void *)cpy_q_q_same_type;
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));

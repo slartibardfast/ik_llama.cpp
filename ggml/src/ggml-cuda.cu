@@ -5304,6 +5304,14 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 if (ggml_are_same_shape(op->src[0], op->src[1]) && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_Q8_0) {
                     return true;
                 }
+                // PHASE_NSTREAM_KV_PERF T3.6.I.c2: same-type quantized
+                // non-contiguous block copy (KV cache defrag of strided
+                // 4D views). Runtime-parameterized in ggml_cuda_cpy.
+                if (ggml_are_same_shape(op->src[0], op->src[1])
+                    && op->src[0]->type == op->src[1]->type
+                    && ggml_is_quantized(op->src[0]->type)) {
+                    return true;
+                }
                 return false;
             } break;
         case GGML_OP_REDUCE:
