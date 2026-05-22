@@ -667,9 +667,33 @@ GGML_CALL int ggml_backend_cuda_graph_probe_active(void) {
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 #ifdef USE_CUDA_GRAPH
-    // Let's leave this debug log in for now, so we have a trace in case
-    // number of CUDA graphs goes crazy
-    GGML_CUDA_LOG_INFO("%s: have %d graphs\n", __func__, int(cuda_graphs.size()));
+    // Graph-pool VRAM probe (T3.6.M, permanent). Sums host-side bookkeeping
+    // (nodes / params / cpy ptr vectors) and device-side cpy dest_ptrs
+    // arrays across all cached graphs. The cudaGraphExec_t binaries
+    // themselves are opaque to CUDA's public API, so they are not counted;
+    // the sums below are an under-count, but they grow proportional to
+    // graph-pool size and are the load-bearing signal for "is the cache
+    // growing without bound" — which is what this trace exists to catch.
+    size_t total_nodes = 0;
+    size_t host_bytes  = 0;
+    size_t dev_bytes   = 0;
+    for (const auto & kv : cuda_graphs) {
+        const ggml_cuda_graph * g = kv.second.get();
+        if (!g) continue;
+        // num_nodes is never set in this codebase; ggml_graph_properties is
+        // resized to cgraph->n_nodes in update_cuda_graph_executable, so its
+        // size is the load-bearing node count for cached entries.
+        total_nodes += g->ggml_graph_properties.size();
+        host_bytes  += g->nodes.capacity()                 * sizeof(cudaGraphNode_t);
+        host_bytes  += g->params.capacity()                * sizeof(cudaKernelNodeParams);
+        host_bytes  += g->ggml_graph_properties.capacity() * sizeof(ggml_graph_node_properties);
+        host_bytes  += g->cpy_dest_ptrs.capacity()         * sizeof(char *);
+        dev_bytes   += (size_t)g->dest_ptrs_size           * sizeof(char *);
+    }
+    GGML_CUDA_LOG_INFO(
+        "%s: have %d graphs (%zu nodes, %.1f KB host bookkeeping, %.1f KB device dest_ptrs)\n",
+        __func__, int(cuda_graphs.size()), total_nodes,
+        host_bytes / 1024.0, dev_bytes / 1024.0);
 #endif
 
     // Explicit early teardown of the cuda_graphs map: each entry's dtor
