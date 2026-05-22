@@ -1,6 +1,6 @@
 // server-trace-ndjson.h
 //
-// S5 — NDJSON trace emission for the Bug C closure scheduler invariants.
+// NDJSON trace emission for batch-composition + graph-cache invariants.
 //
 // Gated on LLAMA_TRACE_NDJSON_DIR. When unset, every call is a no-op
 // branch in the hot path. When set, one NDJSON line is appended per
@@ -9,11 +9,12 @@
 // Schema is defined alongside the validator at
 // /home/llm/yarn-agentic/scripts/validate-batch-composition-trace.py.
 //
-// Per feedback_bake_measurement_env_gates: this is a diagnostic that
-// should be deleted (header + emit calls + env var) once the spec/code
-// agreement is established and the n_stream 4D port (N3) removes the
-// load-bearing decode-side gate. Tracked in
-// /home/llm/yarn-agentic/PHASE_NSTREAM_KV_4D.md S5 closure.
+// Under T4 chunked-prefill admission this trace is the binding gate
+// for the scheduler invariants (TokenBudgetRespected,
+// DecodePriorityAdmission, PerTokenFlagExclusivity, PrefillCarryProgresses)
+// defined in specs/scheduler/batch_composition.allium and
+// specs/multislot/BatchComposition.tla. It is not a diagnostic-only
+// scaffold — keep enabled in any verify run that exercises GP4.m.
 
 #pragma once
 
@@ -21,9 +22,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace server_trace_ndjson {
@@ -68,24 +71,51 @@ inline void emit_set(std::string& out, const std::vector<int>& xs) {
     out += "]";
 }
 
-// Emit a TickDispatch record. Call exactly once per llama_decode
-// dispatched by the server tick — right before the decode runs, so the
-// recorded sets reflect what's about to be processed.
+// Emit a TickDispatch record. Call once per server tick (one
+// update_slots() iteration), AFTER the batch has been fully composed
+// (add_sampled_tokens + batch_pending_prompt) and BEFORE
+// process_batch_tokens dispatches it. Captures the tick-level batch
+// composition under T4 chunked-prefill admission:
+//   prefill_counts        — per-slot count of prefill tokens admitted
+//                           this tick (slot_id -> count, count > 0)
+//   decode_slots          — slot ids whose decode token is in this
+//                           tick's batch
+//   processing_set_at_start_of_tick — slots in PROCESSING state at
+//                           tick start (before add_sampled_tokens)
+//   loading_prompt_set_at_start_of_tick — slots in LOAD_PROMPT command
+//                           at tick start (before batch_pending_prompt)
+//   budget_k              — per-tick token budget K
+//                           (params.prefill_chunk_budget, default
+//                           n_ubatch)
+// Schema and invariants in
+// /home/llm/yarn-agentic/scripts/validate-batch-composition-trace.py
+// (T4 form).
 inline void emit_tick_dispatch(int tick,
-                               const std::vector<int>& prefill_slots,
+                               const std::map<int, int>& prefill_counts,
                                const std::vector<int>& decode_slots,
-                               const std::vector<int>& loading_prompt_set) {
+                               const std::vector<int>& processing_set_at_start_of_tick,
+                               const std::vector<int>& loading_prompt_set_at_start_of_tick,
+                               int budget_k) {
     if (!enabled()) return;
     std::FILE* fp = trace_file();
     if (!fp) return;
     std::string line = "{\"action\": \"TickDispatch\", \"tick\": "
                      + std::to_string(tick)
-                     + ", \"prefill_slots\": ";
-    emit_set(line, prefill_slots);
-    line += ", \"decode_slots\": ";
+                     + ", \"prefill_counts\": {";
+    bool first = true;
+    for (const auto & kv : prefill_counts) {
+        if (!first) line += ", ";
+        first = false;
+        line += "\"" + std::to_string(kv.first) + "\": "
+              + std::to_string(kv.second);
+    }
+    line += "}, \"decode_slots\": ";
     emit_set(line, decode_slots);
+    line += ", \"processing_set_at_start_of_tick\": ";
+    emit_set(line, processing_set_at_start_of_tick);
     line += ", \"loading_prompt_set_at_start_of_tick\": ";
-    emit_set(line, loading_prompt_set);
+    emit_set(line, loading_prompt_set_at_start_of_tick);
+    line += ", \"budget_k\": " + std::to_string(budget_k);
     line += "}\n";
     std::lock_guard<std::mutex> lk(trace_mutex());
     std::fwrite(line.data(), 1, line.size(), fp);

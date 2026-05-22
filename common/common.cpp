@@ -1013,6 +1013,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.n_ubatch = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--prefill-chunk-budget") {
+        CHECK_ARG
+        params.prefill_chunk_budget = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--keep") {
         CHECK_ARG
         params.n_keep = std::stoi(argv[i]);
@@ -2477,6 +2482,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-n,    --predict N",            "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict });
     options.push_back({ "*",           "-b,    --batch-size N",         "logical maximum batch size (default: %d)", params.n_batch });
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });
+    options.push_back({ "*",           "       --prefill-chunk-budget N", "per-tick chunked-prefill admission budget K (Sarathi-Serve). 0 = default (n_ubatch). (default: %d)", params.prefill_chunk_budget });
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });

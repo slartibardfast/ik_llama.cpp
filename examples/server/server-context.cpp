@@ -3621,62 +3621,60 @@ bool server_context::create_checkpoint(server_slot & slot) {
 }
 
 void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
-    // Strict-sequential prompt-loading: at most one slot's prompt added
-    // per batch. Mirrors strict-sequential-decode mode at the prefill
-    // level so prefill ubatch shape == NP=1 prefill ubatch shape exactly.
-    // See specs/deltanet/fattn-per-slot-kv-sm75.md §15.16.
-    static const bool strict_sequential_decode_prompt = []() {
-        const char * e = std::getenv("LLAMA_FATTN_STRICT_SEQUENTIAL_DECODE");
-        return e && std::strcmp(e, "1") == 0;
-    }();
-    bool added_a_prompt_this_call = false;
-
-    // Global PP serialization. Concurrent multi-slot prefill on this
-    // architecture is measured at 4.8x SLOWER per-sequence than serial
-    // prefill (parallel-prefill attention masking is the dominant cost,
-    // not NCCL contention). To keep throughput optimal: at most ONE slot
-    // may be in the prefill phase at any time. TG-phase slots continue
-    // to run concurrently (the per-slot decode cost overlap is ~7%).
+    // T4 chunked-prefill admission (Sarathi-Serve, OSDI '24). Decode
+    // tokens for PROCESSING slots have already been admitted by
+    // add_sampled_tokens() running earlier in update_slots(). This
+    // function admits prefill chunks for LOAD_PROMPT slots, up to a
+    // per-tick token budget K = prefill_chunk_budget (default n_ubatch).
     //
-    // active_pp_slot_id = slot currently mid-prefill (LOAD_PROMPT command
-    // with progress). If no in-progress prefill exists, pre-select the
-    // first LOAD_PROMPT slot in iteration order so a fresh batch can't
-    // interleave two newly-arrived prompts. Any other slot with
-    // LOAD_PROMPT pending is held until the active slot transitions
-    // to TG (state -> PROCESSING).
-    int active_pp_slot_id = -1;
+    // Fairness: per-slot quota = ceil(K / n_eligible_load_nonembedding),
+    // so each eligible LOAD_PROMPT slot is bounded to its fair share
+    // per tick. Slots that hit their quota carry the remainder to the
+    // next tick (slot stays in LOAD_PROMPT with advancing n_past_prompt
+    // — see PrefillCarryProgressesMonotonically in
+    // specs/scheduler/batch_composition.allium).
+    //
+    // BatchCompositionInvariant: total batch tokens (decode + prefill)
+    // <= K per tick. The pre-T4 PrefillSerialisationGate (active_pp_slot_id
+    // single-prefill-slot policy) and DecodeHoldGate (decode held when
+    // any slot is LOAD_PROMPT) are gone; both were superseded by 4D KV
+    // layout (Bug C structurally closed; see PHASE_NSTREAM_KV_PERF.md
+    // Q1) and by Sarathi-Serve admission (this function).
+    const int32_t K = params_base.prefill_chunk_budget > 0
+        ? params_base.prefill_chunk_budget
+        : n_ubatch;
+    tick_trace.budget_k = K;
+
+    // Per-slot batch position of each slot's last admitted prefill
+    // token, recorded as tokens are added. The transition block uses
+    // this to set the logits flag on the slot's OWN last token (not
+    // the global batch tail, since T4 multi-slot admission may
+    // interleave tokens from multiple slots into one batch).
+    std::map<int, int> slot_last_batch_pos;
+
+    // Count non-embedding LOAD_PROMPT slots so per-slot quota can be
+    // computed. Embedding slots are exempt from chunked admission
+    // (legacy semantics — admit whole prompt in one tick or defer).
+    int n_eligible_load_nonembedding = 0;
     for (const auto& s : slots) {
         if (s.state == SLOT_STATE_IDLE
             && s.command == SLOT_COMMAND_LOAD_PROMPT
-            && s.n_prompt_tokens_processed > 0) {
-            active_pp_slot_id = s.id;
-            break;
+            && !s.embedding) {
+            ++n_eligible_load_nonembedding;
+        }
+        if (s.command == SLOT_COMMAND_LOAD_PROMPT) {
+            tick_trace.loading_prompt_set_at_start_of_tick.push_back(s.id);
         }
     }
-    if (active_pp_slot_id == -1) {
-        for (const auto& s : slots) {
-            if (s.state == SLOT_STATE_IDLE
-                && s.command == SLOT_COMMAND_LOAD_PROMPT) {
-                active_pp_slot_id = s.id;
-                break;
-            }
-        }
-    }
+    const int32_t per_slot_quota = n_eligible_load_nonembedding > 0
+        ? (K + n_eligible_load_nonembedding - 1) / n_eligible_load_nonembedding
+        : K;
 
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
-            // In strict-sequential mode, only one prompt per batch.
-            if (strict_sequential_decode_prompt && added_a_prompt_this_call) {
-                break;
-            }
-            // Global PP serialization: skip this slot if another is
-            // mid-prefill. Once active_pp_slot_id transitions out of
-            // LOAD_PROMPT (prefill done, slot now in TG), the next
-            // update_slots() call will pick up a queued slot here.
-            if (active_pp_slot_id != -1 && slot.id != active_pp_slot_id) {
-                continue;
-            }
-            const int32_t batch_n_tokens_before = batch.n_tokens;
+            // T4: no PrefillSerialisationGate. All LOAD_PROMPT slots are
+            // eligible to contribute prefill tokens this tick, bounded
+            // by per_slot_quota (above) and the global K budget.
             // this slot still has a prompt to be processed
             if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                 auto& prompt_tokens = slot.prompt_tokens;
@@ -3944,9 +3942,21 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 int32_t ga_n = slot.ga_n;
                 int32_t ga_w = slot.ga_w;
 
-                // add prompt tokens for processing in the current batch
-                // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
-                while (slot.n_past_prompt < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
+                // T4 chunked admission. Embedding slots bypass the budget
+                // and use legacy single-shot n_batch cap (no chunking).
+                // Non-embedding LOAD_PROMPT slots are bounded by per-slot
+                // quota AND the global K budget.
+                //
+                // TODO: the self-extend stuff here is a mess - simplify
+                // and/or abstract it somehow
+                const int32_t slot_admission_cap =
+                    slot.embedding ? n_batch : per_slot_quota;
+                const int32_t global_admission_cap =
+                    slot.embedding ? n_batch : K;
+                int32_t slot_n_admitted_this_tick = 0;
+                while (slot.n_past_prompt < slot.n_prompt_tokens
+                       && slot_n_admitted_this_tick < slot_admission_cap
+                       && batch.n_tokens < global_admission_cap) {
                     // get next token to process
                     llama_token cur_tok = slot.prompt_tokens[slot.n_past_prompt];
                     if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3971,6 +3981,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_prompt++;
                     slot.n_past++;
                     slot.image_just_processed = false;
+                    slot_last_batch_pos[slot.id] = batch.n_tokens - 1;
+                    if (!slot.embedding) {
+                        tick_trace.prefill_counts[slot.id]++;
+                    }
+                    ++slot_n_admitted_this_tick;
                     // NPC.4: do NOT break early to insert a "tolerance" checkpoint
                     // mid-prefill. That break splits prefill into two batches
                     // (n_prompt-tolerance, tolerance) — the second batch is a
@@ -3983,7 +3998,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     // still happens at slot release and via interval-based
                     // create_checkpoint_at_interval; we just don't FORCE a
                     // mid-prefill split.
-                    
+
                 }
                 LOG_VERBOSE("prompt processing progress", {
                     {"id_slot",  slot.id},
@@ -4007,11 +4022,20 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         }
                     }
 
-                    // extract the logits only for the last token
-                    batch.logits[batch.n_tokens - 1] = true;
+                    // Logits + i_batch on the slot's OWN last admitted
+                    // prefill token, not the global batch tail. Under
+                    // T4 multi-slot admission, later slots may interleave
+                    // tokens after this slot's last admission, so
+                    // batch.n_tokens - 1 is no longer guaranteed to
+                    // belong to this slot.
+                    auto it_lbp = slot_last_batch_pos.find(slot.id);
+                    const int32_t i_logits = (it_lbp != slot_last_batch_pos.end())
+                        ? it_lbp->second
+                        : batch.n_tokens - 1;
+                    batch.logits[i_logits] = true;
 
                     slot.n_decoded = 0;
-                    slot.i_batch = batch.n_tokens - 1;
+                    slot.i_batch = i_logits;
 
                     LOG_VERBOSE("prompt done", {
                         {"id_slot",  slot.id},
@@ -4022,14 +4046,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 }
             }
 
-            if (batch.n_tokens >= n_batch) {
+            // T4: stop when the global per-tick budget K is reached.
+            // Slots not yet visited stay in LOAD_PROMPT and admit on
+            // the next tick.
+            if (batch.n_tokens >= K) {
                 break;
-            }
-            // Mark that this update_slots() call has added prompt tokens
-            // for this slot (whether or not it completed). Strict-sequential
-            // mode then prevents subsequent slots from adding to this batch.
-            if (batch.n_tokens > batch_n_tokens_before) {
-                added_a_prompt_this_call = true;
             }
         }
     }
@@ -4783,43 +4804,13 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
-        // S5 — emit one NDJSON TickDispatch line per dispatched batch when
-        // LLAMA_TRACE_NDJSON_DIR is set. Walks the per-slot state at
-        // dispatch time to derive {prefill_slots, decode_slots,
-        // loading_prompt_set_at_start_of_tick} approximations:
-        //   prefill_slots   — slots whose seq_ids appear in this batch_view
-        //                     AND have command == LOAD_PROMPT
-        //   decode_slots    — slots whose seq_ids appear in this batch_view
-        //                     AND have state == PROCESSING AND command == NONE
-        //   loading_prompt_set — slots in command == LOAD_PROMPT at dispatch
-        // Cross-referenced against the Bug C invariants by
-        // /home/llm/yarn-agentic/scripts/validate-batch-composition-trace.py.
-        if (server_trace_ndjson::enabled()) {
-            std::set<int> batch_seqs;
-            for (int j = 0; j < n_tokens; ++j) {
-                if (batch_view.n_seq_id && batch_view.n_seq_id[j] > 0
-                    && batch_view.seq_id && batch_view.seq_id[j]) {
-                    batch_seqs.insert(batch_view.seq_id[j][0]);
-                }
-            }
-            std::vector<int> prefill_slots;
-            std::vector<int> decode_slots;
-            std::vector<int> loading_prompt_set;
-            for (const auto & s : slots) {
-                if (s.command == SLOT_COMMAND_LOAD_PROMPT) {
-                    loading_prompt_set.push_back(s.id);
-                    if (batch_seqs.count(s.id)) prefill_slots.push_back(s.id);
-                } else if (s.state == SLOT_STATE_PROCESSING
-                           && s.command == SLOT_COMMAND_NONE
-                           && batch_seqs.count(s.id)) {
-                    decode_slots.push_back(s.id);
-                }
-            }
-            static int _trace_tick_counter = 0;
-            server_trace_ndjson::emit_tick_dispatch(
-                _trace_tick_counter++, prefill_slots, decode_slots,
-                loading_prompt_set);
-        }
+        // T4: TickDispatch emission moved to update_slots() so the
+        // record captures the FULL tick batch composition (one record
+        // per tick), not per-dispatch slice. The validator's
+        // DecodePriorityAdmission check binds at the tick level, not
+        // the slice level — under T3.5 split_equal grouping a tick is
+        // typically split into prefill-only and decode-only slices, so
+        // a per-slice trace would falsely violate the invariant.
 
         // Per-decode wall timing (LLAMA_PROFILE_DECODE) — env-gated, no cost
         // when off. Per-batch-shape histogram dumped every 100 decodes. Used
@@ -5103,8 +5094,44 @@ void server_context::update_slots() {
     // start populating the batch for this iteration
     common_batch_clear(batch);
 
+    // T4: snapshot processing_set at start of tick — used by the
+    // TickDispatch trace record emitted below to bind the
+    // DecodePriorityAdmission invariant. Captured BEFORE
+    // add_sampled_tokens so it reflects which slots are eligible to
+    // contribute decode tokens this tick (the loading_prompt_set is
+    // captured inside batch_pending_prompt for the same reason).
+    tick_trace.reset_for_tick();
+    if (server_trace_ndjson::enabled()) {
+        for (const auto & s : slots) {
+            if (s.state == SLOT_STATE_PROCESSING
+                && s.command == SLOT_COMMAND_NONE) {
+                tick_trace.processing_set_at_start_of_tick.push_back(s.id);
+            }
+        }
+    }
+
     // frist, add sampled tokens from any ongoing sequences
     add_sampled_tokens(); // Prepare batch for inference
+
+    // T4: derive decode_slots from the batch composition after
+    // add_sampled_tokens. Any slot that's PROCESSING+NONE and has a
+    // token in the batch contributed a decode token this tick.
+    if (server_trace_ndjson::enabled()) {
+        std::set<int> batch_seqs;
+        for (int j = 0; j < batch.n_tokens; ++j) {
+            if (batch.n_seq_id && batch.n_seq_id[j] > 0
+                && batch.seq_id && batch.seq_id[j]) {
+                batch_seqs.insert(batch.seq_id[j][0]);
+            }
+        }
+        for (const auto & s : slots) {
+            if (s.state == SLOT_STATE_PROCESSING
+                && s.command == SLOT_COMMAND_NONE
+                && batch_seqs.count(s.id)) {
+                tick_trace.decode_slots.push_back(s.id);
+            }
+        }
+    }
 
     // process in chunks of params.n_batch
     int32_t n_batch = llama_session_n_batch(session);
@@ -5121,6 +5148,21 @@ void server_context::update_slots() {
     if (batch.n_tokens == 0) {
         LOG_VERBOSE("no tokens to decode", {});
         return;
+    }
+
+    // T4: emit one TickDispatch record summarising the full tick batch
+    // composition for the validator. This binds at the tick level,
+    // unlike the pre-T4 per-dispatch trace that lived in
+    // process_batch_tokens. See specs/scheduler/batch_composition.allium
+    // and scripts/validate-batch-composition-trace.py.
+    if (server_trace_ndjson::enabled()) {
+        server_trace_ndjson::emit_tick_dispatch(
+            tick_trace.tick_counter++,
+            tick_trace.prefill_counts,
+            tick_trace.decode_slots,
+            tick_trace.processing_set_at_start_of_tick,
+            tick_trace.loading_prompt_set_at_start_of_tick,
+            tick_trace.budget_k);
     }
 
     LOG_VERBOSE("decoding batch", {

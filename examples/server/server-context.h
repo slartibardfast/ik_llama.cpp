@@ -314,6 +314,32 @@ struct server_context {
     int32_t cache_ram_n_min = 0;
     float cache_ram_similarity = 0.5f;
 
+    // T4 chunked-prefill admission — per-tick trace state. Populated by
+    // add_sampled_tokens + batch_pending_prompt during one update_slots
+    // iteration; emitted via server_trace_ndjson::emit_tick_dispatch
+    // when LLAMA_TRACE_NDJSON_DIR is set. The validator at
+    // /home/llm/yarn-agentic/scripts/validate-batch-composition-trace.py
+    // checks TokenBudgetRespected, DecodePriorityAdmission,
+    // PerTokenFlagExclusivity, PrefillCarryProgresses against the
+    // emitted TickDispatch records.
+    struct tick_trace_state {
+        int                 tick_counter = 0;
+        std::map<int, int>  prefill_counts;
+        std::vector<int>    decode_slots;
+        std::vector<int>    processing_set_at_start_of_tick;
+        std::vector<int>    loading_prompt_set_at_start_of_tick;
+        int32_t             budget_k = 0;
+
+        void reset_for_tick() {
+            prefill_counts.clear();
+            decode_slots.clear();
+            processing_set_at_start_of_tick.clear();
+            loading_prompt_set_at_start_of_tick.clear();
+            budget_k = 0;
+        }
+    };
+    tick_trace_state tick_trace;
+
     ~server_context();
 
     bool load_model(const gpt_params& params_);
