@@ -994,6 +994,74 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
 
+# ============================================================
+# PHASE_NSTREAM_KV_PERF T5.0 — paged KV property test stubs.
+# ============================================================
+# Eight RED-bound tests for the paged KV layout per
+# /home/llm/yarn-agentic/PHASE_NSTREAM_KV_PERF.md §Tier 5.
+# Each test FAILS on HEAD (LLAMA_PAGED_KV_LANDED undefined) and
+# transitions PASS at the noted T5.x card close.
+#
+# To activate: define LLAMA_PAGED_KV_LANDED=1 as a build flag when
+# the production paged KV implementation lands AND the test body
+# (where stubbed) is filled in by the T5.x author.
+
+set(TEST_TARGET test-kv-block-allocator)
+add_executable(${TEST_TARGET} spec/test-kv-block-allocator.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-write-index-formula)
+add_executable(${TEST_TARGET} spec/test-paged-write-index-formula.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-write-byte-identity-at-identity)
+add_executable(${TEST_TARGET} spec/test-paged-write-byte-identity-at-identity.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-byte-identity-trivial-mapping)
+add_executable(${TEST_TARGET} spec/test-paged-byte-identity-trivial-mapping.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-multi-seq-byte-identity)
+add_executable(${TEST_TARGET} spec/test-paged-multi-seq-byte-identity.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-kshift-byte-identity)
+add_executable(${TEST_TARGET} spec/test-paged-kshift-byte-identity.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-defrag-preserves-contents)
+add_executable(${TEST_TARGET} spec/test-paged-defrag-preserves-contents.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-allocator-determinism)
+add_executable(${TEST_TARGET} spec/test-paged-allocator-determinism.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
