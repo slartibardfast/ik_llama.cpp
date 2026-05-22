@@ -1812,11 +1812,10 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * k;
     if (is_multi_seq && kv.n_stream > 1) {
-        GGML_ASSERT((int)kv.n_stream == n_seq_in_batch &&
-                    "T3.3: expect n_seq_in_batch == kv.n_stream "
-                    "(split_equal yields one stream per active slot)");
+        // T3.5: span only the first n_seq_in_batch streams.
+        GGML_ASSERT(n_seq_in_batch <= (int)kv.n_stream);
         k = ggml_view_4d(ctx, k_cache,
-                n_embd_head_k, n_kv, n_head_kv, kv.n_stream,
+                n_embd_head_k, n_kv, n_head_kv, n_seq_in_batch,
                 k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], 0);
     } else {
         k = ggml_view_3d(ctx, k_cache,
@@ -1858,8 +1857,9 @@ static ggml_tensor * llm_build_kqv(
         // T3.3: under multi-seq, V also widens to 4D ne[3]=n_stream.
         struct ggml_tensor * v;
         if (is_multi_seq && kv.n_stream > 1) {
+            // T3.5: span only the first n_seq_in_batch streams.
             v = ggml_view_4d(ctx, v_cache,
-                    n_embd_head_v, n_kv, n_head_kv, kv.n_stream,
+                    n_embd_head_v, n_kv, n_head_kv, n_seq_in_batch,
                     v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], 0);
         } else {
             v = ggml_view_3d(ctx, v_cache,
@@ -1885,8 +1885,18 @@ static ggml_tensor * llm_build_kqv(
 
         if (use_per_slot_kv) {
             if (!lctx.default_decoder.inp_per_row_k_bound) {
+                // PHASE_NSTREAM_KV_PERF T3.5: size per_row_k_bound to
+                // the FULL batch token count (n_tokens). Under single-seq
+                // q->ne[1] == n_tokens; under multi-seq dispatch
+                // q->ne[1] == n_tok_per_seq and we want one bound entry
+                // per token in the batch (matches llama_set_inputs's
+                // batch.n_tokens-indexed population). The PSKV kernel
+                // ignores the bound via (void)per_row_k_bound — mask
+                // already handles position visibility — so the
+                // assertion is decorative but must match what
+                // llama_set_inputs writes.
                 lctx.default_decoder.inp_per_row_k_bound =
-                        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q->ne[1]);
+                        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
                 ggml_set_input(lctx.default_decoder.inp_per_row_k_bound);
             }
             cur = ggml_flash_attn_ext_per_slot_kv(ctx, q, k, v, kq_mask,
@@ -3079,12 +3089,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
                     GGML_ASSERT(n_tok_per_seq > 0);
                     GGML_ASSERT(n_tok_per_seq * n_seq_in_batch == n_tokens);
-                    // PHASE_NSTREAM_KV_PERF T3.3-followup: under graph-split
-                    // multi-device build, each device sees only a slice
-                    // of the Q heads (n_head_q_local = split_wq->ne[1] /
-                    // n_embd_head_k). Use the per-device count, NOT the
-                    // full n_head from hparams.
-                    const int64_t n_head_q_local = split_wq->ne[1] / n_embd_head_k;
+                    // PHASE_NSTREAM_KV_PERF T3.5: under graph-split
+                    // multi-device build, derive per-device n_head_q from
+                    // Qcur's actual element count. The build-context
+                    // `n_head` member is the FULL n_head from hparams,
+                    // while Qcur on this device may carry only a per-
+                    // device slice (head split across devices). Using
+                    // ggml_nelements(Qcur) / (n_embd_head_k * n_tokens)
+                    // gives the correct local count regardless of how
+                    // the matmul layout maps to ne.
+                    const int64_t qcur_nelem = ggml_nelements(Qcur);
+                    GGML_ASSERT(qcur_nelem % ((int64_t)n_embd_head_k * n_tokens) == 0);
+                    const int64_t n_head_q_local =
+                        qcur_nelem / ((int64_t)n_embd_head_k * n_tokens);
                     auto q_4d = ggml_reshape_4d(ctx0, Qcur,
                             n_embd_head_k, n_head_q_local, n_tok_per_seq, n_seq_in_batch);
                     q = ggml_permute(ctx0, q_4d, 0, 2, 1, 3);
@@ -3106,12 +3123,19 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 ggml_tensor * k;
                 ggml_tensor * v;
                 if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
-                    GGML_ASSERT((int)kv_self.n_stream == n_seq_in_batch);
+                    // PHASE_NSTREAM_KV_PERF T3.5: K/V view spans the
+                    // first n_seq_in_batch streams (not all n_stream).
+                    // Caller (process_batch_tokens) guarantees batch
+                    // seq_ids are contiguous in order from 0 so the
+                    // view's parent->nb[3] stride correctly maps each
+                    // ne[3] index to its stream slice. n_seq_in_batch
+                    // <= kv_self.n_stream by construction.
+                    GGML_ASSERT(n_seq_in_batch <= (int)kv_self.n_stream);
                     k = ggml_view_4d(ctx0, split_kl,
-                            n_embd_head_k, n_kv, n_head_kv, kv_self.n_stream,
+                            n_embd_head_k, n_kv, n_head_kv, n_seq_in_batch,
                             split_kl->nb[1], split_kl->nb[2], split_kl->nb[3], 0);
                     v = ggml_view_4d(ctx0, split_vl,
-                            n_embd_head_v, n_kv, n_head_kv, kv_self.n_stream,
+                            n_embd_head_v, n_kv, n_head_kv, n_seq_in_batch,
                             split_vl->nb[1], split_vl->nb[2], split_vl->nb[3], 0);
                 } else {
                     k = ggml_view_3d(ctx0, split_kl,
@@ -3157,8 +3181,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
 
                 if (use_per_slot_kv) {
                     if (!lctx.default_decoder.inp_per_row_k_bound) {
+                        // T3.5: size to FULL batch n_tokens (see comment
+                        // in llm_build_kqv site).
                         lctx.default_decoder.inp_per_row_k_bound =
-                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q->ne[1]);
+                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
                         ggml_set_input(lctx.default_decoder.inp_per_row_k_bound);
                     }
                     cur = ggml_flash_attn_ext_per_slot_kv(ctx0, q, k, v, KQ_mask,

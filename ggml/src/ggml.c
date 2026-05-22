@@ -10258,7 +10258,12 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
     if (mask) {
         GGML_ASSERT(ggml_is_contiguous(mask));
         GGML_ASSERT(mask->ne[2] == 1);
-        GGML_ASSERT(mask->ne[3] == 1);
+        // PHASE_NSTREAM_KV_PERF T3.5: mask may be 4D
+        // [n_kv, pad(n_tok_per_seq), 1, n_seq_in_batch] under unified
+        // multi-seq dispatch. The PSKV kernel handles per-seq addressing
+        // via nb33 (T3.1). Require mask->ne[3] to match q->ne[3] so
+        // each query seq finds its own mask block.
+        GGML_ASSERT(mask->ne[3] == 1 || mask->ne[3] == q->ne[3]);
         GGML_ASSERT(mask->ne[1] >= GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) &&
                 "the Flash-Attention kernel requires the mask to be padded to GGML_KQ_MASK_PAD and at least n_queries big");
     }
@@ -10269,8 +10274,14 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
 
     GGML_ASSERT(per_row_k_bound);
     GGML_ASSERT(per_row_k_bound->type == GGML_TYPE_I32);
-    // per_row_k_bound is a 1-D tensor of length q->ne[1] (n_tok).
-    GGML_ASSERT(per_row_k_bound->ne[0] == q->ne[1]);
+    // PHASE_NSTREAM_KV_PERF T3.5: per_row_k_bound is sized n_tokens
+    // (the full batch token count). Under single-seq q->ne[1] ==
+    // n_tokens; under multi-seq dispatch q->ne[1] = n_tok_per_seq
+    // and q->ne[3] = n_seq_in_batch with n_tokens = q->ne[1]*q->ne[3].
+    // The PSKV kernel currently ignores the bound (mask handles
+    // position visibility), so this is a decorative ABI check.
+    GGML_ASSERT(per_row_k_bound->ne[0] == q->ne[1] ||
+                per_row_k_bound->ne[0] == q->ne[1] * q->ne[3]);
     GGML_ASSERT(per_row_k_bound->ne[1] == 1);
     GGML_ASSERT(per_row_k_bound->ne[2] == 1);
     GGML_ASSERT(per_row_k_bound->ne[3] == 1);

@@ -11,6 +11,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -4158,24 +4159,26 @@ static void restore_speculative_checkpoint(
     discard_speculative_checkpoint(slot, decoder);
 }
 
-void server_context::speculative_decoding_accept(int32_t batch_offset, int run_seq_id) {
-    // Scoped to the run that the surrounding process_batch_tokens loop
-    // just dispatched. `batch_offset` is the run's start index in the
-    // combined `batch`; `run_seq_id` identifies the single slot whose
-    // tokens were submitted.
+void server_context::speculative_decoding_accept(int32_t batch_offset,
+                                                 int run_seq_id,
+                                                 int32_t n_tokens_in_view) {
+    // PHASE_NSTREAM_KV_PERF T3.5: scoped to the dispatched view, not
+    // necessarily a single per-stream run. `batch_offset` is the
+    // view's start index in the combined `batch`; `n_tokens_in_view`
+    // is the dispatched chunk length. When `run_seq_id` is >= 0, the
+    // legacy per-run filter applies (single slot, used by callers
+    // that want to restrict to one seq). When `run_seq_id` is -1
+    // (T3.5 unified dispatch), all slots whose i_batch_dft entries
+    // fall within the local view are processed.
     //
-    // Why scope here: at np>=2 the per-stream split in
-    // process_batch_tokens dispatches one llama_decode per slot per
-    // tick. The engine resets `output_ids` on every llama_decode, so
-    // only the most-recently-decoded slot's logits are addressable —
-    // and even then via the LOCAL frame [0..n_tokens) of the dispatched
-    // batch_view, not the GLOBAL `batch` frame. slot.i_batch_dft is
-    // recorded in the global frame; we translate by subtracting
-    // batch_offset before any llama_get_logits_ith / get_embeddings_ith
-    // call.
+    // Local-frame translation: slot.i_batch_dft is recorded in the
+    // GLOBAL `batch` frame; the engine's output_ids vector is indexed
+    // in the LOCAL frame [0..n_tokens_in_view) of the dispatched
+    // batch_view. Translate by subtracting batch_offset before any
+    // llama_get_logits_ith / get_embeddings_ith call.
     //
     // Two-phase split (preserved from the np=1 closure): Phase A
-    // reads the verify logits / embeddings for THIS run's slot only,
+    // reads the verify logits / embeddings for every in-view slot,
     // captures everything the sampler needs into `accepted`; Phase B
     // then performs the state mutation (restore_speculative_checkpoint,
     // mtp_accept_tokens, etc.) whose internal llama_decode calls would
@@ -4190,18 +4193,37 @@ void server_context::speculative_decoding_accept(int32_t batch_offset, int run_s
     std::vector<accepted_slot> accepted;
     accepted.reserve(slots.size());
 
-    // ---- Phase A — read-only for THIS run's slot ----
+    // ---- Phase A — read-only for in-view slots ----
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
             continue;
         }
-        if ((int) slot.id != run_seq_id) {
-            // Another slot's verify tokens belong to a different run;
-            // its decode either hasn't happened yet (output_ids will be
-            // -1 in this run's frame) or already happened earlier (its
-            // output_ids has since been overwritten by THIS run's
-            // decode). Either way, do not read its logits here — its
-            // own run iteration's call sampled it.
+        if (run_seq_id >= 0 && (int) slot.id != run_seq_id) {
+            // Legacy per-run filter — kept for callers that opt in
+            // (e.g., the strict-sequential path); skipped under T3.5
+            // unified dispatch where run_seq_id == -1.
+            continue;
+        }
+
+        // T3.5: under unified dispatch a slot's draft tokens must lie
+        // entirely within this dispatched view for the local-frame
+        // translation to be valid. Skip slots whose i_batch_dft entries
+        // straddle the chunk boundary or fall outside.
+        bool any_in_view     = false;
+        bool any_out_of_view = false;
+        for (int32_t g : slot.i_batch_dft) {
+            const int32_t local = g - batch_offset;
+            if (local >= 0 && local < n_tokens_in_view) {
+                any_in_view = true;
+            } else {
+                any_out_of_view = true;
+            }
+        }
+        if (!any_in_view) continue;
+        if (any_out_of_view) {
+            // Practically rare — add_sampled_tokens emits at most
+            // draft_max+1 tokens per slot per tick and n_batch is much
+            // larger than the sum of slot contributions. Skip safely.
             continue;
         }
 
@@ -4635,31 +4657,119 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
-    // PHASE_NSTREAM_KV_4D N2.d: per-stream dispatch. The assembled
-    // `batch` groups each slot's tokens contiguously (add_sampled_tokens
-    // / batch_pending_prompt walk slots in order). Never cross a
-    // primary seq_id boundary within a single llama_decode call — each
-    // llama_decode then sees a uniform single-seq batch, and the K/V
-    // graph build addresses the correct stream's slice via stream_id =
-    // batch.seq_id[0][0]. At n_seq_max==1 batches are single-seq by
-    // construction and the run-detection collapses to the legacy
-    // single-dispatch path.
+    // PHASE_NSTREAM_KV_PERF T3.5: split_equal unified-stream dispatch.
+    // The assembled `batch` may span multiple primary seq_ids (decode
+    // side adds one (draft_max+1)-block per active slot; prefill side
+    // serialises to one slot per tick). The T3.3 4D build path requires
+    // shape-uniformity: n_tok_per_seq * n_seq_in_batch == n_tokens.
+    // Partition the assembled batch into shape-uniform groups before
+    // dispatch. Two practical cases:
+    //   A. Single-seq run (prefill block, or decode under n_seq_max==1).
+    //   B. Multi-seq group with uniform per-seq count (decode side
+    //      under n_seq_max>1 — add_sampled_tokens contributes a block
+    //      of (draft_max+1) tokens per active slot, contiguous, all
+    //      with the same per-seq count).
+    // Multi-seq groups dispatch as one llama_decode (the T3.5 win);
+    // single-seq groups chunk by n_batch (prefill chunking).
+    //
+    // Goal #2 evidence counter (PHASE_NSTREAM_KV_PERF T3.5):
+    // dispatch_multi_seq_count proves that the multi-seq build path
+    // is actively exercised in production. Incremented per multi-seq
+    // group dispatch; kept as a permanent server-internal metric so
+    // future verify runs can introspect it via the server log.
+    static std::atomic<uint64_t> dispatch_multi_seq_count{0};
+    static std::atomic<uint64_t> dispatch_total_count{0};
+
     for (int32_t i = 0; i < batch.n_tokens; /* i advances inside */) {
-        // Identify the contiguous primary-seq_id run starting at i.
-        const int run_seq_id =
+        // Detect first seq's contribution length starting at i.
+        const int seq_first =
             (batch.n_seq_id && batch.seq_id &&
              batch.n_seq_id[i] > 0 && batch.seq_id[i])
                 ? batch.seq_id[i][0] : 0;
-        int32_t run_end = i + 1;
-        while (run_end < batch.n_tokens) {
-            const int next_sid =
-                (batch.n_seq_id[run_end] > 0 && batch.seq_id[run_end])
-                    ? batch.seq_id[run_end][0] : 0;
-            if (next_sid != run_seq_id) break;
-            ++run_end;
+        int32_t count_first = 1;
+        while (i + count_first < batch.n_tokens) {
+            const int sid =
+                (batch.n_seq_id[i + count_first] > 0
+                 && batch.seq_id[i + count_first])
+                    ? batch.seq_id[i + count_first][0] : 0;
+            if (sid != seq_first) break;
+            ++count_first;
         }
 
-        const int32_t n_tokens = std::min(n_batch, run_end - i);
+        // Try to extend into a shape-uniform multi-seq group. The 4D
+        // K/V view in the build path spans the FIRST n_seq_in_batch
+        // streams (offset 0, stride parent->nb[3]). For the view's
+        // ne[3] index i to map to stream i, the batch's seq_ids in
+        // this group must be exactly 0, 1, 2, ..., n_seq_in_batch-1
+        // IN THAT ORDER. If not, fall back to single-seq dispatch for
+        // the leading run.
+        std::set<int> seqs_seen;
+        seqs_seen.insert(seq_first);
+        int32_t group_end = i + count_first;
+        // Require the first seq to be 0 (the start of the contiguous
+        // [0, k) range). If not, abandon multi-seq grouping.
+        const bool start_is_zero = (seq_first == 0);
+        int expected_next_sid = 1;
+        while (start_is_zero && group_end < batch.n_tokens) {
+            const int sid_j =
+                (batch.n_seq_id[group_end] > 0 && batch.seq_id[group_end])
+                    ? batch.seq_id[group_end][0] : 0;
+            if (sid_j != expected_next_sid) break;  // not contiguous
+            int32_t count_j = 1;
+            while (group_end + count_j < batch.n_tokens) {
+                const int sid_jj =
+                    (batch.n_seq_id[group_end + count_j] > 0
+                     && batch.seq_id[group_end + count_j])
+                        ? batch.seq_id[group_end + count_j][0] : 0;
+                if (sid_jj != sid_j) break;
+                ++count_j;
+            }
+            if (count_j != count_first) break;
+            seqs_seen.insert(sid_j);
+            ++expected_next_sid;
+            group_end += count_j;
+        }
+
+        const int32_t group_size = group_end - i;
+        const bool    group_is_multi_seq = (seqs_seen.size() > 1);
+
+        // Multi-seq groups dispatch atomically (in practice group_size
+        // <= n_batch since decode contributions per tick are small).
+        // Single-seq groups chunk by n_batch.
+        int32_t n_tokens;
+        if (group_is_multi_seq) {
+            if (group_size > n_batch) {
+                LOG_WARNING("T3.5: multi-seq group exceeds n_batch; "
+                            "falling back to first-seq-only dispatch", {
+                    {"group_size", group_size},
+                    {"n_batch",    n_batch},
+                });
+                n_tokens = count_first;
+            } else {
+                n_tokens = group_size;
+                dispatch_multi_seq_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            n_tokens = std::min(n_batch, group_size);
+        }
+        dispatch_total_count.fetch_add(1, std::memory_order_relaxed);
+
+        // Periodically emit the dispatch counter so verify-run server
+        // logs carry it. Cheap, formatted, once every 64 dispatches.
+        const uint64_t total_n = dispatch_total_count.load(std::memory_order_relaxed);
+        if ((total_n & 63ULL) == 0ULL) {
+            const uint64_t multi_n = dispatch_multi_seq_count.load(std::memory_order_relaxed);
+            LLAMA_LOG_INFO("dispatch counter: total=%llu multi_seq=%llu\n",
+                           (unsigned long long)total_n,
+                           (unsigned long long)multi_n);
+        }
+
+        // Use the first seq's id as the "run_seq_id" name for trace
+        // emission and other places that still expect a primary id;
+        // safe for both single-seq and multi-seq groups (the seq is
+        // the first one in the run, for documentation purposes).
+        const int run_seq_id = seq_first;
+        (void)run_seq_id;  // referenced by trace block below
         extend_context(n_tokens);
 
         llama_batch batch_view = {
@@ -4808,7 +4918,17 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             for (auto& slot : slots) {
                 if ((slot.state == SLOT_STATE_PROCESSING && slot.n_decoded == 0) ||
                     (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT)) {
-                    bool has_tokens_for_slot = (batch_view.n_tokens > 0 && batch_view.n_seq_id[0] > 0 && batch_view.seq_id[0][0] == slot.id);
+                    // T3.5: scan all tokens in the (possibly multi-seq)
+                    // view for this slot's seq_id, not just position 0.
+                    bool has_tokens_for_slot = false;
+                    for (int t = 0; t < batch_view.n_tokens; ++t) {
+                        if (batch_view.n_seq_id && batch_view.n_seq_id[t] > 0
+                            && batch_view.seq_id && batch_view.seq_id[t]
+                            && batch_view.seq_id[t][0] == (int)slot.id) {
+                            has_tokens_for_slot = true;
+                            break;
+                        }
+                    }
                     if (has_tokens_for_slot) {
                         mtp_warmup_needed = true;
                         break;
@@ -4943,8 +5063,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         }
 
         // speculative decoding - main model sample and accept
-        // (scoped to this run's slot — see speculative_decoding_accept comment)
-        speculative_decoding_accept(i, run_seq_id);
+        // (T3.5 unified: process all slots whose i_batch_dft falls
+        // within the dispatched view; run_seq_id=-1 disables the
+        // per-run filter, n_tokens scopes the local frame.)
+        speculative_decoding_accept(i, /*run_seq_id*/ -1, /*n_tokens_in_view*/ n_tokens);
 
         // PHASE_NSTREAM_KV_4D N2.d: advance to the next per-stream
         // chunk. n_tokens is bounded by both n_batch and the current

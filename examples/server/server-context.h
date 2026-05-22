@@ -409,7 +409,12 @@ struct server_context {
 
     void extend_context(const int32_t n_tokens);
 
-    void speculative_decoding_accept(int32_t batch_offset, int run_seq_id);
+    // n_tokens_in_view bounds the local frame of the dispatched batch_view;
+    // slots whose i_batch_dft entries fall outside are skipped. run_seq_id
+    // == -1 disables the per-run filter (T3.5 unified-stream dispatch);
+    // >= 0 keeps the legacy per-run filter.
+    void speculative_decoding_accept(int32_t batch_offset, int run_seq_id,
+                                     int32_t n_tokens_in_view = INT32_MAX);
 
     bool accept_special_token(const server_slot& slot, const llama_token token);
 
