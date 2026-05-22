@@ -905,6 +905,51 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# PHASE_NSTREAM_KV_PERF T3.6.T1 — K-shift per-stream binding test.
+# FAIL expected on T3.5 HEAD (build_k_shift asserts n_stream == 1).
+# PASS after T3.6.I.c1 lifts the assert.
+set(TEST_TARGET test-kv-shift-per-stream)
+add_executable(${TEST_TARGET} spec/test-kv-shift-per-stream.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
+# PHASE_NSTREAM_KV_PERF T3.6.T2 — defrag per-stream binding test.
+# FAIL expected on T3.5 HEAD (build_defrag asserts n_stream == 1).
+# PASS after T3.6.I.c2 lifts the assert.
+set(TEST_TARGET test-kv-defrag-per-stream)
+add_executable(${TEST_TARGET} spec/test-kv-defrag-per-stream.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
+# PHASE_NSTREAM_KV_PERF T3.6.T3 — graph reuse under multi-seq + set_rows.
+# FAIL expected on T3.5 HEAD (n_stream > 1 bailout sets miss_reason=6
+# at src/llama.cpp:615). PASS after T3.6.I.b drops the bailout.
+set(TEST_TARGET test-graph-reuse-set-rows)
+add_executable(${TEST_TARGET} spec/test-graph-reuse-set-rows.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src)
+target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
