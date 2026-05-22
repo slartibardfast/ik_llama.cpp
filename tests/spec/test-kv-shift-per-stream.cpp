@@ -18,16 +18,18 @@
 // (assert kv_self.n_stream == 1). On post-T3.6.I.c1 it PASSES.
 //
 // Defensive coverage: runs the K-shift binding under BOTH
-//   - LAYER split (single-device per layer; no CUDA_Split buffer), and
+//   - LAYER split (single-device per layer), and
 //   - GRAPH split (CUDA_Split per-device row-distributed K/V cache).
 //
-// LAYER split asserts the full K-shift binding (isolation + per-cell
-// rotation). GRAPH split asserts the DOCUMENTED graceful limitation:
-// llama_kv_cache_update MUST return rc=1 (and NOT crash with a CUDA
-// illegal-memory-access) when can_shift is gated off under
-// split_mode=GRAPH + n_stream>1. The gate is a deliberate guard
-// (src/llama.cpp:get_can_shift) until the input-population layer is
-// restructured to emit one inp_K_shift per stream.
+// LAYER asserts the full K-shift binding (isolation + per-cell
+// rotation). GRAPH asserts the documented graceful rc=1 — a
+// regression that lifts the get_can_shift gate without first fixing
+// the ggml-scheduler-level leaf-input allocation bug (see comment in
+// src/llama.cpp:get_can_shift) would fail this branch (process abort,
+// exit code != 0). The T3.6.I.c1.x input-layer restructure ruled out
+// view-aliasing as the underlying cause; the remaining gap is in
+// ggml_backend_sched_split_graph's handling of fresh-graph leaf
+// inputs on a reset scheduler under multi-device split.
 //
 // Returns: 0 = PASS, 1 = FAIL, 77 = SKIP (no model path supplied).
 //
@@ -197,15 +199,16 @@ bool run_binding(const std::string & model_path, llama_split_mode split_mode,
         }
     } else {
         // GRAPH split: documented limitation. Expect rc=1 (graceful
-        // can_shift=false gate) — NOT a crash. This is the defensive
-        // assertion: a future regression that lets K-shift run through
-        // and CUDA-crash under graph-split would fail this branch
-        // (process abort, exit code != 0).
+        // can_shift=false gate) — NOT a crash. The defensive assertion:
+        // a future regression that lets K-shift run through and CUDA-
+        // crash under graph-split would fail this branch.
         if (rc != 1) {
             FAIL_AT("[%s] llama_kv_cache_update rc=%d (expected 1 — "
                     "graph-split + n_stream>1 is gated off in "
-                    "get_can_shift). A change of behavior here means "
-                    "the gate was lifted prematurely.", split_label, rc);
+                    "get_can_shift; see src/llama.cpp comment). A change "
+                    "of behavior here means the ggml-scheduler leaf-input "
+                    "allocation under multi-device split was fixed and "
+                    "the gate can be lifted.", split_label, rc);
         }
         std::fprintf(stdout, "[%s] documented graceful rc=1 (K-shift "
                      "gated off under graph-split — see "

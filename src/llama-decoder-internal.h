@@ -96,7 +96,17 @@ struct llama_decoder {
     struct ggml_tensor * inp_out_ids     = nullptr; // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask     = nullptr; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa = nullptr; // F32 [kv_size, n_batch]
-    struct ggml_tensor * inp_K_shift     = nullptr; // I32 [kv_size]
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 input-layer restructure:
+    // K-shift deltas are now n_stream separate I32 input tensors, each
+    // of size kvps (= kv_size_per_stream). The previous single 1D tensor
+    // of size kv_size combined with per-stream view-slicing in
+    // build_k_shift broke under graph-split: the scheduler's cross-
+    // device input distribution used view->data pointers established
+    // at view-creation time, before the parent input was allocated on
+    // the host staging buffer (resulted in CUDA illegal-memory-access).
+    // With n_stream separate inputs each gets its own scheduler-managed
+    // allocation, no view-slicing required.
+    std::vector<struct ggml_tensor *> inp_K_shift_per_stream; // n_stream × I32[kvps]
     struct ggml_tensor * inp_mean        = nullptr; // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls         = nullptr; // I32 [n_batch]
     struct ggml_tensor * inp_s_copy      = nullptr; // I32 [kv_size]

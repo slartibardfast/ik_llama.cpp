@@ -146,7 +146,7 @@ void llm_build_context::init() {
     lctx.default_decoder.inp_out_ids     = nullptr;
     lctx.default_decoder.inp_KQ_mask     = nullptr;
     lctx.default_decoder.inp_KQ_mask_swa = nullptr;
-    lctx.default_decoder.inp_K_shift     = nullptr;
+    lctx.default_decoder.inp_K_shift_per_stream.clear();
     lctx.default_decoder.inp_mean        = nullptr;
     lctx.default_decoder.inp_cls         = nullptr;
     lctx.default_decoder.inp_s_copy      = nullptr;
@@ -184,12 +184,13 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
         : cparams.yarn_attn_factor;
 
-    lctx.default_decoder.inp_K_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ctx);
-    cb(lctx.default_decoder.inp_K_shift, "K_shift", -1);
-    ggml_set_input(lctx.default_decoder.inp_K_shift);
-
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c1: per-stream rope loop, with
-    // graph-split awareness.
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1 input-layer restructure:
+    // allocate n_stream separate I32 1D input tensors of size kvps.
+    // Each per-stream rope reads from its dedicated input — no view-
+    // slicing of a shared parent tensor (which broke the scheduler's
+    // cross-device input distribution under graph-split). Each tensor
+    // is independently scheduler-allocated and host-populated, so
+    // cross-device cpy uses each tensor's own data pointer.
     //
     // Under the 4D KV layout [head_dim, kvps, n_head_kv, n_stream],
     // ggml_rope_ext requires b 1D with size a->ne[2] (the position
@@ -204,16 +205,19 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     // Each device's split tensor is itself 4D
     // [head_dim, kvps, nhead_per_device, n_stream]. We loop devices
     // first, then streams within each device's split tensor.
-    //
-    // The inp_K_shift populator (src/llama.cpp:4356-4366) writes
-    // per-cell flat deltas where data[i] is the delta for cell i;
-    // under the 4D layout flat index i decomposes as
-    //   (stream = i / kvps, local_pos = i % kvps).
-    // So a per-stream slice of inp_K_shift of size kvps starting at
-    // offset s*kvps gives exactly the deltas for stream s.
     const uint32_t n_stream = std::max<uint32_t>(1, kv_self.n_stream);
     const uint32_t kvps =
         kv_self.kv_size_per_stream > 0 ? kv_self.kv_size_per_stream : n_ctx;
+
+    lctx.default_decoder.inp_K_shift_per_stream.clear();
+    lctx.default_decoder.inp_K_shift_per_stream.reserve(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)kvps);
+        std::string name = std::string("K_shift_s") + std::to_string(s);
+        cb(t, name.c_str(), -1);
+        ggml_set_input(t);
+        lctx.default_decoder.inp_K_shift_per_stream.push_back(t);
+    }
 
     auto build_one_rope = [&](ggml_tensor * k_view,
                               ggml_tensor * b_view,
@@ -256,22 +260,13 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         if (kl_extra) {
             // Graph-split (CUDA_Split): operate on per-device split
             // tensors. Each split is 4D [head_dim, kvps, nhead_split,
-            // n_stream]; rope_factors may also be split. Hoist the
-            // per-stream b_view above the device loop so the scheduler
-            // sees one view object per stream (not one per device-
-            // per-stream); both branches of the rope graph then
-            // reference the same input slice and the scheduler can
-            // schedule a single cross-device input distribution.
+            // n_stream]; rope_factors may also be split. Per-stream
+            // inputs (inp_K_shift_per_stream[s]) are used directly —
+            // no view-slicing — so each rope op's b input has its own
+            // independently allocated scheduler-managed tensor.
             auto * rope_factors_extra = rope_factors && rope_factors->extra
                 ? (ggml_split_tensor_t *)rope_factors->extra
                 : nullptr;
-            std::vector<ggml_tensor *> b_view_per_stream(n_stream, nullptr);
-            for (uint32_t s = 0; s < n_stream; ++s) {
-                b_view_per_stream[s] = ggml_view_1d(ctx0,
-                        lctx.default_decoder.inp_K_shift,
-                        (int64_t)kvps,
-                        (size_t)s * kvps * ggml_element_size(lctx.default_decoder.inp_K_shift));
-            }
             for (int id = 0; id < kl_extra->n_device; ++id) {
                 auto * split = kl_extra->splits[id];
                 if (!split) continue;
@@ -289,7 +284,8 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                             n_embd_head_k, nhead_split, (int64_t)kvps,
                             head_stride, pos_stride, stream_offs);
 
-                    ggml_tensor * tmp = build_one_rope(k_view, b_view_per_stream[s],
+                    ggml_tensor * tmp = build_one_rope(k_view,
+                            lctx.default_decoder.inp_K_shift_per_stream[s],
                             rope_factors_split, il);
                     ggml_build_forward_expand(gf, tmp);
                 }
@@ -307,12 +303,8 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                         n_embd_head_k, n_head_kv, (int64_t)kvps,
                         head_stride, pos_stride, stream_offs);
 
-                ggml_tensor * b_view = ggml_view_1d(ctx0,
-                        lctx.default_decoder.inp_K_shift,
-                        (int64_t)kvps,
-                        (size_t)s * kvps * ggml_element_size(lctx.default_decoder.inp_K_shift));
-
-                ggml_tensor * tmp = build_one_rope(k_view, b_view,
+                ggml_tensor * tmp = build_one_rope(k_view,
+                        lctx.default_decoder.inp_K_shift_per_stream[s],
                         rope_factors, il);
                 ggml_build_forward_expand(gf, tmp);
             }
