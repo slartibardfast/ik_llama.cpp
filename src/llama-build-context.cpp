@@ -171,12 +171,6 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
     GGML_ASSERT(kv_self.size == n_ctx);
-    // PHASE_NSTREAM_KV_4D N2.b: K-shift not yet rewritten for the
-    // per-stream 4D layout. Production decode path (Qwen3.6 with
-    // --fa on, ctx_shift off) does not exercise K-shift. Gate to
-    // n_stream==1 until a per-stream K-shift is implemented.
-    GGML_ASSERT(kv_self.n_stream == 1 &&
-            "build_k_shift not yet stream-aware; requires n_stream==1");
 
     const auto & rope_type_shift = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
         // @ngxson : this is a workaround
@@ -194,6 +188,23 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     cb(lctx.default_decoder.inp_K_shift, "K_shift", -1);
     ggml_set_input(lctx.default_decoder.inp_K_shift);
 
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1: per-stream rope loop.
+    // Under the 4D KV layout [head_dim, kvps, n_head_kv, n_stream],
+    // ggml_rope_ext requires b 1D with size a->ne[2] (the position
+    // axis). A single 4D rope on the whole K would broadcast the
+    // same delta vector across every stream, which is WRONG when
+    // each stream's cells carry distinct per-cell deltas. See
+    // specs/kv-cache/k_shift_per_stream.allium (KShiftIsolation).
+    // The inp_K_shift populator (src/llama.cpp:4356-4366) writes
+    // per-cell flat deltas where data[i] is the delta for cell i;
+    // under the 4D layout flat index i decomposes as
+    //   (stream = i / kvps, local_pos = i % kvps).
+    // So a per-stream slice of inp_K_shift of size kvps starting at
+    // offset s*kvps gives exactly the deltas for stream s.
+    const uint32_t n_stream = std::max<uint32_t>(1, kv_self.n_stream);
+    const uint32_t kvps =
+        kv_self.kv_size_per_stream > 0 ? kv_self.kv_size_per_stream : n_ctx;
+
     for (int il = 0; il < n_layer; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
             continue;
@@ -202,40 +213,60 @@ ggml_cgraph * llm_build_context::build_k_shift() {
             continue;
         }
         const int64_t n_head_kv = hparams.n_head_kv(il);
-        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
         struct ggml_tensor * rope_factors = build_rope_factors(il);
-        struct ggml_tensor * k =
-            ggml_view_3d(ctx0, kv_self.k_l[il],
-                    n_embd_head_k, n_head_kv, n_ctx,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_head_k),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    0);
 
-        struct ggml_tensor * tmp;
-        if (ggml_is_quantized(k->type)) {
-            // dequantize to f32 -> RoPE -> quantize back
-            tmp = ggml_cast(ctx0, k, GGML_TYPE_F32);
-            cb(tmp, "K_f32", il);
-            for (auto * backend : lctx.backends) {
-                // Figure out which backend KV cache belongs to
-                if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft)) {
-                    ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, tmp, backend);
-                    break;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            // Per-stream K view. Position axis is ne[2] = kvps; head
+            // axis is ne[1] = n_head_kv. Strides:
+            //   nb[1] = parent's nb[2] (per-head stride within stream)
+            //   nb[2] = parent's nb[1] (per-position stride)
+            // Offset = s * parent's nb[3] (stream slice base).
+            //
+            // Under n_stream == 1 this reduces to the legacy view
+            // (single iteration, offset 0, ne[2] = kvps = n_ctx).
+            const size_t k_head_stride_within_stream = kv_self.k_l[il]->nb[2];
+            const size_t k_pos_stride                = kv_self.k_l[il]->nb[1];
+            const size_t k_stream_offs               = (size_t)s * kv_self.k_l[il]->nb[3];
+
+            struct ggml_tensor * k =
+                ggml_view_3d(ctx0, kv_self.k_l[il],
+                        n_embd_head_k, n_head_kv, (int64_t)kvps,
+                        k_head_stride_within_stream,
+                        k_pos_stride,
+                        k_stream_offs);
+
+            // Per-stream slice of inp_K_shift: kvps deltas starting
+            // at s*kvps. dtype is I32; element size = 4 bytes.
+            struct ggml_tensor * inp_K_shift_s =
+                ggml_view_1d(ctx0, lctx.default_decoder.inp_K_shift,
+                        (int64_t)kvps,
+                        (size_t)s * kvps * ggml_element_size(lctx.default_decoder.inp_K_shift));
+
+            struct ggml_tensor * tmp;
+            if (ggml_is_quantized(k->type)) {
+                // dequantize to f32 -> RoPE -> quantize back
+                tmp = ggml_cast(ctx0, k, GGML_TYPE_F32);
+                cb(tmp, "K_f32", il);
+                for (auto * backend : lctx.backends) {
+                    if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft)) {
+                        ggml_backend_sched_set_tensor_backend(lctx.default_decoder.sched, tmp, backend);
+                        break;
+                    }
                 }
+                tmp = ggml_rope_ext_inplace(ctx0, tmp,
+                        inp_K_shift_s, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
+                cb(tmp, "K_shifted_f32", il);
+                tmp = ggml_cpy(ctx0, tmp, k);
+            } else {
+                // we rotate only the first n_rot dimensions
+                tmp = ggml_rope_ext_inplace(ctx0, k,
+                        inp_K_shift_s, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
+                        ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
             }
-            tmp = ggml_rope_ext_inplace(ctx0, tmp,
-                    lctx.default_decoder.inp_K_shift, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
-            cb(tmp, "K_shifted_f32", il);
-            tmp = ggml_cpy(ctx0, tmp, k);
-        } else {
-            // we rotate only the first n_rot dimensions
-            tmp = ggml_rope_ext_inplace(ctx0, k,
-                    lctx.default_decoder.inp_K_shift, rope_factors, n_rot, rope_type_shift, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, yarn_attn_factor_shift, beta_fast, beta_slow);
+            cb(tmp, "K_shifted", il);
+            ggml_build_forward_expand(gf, tmp);
         }
-        cb(tmp, "K_shifted", il);
-        ggml_build_forward_expand(gf, tmp);
     }
 
     return gf;

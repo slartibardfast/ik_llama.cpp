@@ -6878,7 +6878,17 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
 static bool get_can_shift(struct llama_context & lctx) {
     bool no_shift = lctx.model.arch == LLM_ARCH_DEEPSEEK2 || lctx.model.arch == LLM_ARCH_GLM_DSA;  // not supported due to MLA
-    no_shift = no_shift || lctx.model.hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+    // PHASE_NSTREAM_KV_PERF T3.6.I.c1: align with upstream llama.cpp's
+    // distinction between MROPE and IMROPE.
+    //   - MROPE (Qwen2VL etc): true 2D positions, per-axis shift not yet
+    //     implemented anywhere — keep gated off.
+    //   - IMROPE (Qwen 3.5 / Qwen 3.6 text models): all axes derive from
+    //     one scalar base position, so shifting the scalar correctly
+    //     shifts every rotated dim. The IMROPE→NEOX rope workaround in
+    //     build_k_shift's `rope_type_shift` ternary is sufficient.
+    // See upstream src/llama-kv-cache.cpp:1306-1310 (commit b768f0843f),
+    // and the matching workaround at upstream src/llama-kv-cache.cpp:2571.
+    no_shift = no_shift || lctx.model.hparams.rope_type == LLAMA_ROPE_TYPE_MROPE;
     return !no_shift;
 }
 
