@@ -376,6 +376,31 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # P0.A.3 — Observational equivalence of residual extraction. With the
+    # cb_eval hook armed, decoding the same prompt twice (extract disarmed
+    # vs armed) must produce byte-identical argmax sequences. Binds the
+    # ResidualExtractObservationallyEquivalent invariant (Allium +
+    # CbEvalObservational.tla).
+    set(TEST_TARGET test-dflash-extract-observational)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-dflash-extract-observational.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+    # PHASE_NSTREAM_KV_PERF T3.3 + T3.4 — unified-stream dispatch byte
+    # identity. Multi-seq batch (two seqs, identical prompts) via one
+    # llama_decode must match per-seq logits of two serial single-seq
+    # decodes at the same starting state.
+    set(TEST_TARGET test-multi-seq-decode-byte-identity)
+    add_executable(${TEST_TARGET}
+        spec/test-multi-seq-decode-byte-identity.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # K1' — DeltaNet save_all_steps intermediate-state equivalence. For
     # every k ∈ {0..4}, per_step_ssm[k] from an n=5 save_all run must
     # byte-equal final state from a fresh n=k+1 save=false run. Binds
