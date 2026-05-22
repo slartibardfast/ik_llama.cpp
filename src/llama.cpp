@@ -607,11 +607,25 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse)                     { g_can_reuse_last_miss_reason = 4;  return false; }
     if (u_batch.all_seq_id != prev->all_seq_id)   { g_can_reuse_last_miss_reason = 5;  return false; }
     if (transformer_kv.head <= 0)                        { g_can_reuse_last_miss_reason = 6;  return false; }
-    // n_stream > 1 forces a fresh graph build per decode. The per-stream
-    // K/V read view offsets are baked into the graph at build time;
-    // reusing a graph captured for stream A against stream B's decode
-    // would read from the wrong slice. T3 unified-stream dispatch
-    // removes this bailout by making one decode cover all streams.
+    // T3.6.I.b update: the n_stream > 1 bailout stays.
+    //
+    // The audit's F9 finding was incomplete: build_std_attention's
+    // single-seq branch (src/llama-build-context.cpp:1821-1826)
+    // bakes `kqv_stream_id * nb[3]` into the K view's offset.
+    // Single-seq decodes on a multi-stream context are NOT reuse-safe
+    // across streams: a graph captured for stream A reused for stream
+    // B would read stream A's K data.
+    //
+    // The multi-seq dispatch path (is_multi_seq=true) builds the K
+    // view at offset 0 with ne[3]=n_seq_in_batch, which IS reuse-safe;
+    // but that path already trips the n_tokens>1 MTP gate at line 601
+    // (reason=2) unless prev was MTP fused with matching shape, so
+    // dropping this bailout would yield no real reuse uplift while
+    // exposing the single-seq cross-stream bug.
+    //
+    // T3.6.I.b's load-bearing change is the SET_ROWS pass-through in
+    // update_cache_copies (below) — that is correct on its own and
+    // keeps multi-seq K/V WRITE compatible with the graph cache.
     if (transformer_kv.n_stream > 1)                     { g_can_reuse_last_miss_reason = 6;  return false; }
     // Phase 36 Step 5: bucket n_kv to multiples of 64 so consecutive
     // draft steps within the same 64-cell bucket reuse the same cached
@@ -650,7 +664,12 @@ bool llama_context::update_cache_copies() {
             for (int id = 0; id < kl->n_device; ++id) {
                 if (!kl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 0];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) return false;
+                if (!c.cpy) return false;
+                // T3.6.I.b: SET_ROWS nodes pass through — their destination
+                // rows are bound by inp_kv_idxs (refreshed in
+                // llama_set_inputs each call). No view-offs rewrite needed.
+                if (c.cpy->op == GGML_OP_SET_ROWS) continue;
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != kl->splits[id]) return false;
                 // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
                 // c.step was set to the parent's nb[1] (= head_dim * ts)
                 // in llm_build_kv_store. For the new 4D K/V layout the
@@ -674,7 +693,10 @@ bool llama_context::update_cache_copies() {
             for (int id = 0; id < vl->n_device; ++id) {
                 if (!vl->splits[id]) continue;
                 auto& c = cache_copies[2*model.splits.size()*il + 2*id + 1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) return false;
+                if (!c.cpy) return false;
+                // T3.6.I.b: SET_ROWS nodes pass through (see K branch above).
+                if (c.cpy->op == GGML_OP_SET_ROWS) continue;
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != vl->splits[id]) return false;
                 // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
                 // c.step was set to the parent's nb[1] (= head_dim * ts)
                 // in llm_build_kv_store. For the new 4D K/V layout the
@@ -700,7 +722,10 @@ bool llama_context::update_cache_copies() {
                     continue;
                 }
                 auto& c = cache_copies[2*il+0];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.k_l[il]) return false;
+                if (!c.cpy) return false;
+                // T3.6.I.b: SET_ROWS nodes pass through (see split branch above).
+                if (c.cpy->op == GGML_OP_SET_ROWS) continue;
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.k_l[il]) return false;
                 // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
                 // c.step was set to the parent's nb[1] (= head_dim * ts)
                 // in llm_build_kv_store. For the new 4D K/V layout the
@@ -726,7 +751,10 @@ bool llama_context::update_cache_copies() {
                     continue;
                 }
                 auto& c = cache_copies[2*il+1];
-                if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.v_l[il]) return false;
+                if (!c.cpy) return false;
+                // T3.6.I.b: SET_ROWS nodes pass through (see K branch above).
+                if (c.cpy->op == GGML_OP_SET_ROWS) continue;
+                if (c.cpy->op != GGML_OP_CPY || c.cpy->view_src != transformer_kv.v_l[il]) return false;
                 // PHASE_NSTREAM_KV_4D N2.b: per-stream view_offs patch.
                 // c.step was set to the parent's nb[1] (= head_dim * ts)
                 // in llm_build_kv_store. For the new 4D K/V layout the
