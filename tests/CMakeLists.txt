@@ -832,11 +832,30 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 # S4 — Property tests derived from specs/scheduler/batch_composition.allium
 # and specs/kv-cache/n_stream_layer.allium. See cached-crunching-tiger.md.
 
-# test-batch-composition-gates: pure-logic stub test of the two-gate
-# scheduler that closes Bug C. PASS expected on HEAD — the Bug C
-# closure is already in server-context.cpp.
+# test-batch-composition-gates: PRE-T4 LEGACY REGRESSION test of the
+# two-gate scheduler that USED to close Bug C. The contracts asserted
+# here (PrefillSerialisationGate, DecodeHoldGate, MixedBatchProhibition)
+# were superseded by the Tier 4 chunked-prefill admission rewrite of
+# specs/scheduler/batch_composition.allium (2026-05-22). The test
+# remains as a regression check that the legacy gate semantics are
+# still implementable in stub form — its internal stub is self-
+# contained and does NOT bind on the production code path.
 set(TEST_TARGET test-batch-composition-gates)
 add_executable(${TEST_TARGET} spec/test-batch-composition-gates.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
+# test-chunked-prefill-admission: T4.1 property test of the Tier 4
+# chunked-prefill admission contracts (TokenBudgetPerUbatch,
+# DecodePriorityAdmission, ChunkedPrefillAdmission,
+# PrefillCarryProgressesMonotonically) from
+# specs/scheduler/batch_composition.allium. Stub mirrors the
+# admission loop landing in T4.2/T4.4; end-to-end server binding is
+# via scripts/validate-batch-composition-trace.py under T4.6.
+set(TEST_TARGET test-chunked-prefill-admission)
+add_executable(${TEST_TARGET} spec/test-chunked-prefill-admission.cpp)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
 install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
