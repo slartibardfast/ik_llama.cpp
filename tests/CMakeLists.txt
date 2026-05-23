@@ -1017,33 +1017,15 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
-set(TEST_TARGET test-paged-write-index-formula)
-add_executable(${TEST_TARGET} spec/test-paged-write-index-formula.cpp)
-target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
-install(TARGETS ${TEST_TARGET} RUNTIME)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
-
-set(TEST_TARGET test-paged-write-byte-identity-at-identity)
-add_executable(${TEST_TARGET} spec/test-paged-write-byte-identity-at-identity.cpp)
-target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
-install(TARGETS ${TEST_TARGET} RUNTIME)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
-
-set(TEST_TARGET test-paged-byte-identity-trivial-mapping)
-add_executable(${TEST_TARGET} spec/test-paged-byte-identity-trivial-mapping.cpp)
-target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
-install(TARGETS ${TEST_TARGET} RUNTIME)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
-
-set(TEST_TARGET test-paged-multi-seq-byte-identity)
-add_executable(${TEST_TARGET} spec/test-paged-multi-seq-byte-identity.cpp)
-target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
-install(TARGETS ${TEST_TARGET} RUNTIME)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+# T5.9.E cleanup (2026-05-23): four byte-identity stubs from T5.2/T5.3/T5.5/T5.6
+# (test-paged-write-index-formula, test-paged-write-byte-identity-at-identity,
+#  test-paged-byte-identity-trivial-mapping, test-paged-multi-seq-byte-identity)
+# were deleted. Their contracts were superseded at T5.6 when the paged
+# path moved from "byte-layout identity at trivial block_table" to
+# "value-equality under identity block_table mapping". Coverage is
+# now held by verify-production-determinism.sh (cross-NP byte-identity
+# over the full pipeline) + test-paged-kshift-byte-identity (paged K-shift
+# specific) + test-paged-defrag-preserves-contents (defrag composition).
 
 set(TEST_TARGET test-paged-kshift-byte-identity)
 add_executable(${TEST_TARGET} spec/test-paged-kshift-byte-identity.cpp)
