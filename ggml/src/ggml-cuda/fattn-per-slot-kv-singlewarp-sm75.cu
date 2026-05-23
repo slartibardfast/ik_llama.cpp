@@ -48,6 +48,39 @@
 //   Dk, Dv   — head dims (must be Dk = Dv = 256 in our config; static_assert).
 //   type_K   — K cache dtype (GGML_TYPE_Q4_0 in production).
 //   type_V   — V cache dtype (GGML_TYPE_Q4_0 in production).
+//
+// PHASE_NSTREAM_KV_PERF T5.5 — paged KV READ path.
+//
+// Two address modes supported (selected at runtime by block_table param):
+//
+//   Legacy (block_table == nullptr): the K/V buffers are laid out as one
+//   contiguous per-(seq, head_kv) slab. K_base for (seq, head_kv) =
+//   K_direct + nb13*seq + nb12*head_kv; positions k = 0..ne11-1 walk
+//   linearly via k*nb11. This is the layout shipped through T4.
+//
+//   Paged (block_table != nullptr): the K/V buffers are organised as a
+//   block pool of size n_blocks_per_seq * n_seq blocks; each block holds
+//   BLOCK_SIZE=64 positions × n_head_kv heads × head_dim elements in
+//   standard ggml row-major. nb13 is now the per-BLOCK stride. For each
+//   position k, the physical block id is block_table[seq*n_blocks_per_seq
+//   + k/BLOCK_SIZE]. Because the K-loop steps in chunks of ILP_W=4 and
+//   BLOCK_SIZE=64 is a multiple of 4 (and the chunk start is itself
+//   aligned to 4), all 4 positions in one ILP chunk live in the same
+//   block — bid is looked up once per chunk.
+//
+//   At trivial (identity) block_table = [seq*n_blocks_per_seq, seq*n_blocks_per_seq+1, ...]
+//   AND BLOCK_SIZE*n_blocks_per_seq == kvps, the paged path's byte addresses
+//   are byte-identical to the legacy path's addresses (the determinism
+//   contract anchor; see PagedFAReadEquivToContiguousAtIdentity in
+//   specs/kv-cache/paged_read_path.allium).
+//
+// At T5.8 closure the legacy branch (block_table == nullptr) is removed
+// per [[feedback_bake_measurement_env_gates]] — until then it is the
+// reference path the test-paged-byte-identity-trivial-mapping test
+// compares against.
+
+static constexpr int PAGED_BLOCK_SIZE_TOKENS = 64;
+
 template<int Dk, int Dv, ggml_type type_K, ggml_type type_V>
 __launch_bounds__(WARP_SIZE, 8)
 static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
@@ -57,6 +90,8 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         const char * __restrict__ mask,
         const char * __restrict__ /*sinks*/,
         const int  * __restrict__ per_row_k_bound,
+        const int  * __restrict__ block_table,    // T5.5: nullptr => legacy
+        const int                  n_blocks_per_seq,  // T5.5: meaningful only when block_table != nullptr
         float      * __restrict__ dst,
         float2     * __restrict__ /*dst_meta*/,
         const float scale,
@@ -96,8 +131,13 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
     const float  slope  = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
     // K and V base pointers for this (seq, head_kv).
-    const char * K_base = K_direct + nb13*seq + nb12*head_kv;
-    const char * V_base = V_direct + nb23*seq + nb22*head_kv;
+    // Under legacy mode (block_table == nullptr), one base is computed
+    // once and the k-loop walks linearly via k*nb11. Under paged mode,
+    // a per-block base is computed inside the k-loop (per ILP chunk).
+    const bool   paged       = (block_table != nullptr);
+    const int *  bt_seq      = paged ? (block_table + seq * n_blocks_per_seq) : nullptr;
+    const char * K_base_leg  = paged ? nullptr : (K_direct + nb13*seq + nb12*head_kv);
+    const char * V_base_leg  = paged ? nullptr : (V_direct + nb23*seq + nb22*head_kv);
 
     // Q load into registers. Each thread holds 8 fp32 elements.
     float Q_reg[Q_PER_THREAD];
@@ -141,11 +181,26 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         float partial_c = 0.0f;
         float partial_d = 0.0f;
 
+        // Per-chunk K base. In paged mode, recompute from block_table.
+        // BLOCK_SIZE=64 is a multiple of ILP_W=4 and k is aligned to 4,
+        // so all 4 positions in this chunk live in the same block.
+        const char * K_chunk_base;
+        int          k_in_chunk_off;
+        if (paged) {
+            const int block_idx  = k / PAGED_BLOCK_SIZE_TOKENS;
+            const int bid        = bt_seq[block_idx];
+            K_chunk_base         = K_direct + (size_t)bid * nb13 + (size_t)head_kv * nb12;
+            k_in_chunk_off       = k & (PAGED_BLOCK_SIZE_TOKENS - 1);  // k % 64
+        } else {
+            K_chunk_base         = K_base_leg;
+            k_in_chunk_off       = k;
+        }
+
         if constexpr (type_K == GGML_TYPE_Q4_0) {
-            const block_q4_0 * K_row_a = (const block_q4_0 *)(K_base + (k  )*nb11);
-            const block_q4_0 * K_row_b = (const block_q4_0 *)(K_base + (k+1)*nb11);
-            const block_q4_0 * K_row_c = (const block_q4_0 *)(K_base + (k+2)*nb11);
-            const block_q4_0 * K_row_d = (const block_q4_0 *)(K_base + (k+3)*nb11);
+            const block_q4_0 * K_row_a = (const block_q4_0 *)(K_chunk_base + (k_in_chunk_off  )*nb11);
+            const block_q4_0 * K_row_b = (const block_q4_0 *)(K_chunk_base + (k_in_chunk_off+1)*nb11);
+            const block_q4_0 * K_row_c = (const block_q4_0 *)(K_chunk_base + (k_in_chunk_off+2)*nb11);
+            const block_q4_0 * K_row_d = (const block_q4_0 *)(K_chunk_base + (k_in_chunk_off+3)*nb11);
             #pragma unroll
             for (int i = 0; i < Q_PER_THREAD; ++i) {
                 const int d        = lane + i*WARP_SIZE;
@@ -177,10 +232,10 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 partial_d += k_val_d * Q_reg[i];
             }
         } else {
-            const half * K_row_a = (const half *)(K_base + (k  )*nb11);
-            const half * K_row_b = (const half *)(K_base + (k+1)*nb11);
-            const half * K_row_c = (const half *)(K_base + (k+2)*nb11);
-            const half * K_row_d = (const half *)(K_base + (k+3)*nb11);
+            const half * K_row_a = (const half *)(K_chunk_base + (k_in_chunk_off  )*nb11);
+            const half * K_row_b = (const half *)(K_chunk_base + (k_in_chunk_off+1)*nb11);
+            const half * K_row_c = (const half *)(K_chunk_base + (k_in_chunk_off+2)*nb11);
+            const half * K_row_d = (const half *)(K_chunk_base + (k_in_chunk_off+3)*nb11);
             #pragma unroll
             for (int i = 0; i < Q_PER_THREAD; ++i) {
                 const int d = lane + i*WARP_SIZE;
@@ -197,10 +252,19 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         kq_arr[2] = warp_reduce_sum(partial_c) + slope * __half2float(maskh[k+2]);
         kq_arr[3] = warp_reduce_sum(partial_d) + slope * __half2float(maskh[k+3]);
 
+        // Per-chunk V base — same paged/legacy logic as K, but using
+        // V_direct and V's strides (nb22/nb23).
+        const char * V_chunk_base = paged
+            ? (V_direct + (size_t)bt_seq[k / PAGED_BLOCK_SIZE_TOKENS] * nb23
+                        + (size_t)head_kv * nb22)
+            : V_base_leg;
+        const int    v_in_chunk_off = paged ? (k & (PAGED_BLOCK_SIZE_TOKENS - 1)) : k;
+
         // Sequential softmax+V passes in canonical k order.
         #pragma unroll
         for (int s = 0; s < ILP_W; ++s) {
-            const int   k_s  = k + s;
+            const int   k_s     = k + s;
+            const int   v_off_s = v_in_chunk_off + s;
             const float kq_s = kq_arr[s];
 
             const float new_max  = fmaxf(kqmax, kq_s);
@@ -212,8 +276,9 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
             kqsum = kqsum * scale_corr + phi;
             #pragma unroll
             for (int i = 0; i < V_PER_THREAD; ++i) VKQ[i] *= scale_corr;
+            (void)k_s;  // legacy V_off was k_s; now derived via v_off_s
             if constexpr (type_V == GGML_TYPE_Q4_0) {
-                const block_q4_0 * V_row = (const block_q4_0 *)(V_base + k_s*nb21);
+                const block_q4_0 * V_row = (const block_q4_0 *)(V_chunk_base + v_off_s*nb21);
                 #pragma unroll
                 for (int i = 0; i < V_PER_THREAD; ++i) {
                     const int d        = lane + i*WARP_SIZE;
@@ -228,7 +293,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                     VKQ[i] += phi * v_val;
                 }
             } else {
-                const half * V_row = (const half *)(V_base + k_s*nb21);
+                const half * V_row = (const half *)(V_chunk_base + v_off_s*nb21);
                 #pragma unroll
                 for (int i = 0; i < V_PER_THREAD; ++i) {
                     const int d = lane + i*WARP_SIZE;
@@ -239,10 +304,25 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
     }
 
     // Tail (ne11 % ILP_W): scalar inner loop identical to pre-ILP singlewarp.
+    // Per-k bid lookup in paged mode (bid may change at block boundary).
     for (int k = ne11_aligned; k < ne11; ++k) {
+        const char * K_tail_base;
+        const char * V_tail_base;
+        int          k_tail_off;
+        if (paged) {
+            const int block_idx = k / PAGED_BLOCK_SIZE_TOKENS;
+            const int bid       = bt_seq[block_idx];
+            K_tail_base         = K_direct + (size_t)bid * nb13 + (size_t)head_kv * nb12;
+            V_tail_base         = V_direct + (size_t)bid * nb23 + (size_t)head_kv * nb22;
+            k_tail_off          = k & (PAGED_BLOCK_SIZE_TOKENS - 1);
+        } else {
+            K_tail_base = K_base_leg;
+            V_tail_base = V_base_leg;
+            k_tail_off  = k;
+        }
         float partial = 0.0f;
         if constexpr (type_K == GGML_TYPE_Q4_0) {
-            const block_q4_0 * K_row = (const block_q4_0 *)(K_base + k*nb11);
+            const block_q4_0 * K_row = (const block_q4_0 *)(K_tail_base + k_tail_off*nb11);
             #pragma unroll
             for (int i = 0; i < Q_PER_THREAD; ++i) {
                 const int d        = lane + i*WARP_SIZE;
@@ -256,7 +336,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 partial += d_scale * (float)(q_nib - 8) * Q_reg[i];
             }
         } else {
-            const half * K_row = (const half *)(K_base + k*nb11);
+            const half * K_row = (const half *)(K_tail_base + k_tail_off*nb11);
             #pragma unroll
             for (int i = 0; i < Q_PER_THREAD; ++i) {
                 const int d = lane + i*WARP_SIZE;
@@ -274,7 +354,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         #pragma unroll
         for (int i = 0; i < V_PER_THREAD; ++i) VKQ[i] *= scale_corr;
         if constexpr (type_V == GGML_TYPE_Q4_0) {
-            const block_q4_0 * V_row = (const block_q4_0 *)(V_base + k*nb21);
+            const block_q4_0 * V_row = (const block_q4_0 *)(V_tail_base + k_tail_off*nb21);
             #pragma unroll
             for (int i = 0; i < V_PER_THREAD; ++i) {
                 const int d        = lane + i*WARP_SIZE;
@@ -288,7 +368,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 VKQ[i] += phi * d_scale * (float)(q_nib - 8);
             }
         } else {
-            const half * V_row = (const half *)(V_base + k*nb21);
+            const half * V_row = (const half *)(V_tail_base + k_tail_off*nb21);
             #pragma unroll
             for (int i = 0; i < V_PER_THREAD; ++i) {
                 const int d = lane + i*WARP_SIZE;
@@ -316,6 +396,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
 #else
     NO_DEVICE_CODE;
     (void)Q; (void)K_direct; (void)V_direct; (void)mask; (void)dst;
+    (void)block_table; (void)n_blocks_per_seq;
     (void)scale; (void)max_bias; (void)m0; (void)m1; (void)n_head_log2;
     (void)ne00; (void)ne01; (void)ne02; (void)ne03;
     (void)ne10; (void)ne11; (void)ne12; (void)ne13;
@@ -337,6 +418,10 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     // CY.F.17: per_row_k_bound is dst->src[5]. Int32 tensor [n_tokens]
     // bounding the per-row K-loop iteration. Absent → fall back to ne11.
     const ggml_tensor * per_row_k_bound = dst->src[5];
+    // T5.5: block_table is dst->src[6]. Int32 tensor [n_blocks_per_seq, n_seqs].
+    // Absent → legacy contiguous addressing (Bundle A / pre-Tier-5).
+    // Present → paged addressing per PagedFAReadEquivToContiguousAtIdentity.
+    const ggml_tensor * block_table     = (GGML_MAX_SRC > 6) ? dst->src[6] : nullptr;
 
     GGML_ASSERT(Q && K && V && mask);
     GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == 256);
@@ -346,6 +431,7 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     GGML_ASSERT((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) &&
                 "FIX-C v5 singlewarp supports Q4_0 (production) or F16 (test) KV cache");
     GGML_ASSERT(!per_row_k_bound || per_row_k_bound->type == GGML_TYPE_I32);
+    GGML_ASSERT(!block_table || block_table->type == GGML_TYPE_I32);
 
     float scale, max_bias, softcap;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -371,6 +457,12 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     const int * per_row_k_bound_dev = per_row_k_bound
         ? (const int *) per_row_k_bound->data
         : nullptr;
+    const int * block_table_dev = block_table
+        ? (const int *) block_table->data
+        : nullptr;
+    const int n_blocks_per_seq = block_table
+        ? (int) block_table->ne[0]
+        : 0;
 
     auto launch_kernel = [&](auto kernel) {
         kernel<<<grid, block, 0, ctx.stream()>>>(
@@ -380,6 +472,8 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
             (const char *) mask->data,
             nullptr,            // sinks (unused)
             per_row_k_bound_dev,
+            block_table_dev,
+            n_blocks_per_seq,
             (float *) dst->data,
             nullptr,
             scale, max_bias, m0, m1, softcap, n_head_log2,
