@@ -1407,6 +1407,9 @@ static bool llama_kv_cache_init(
 bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
         const struct llama_batch & batch) {
+    // Reset T5.9.B' admission-fail signal at every entry; populated
+    // below if the paged pool can't admit the batch.
+    cache.last_find_slot_fail_reason = llama_kv_cache::LLAMA_KV_FAIL_NONE;
     const uint32_t n_tokens = batch.n_tokens;
 
     if (cache.recurrent) {
@@ -1601,6 +1604,8 @@ bool llama_kv_cache_find_slot(
                     "should return HTTP 503 + Retry-After.\n",
                     __func__, cache.paged.n_free(),
                     cache.paged.total_blocks());
+                cache.last_find_slot_fail_reason =
+                    llama_kv_cache::LLAMA_KV_FAIL_POOL_EXHAUSTED;
                 return false;
             }
         }
@@ -6108,6 +6113,15 @@ static int llama_decode_internal(
             }
 
             if (!llama_kv_cache_find_slot(transformer_kv, u_batch)) {
+                // T5.9.B': map paged-pool exhaustion to ALLOC_FAILED so
+                // the server returns 503 + Retry-After (per the
+                // user-locked T5.9 failure mode). Other find_slot
+                // failures (legacy kv-cache full) keep the historical
+                // ret=1 → 500 path.
+                if (transformer_kv.last_find_slot_fail_reason ==
+                    llama_kv_cache::LLAMA_KV_FAIL_POOL_EXHAUSTED) {
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
                 return 1;
             }
 

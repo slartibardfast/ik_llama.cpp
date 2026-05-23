@@ -101,11 +101,34 @@ llm_build_context::llm_build_context(
         // PHASE_NSTREAM_KV_4D N2.b: at n_stream>1 the K/V views read
         // [0..n_kv) WITHIN a stream's slice, so n_kv must be bounded
         // by kv_size_per_stream (not kv_size, which spans all streams).
-        n_kv             (worst_case
-                          ? (kv_self.n_stream > 1
-                             ? (int32_t)kv_self.kv_size_per_stream
-                             : (int32_t)kv_self.size)
-                          : kv_self.n),
+        //
+        // PHASE_NSTREAM_KV_PERF T5.9.B': under paged BACKING with
+        // user override --kv-pool-blocks N < auto, the physical
+        // K/V buffer holds total_pool_blocks × BLOCK_SIZE_TOKENS
+        // positions total — strictly less than kvps × n_stream.
+        // The K/V views' contiguous byte budget (computed in
+        // ggml_new_tensor_impl from ne alone, IGNORING the manual
+        // nb1/nb2/nb3 args) is ne[0] × ne[1] × ne[2] × ne[3] ×
+        // bytes_per_pos. Source contiguous bytes per device are
+        // bytes_per_pos × BLOCK × n_head_kv_per_dev × total_pool_blocks.
+        // For view ≤ source we need ne[1] × ne[3] ≤ BLOCK ×
+        // total_pool_blocks. Conservatively bound ne[3] (=
+        // n_seq_in_batch) by n_stream and cap n_kv at the per-stream
+        // fair share (BLOCK × total_pool_blocks) / n_stream.
+        // At auto-size (total_pool_blocks = kvps × n_stream / BLOCK)
+        // the cap evaluates to kvps — no-op at production. Per-row
+        // K bound (src[5] of FA per-slot-kv) still masks beyond
+        // active position; admission gating prevents kv_self.n from
+        // exceeding the cap at runtime.
+        n_kv             (std::min<int32_t>(
+                              worst_case
+                                  ? (kv_self.n_stream > 1
+                                     ? (int32_t)kv_self.kv_size_per_stream
+                                     : (int32_t)kv_self.size)
+                                  : (int32_t)kv_self.n,
+                              (int32_t)((int64_t)kv_self.paged.total_blocks()
+                                        * (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS
+                                        / (int64_t)std::max<uint32_t>(kv_self.n_stream, 1u)))),
         n_outputs        (worst_case ? n_outputs_ > 0 ? n_outputs_ : n_tokens : lctx.decoder_ref->n_outputs),
         n_outputs_enc    (worst_case ? n_tokens : lctx.embd_enc.size() / hparams.n_embd),
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),

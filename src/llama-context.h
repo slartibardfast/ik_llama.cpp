@@ -96,6 +96,18 @@ struct llama_kv_cache {
     // and tests/spec/test-kv-block-allocator.cpp.
     llama_paged_kv_allocator paged;
 
+    // T5.9.B': set by llama_kv_cache_find_slot to LLAMA_KV_FAIL_POOL_EXHAUSTED
+    // when find_slot returns false because the paged pool can't admit the
+    // batch. llama_decode_internal maps this to GGML_STATUS_ALLOC_FAILED so
+    // the server returns HTTP 503 + Retry-After per the user-locked T5.9
+    // failure mode. Cleared (= NONE) at every find_slot entry.
+    enum llama_kv_find_slot_fail_reason : int {
+        LLAMA_KV_FAIL_NONE             = 0,
+        LLAMA_KV_FAIL_KV_CACHE_FULL    = 1,
+        LLAMA_KV_FAIL_POOL_EXHAUSTED   = 2,
+    };
+    llama_kv_find_slot_fail_reason last_find_slot_fail_reason = LLAMA_KV_FAIL_NONE;
+
     // computed before each graph build
     uint32_t n = 0;
 
