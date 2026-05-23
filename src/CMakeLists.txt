@@ -47,6 +47,8 @@ add_library(llama
             llama.cpp
             llama-vocab.cpp
             llama-dflash.cpp
+            llama-paged-kv-allocator.h
+            llama-paged-kv-allocator.cpp
             llama-grammar.cpp
             llama-sampling.cpp
             llama-mmap.cpp

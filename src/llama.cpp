@@ -932,6 +932,18 @@ static bool llama_kv_cache_init(
     cache.kv_size_per_stream = kv_size / cache.n_stream;
     cache.v_heads.assign(cache.n_stream, 0u);
 
+    // T5.1 — initialise the paged KV block allocator alongside the
+    // contiguous layout. Block count = ceil(kv_size / block_size).
+    // Per /home/llm/yarn-agentic/specs/kv-cache/paged_block_allocator.allium
+    // and PHASE_NSTREAM_KV_PERF.md §"Bundles": dormant at T5.1; consumed
+    // by find_slot / inp_kv_idxs / kernel from T5.2 onwards.
+    {
+        const int32_t blk = llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+        const int32_t n_blocks_paged =
+            (int32_t)((kv_size + (uint32_t)blk - 1) / (uint32_t)blk);
+        cache.paged.init(n_blocks_paged, (int32_t)cache.n_stream);
+    }
+
     cache.type_k  = type_k;
     cache.type_v  = type_v;
 

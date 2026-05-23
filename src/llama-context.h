@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-cparams.h"
 #include "llama-sampling.h"
+#include "llama-paged-kv-allocator.h"
 #include "qnext-state-slot-allocator.h"
 #include "qnext-seq-pattern.h"
 
@@ -66,6 +67,26 @@ struct llama_kv_cache {
     uint32_t n_stream            = 1;
     uint32_t kv_size_per_stream  = 0;
     std::vector<uint32_t>        v_heads;
+
+    // T5.1 — paged KV block allocator (PHASE_NSTREAM_KV_PERF Tier 5).
+    //
+    // At T5.1 this allocator lands as a standalone, DORMANT component:
+    // it is initialised at kv_cache_init alongside the contiguous
+    // layout but is NOT yet consumed by find_slot or the K/V WRITE/READ
+    // paths. Production behaviour at n_stream==1 single-seq workloads
+    // is byte-identical to pre-T5.1 because the contiguous layout's
+    // v_heads / cells[] path remains the sole source of truth.
+    //
+    // T5.2/T5.3/T5.4 (Bundle A) progressively migrate the WRITE path
+    // to consume `paged.block_table(seq)` via inp_kv_idxs; T5.5–T5.8
+    // (Bundle B) migrate the READ path + kernel signature.
+    //
+    // The allocator's correctness contracts (BlockUniquelyOwned,
+    // FreeListDisjoint, AllocLazy, DeterministicAtFixedSequence,
+    // IdentityMappingAtSingleSeq) are bound by
+    // /home/llm/yarn-agentic/specs/kv-cache/paged_block_allocator.allium
+    // and tests/spec/test-kv-block-allocator.cpp.
+    llama_paged_kv_allocator paged;
 
     // computed before each graph build
     uint32_t n = 0;

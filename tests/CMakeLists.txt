@@ -1007,7 +1007,10 @@ set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
 # (where stubbed) is filled in by the T5.x author.
 
 set(TEST_TARGET test-kv-block-allocator)
-add_executable(${TEST_TARGET} spec/test-kv-block-allocator.cpp)
+add_executable(${TEST_TARGET}
+    spec/test-kv-block-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
 install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
@@ -1056,7 +1059,10 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
 set(TEST_TARGET test-paged-allocator-determinism)
-add_executable(${TEST_TARGET} spec/test-paged-allocator-determinism.cpp)
+add_executable(${TEST_TARGET}
+    spec/test-paged-allocator-determinism.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
 install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
