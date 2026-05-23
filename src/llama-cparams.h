@@ -44,6 +44,15 @@ struct llama_cparams {
     bool split_mode_graph_scheduling;
     //bool split_mode_f16;
     bool scheduler_async;
+    // T5.9: paged BACKING — physical block-pool sizing for the KV
+    // cache buffer. 0 = auto (derive from n_ctx × n_seq_max /
+    // BLOCK_SIZE_TOKENS, byte-identical to legacy). > 0 = explicit
+    // override, in units of BLOCK_SIZE_TOKENS-block count. Use to
+    // under-allocate the pool below nominal max when nominal can't
+    // fit VRAM (e.g. ctx ≥ 1M NP=8 workloads). Bound by
+    // specs/kv-cache/paged_kv_pool_sizing.allium
+    // ::SizingDerivedFromCtxAndParallel.
+    int32_t  kv_pool_blocks;
     int  min_experts;
     float thresh_experts;
     bool mtp;

@@ -934,15 +934,31 @@ static bool llama_kv_cache_init(
     cache.v_heads.assign(cache.n_stream, 0u);
 
     // T5.1 — initialise the paged KV block allocator alongside the
-    // contiguous layout. Block count = ceil(kv_size / block_size).
-    // Per /home/llm/yarn-agentic/specs/kv-cache/paged_block_allocator.allium
-    // and PHASE_NSTREAM_KV_PERF.md §"Bundles": dormant at T5.1; consumed
-    // by find_slot / inp_kv_idxs / kernel from T5.2 onwards.
+    // KV buffer. T5.9 (paged BACKING): pool size derives from
+    // cparams.kv_pool_blocks (CLI override) or auto-derives from
+    // kv_size / block_size at default. Per
+    // /home/llm/yarn-agentic/specs/kv-cache/paged_kv_pool_sizing.allium
+    // ::SizingDerivedFromCtxAndParallel.
+    int32_t total_pool_blocks = 0;
     {
         const int32_t blk = llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
-        const int32_t n_blocks_paged =
+        const int32_t auto_pool_blocks =
             (int32_t)((kv_size + (uint32_t)blk - 1) / (uint32_t)blk);
-        cache.paged.init(n_blocks_paged, (int32_t)cache.n_stream);
+        total_pool_blocks = cparams.kv_pool_blocks > 0
+            ? cparams.kv_pool_blocks
+            : auto_pool_blocks;
+    }
+    cache.paged.init(total_pool_blocks, (int32_t)cache.n_stream);
+    cache.total_pool_blocks = total_pool_blocks;
+    // T5.9: at auto-sized pool (no CLI override), seed each stream's
+    // block_table with the contiguous prefix
+    // [s*nbps .. s*nbps + nbps-1]. This makes the kernel's
+    // bid-indexed byte addresses identical to T5.8's stream-major
+    // s*nb[3]_old + k*paged_nb_per_block. Bound by
+    // paged_block_allocator.allium::IdentityMappingAtSingleSeq
+    // generalised per-stream.
+    if (cparams.kv_pool_blocks == 0) {
+        cache.paged.seed_identity_per_stream();
     }
 
     cache.type_k  = type_k;
@@ -1158,26 +1174,42 @@ static bool llama_kv_cache_init(
             // PHASE_NSTREAM_KV_4D N2.a: 4D K shape
             // [head_dim, kv_size_per_stream, n_head_kv, n_stream].
             //
-            // This is the upstream-aligned axis order — positions
-            // inner per stream, heads outer per stream, streams
-            // outermost. The byte layout is NOT byte-identical to the
-            // legacy 2D K. Default contig strides give
+            // T5.9 paged BACKING: K/V tensor is now block-major. The
+            // shape becomes [head_dim, BLOCK_SIZE_TOKENS, n_head_kv,
+            // total_pool_blocks] — each row corresponds to a (block,
+            // head, position-within-block) triple. Default contig
+            // strides give
             //   nb[0] = type_size
             //   nb[1] = head_dim * type_size
-            //   nb[2] = head_dim * kvps * type_size  (head stride within a stream)
-            //   nb[3] = head_dim * kvps * n_head_kv * type_size  (stream stride)
-            // Stream s's slice spans bytes [s*nb[3], (s+1)*nb[3]).
-            // Graph builders read/write per-stream by adding s*nb[3]
-            // to their view offsets. Per-stream allocator and
-            // per-stream dispatch (N2.c, N2.d) become correct under
-            // this layout because cells[s*kvps+p_local] addresses the
-            // byte range where stream s's local position p_local is
-            // stored.
+            //   nb[2] = head_dim * BLOCK * type_size            (head stride within a block)
+            //   nb[3] = head_dim * BLOCK * n_head_kv * type_size (block-of-all-heads stride)
+            // The kernel addresses K as
+            //   K_base + bid * nb[3] + h * nb[2] + p_in_block * nb[1]
+            // which is exactly the formula T5.7b's PSKV singlewarp
+            // already uses (paged_nb13 = nb1 × BLOCK × ne12, paged_nb12
+            // = nb1 × BLOCK). SET_ROWS at the WRITE site uses row index
+            //   r = bid * BLOCK * n_head_kv + h * BLOCK + p_in_block
+            // (see line ~5234) which is identical to flat row indexing
+            // under this new shape. The physical bytes occupied are
+            // byte-identical to T5.8 at auto-sized pool because:
+            // total bytes = head_dim × BLOCK × n_head_kv × total_pool_blocks × ts
+            //             = head_dim × BLOCK × n_head_kv × nbps × n_stream × ts (auto-size)
+            //             = head_dim × kvps × n_head_kv × n_stream × ts        (T5.8 total).
+            // At `--kv-pool-blocks N` user override the buffer is
+            // proportionally smaller — exactly what unlocks high-ctx
+            // feasibility per specs/kv-cache/paged_kv_pool_sizing.allium
+            // ::SizingDerivedFromCtxAndParallel.
+            //
+            // Stream identity at auto-size is preserved by
+            // paged.seed_identity_per_stream() in init: stream s owns
+            // bids [s*nbps, s*nbps+nbps-1], so the kernel's bid-based
+            // addressing produces the same byte addresses as T5.8's
+            // s*nb[3]_old + k*paged_nb_per_block.
             k = ggml_new_tensor_4d(ctx, this_type_k,
                                    n_embd_head_k,
-                                   cache.kv_size_per_stream,
+                                   (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS,
                                    n_head_kv,
-                                   cache.n_stream);
+                                   (int64_t)total_pool_blocks);
 
             auto this_type_v = type_v;
             if (type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
@@ -1201,20 +1233,23 @@ static bool llama_kv_cache_init(
                                       (n_head_kv != 0) &&
                                       ((uint32_t)n_embd_v_row == (uint32_t)n_embd_head_v * (uint32_t)n_head_kv);
             if (v_factors_4d) {
+                // T5.9 paged BACKING: mirror K's block-major shape.
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        (int64_t)n_embd_head_v,
-                                       cache.kv_size_per_stream,
+                                       (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS,
                                        n_head_kv,
-                                       cache.n_stream);
+                                       (int64_t)total_pool_blocks);
             } else {
-                // Hybrid V tail: per-stream contiguous block of flat
-                // rows. ne[1] carries kvps so per-stream slicing matches
-                // the regular path even when head factoring fails.
+                // Hybrid V tail: ne[2]=1 (no per-head axis); under
+                // T5.9 still block-major so ne[1]=BLOCK and
+                // ne[3]=total_pool_blocks. The kernel path doesn't
+                // route through hybrid V; this keeps the shape
+                // shape-coherent with K for split-buffer accounting.
                 v = ggml_new_tensor_4d(ctx, this_type_v,
                                        n_embd_v_row,
-                                       cache.kv_size_per_stream,
+                                       (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS,
                                        1u,
-                                       cache.n_stream);
+                                       (int64_t)total_pool_blocks);
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -1230,12 +1265,13 @@ static bool llama_kv_cache_init(
                 auto & split_v_l = cache.split_v_l.emplace_back();
                 split_k_l.tensor_splits.resize(extra_K->n_device, nullptr);
                 split_v_l.tensor_splits.resize(extra_V->n_device, nullptr);
-                // PHASE_NSTREAM_KV_4D N2.a: per-device split tensors
-                // adopt the same 4D shape as the primary K/V
-                //   [head_dim, kv_size_per_stream, nhead_kv_split, n_stream]
-                // so the multi-device split path uses the same
-                // s*nb[3] stream offset formula as the single-device
-                // path in build_std_attention.
+                // T5.9 paged BACKING: per-device split tensors mirror
+                // the primary K/V block-major shape
+                //   [head_dim, BLOCK_SIZE_TOKENS, nhead_kv_split, total_pool_blocks]
+                // — same buffer-sizing rule, same per-block byte
+                // arithmetic. The multi-device split path uses the
+                // same bid-via-block_table indirection as the
+                // single-device path.
                 for (int is = 0; is < extra_K->n_device; ++is) {
                     auto split = use_V_for_K ? extra_V->splits[is] : extra_K->splits[is];
                     if (!split) continue;
@@ -1246,9 +1282,9 @@ static bool llama_kv_cache_init(
                     }
                     split_k_l.tensor_splits[is] = ggml_new_tensor_4d(ctx, this_type_k,
                             n_embd_head_k,
-                            cache.kv_size_per_stream,
+                            (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS,
                             nhead_kv,
-                            cache.n_stream);
+                            (int64_t)total_pool_blocks);
                     auto split_name = k_name + '.' + std::to_string(is);
                     ggml_set_name(split_k_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_k_l.tensor_splits[is]);
@@ -1267,9 +1303,9 @@ static bool llama_kv_cache_init(
                     GGML_ASSERT(nh_v_split > 0 && (int64_t)n_embd_head_v * nh_v_split == split->ne[1]);
                     split_v_l.tensor_splits[is] = ggml_new_tensor_4d(ctx, this_type_v,
                             n_embd_head_v,
-                            cache.kv_size_per_stream,
+                            (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS,
                             nh_v_split,
-                            cache.n_stream);
+                            (int64_t)total_pool_blocks);
                     auto split_name = v_name + '.' + std::to_string(is);
                     ggml_set_name(split_v_l.tensor_splits[is], split_name.c_str());
                     mem_split[is] += ggml_nbytes(split_v_l.tensor_splits[is]);
@@ -1508,6 +1544,79 @@ bool llama_kv_cache_find_slot(
             scans.push_back({stream_id, base, head_local});
         }
 
+        // T5.9 paged BACKING: pre-check the paged allocator BEFORE
+        // committing cells[] writes. If the pool can't accommodate
+        // ALL seq runs in this find_slot, fail cleanly so the
+        // caller (and ultimately the server) can return HTTP 503 +
+        // Retry-After. At auto-sized pool with
+        // seed_identity_per_stream(), this pre-check always succeeds
+        // (every seq has nbps blocks pre-allocated). At
+        // `--kv-pool-blocks N` override with lazy allocation, this
+        // is the admission gate per
+        // specs/kv-cache/paged_kv_pool_sizing.allium
+        // ::PoolExhaustionReturns503.
+        //
+        // The pre-check simulates the writes against a hypothetical
+        // free-block budget. Only if all runs would succeed do we
+        // commit for real. Avoids partial-commit rollback complexity.
+        {
+            const int32_t blk_tok =
+                llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+            int32_t hyp_n_free = cache.paged.n_free();
+            // Track per-(seq) hypothetical state inline so multiple
+            // runs targeting the same seq compose correctly.
+            std::vector<int32_t> hyp_owned(cache.n_stream);
+            std::vector<int32_t> hyp_written(cache.n_stream);
+            for (uint32_t s = 0; s < cache.n_stream; ++s) {
+                hyp_owned[s]   =
+                    cache.paged.n_blocks_owned_by((int32_t)s);
+                hyp_written[s] =
+                    cache.paged.written_tokens_of((int32_t)s);
+            }
+            bool admit_ok = true;
+            for (size_t r = 0; r < seq_runs.size(); ++r) {
+                const auto & run = seq_runs[r];
+                const auto & sc  = scans[r];
+                const int32_t sid       = (int32_t)sc.stream_id;
+                const int32_t new_total =
+                    hyp_written[sid] + (int32_t)run.n_tok;
+                const int32_t needed = (new_total == 0)
+                    ? 0
+                    : ((new_total - 1) / blk_tok) + 1;
+                const int32_t deficit = needed - hyp_owned[sid];
+                if (deficit > 0) {
+                    if (hyp_n_free < deficit) {
+                        admit_ok = false;
+                        break;
+                    }
+                    hyp_n_free      -= deficit;
+                    hyp_owned[sid]  += deficit;
+                }
+                hyp_written[sid] = new_total;
+            }
+            if (!admit_ok) {
+                LLAMA_LOG_ERROR(
+                    "%s: paged KV pool exhausted across batch "
+                    "(n_free=%d, total_pool_blocks=%d). Server "
+                    "should return HTTP 503 + Retry-After.\n",
+                    __func__, cache.paged.n_free(),
+                    cache.paged.total_blocks());
+                return false;
+            }
+        }
+        // Commit phase: paged.write_tokens for each run (guaranteed
+        // to succeed after the pre-check above), then write cells
+        // and advance v_heads.
+        for (size_t r = 0; r < seq_runs.size(); ++r) {
+            const auto & run  = seq_runs[r];
+            const auto & scan = scans[r];
+            const bool paged_ok = cache.paged.write_tokens(
+                (int32_t)scan.stream_id, (int32_t)run.n_tok);
+            GGML_ASSERT(paged_ok &&
+                "T5.9 find_slot pre-check passed but commit failed");
+            (void)paged_ok;
+        }
+
         // Commit phase: write cells and advance v_heads.
         for (size_t r = 0; r < seq_runs.size(); ++r) {
             const auto & run = seq_runs[r];
@@ -1522,14 +1631,6 @@ bool llama_kv_cache_find_slot(
             }
             cache.v_heads[scan.stream_id] = scan.head_local;
             cache.used += run.n_tok;
-            // T5.2 — shadow paged allocator update. Mirrors cells[] write
-            // progress so paged.block_table(seq) stays consistent with
-            // find_slot's view of which positions are occupied by which
-            // seq. Best-effort: OOM in the shadow pool is non-fatal (the
-            // allocator is dormant from the kernel/build_context POV at
-            // T5.2; T5.3 makes it load-bearing).
-            (void)cache.paged.write_tokens((int32_t)scan.stream_id,
-                                           (int32_t)run.n_tok);
         }
 
         // Legacy cache.head invariant: point at seq-0's slot's first
@@ -1592,9 +1693,26 @@ bool llama_kv_cache_find_slot(
         }
     }
 
-    // T5.2 — shadow paged allocator update (single-seq path).
-    // Best-effort: see the multi-seq commit-phase comment above.
-    (void)cache.paged.write_tokens((int32_t)stream_id, (int32_t)n_tokens);
+    // T5.9: load-bearing paged allocator update (single-seq path).
+    // At auto-sized pool with seed_identity_per_stream(), this
+    // always succeeds (every seq pre-allocated to nbps blocks). At
+    // `--kv-pool-blocks N` override with lazy allocation, this is
+    // the admission gate. On failure roll back the cells writes
+    // above and return false so the caller (server) emits HTTP 503.
+    if (!cache.paged.write_tokens((int32_t)stream_id, (int32_t)n_tokens)) {
+        // Roll back cells[] writes from the loop above.
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            cache.cells[base + head_local + i].pos = -1;
+            cache.cells[base + head_local + i].seq_id.clear();
+        }
+        LLAMA_LOG_ERROR(
+            "%s: paged KV pool exhausted (single-seq path) at "
+            "stream=%u n_tokens=%u (n_free=%d total_pool_blocks=%d). "
+            "Server should return HTTP 503 + Retry-After.\n",
+            __func__, stream_id, n_tokens, cache.paged.n_free(),
+            cache.paged.total_blocks());
+        return false;
+    }
 
     cache.v_heads[stream_id] = head_local;
     cache.head               = base + head_local;
@@ -7428,6 +7546,7 @@ struct llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.kv_pool_blocks              =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -7831,6 +7950,7 @@ struct llama_context * llama_init_from_model(
     cparams.yarn_beta_fast   = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow >= 0.0f ? params.yarn_beta_slow : hparams.yarn_beta_slow;
     cparams.defrag_thold     = params.defrag_thold;
+    cparams.kv_pool_blocks   = params.kv_pool_blocks;
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;

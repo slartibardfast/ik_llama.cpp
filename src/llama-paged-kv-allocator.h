@@ -52,6 +52,22 @@ public:
     // re-init clears all tables and refills the free list.
     void init(int32_t n_blocks, int32_t n_seqs);
 
+    // T5.9: seed each seq's block_table with an identity-per-stream
+    // contiguous prefix: tables[s] = [s*nbps, s*nbps+1, ..., s*nbps+nbps-1]
+    // where nbps = total_blocks / n_seqs. Pops those blocks from the
+    // free_list. This restores byte-identity to the T5.8 stream-major
+    // layout under T5.9's block-major K/V tensor shape: the kernel's
+    // `bid * paged_nb_per_block` lands at the same bytes as T5.8's
+    // `s * nb[3] + k * paged_nb_per_block` because bid = s * nbps + k.
+    //
+    // Precondition: allocator was just init()'d (no prior allocs);
+    // total_blocks must be a multiple of n_seqs (auto-sizing
+    // guarantees this).
+    //
+    // Composes with paged_block_allocator.allium::
+    // IdentityMappingAtSingleSeq generalised per-stream.
+    void seed_identity_per_stream();
+
     // Allocate one block to seq. Returns the block_id popped from the
     // top of the LIFO free_list, or OOB_SENTINEL if the pool is empty.
     int32_t alloc_block(int32_t seq);

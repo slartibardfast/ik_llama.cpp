@@ -477,6 +477,13 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // defragment the KV cache if holes/size > thold, < 0 disabled (default)
+        // T5.9 paged BACKING: physical KV block-pool sizing in
+        // units of BLOCK_SIZE_TOKENS-block count. 0 = auto-derive
+        // from n_ctx × n_seq_max (byte-identical to legacy). > 0 =
+        // explicit override; use to under-allocate the pool below
+        // nominal max when nominal can't fit VRAM. Production
+        // profile (qwen36-27b-x2-dflash.sh) leaves this at 0.
+        int32_t  kv_pool_blocks;
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

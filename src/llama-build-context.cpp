@@ -301,8 +301,13 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     const uint32_t nbps      = kvps / (uint32_t)BLOCK;
     GGML_ASSERT(kvps % (uint32_t)BLOCK == 0 &&
             "T5.7b K-shift: kvps must be a multiple of BLOCK_SIZE_TOKENS");
-    GGML_ASSERT((uint32_t)kv_self.paged.total_blocks() == nbps * n_stream &&
-            "T5.7b K-shift: paged.total_blocks() must equal nbps * n_stream");
+    // T5.9 paged BACKING: relax the nominal-max assertion. Under
+    // `--kv-pool-blocks N` user override, total_blocks may be less
+    // than nbps × n_stream (under-allocation for high-ctx
+    // workloads). Each stream's block_table[s] still grows at most
+    // to nbps blocks (bounded by per-stream ctx), enforced per-loop
+    // below at the n_blocks_s <= nbps assertion. `nbps` is still
+    // used below as the per-stream block-count cap.
 
     for (int il = 0; il < n_layer; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
@@ -444,37 +449,42 @@ ggml_cgraph * llm_build_context::build_s_copy() {
 ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes(n_tokens), false);
 
-    // PHASE_NSTREAM_KV_PERF T3.6.I.c2: per-(device, stream) defrag with
-    // 3D-per-stream views.
+    // T5.9 paged BACKING: per-position defrag via block_table
+    // indirection.
     //
-    // Cell-metadata moves are already restricted to a single stream by
-    // llama_kv_cache_defrag_internal (per-stream outer loop). This
-    // builder consumes the flat `ids` array — for each contiguous run
-    // (dst=i, src=ids[i], length nm), both i and ids[i] are guaranteed
-    // to be within the SAME stream s = i / kvps. We add a defensive
-    // stream-boundary check to break batched runs that would otherwise
-    // span streams.
+    // Under T5.8 the K/V tensor was stream-major
+    // [head_dim, kvps, n_head_kv, n_stream] and build_defrag used
+    // `s * parent->nb[3] + p_local * parent->nb[1]` to address
+    // stream s's local position p_local. Under T5.9 the tensor is
+    // block-major [head_dim, BLOCK, n_head_kv, total_pool_blocks]
+    // and `parent->nb[3]` is the *block* stride (one block of all
+    // heads), not the stream stride. The correct byte offset for
+    // logical (stream s, position p_local) is:
     //
-    // Under the 4D KV layout [head_dim, kvps, n_head_kv, n_stream]:
-    //   nb[1] = head_dim*ts            (per-position stride)
-    //   nb[2] = head_dim*kvps*ts       (per-head stride within stream)
-    //   nb[3] = head_dim*kvps*nhead*ts (stream stride)
-    // The legacy 2D [n_embd_k_gqa, nm] view collapsed head_dim and
-    // n_head_kv into one dim — INCORRECT under 4D because head_dim is
-    // contiguous but n_head_kv is separated by kvps positions. The new
-    // 3D-per-stream view is [head_dim, n_head_kv, nm] with
-    //   nb_view[1] = parent->nb[2]
-    //   nb_view[2] = parent->nb[1]
-    //   offset     = s * parent->nb[3] + p_local * parent->nb[1]
+    //   bid_at_p          = block_table[s][p_local / BLOCK]
+    //   offset_in_block_p = p_local % BLOCK
+    //   bytes             = bid_at_p * parent->nb[3]
+    //                     + offset_in_block_p * parent->nb[1]
     //
-    // Under split_mode == GRAPH the parent kv_self.k_l[il] is a stub;
-    // we iterate per-device on kl_extra->splits[id]. Same for V.
-    // (See specs/kv-cache/defrag_per_stream.allium DefragViewIs3DPerStream
-    //  and the T3.6.I.c1.x2 pattern in build_k_shift.)
+    // Per-position iteration (no run-batching across block
+    // boundaries) — defrag is a rare path (production has
+    // `defrag_thold = -1.0f` default off), so the simpler
+    // per-position cpy is preferred over run-of-nm batching that
+    // would need to chop at block boundaries on both src and dst.
+    //
+    // Stream-isolation invariant
+    // (specs/kv-cache/defrag_per_stream.allium::DefragNoCrossStream)
+    // is preserved by the per-stream outer loop in
+    // llama_kv_cache_defrag_internal: each (i, ids[i]) pair shares
+    // s = i / kvps = ids[i] / kvps.
+    //
+    // Under split_mode == GRAPH the parent kv_self.k_l[il] is a
+    // stub; we iterate per-device on kl_extra->splits[id]. Same for V.
     const uint32_t kvps =
         (kv_self.kv_size_per_stream > 0)
             ? kv_self.kv_size_per_stream
             : (uint32_t)kv_self.size;
+    const int32_t  BLOCK = llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
 
     for (uint32_t i = 0; i < ids.size(); ++i) {
         const uint32_t id = ids[i];
@@ -483,22 +493,25 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             continue;
         }
 
-        uint32_t nm = 1;
-        // Per-stream batching: stay within stream of `i`. Both i and
-        // ids[i+nm-1] must share the same s = i / kvps. The dispatcher
-        // guarantees ids[i] is in the same stream as i, but contracts
-        // across stream boundaries (i transitioning to the next stream)
-        // are not allowed to merge.
+        // T5.9: per-position (nm == 1). Run-batching dropped — see
+        // comment above. Stream is derived from `i`; the per-stream
+        // outer loop in llama_kv_cache_defrag_internal guarantees
+        // ids[i] is in the same stream.
+        const uint32_t nm = 1;
         const uint32_t s = (kvps > 0) ? (i / kvps) : 0u;
-        while (i + nm < ids.size()
-                && ids[i + nm] == id + nm
-                && (kvps == 0 || ((i + nm) / kvps == s))
-                && (kvps == 0 || ((id + nm) / kvps == s))) {
-            nm++;
-        }
-
         const uint32_t p_dst = (kvps > 0) ? (i  % kvps) : i;
         const uint32_t p_src = (kvps > 0) ? (id % kvps) : id;
+
+        // Look up physical block ids via the paged block_table.
+        const auto & btbl = kv_self.paged.block_table((int32_t)s);
+        const uint32_t k_dst = p_dst / (uint32_t)BLOCK;
+        const uint32_t k_src = p_src / (uint32_t)BLOCK;
+        GGML_ASSERT(k_dst < btbl.size() && k_src < btbl.size() &&
+                    "T5.9 build_defrag: block_table not populated for required positions");
+        const int32_t  bid_dst        = btbl[k_dst];
+        const int32_t  bid_src        = btbl[k_src];
+        const uint32_t off_in_blk_dst = p_dst % (uint32_t)BLOCK;
+        const uint32_t off_in_blk_src = p_src % (uint32_t)BLOCK;
 
         for (int il = 0; il < n_layer; ++il) {
             if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
@@ -523,17 +536,20 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
                 const int64_t nhead_k_split = parent_k->ne[2];
                 const size_t  k_head_stride = parent_k->nb[2];
                 const size_t  k_pos_stride  = parent_k->nb[1];
-                const size_t  k_stream_offs = (size_t)s * parent_k->nb[3];
+                // T5.9: bid * nb[3] = bytes for one block-of-all-heads.
+                const size_t  k_blk_stride  = parent_k->nb[3];
 
                 ggml_tensor * view_k_src = ggml_view_3d(ctx0, parent_k,
                         head_dim_k, nhead_k_split, (int64_t)nm,
                         k_head_stride, k_pos_stride,
-                        k_stream_offs + (size_t)p_src * k_pos_stride);
+                        (size_t)bid_src * k_blk_stride
+                            + (size_t)off_in_blk_src * k_pos_stride);
 
                 ggml_tensor * view_k_dst = ggml_view_3d(ctx0, parent_k,
                         head_dim_k, nhead_k_split, (int64_t)nm,
                         k_head_stride, k_pos_stride,
-                        k_stream_offs + (size_t)p_dst * k_pos_stride);
+                        (size_t)bid_dst * k_blk_stride
+                            + (size_t)off_in_blk_dst * k_pos_stride);
 
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
             }
@@ -557,17 +573,19 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
                         const int64_t v_nhead      = parent_v->ne[2];
                         const size_t  v_head_stride = parent_v->nb[2];
                         const size_t  v_pos_stride  = parent_v->nb[1];
-                        const size_t  v_stream_offs = (size_t)s * parent_v->nb[3];
+                        const size_t  v_blk_stride  = parent_v->nb[3];
 
                         ggml_tensor * view_v_src = ggml_view_3d(ctx0, parent_v,
                                 v_dim0, v_nhead, (int64_t)nm,
                                 v_head_stride, v_pos_stride,
-                                v_stream_offs + (size_t)p_src * v_pos_stride);
+                                (size_t)bid_src * v_blk_stride
+                                    + (size_t)off_in_blk_src * v_pos_stride);
 
                         ggml_tensor * view_v_dst = ggml_view_3d(ctx0, parent_v,
                                 v_dim0, v_nhead, (int64_t)nm,
                                 v_head_stride, v_pos_stride,
-                                v_stream_offs + (size_t)p_dst * v_pos_stride);
+                                (size_t)bid_dst * v_blk_stride
+                                    + (size_t)off_in_blk_dst * v_pos_stride);
 
                         ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
                     }

@@ -808,6 +808,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.defrag_thold = std::stof(argv[i]);
         return true;
     }
+    if (arg == "--kv-pool-blocks") {
+        // T5.9 paged BACKING: explicit override for the physical KV
+        // block-pool size, in units of BLOCK_SIZE_TOKENS (64) blocks.
+        // 0 (default) = auto-derive from ctx-size × parallel /
+        // BLOCK_SIZE_TOKENS; use a smaller value to under-allocate
+        // the pool when nominal max doesn't fit VRAM (e.g. ctx ≥ 1M
+        // NP=8 workloads). Production profile leaves this at 0.
+        // Bound by specs/kv-cache/paged_kv_pool_sizing.allium
+        // ::SizingDerivedFromCtxAndParallel.
+        CHECK_ARG
+        const int v = std::stoi(argv[i]);
+        if (v < 0) { invalid_param = true; return true; }
+        params.kv_pool_blocks = v;
+        return true;
+    }
     if (arg == "--max-extra-alloc" || arg == "-mea") {
         CHECK_ARG
         params.max_extra_alloc_MiB = std::stoi(argv[i]);
@@ -3649,6 +3664,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.defrag_thold      = params.defrag_thold;
+    cparams.kv_pool_blocks    = params.kv_pool_blocks;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;

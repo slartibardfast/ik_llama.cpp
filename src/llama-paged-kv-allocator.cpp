@@ -25,6 +25,34 @@ void llama_paged_kv_allocator::init(int32_t n_blocks, int32_t n_seqs) {
     }
 }
 
+void llama_paged_kv_allocator::seed_identity_per_stream() {
+    // Precondition: just-initialised state (no allocs). All blocks
+    // are in free_list; every table is empty.
+    const int32_t n_seqs   = (int32_t)tables_.size();
+    if (n_seqs <= 0) return;
+    assert(total_blocks_ % n_seqs == 0 &&
+           "seed_identity_per_stream: total_blocks must be divisible by n_seqs");
+    const int32_t nbps = total_blocks_ / n_seqs;
+    // For each seq s, claim block IDs [s*nbps, s*nbps + nbps).
+    // The order is: seq 0 gets blocks 0..nbps-1, seq 1 gets blocks
+    // nbps..2*nbps-1, etc. The free_list is rebuilt to be empty
+    // (everything is now allocated), and pool_owner_ records each
+    // bid's owning seq.
+    free_list_.clear();
+    for (int32_t s = 0; s < n_seqs; ++s) {
+        tables_[(size_t)s].clear();
+        tables_[(size_t)s].reserve((size_t)nbps);
+        for (int32_t k = 0; k < nbps; ++k) {
+            const int32_t bid = s * nbps + k;
+            pool_owner_[(size_t)bid] = s;
+            tables_[(size_t)s].push_back(bid);
+            // Trace event (no-op outside developer builds).
+            llama_paged_kv_trace_event(0, s, bid,
+                LLAMA_PAGED_KV_TRACE_ALLOC, -1);
+        }
+    }
+}
+
 int32_t llama_paged_kv_allocator::alloc_block(int32_t seq) {
     assert(seq >= 0 && seq < (int32_t)tables_.size() &&
            "llama_paged_kv_allocator::alloc_block: seq out of range");

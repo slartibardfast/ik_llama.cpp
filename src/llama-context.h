@@ -68,6 +68,14 @@ struct llama_kv_cache {
     uint32_t kv_size_per_stream  = 0;
     std::vector<uint32_t>        v_heads;
 
+    // T5.9: paged BACKING — total physical block count of the KV
+    // pool. Equals `paged.total_blocks()`, mirrored on the cache
+    // for sites that read it without crossing the allocator API.
+    // At auto-sized init it is `ceil(kv_size / BLOCK_SIZE_TOKENS)`
+    // (byte-identical to T5.8). At `--kv-pool-blocks N` override
+    // it is N (may be less than nominal max).
+    int32_t  total_pool_blocks   = 0;
+
     // T5.1 — paged KV block allocator (PHASE_NSTREAM_KV_PERF Tier 5).
     //
     // At T5.1 this allocator lands as a standalone, DORMANT component:
