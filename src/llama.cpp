@@ -1521,6 +1521,14 @@ bool llama_kv_cache_find_slot(
             }
             cache.v_heads[scan.stream_id] = scan.head_local;
             cache.used += run.n_tok;
+            // T5.2 — shadow paged allocator update. Mirrors cells[] write
+            // progress so paged.block_table(seq) stays consistent with
+            // find_slot's view of which positions are occupied by which
+            // seq. Best-effort: OOM in the shadow pool is non-fatal (the
+            // allocator is dormant from the kernel/build_context POV at
+            // T5.2; T5.3 makes it load-bearing).
+            (void)cache.paged.write_tokens((int32_t)scan.stream_id,
+                                           (int32_t)run.n_tok);
         }
 
         // Legacy cache.head invariant: point at seq-0's slot's first
@@ -1582,6 +1590,10 @@ bool llama_kv_cache_find_slot(
             cache.cells[base + head_local + i].seq_id.insert(batch.seq_id[i][j]);
         }
     }
+
+    // T5.2 — shadow paged allocator update (single-seq path).
+    // Best-effort: see the multi-seq commit-phase comment above.
+    (void)cache.paged.write_tokens((int32_t)stream_id, (int32_t)n_tokens);
 
     cache.v_heads[stream_id] = head_local;
     cache.head               = base + head_local;
@@ -2287,6 +2299,13 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     // PHASE_NSTREAM_KV_4D N1: also reset per-stream heads.
     for (uint32_t s = 0; s < cache.n_stream; ++s) {
         cache.v_heads[s] = 0;
+    }
+    // T5.2 — shadow paged allocator: free every seq so written_tokens
+    // and block_tables match the cleared contiguous state. Per
+    // paged_block_allocator.allium FreeSeqBehavior::Idempotent the
+    // call is a no-op for any seq that has no blocks.
+    for (int32_t s = 0; s < cache.paged.n_seqs(); ++s) {
+        cache.paged.free_seq(s);
     }
 
     for (auto & buf : cache.bufs) {
