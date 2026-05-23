@@ -4877,11 +4877,22 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     if (ret != user_cancel) {
                         LLAMA_LOG_INFO("n_past = %d\n", (int)slot.cache_tokens.size());
                         if (alloc_failed) {
+                            // T5.9: paged-pool exhaustion is transient — slots
+                            // will free blocks as their decodes complete. Tell
+                            // the client to retry shortly via 503 + Retry-After.
                             send_error(slot,
                                 "GPU memory allocation failed during inference; retrying may succeed",
                                 ERROR_TYPE_UNAVAILABLE);
                         } else {
-                            send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
+                            // T5.9.E gap-3: this is the "prompt physically
+                            // can't fit per-slot capacity" path — definitive,
+                            // not transient. Map to HTTP 413 Payload Too Large
+                            // instead of the legacy 500 server_error so clients
+                            // can distinguish "your input is too big" (don't
+                            // retry as-is) from "server is overloaded" (retry).
+                            send_error(slot,
+                                "Input prompt is too big compared to KV size. Please try increasing KV size.",
+                                ERROR_TYPE_PAYLOAD_TOO_LARGE);
                         }
                     }
                 }

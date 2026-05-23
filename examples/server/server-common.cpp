@@ -1546,6 +1546,10 @@ json format_error_response(const std::string& message, const enum error_type typ
         type_str = "unavailable_error";
         code = 503;
         break;
+    case ERROR_TYPE_PAYLOAD_TOO_LARGE:
+        type_str = "payload_too_large_error";
+        code = 413;
+        break;
     }
     return json{
         {"code", code},

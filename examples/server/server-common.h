@@ -63,6 +63,7 @@ enum error_type {
     ERROR_TYPE_PERMISSION,
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
+    ERROR_TYPE_PAYLOAD_TOO_LARGE, // T5.9: prompt physically can't fit per-slot cap (413)
 };
 
 extern bool server_verbose;
