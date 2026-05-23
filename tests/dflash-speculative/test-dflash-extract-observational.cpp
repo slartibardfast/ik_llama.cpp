@@ -9,10 +9,12 @@
 // and propagating an argmax flip through downstream layers. Specs:
 //
 //   /home/llm/yarn-agentic/specs/dflash/cb_eval_residual_capture.allium
-//       contract ResidualExtract + invariant
-//       ResidualExtractObservationallyEquivalent
+//       (contract ResidualExtract; the
+//        ResidualExtractObservationallyEquivalent property)
 //   /home/llm/yarn-agentic/specs/dflash/CbEvalObservational.tla
-//       invariant ObservationalEquivalence + SchedulerStaysFastPath
+//       (TLA model: ObservationalEquivalence and SchedulerStaysFastPath
+//        properties — out-of-scope for scripts/check-bindings.py which
+//        only scans the core DFlash spec/binding pair)
 //
 // The test:
 //
