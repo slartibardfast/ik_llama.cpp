@@ -253,7 +253,7 @@ struct gpt_params {
     float   yarn_beta_fast        =   -1.0f; // YaRN low correction dim
     float   yarn_beta_slow        =   -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =       0; // YaRN original context length
-    float   defrag_thold          =   -1.0f; // KV cache defragmentation threshold
+    float   defrag_thold          =    0.1f; // KV cache defragmentation threshold; -1 disables. T5.9.E follow-on (2026-05-23): default flipped from -1 to 0.1 — paged BACKING + per-position-via-block_table build_defrag are validated at production sizes; fragmentation > 10% triggers a defrag pass. Pass -1 to opt out.
     int32_t kv_pool_blocks        =      0;  // T5.9 paged BACKING: 0 = auto from ctx*parallel/BLOCK_SIZE; > 0 = explicit pool size
     float   ban_phrases_bias      = -999.0f; // logit bias applied to ban phrases
     int32_t max_extra_alloc_MiB   =     256; // additional VRAM per GPU the scheduler may allocate for more efficient compute graph evaluation
