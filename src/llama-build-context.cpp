@@ -277,53 +277,32 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         return tmp;
     };
 
-    // PHASE_NSTREAM_KV_PERF T5.7 paged-K-shift dispatch.
+    // PHASE_NSTREAM_KV_PERF T5.7b paged-K-shift dispatch (always-on).
     //
-    // Under paged layout (kv_self.n_stream > 1, matching the WRITE
-    // / READ path activation in T5.6), the K cache buffer's bytes
-    // for (stream s, head h, position p) live at:
+    // Under paged layout (always active post-T5.7b pretence drop),
+    // the K cache buffer's bytes for (stream s, head h, position p)
+    // live at:
     //   addr = bid * BLOCK * n_head_kv * nb[1]
     //        + h   * BLOCK * nb[1]
     //        + (p % BLOCK) * nb[1]
     // where bid = paged.block_table(s)[p / BLOCK] and BLOCK = 64.
     //
-    // The legacy view-3d K-shift used strides
-    //   head_stride = nb[2] = kvps * head_dim * type_size
-    //   pos_stride  = nb[1] = head_dim * type_size
-    //   stream_offs = s * nb[3]
-    // — those address cells under the legacy [head_dim, kvps,
-    //   n_head_kv, n_stream] interpretation, which is NOT where the
-    //   bytes physically are at n_stream > 1 post-T5.6 (the SET_ROWS
-    //   WRITE path now scatters using the paged row formula).
-    //
-    // The paged path emits one rope op per (layer, stream, block) —
-    // each block_id is looked up from kv.paged.block_table(s) at
-    // graph-build time and folded into the view offset as a
-    // constant. Per-position delta semantics are preserved by
-    // slicing the existing kvps-length per-stream K-shift input
-    // for the block's 64-position window; positions with delta=0
-    // get identity rotation. This handles the boundary case (a
-    // shift range crossing a block boundary) without needing any
-    // per-block delta machinery — the spec contract
-    // FractionalBlockShiftDisallowed is satisfied because the
-    // boundary block's per-position delta vector has zeros outside
-    // the shift range.
-    //
-    // n_stream == 1 retains the legacy view-3d path because the K
-    // cache buffer at NP=1 is still written via the legacy CPY
-    // fallback in llm_build_kv_store (T5.7 pretence drop is a
-    // follow-on sub-step within Bundle B). The two paths address
-    // the buffer consistently with whichever write path produced
-    // its bytes.
-    const bool   paged_mode  = (n_stream > 1);
+    // The path emits one rope op per (layer, stream, block) — each
+    // block_id is looked up from kv.paged.block_table(s) at graph-
+    // build time and folded into the view offset as a constant.
+    // Per-position delta semantics are preserved by slicing the
+    // existing kvps-length per-stream K-shift input for the block's
+    // 64-position window; positions with delta=0 get identity
+    // rotation. The boundary case (a shift range crossing a block
+    // boundary) is handled naturally — the boundary block's per-
+    // position delta vector has zeros outside the shift range
+    // (spec: FractionalBlockShiftDisallowed).
     const int32_t BLOCK      = llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
-    const uint32_t nbps      = paged_mode ? (kvps / (uint32_t)BLOCK) : 0;
-    if (paged_mode) {
-        GGML_ASSERT(kvps % (uint32_t)BLOCK == 0 &&
-                "T5.7 K-shift: kvps must be a multiple of BLOCK_SIZE_TOKENS");
-        GGML_ASSERT((uint32_t)kv_self.paged.total_blocks() == nbps * n_stream &&
-                "T5.7 K-shift: paged.total_blocks() must equal nbps * n_stream");
-    }
+    const uint32_t nbps      = kvps / (uint32_t)BLOCK;
+    GGML_ASSERT(kvps % (uint32_t)BLOCK == 0 &&
+            "T5.7b K-shift: kvps must be a multiple of BLOCK_SIZE_TOKENS");
+    GGML_ASSERT((uint32_t)kv_self.paged.total_blocks() == nbps * n_stream &&
+            "T5.7b K-shift: paged.total_blocks() must equal nbps * n_stream");
 
     for (int il = 0; il < n_layer; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
@@ -357,20 +336,20 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                     ? lctx.backends[id]
                     : nullptr;
 
-                if (paged_mode) {
+                {
                     const size_t nb1                  = split->nb[1];
                     const size_t paged_nb_per_head    = (size_t)BLOCK * nb1;
                     const size_t paged_nb_per_block   = paged_nb_per_head * (size_t)nhead_split;
                     // Iterate over the blocks actually allocated to
                     // this stream (AllocLazy — block_table grows on
                     // demand). Unallocated blocks have no K data to
-                    // shift; the legacy path's identity-rotation on
-                    // unwritten cells is also a no-op semantically.
+                    // shift; identity rotation on unwritten cells is a
+                    // no-op semantically.
                     for (uint32_t s = 0; s < n_stream; ++s) {
                         const auto & btbl = kv_self.paged.block_table((int32_t)s);
                         const uint32_t n_blocks_s = (uint32_t)btbl.size();
                         GGML_ASSERT(n_blocks_s <= nbps &&
-                                "T5.7 K-shift (graph-split): block_table exceeds nbps");
+                                "T5.7b K-shift (graph-split): block_table exceeds nbps");
                         for (uint32_t i = 0; i < n_blocks_s; ++i) {
                             const int32_t bid = btbl[i];
                             ggml_tensor * k_view = ggml_view_3d(ctx0, split,
@@ -386,21 +365,6 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                             ggml_build_forward_expand(gf, tmp);
                         }
                     }
-                } else {
-                    for (uint32_t s = 0; s < n_stream; ++s) {
-                        const size_t head_stride   = split->nb[2];
-                        const size_t pos_stride    = split->nb[1];
-                        const size_t stream_offs   = (size_t)s * split->nb[3];
-
-                        ggml_tensor * k_view = ggml_view_3d(ctx0, split,
-                                n_embd_head_k, nhead_split, (int64_t)kvps,
-                                head_stride, pos_stride, stream_offs);
-
-                        ggml_tensor * tmp = build_one_rope(k_view,
-                                lctx.default_decoder.inp_K_shift_per_stream[id][s],
-                                rope_factors_split, il, split_backend);
-                        ggml_build_forward_expand(gf, tmp);
-                    }
                 }
             }
         } else {
@@ -408,7 +372,7 @@ ggml_cgraph * llm_build_context::build_k_shift() {
             // the parent tensor directly. n_device == 1 in this branch
             // so the inputs live at inp_K_shift_per_stream[0][s].
             const int64_t n_head_kv = hparams.n_head_kv(il);
-            if (paged_mode) {
+            {
                 const size_t nb1                  = kv_self.k_l[il]->nb[1];
                 const size_t paged_nb_per_head    = (size_t)BLOCK * nb1;
                 const size_t paged_nb_per_block   = paged_nb_per_head * (size_t)n_head_kv;
@@ -418,7 +382,7 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                     const auto & btbl = kv_self.paged.block_table((int32_t)s);
                     const uint32_t n_blocks_s = (uint32_t)btbl.size();
                     GGML_ASSERT(n_blocks_s <= nbps &&
-                            "T5.7 K-shift (layer-split): block_table exceeds nbps");
+                            "T5.7b K-shift (layer-split): block_table exceeds nbps");
                     for (uint32_t i = 0; i < n_blocks_s; ++i) {
                         const int32_t bid = btbl[i];
                         ggml_tensor * k_view = ggml_view_3d(ctx0, kv_self.k_l[il],
@@ -433,21 +397,6 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                                 rope_factors, il, nullptr);
                         ggml_build_forward_expand(gf, tmp);
                     }
-                }
-            } else {
-                for (uint32_t s = 0; s < n_stream; ++s) {
-                    const size_t head_stride = kv_self.k_l[il]->nb[2];
-                    const size_t pos_stride  = kv_self.k_l[il]->nb[1];
-                    const size_t stream_offs = (size_t)s * kv_self.k_l[il]->nb[3];
-
-                    ggml_tensor * k_view = ggml_view_3d(ctx0, kv_self.k_l[il],
-                            n_embd_head_k, n_head_kv, (int64_t)kvps,
-                            head_stride, pos_stride, stream_offs);
-
-                    ggml_tensor * tmp = build_one_rope(k_view,
-                            lctx.default_decoder.inp_K_shift_per_stream[0][s],
-                            rope_factors, il, nullptr);
-                    ggml_build_forward_expand(gf, tmp);
                 }
             }
         }
@@ -1001,55 +950,29 @@ void llm_build_context::llm_build_kv_store(
 
     if (k_cur) {
         GGML_ASSERT(2*il+1 < (int)lctx.cache_copies.size());
+        GGML_ASSERT(kv_idxs != nullptr &&
+                "T5.7b llm_build_kv_store: kv_idxs always built (n_stream==1 pretence dropped)");
         const size_t k_pos_stride    = kv.k_l[il]->nb[1];
-        const size_t k_head_stride   = kv.k_l[il]->nb[2];
-        const size_t k_stream_stride = kv.k_l[il]->nb[3];
-
-        if (kv_idxs != nullptr) {
-            // PHASE_NSTREAM_KV_PERF T3.3-followup: scatter K to per-(token,
-            // head) destination cells across all streams via ggml_set_rows.
-            // K cache is 4D [head_dim, kvps, n_head_kv, n_stream] with
-            // contiguous strides (nb[2] == nb[1]*kvps, nb[3] == nb[2]*n_head_kv);
-            // reshape to 2D [head_dim, kvps*n_head_kv*n_stream] folds those
-            // three dims into one global row dim. k_cur arrives 3D
-            // [head_dim, n_head_kv, n_tokens] from RoPE/projection; reshape
-            // to 2D [head_dim, n_tokens*n_head_kv] (h varies fastest, then t)
-            // matching the index layout in inp_kv_idxs.
-            // Cast to F32 if needed: ggml_set_rows requires src type == F32.
+        (void)stream_id;
+        (void)p_local;
+        {
+            // T5.7b paged WRITE — SET_ROWS using paged formula rows.
+            // Cast to F32 if needed: ggml_set_rows requires src == F32.
             ggml_tensor * k_src = k_cur;
             if (k_src->type != GGML_TYPE_F32) {
                 k_src = ggml_cast(ctx, k_src, GGML_TYPE_F32);
             }
-            // T5.6 paged layout: 2D reshape over total_blocks * BLOCK_SIZE
-            // * n_head_kv rows. Byte total matches contiguous because
-            // total_blocks * BLOCK_SIZE == kvps * n_stream by construction
-            // at kv_cache_init (paged.init(ceil(kv_size/BLOCK), n_stream)).
             const int64_t blk_tokens_i64 =
                 (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
             const int64_t k_row_total =
                 (int64_t)kv.paged.total_blocks() * blk_tokens_i64 * n_head_kv;
             ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx, kv.k_l[il],
                     n_embd_head_k, k_row_total);
-            // Flatten k_cur source rows to [head_dim, n_tokens*n_head_kv].
             ggml_tensor * k_src_2d = ggml_reshape_2d(ctx, k_src,
                     n_embd_head_k, (int64_t)n_tokens * n_head_kv);
             lctx.cache_copies[2*il+0].cpy  = ggml_set_rows(ctx,
                     k_cache_2d, k_src_2d, kv_idxs);
             lctx.cache_copies[2*il+0].step = k_pos_stride;
-            ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
-        } else {
-            ggml_tensor * k_cache_view = ggml_view_3d(ctx, kv.k_l[il],
-                    n_embd_head_k, n_head_kv, n_tokens,
-                    k_head_stride, k_pos_stride,
-                    (size_t)p_local * k_pos_stride + (size_t)stream_id * k_stream_stride);
-
-            lctx.cache_copies[2*il+0].cpy  = ggml_cpy(ctx, k_cur, k_cache_view);
-            // step is per-position in the byte sense; update_cache_copies
-            // recomputes the full view_offs from cache.head when the graph
-            // is reused.
-            lctx.cache_copies[2*il+0].step = k_pos_stride;
-
-            // note: storing RoPE-ed version of K in the KV cache
             ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
         }
     }
@@ -1057,20 +980,10 @@ void llm_build_context::llm_build_kv_store(
     if (v_cur) {
         ggml_tensor * v_cache_view = nullptr;
         if (!kv.v_trans) {
-            // FA path: V mirrors K's per-stream offset math. Source
-            // v_cur arrives 2D [n_embd_v_gqa, n_tokens] from the
-            // V-projection; reshape it to 3D [head_dim_v, n_head_kv,
-            // n_tokens] (no data movement — same bytes, just labels)
-            // so cpy aligns dim-by-dim with the 3D destination view.
             const size_t v_pos_stride    = kv.v_l[il]->nb[1];
-            const size_t v_head_stride   = kv.v_l[il]->nb[2];
-            const size_t v_stream_stride = kv.v_l[il]->nb[3];
-
-            if (kv_idxs != nullptr) {
-                // T3.3-followup scatter path. Same shape transform as K
-                // but for V cache (head_dim_v in place of head_dim_k);
-                // reuse the kv_idxs tensor since head_local/stream/head
-                // indexing is identical to K's.
+            GGML_ASSERT(kv_idxs != nullptr &&
+                    "T5.7b llm_build_kv_store: kv_idxs always built (n_stream==1 pretence dropped)");
+            {
                 if (v_cur->ne[1] == n_tokens && ggml_n_dims(v_cur) == 2) {
                     v_cur = ggml_reshape_3d(ctx, v_cur, n_embd_head_v, n_head_kv, n_tokens);
                 }
@@ -1078,7 +991,6 @@ void llm_build_context::llm_build_kv_store(
                 if (v_src->type != GGML_TYPE_F32) {
                     v_src = ggml_cast(ctx, v_src, GGML_TYPE_F32);
                 }
-                // T5.6 paged layout: see K's reshape comment above.
                 const int64_t blk_tokens_v_i64 =
                     (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
                 const int64_t v_row_total =
@@ -1093,17 +1005,6 @@ void llm_build_context::llm_build_kv_store(
                 ggml_build_forward_expand(graph, lctx.cache_copies[2*il+1].cpy);
                 return;
             }
-
-            v_cache_view = ggml_view_3d(ctx, kv.v_l[il],
-                    n_embd_head_v, n_head_kv, n_tokens,
-                    v_head_stride, v_pos_stride,
-                    (size_t)p_local * v_pos_stride + (size_t)stream_id * v_stream_stride);
-
-            if (v_cur->ne[1] == n_tokens && ggml_n_dims(v_cur) == 2) {
-                v_cur = ggml_reshape_3d(ctx, v_cur, n_embd_head_v, n_head_kv, n_tokens);
-            }
-
-            lctx.cache_copies[2*il+1].step = v_pos_stride;
         } else {
             // note: the V cache is transposed for legacy non-FA
             // layouts. The v_trans non-FA path is NOT updated for the
@@ -2082,22 +1983,17 @@ static ggml_tensor * llm_build_kqv(
     const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
     const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(il);
 
-    // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream dispatch the
-    // multi-seq build reshapes q_cur into a 4D Q
-    //   [head_dim, n_head, n_tok_per_seq, n_seq_in_batch]
-    // then permutes to PSKV's expected layout
-    //   [head_dim, n_tok_per_seq, n_head, n_seq_in_batch].
-    // Single-seq path is byte-identical to HEAD.
+    // T5.7b: always 4D Q reshape — single-seq batches collapse to
+    //   [head_dim, n_head, n_tokens, 1] which is 3D-equivalent.
     struct ggml_tensor * q;
-    if (is_multi_seq && kv.n_stream > 1) {
-        GGML_ASSERT(n_tok_per_seq_in > 0 && "T3.3: missing n_tok_per_seq");
+    {
+        (void)is_multi_seq;
+        GGML_ASSERT(n_tok_per_seq_in > 0 && "T5.7b: missing n_tok_per_seq");
         GGML_ASSERT(n_tok_per_seq_in * n_seq_in_batch == n_tokens &&
-                    "T3.3: contiguous-per-seq batch must have uniform shape");
+                    "T5.7b: contiguous-per-seq batch must have uniform shape");
         auto q_4d = ggml_reshape_4d(ctx, q_cur, n_embd_head_k, n_head,
                                     n_tok_per_seq_in, n_seq_in_batch);
         q = ggml_permute(ctx, q_4d, 0, 2, 1, 3);
-    } else {
-        q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     }
     cb(q, "q", il);
 
@@ -2134,19 +2030,13 @@ static ggml_tensor * llm_build_kqv(
         kqv_stream_id = (uint32_t)(kv.head / kqv_kvps);
     }
 
+    // T5.7b: always 4D view; n_seq_in_batch == 1 at single-seq batches.
     struct ggml_tensor * k;
-    if (is_multi_seq && kv.n_stream > 1) {
-        // T3.5: span only the first n_seq_in_batch streams.
+    {
         GGML_ASSERT(n_seq_in_batch <= (int)kv.n_stream);
         k = ggml_view_4d(ctx, k_cache,
                 n_embd_head_k, n_kv, n_head_kv, n_seq_in_batch,
                 k_cache->nb[1], k_cache->nb[2], k_cache->nb[3], 0);
-    } else {
-        k = ggml_view_3d(ctx, k_cache,
-                n_embd_head_k, n_kv, n_head_kv,
-                k_cache->nb[1],  // position stride within stream
-                k_cache->nb[2],  // head stride within stream
-                (size_t)kqv_stream_id * k_cache->nb[3]);
     }
     cb(k, "k", il);
 
@@ -2180,17 +2070,11 @@ static ggml_tensor * llm_build_kqv(
         // head-by-head, offset = stream_id * parent's nb[3].
         // T3.3: under multi-seq, V also widens to 4D ne[3]=n_stream.
         struct ggml_tensor * v;
-        if (is_multi_seq && kv.n_stream > 1) {
-            // T3.5: span only the first n_seq_in_batch streams.
+        {
+            // T5.7b: always 4D view.
             v = ggml_view_4d(ctx, v_cache,
                     n_embd_head_v, n_kv, n_head_kv, n_seq_in_batch,
                     v_cache->nb[1], v_cache->nb[2], v_cache->nb[3], 0);
-        } else {
-            v = ggml_view_3d(ctx, v_cache,
-                    n_embd_head_v, n_kv, n_head_kv,
-                    v_cache->nb[1],
-                    v_cache->nb[2],
-                    (size_t)kqv_stream_id * v_cache->nb[3]);
         }
         cb(v, "v", il);
 
@@ -2229,27 +2113,34 @@ static ggml_tensor * llm_build_kqv(
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "fa", il);
             // PSKV op does not take sinks (predicate requires sinks==nullptr).
-            // T5.6: attach paged block_table when this build went paged
-            // on the WRITE side (same predicate). At n_stream==1 src[6]
-            // stays NULL and the kernel runs in legacy mode. Allocate
-            // the input tensor lazily on first layer; reuse on subsequent
-            // layers via the cached decoder field. The host populator in
-            // llama_set_inputs writes per-(seq, block_idx) physical bids
-            // from kv.paged.block_table(s).
-            if (is_multi_seq && kv.n_stream > 1) {
+            // T5.7b: always attach paged block_table. At single-seq
+            // batches (n_seq_in_batch == 1) view the global tensor at
+            // the active stream's slice so blockIdx.z=0 indexes the
+            // active stream's blocks. At multi-seq the global tensor
+            // is passed directly (T3 convention: batch seq_ids
+            // contiguous from 0).
+            {
                 if (!lctx.default_decoder.inp_block_table) {
                     const uint32_t blk_tokens =
                         (uint32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
                     GGML_ASSERT(kv.kv_size_per_stream > 0 &&
                                 kv.kv_size_per_stream % blk_tokens == 0 &&
-                                "T5.6 (llm_build_kqv): kvps must be a multiple of BLOCK_SIZE_TOKENS");
+                                "T5.7b (llm_build_kqv): kvps must be a multiple of BLOCK_SIZE_TOKENS");
                     const int64_t nbps   = (int64_t)(kv.kv_size_per_stream / blk_tokens);
                     const int64_t n_seqs = (int64_t)kv.n_stream;
                     lctx.default_decoder.inp_block_table =
                         ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nbps, n_seqs);
                     ggml_set_input(lctx.default_decoder.inp_block_table);
                 }
-                ggml_flash_attn_ext_set_block_table(cur, lctx.default_decoder.inp_block_table);
+                ggml_tensor * inp_bt_full = lctx.default_decoder.inp_block_table;
+                ggml_tensor * bt_for_kernel = inp_bt_full;
+                if (n_seq_in_batch == 1 && kqv_stream_id > 0) {
+                    bt_for_kernel = ggml_view_2d(ctx, inp_bt_full,
+                            inp_bt_full->ne[0], 1,
+                            inp_bt_full->nb[1],
+                            (size_t)kqv_stream_id * inp_bt_full->nb[1]);
+                }
+                ggml_flash_attn_ext_set_block_table(cur, bt_for_kernel);
             }
         } else {
             cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
@@ -2453,14 +2344,10 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     if (k_cur || v_cur) {
-        // PHASE_NSTREAM_KV_PERF T3.3-followup: when the multi-seq build
-        // path is active, construct (or fetch) the per-(token, head)
-        // global row index tensor and route the K/V WRITE through
-        // ggml_set_rows in llm_build_kv_store.
-        ggml_tensor * kv_idxs = nullptr;
-        if (is_multi_seq_n_stream && kv.n_stream > 1) {
-            kv_idxs = build_inp_kv_idxs(hparams.n_head_kv(il));
-        }
+        // PHASE_NSTREAM_KV_PERF T5.7b: always build kv_idxs — paged
+        // SET_ROWS routes K/V WRITE through the paged formula at any
+        // n_stream (n_stream==1 contiguous-slab pretence dropped).
+        ggml_tensor * kv_idxs = build_inp_kv_idxs(hparams.n_head_kv(il));
         llm_build_kv_store(lctx, ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il, kv_idxs);
     }
 
@@ -3327,21 +3214,23 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 const size_t k_head_stride   = split_kl->nb[2];
                 const size_t k_stream_stride = split_kl->nb[3];
 
-                // PHASE_NSTREAM_KV_PERF T5.6 (was T3.3-followup): under
-                // multi-seq dispatch, route K/V WRITE through
-                // ggml_set_rows scatter using PAGED block-table indexing.
-                // The kv_idxs formula in llama_set_inputs encodes
+                // PHASE_NSTREAM_KV_PERF T5.7b: route K/V WRITE through
+                // paged SET_ROWS at all dispatches (single-seq + multi-
+                // seq, NP=1 + NP>1). The kv_idxs formula in
+                // llama_set_inputs encodes
                 //   row = bid*BLOCK_SIZE*n_head_kv + h*BLOCK_SIZE
                 //         + p_in_block
                 // and total_rows = total_blocks * BLOCK_SIZE * n_head_kv
                 // (== kvps * n_stream * n_head_kv by construction, so
                 // the underlying cache buffer's byte count is unchanged).
-                ggml_tensor * kv_idxs = nullptr;
-                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
-                    kv_idxs = build_inp_kv_idxs(n_head_kv);
-                }
-
-                if (kv_idxs != nullptr) {
+                // The n_stream==1 contiguous-slab pretence is dropped —
+                // every WRITE goes through the paged formula.
+                ggml_tensor * kv_idxs = build_inp_kv_idxs(n_head_kv);
+                (void)k_head_stride;
+                (void)k_stream_stride;
+                (void)_ms_stream_id;
+                (void)_ms_p_local;
+                {
                     ggml_tensor * k_src = Kcur;
                     if (k_src->type != GGML_TYPE_F32) {
                         k_src = ggml_cast(ctx0, k_src, GGML_TYPE_F32);
@@ -3358,65 +3247,32 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                             k_cache_2d, k_src_2d, kv_idxs);
                     lctx.cache_copies[idx+0].step = k_pos_stride;
                     ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
-                } else {
-                    ggml_tensor * k_cache_view = ggml_view_3d(ctx0, split_kl,
-                            n_embd_head_k, n_head_kv, n_tokens,
-                            k_head_stride, k_pos_stride,
-                            (size_t)_ms_p_local * k_pos_stride + (size_t)_ms_stream_id * k_stream_stride);
-
-                    lctx.cache_copies[idx+0].cpy  = ggml_cpy(ctx0, Kcur, k_cache_view);
-                    lctx.cache_copies[idx+0].step = k_pos_stride;
-
-                    // note: storing RoPE-ed version of K in the KV cache
-                    ggml_build_forward_expand(gf, lctx.cache_copies[idx+0].cpy);
                 }
 
                 struct ggml_tensor * v_cache_view = nullptr;
 
                 if (cparams.flash_attn) {
-                    // V mirrors K under the new 4D layout
                     const size_t v_pos_stride    = split_vl->nb[1];
-
-                    if (kv_idxs != nullptr) {
-                        if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
-                            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
-                        }
-                        ggml_tensor * v_src = Vcur;
-                        if (v_src->type != GGML_TYPE_F32) {
-                            v_src = ggml_cast(ctx0, v_src, GGML_TYPE_F32);
-                        }
-                        const int64_t blk_tokens_v_i64 =
-                            (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
-                        const int64_t v_row_total =
-                            (int64_t)kv_self.paged.total_blocks() * blk_tokens_v_i64 * n_head_kv;
-                        ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx0, split_vl,
-                                n_embd_head_v, v_row_total);
-                        ggml_tensor * v_src_2d = ggml_reshape_2d(ctx0, v_src,
-                                n_embd_head_v, (int64_t)n_tokens * n_head_kv);
-                        lctx.cache_copies[idx+1].cpy  = ggml_set_rows(ctx0,
-                                v_cache_2d, v_src_2d, kv_idxs);
-                        lctx.cache_copies[idx+1].step = v_pos_stride;
-                        ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
-                        cb(lctx.cache_copies[idx+1].cpy, "v_cache_set_rows", il_cb);
-                    } else {
-                        const size_t v_head_stride   = split_vl->nb[2];
-                        const size_t v_stream_stride = split_vl->nb[3];
-
-                        v_cache_view = ggml_view_3d(ctx0, split_vl,
-                                n_embd_head_v, n_head_kv, n_tokens,
-                                v_head_stride, v_pos_stride,
-                                (size_t)_ms_p_local * v_pos_stride + (size_t)_ms_stream_id * v_stream_stride);
-
-                        if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
-                            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
-                        }
-
-                        lctx.cache_copies[idx+1].step = v_pos_stride;
-                        cb(v_cache_view, "v_cache_view", il_cb);
-
-                        lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
-                        ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+                    if (Vcur->ne[1] == n_tokens && ggml_n_dims(Vcur) == 2) {
+                        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
                     }
+                    ggml_tensor * v_src = Vcur;
+                    if (v_src->type != GGML_TYPE_F32) {
+                        v_src = ggml_cast(ctx0, v_src, GGML_TYPE_F32);
+                    }
+                    const int64_t blk_tokens_v_i64 =
+                        (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+                    const int64_t v_row_total =
+                        (int64_t)kv_self.paged.total_blocks() * blk_tokens_v_i64 * n_head_kv;
+                    ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx0, split_vl,
+                            n_embd_head_v, v_row_total);
+                    ggml_tensor * v_src_2d = ggml_reshape_2d(ctx0, v_src,
+                            n_embd_head_v, (int64_t)n_tokens * n_head_kv);
+                    lctx.cache_copies[idx+1].cpy  = ggml_set_rows(ctx0,
+                            v_cache_2d, v_src_2d, kv_idxs);
+                    lctx.cache_copies[idx+1].step = v_pos_stride;
+                    ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
+                    cb(lctx.cache_copies[idx+1].cpy, "v_cache_set_rows", il_cb);
                 } else {
                     // note: the V cache is transposed when not using flash attention.
                     // v_trans non-FA path NOT updated for the new layout;
@@ -3435,24 +3291,17 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     ggml_build_forward_expand(gf, lctx.cache_copies[idx+1].cpy);
                 }
 
-                // PHASE_NSTREAM_KV_PERF T3.3: under unified-stream
-                // dispatch, Q reshapes to 4D
+                // PHASE_NSTREAM_KV_PERF T5.7b: always use unified-stream
+                // 4D dispatch. Q reshapes to 4D
                 //   [head_dim, n_head, n_tok_per_seq, n_seq_in_batch]
                 // then permutes to PSKV layout
                 //   [head_dim, n_tok_per_seq, n_head, n_seq_in_batch].
+                // At single-seq batches, n_seq_in_batch == 1 and the
+                // 4D collapses to 3D-equivalent (ne[3] == 1).
                 ggml_tensor * q;
-                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
+                {
                     GGML_ASSERT(n_tok_per_seq > 0);
                     GGML_ASSERT(n_tok_per_seq * n_seq_in_batch == n_tokens);
-                    // PHASE_NSTREAM_KV_PERF T3.5: under graph-split
-                    // multi-device build, derive per-device n_head_q from
-                    // Qcur's actual element count. The build-context
-                    // `n_head` member is the FULL n_head from hparams,
-                    // while Qcur on this device may carry only a per-
-                    // device slice (head split across devices). Using
-                    // ggml_nelements(Qcur) / (n_embd_head_k * n_tokens)
-                    // gives the correct local count regardless of how
-                    // the matmul layout maps to ne.
                     const int64_t qcur_nelem = ggml_nelements(Qcur);
                     GGML_ASSERT(qcur_nelem % ((int64_t)n_embd_head_k * n_tokens) == 0);
                     const int64_t n_head_q_local =
@@ -3460,31 +3309,17 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     auto q_4d = ggml_reshape_4d(ctx0, Qcur,
                             n_embd_head_k, n_head_q_local, n_tok_per_seq, n_seq_in_batch);
                     q = ggml_permute(ctx0, q_4d, 0, 2, 1, 3);
-                } else {
-                    q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
                 }
                 cb(q, "q", il_cb);
 
-                // Stream-aware K/V READ views for attention compute.
-                // Same indexing convention as cache_copies: split-mode
-                // uses 2*wq->n_device*il + 2*id + 0/1 for K/V per device.
-                // The per-stream offset is encoded at build time; the
-                // n_stream > 1 can_reuse_graph bailout forces a fresh
-                // build per decode so the offset is correct by call.
-                //
-                // T3.3 multi-seq: K and V widen to 4D over the full
-                // ne[3]=n_stream span — no per-stream offset, PSKV's
-                // ne[3]>1 dispatch picks each (tok, head, seq).
+                // K/V READ views always 4D under T5.7b paged. At multi-
+                // seq batches the view spans n_seq_in_batch streams
+                // contiguous from 0 (T3 convention). At single-seq
+                // batches ne[3]=1 and the active stream's block_table
+                // slice is passed to the FA op below.
                 ggml_tensor * k;
                 ggml_tensor * v;
-                if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
-                    // PHASE_NSTREAM_KV_PERF T3.5: K/V view spans the
-                    // first n_seq_in_batch streams (not all n_stream).
-                    // Caller (process_batch_tokens) guarantees batch
-                    // seq_ids are contiguous in order from 0 so the
-                    // view's parent->nb[3] stride correctly maps each
-                    // ne[3] index to its stream slice. n_seq_in_batch
-                    // <= kv_self.n_stream by construction.
+                {
                     GGML_ASSERT(n_seq_in_batch <= (int)kv_self.n_stream);
                     k = ggml_view_4d(ctx0, split_kl,
                             n_embd_head_k, n_kv, n_head_kv, n_seq_in_batch,
@@ -3492,17 +3327,6 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     v = ggml_view_4d(ctx0, split_vl,
                             n_embd_head_v, n_kv, n_head_kv, n_seq_in_batch,
                             split_vl->nb[1], split_vl->nb[2], split_vl->nb[3], 0);
-                } else {
-                    k = ggml_view_3d(ctx0, split_kl,
-                            n_embd_head_k, n_kv, n_head_kv,
-                            split_kl->nb[1],  // position stride within stream
-                            split_kl->nb[2],  // head stride within stream
-                            (size_t)_ms_stream_id * split_kl->nb[3]);
-                    v = ggml_view_3d(ctx0, split_vl,
-                            n_embd_head_v, n_kv, n_head_kv,
-                            split_vl->nb[1],
-                            split_vl->nb[2],
-                            (size_t)_ms_stream_id * split_vl->nb[3]);
                 }
                 cb(k, "k", il_cb);
                 cb(v, "v", il_cb);
@@ -3548,17 +3372,26 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
                     cb(cur, "flash_attn_per_slot_kv", il_cb);
 
-                    // PHASE_NSTREAM_KV_PERF T5.6: under multi-seq unified-
-                    // stream dispatch the K/V WRITE path is paged
-                    // (SET_ROWS over a [head_dim, total_blocks*BLOCK_SIZE
-                    // *n_head_kv] view). Attach the paged block table so
-                    // the PSKV kernel reads through the same indirection.
-                    // At n_stream==1 the kernel stays in legacy mode
-                    // (src[6] stays NULL), preserving the byte path used
-                    // by single-seq workloads.
-                    if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
-                        ggml_flash_attn_ext_set_block_table(cur, build_inp_block_table());
+                    // PHASE_NSTREAM_KV_PERF T5.7b: always attach paged
+                    // block_table — every WRITE is paged so every READ
+                    // routes through the same indirection. At single-
+                    // seq batches (n_seq_in_batch == 1) the global
+                    // [nbps, n_stream] tensor is viewed at the active
+                    // stream's slice so blockIdx.z=0 in the kernel
+                    // indexes the correct stream's blocks. At multi-
+                    // seq batches the global tensor is passed directly
+                    // (T3 convention: batch seq_ids contiguous from 0,
+                    // so slots [0..n_seq_in_batch) match block_table
+                    // [0..n_seq_in_batch)).
+                    ggml_tensor * inp_bt_full = build_inp_block_table();
+                    ggml_tensor * bt_for_kernel = inp_bt_full;
+                    if (n_seq_in_batch == 1 && _ms_stream_id > 0) {
+                        bt_for_kernel = ggml_view_2d(ctx0, inp_bt_full,
+                                inp_bt_full->ne[0], 1,
+                                inp_bt_full->nb[1],
+                                (size_t)_ms_stream_id * inp_bt_full->nb[1]);
                     }
+                    ggml_flash_attn_ext_set_block_table(cur, bt_for_kernel);
                 } else {
                     cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

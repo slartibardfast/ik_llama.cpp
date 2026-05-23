@@ -5180,9 +5180,11 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         const uint32_t blk_tokens  = (uint32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
         // n_head_kv is inferred from the tensor size set at build time:
         //   inp_kv_idxs->ne[0] == n_tokens * n_head_kv
-        GGML_ASSERT(n_tokens > 0 && kvps > 0 && n_stream > 1);
+        // T5.7b: pretence drop — n_stream==1 also routes through paged.
+        GGML_ASSERT(n_tokens > 0 && kvps > 0 && n_stream >= 1);
         GGML_ASSERT(kvps % blk_tokens == 0 &&
                     "T5.6: kvps must be a multiple of BLOCK_SIZE_TOKENS");
+        (void)n_stream;
         GGML_ASSERT(lctx.default_decoder.inp_kv_idxs->ne[0] % n_tokens == 0);
         const int64_t n_head_kv =
             lctx.default_decoder.inp_kv_idxs->ne[0] / n_tokens;
