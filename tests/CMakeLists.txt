@@ -1055,8 +1055,13 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
 set(TEST_TARGET test-paged-defrag-preserves-contents)
-add_executable(${TEST_TARGET} spec/test-paged-defrag-preserves-contents.cpp)
+add_executable(${TEST_TARGET}
+    spec/test-paged-defrag-preserves-contents.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+target_compile_definitions(${TEST_TARGET} PRIVATE LLAMA_PAGED_KV_LANDED=1)
 install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")

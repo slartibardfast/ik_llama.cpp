@@ -7,6 +7,7 @@
 #include "llama-paged-kv-allocator.h"
 #include "llama-paged-kv-trace.h"
 
+#include <algorithm>
 #include <cassert>
 
 static const std::vector<int32_t> empty_block_table;
@@ -123,4 +124,70 @@ const std::vector<int32_t> & llama_paged_kv_allocator::block_table(int32_t seq) 
         return empty_block_table;
     }
     return tables_[(size_t)seq];
+}
+
+std::vector<llama_paged_kv_allocator::defrag_move> llama_paged_kv_allocator::defrag() {
+    // Pool compaction: move allocated blocks at high IDs into low-ID
+    // free slots so allocated blocks occupy a contiguous prefix
+    // [0..n_allocated). Greedy pairing of highest-allocated with
+    // lowest-free; the post-defrag pool has zero gaps below the
+    // highest allocated block.
+    //
+    // Per the spec contract DefragPreservesLogicalContents the caller
+    // physically applies each returned move via a block-sized byte
+    // copy in the K/V cache buffer. This method only mutates the
+    // allocator's bookkeeping; it does not touch device memory.
+    std::vector<defrag_move> moves;
+
+    std::vector<int32_t> allocated_bids;   // sorted descending
+    std::vector<int32_t> free_bids;        // sorted ascending
+    allocated_bids.reserve((size_t)total_blocks_);
+    free_bids.reserve((size_t)total_blocks_);
+    for (int32_t b = 0; b < total_blocks_; ++b) {
+        if (pool_owner_[(size_t)b] >= 0) {
+            allocated_bids.push_back(b);
+        } else {
+            free_bids.push_back(b);
+        }
+    }
+    std::reverse(allocated_bids.begin(), allocated_bids.end());
+
+    size_t ai = 0, fi = 0;
+    while (ai < allocated_bids.size() && fi < free_bids.size() &&
+           allocated_bids[ai] > free_bids[fi]) {
+        const int32_t old_bid = allocated_bids[ai];
+        const int32_t new_bid = free_bids[fi];
+        const int32_t owner   = pool_owner_[(size_t)old_bid];
+
+        // Rewire ownership: free old_bid, claim new_bid for owner.
+        pool_owner_[(size_t)new_bid] = owner;
+        pool_owner_[(size_t)old_bid] = -1;
+
+        // Update owner's table: replace old_bid with new_bid at its
+        // logical position (single occurrence per seq by
+        // BlockUniquelyOwned).
+        auto & tbl = tables_[(size_t)owner];
+        for (auto & b : tbl) {
+            if (b == old_bid) { b = new_bid; break; }
+        }
+
+        moves.push_back({old_bid, new_bid});
+
+        // Trace hook — fires only when LLAMA_T5_TRACE=1.
+        llama_paged_kv_trace_event(0, owner, new_bid,
+                                   LLAMA_PAGED_KV_TRACE_DEFRAG_MOVE, old_bid);
+
+        ++ai; ++fi;
+    }
+
+    // Rebuild free_list from pool_owner_ in LIFO ascending-IDs-on-top
+    // order (matches init's invariant: lowest free id pops first).
+    free_list_.clear();
+    for (int32_t b = total_blocks_ - 1; b >= 0; --b) {
+        if (pool_owner_[(size_t)b] == -1) {
+            free_list_.push_front(b);
+        }
+    }
+
+    return moves;
 }

@@ -96,6 +96,29 @@ public:
     // Query: number of sequences this allocator was initialised for.
     int32_t n_seqs() const { return (int32_t)tables_.size(); }
 
+    // T5.7c — paged defrag. Compacts the block pool by moving blocks
+    // from high IDs into lower-ID free slots, so allocated blocks
+    // occupy a contiguous prefix [0..n_allocated). Returns the list
+    // of {old_bid -> new_bid} moves the caller must apply physically
+    // (block-sized byte copy in the K/V cache buffer).
+    //
+    // Updates internal state in lockstep with the returned moves:
+    //   - pool_owner_  rewires moved blocks
+    //   - tables_[s]   replaces old_bid entries with new_bid (preserving
+    //                  per-seq logical order)
+    //   - free_list_   rebuilt LIFO with the post-defrag free set
+    //
+    // Idempotent: re-running defrag on an already-compact pool returns
+    // an empty move list and is a no-op on state.
+    //
+    // Binds:
+    //   paged_block_allocator.allium::DefragMechanics
+    //   paged_kshift_defrag.allium::DefragPreservesLogicalContents
+    //     ::MoveBytesAreCopiedExactly (caller's responsibility)
+    //     ::DefragMaintainsBlockUniquelyOwned (this method preserves)
+    struct defrag_move { int32_t old_bid; int32_t new_bid; };
+    std::vector<defrag_move> defrag();
+
 private:
     int32_t total_blocks_ = 0;
     std::vector<int32_t> pool_owner_;          // size total_blocks_; -1 = FREE
