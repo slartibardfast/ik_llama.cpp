@@ -3,6 +3,7 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-paged-kv-allocator.h"
 
 #include "ggml.h"
 
@@ -158,6 +159,7 @@ void llm_build_context::init() {
     lctx.default_decoder.inp_KQ_mask_cross = nullptr;
     lctx.default_decoder.inp_per_row_k_bound = nullptr;
     lctx.default_decoder.inp_kv_idxs         = nullptr;
+    lctx.default_decoder.inp_block_table     = nullptr;
 }
 
 void llm_build_context::free() {
@@ -667,6 +669,34 @@ ggml_tensor * llm_build_context::build_inp_kv_idxs(int64_t n_head_kv) {
     return lctx.default_decoder.inp_kv_idxs;
 }
 
+ggml_tensor * llm_build_context::build_inp_block_table() {
+    // PHASE_NSTREAM_KV_PERF T5.6: per-(seq, block_idx) physical block id
+    // tensor consumed by both the K/V WRITE formula (via llama.cpp host
+    // populator) and the PSKV singlewarp kernel (as src[6] of FA op).
+    //
+    // Shape [n_blocks_per_seq, n_seqs] where n_blocks_per_seq is the
+    // maximum number of blocks any one seq can address — equal to
+    // kvps / BLOCK_SIZE_TOKENS for the current trivial identity mapping
+    // (one block per BLOCK_SIZE positions per seq). At full ctx every
+    // seq has exactly n_blocks_per_seq blocks; below full ctx the
+    // populator pads unallocated entries with block_id 0 (safe since
+    // the FA mask zeros contributions beyond per-seq n_past).
+    if (lctx.default_decoder.inp_block_table != nullptr) {
+        return lctx.default_decoder.inp_block_table;
+    }
+    const uint32_t blk_tokens = (uint32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+    const uint32_t kvps       = kv_self.kv_size_per_stream;
+    GGML_ASSERT(kvps > 0 && kvps % blk_tokens == 0 &&
+                "T5.6 build_inp_block_table: kvps must be a multiple of BLOCK_SIZE_TOKENS");
+    const int64_t n_blocks_per_seq = (int64_t)(kvps / blk_tokens);
+    const int64_t n_seqs           = (int64_t)kv_self.n_stream;
+    lctx.default_decoder.inp_block_table = ggml_new_tensor_2d(
+        ctx0, GGML_TYPE_I32, n_blocks_per_seq, n_seqs);
+    cb(lctx.default_decoder.inp_block_table, "inp_block_table", -1);
+    ggml_set_input(lctx.default_decoder.inp_block_table);
+    return lctx.default_decoder.inp_block_table;
+}
+
 ggml_tensor * llm_build_context::build_inp_mean() {
     lctx.default_decoder.inp_mean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
     cb(lctx.default_decoder.inp_mean, "inp_mean", -1);
@@ -885,9 +915,14 @@ void llm_build_context::llm_build_kv_store(
             if (k_src->type != GGML_TYPE_F32) {
                 k_src = ggml_cast(ctx, k_src, GGML_TYPE_F32);
             }
-            // Flatten K cache to 2D scatter target.
+            // T5.6 paged layout: 2D reshape over total_blocks * BLOCK_SIZE
+            // * n_head_kv rows. Byte total matches contiguous because
+            // total_blocks * BLOCK_SIZE == kvps * n_stream by construction
+            // at kv_cache_init (paged.init(ceil(kv_size/BLOCK), n_stream)).
+            const int64_t blk_tokens_i64 =
+                (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
             const int64_t k_row_total =
-                (int64_t)kv.kv_size_per_stream * n_head_kv * (int64_t)kv.n_stream;
+                (int64_t)kv.paged.total_blocks() * blk_tokens_i64 * n_head_kv;
             ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx, kv.k_l[il],
                     n_embd_head_k, k_row_total);
             // Flatten k_cur source rows to [head_dim, n_tokens*n_head_kv].
@@ -938,8 +973,11 @@ void llm_build_context::llm_build_kv_store(
                 if (v_src->type != GGML_TYPE_F32) {
                     v_src = ggml_cast(ctx, v_src, GGML_TYPE_F32);
                 }
+                // T5.6 paged layout: see K's reshape comment above.
+                const int64_t blk_tokens_v_i64 =
+                    (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
                 const int64_t v_row_total =
-                    (int64_t)kv.kv_size_per_stream * n_head_kv * (int64_t)kv.n_stream;
+                    (int64_t)kv.paged.total_blocks() * blk_tokens_v_i64 * n_head_kv;
                 ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx, kv.v_l[il],
                         n_embd_head_v, v_row_total);
                 ggml_tensor * v_src_2d = ggml_reshape_2d(ctx, v_src,
@@ -2086,6 +2124,28 @@ static ggml_tensor * llm_build_kqv(
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "fa", il);
             // PSKV op does not take sinks (predicate requires sinks==nullptr).
+            // T5.6: attach paged block_table when this build went paged
+            // on the WRITE side (same predicate). At n_stream==1 src[6]
+            // stays NULL and the kernel runs in legacy mode. Allocate
+            // the input tensor lazily on first layer; reuse on subsequent
+            // layers via the cached decoder field. The host populator in
+            // llama_set_inputs writes per-(seq, block_idx) physical bids
+            // from kv.paged.block_table(s).
+            if (is_multi_seq && kv.n_stream > 1) {
+                if (!lctx.default_decoder.inp_block_table) {
+                    const uint32_t blk_tokens =
+                        (uint32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+                    GGML_ASSERT(kv.kv_size_per_stream > 0 &&
+                                kv.kv_size_per_stream % blk_tokens == 0 &&
+                                "T5.6 (llm_build_kqv): kvps must be a multiple of BLOCK_SIZE_TOKENS");
+                    const int64_t nbps   = (int64_t)(kv.kv_size_per_stream / blk_tokens);
+                    const int64_t n_seqs = (int64_t)kv.n_stream;
+                    lctx.default_decoder.inp_block_table =
+                        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nbps, n_seqs);
+                    ggml_set_input(lctx.default_decoder.inp_block_table);
+                }
+                ggml_flash_attn_ext_set_block_table(cur, lctx.default_decoder.inp_block_table);
+            }
         } else {
             cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
@@ -3162,10 +3222,15 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 const size_t k_head_stride   = split_kl->nb[2];
                 const size_t k_stream_stride = split_kl->nb[3];
 
-                // PHASE_NSTREAM_KV_PERF T3.3-followup: under multi-seq
-                // dispatch, route K/V WRITE through ggml_set_rows scatter
-                // so each (token, head) lands in its destination stream's
-                // slice. Build the per-(token, head) indices tensor lazily.
+                // PHASE_NSTREAM_KV_PERF T5.6 (was T3.3-followup): under
+                // multi-seq dispatch, route K/V WRITE through
+                // ggml_set_rows scatter using PAGED block-table indexing.
+                // The kv_idxs formula in llama_set_inputs encodes
+                //   row = bid*BLOCK_SIZE*n_head_kv + h*BLOCK_SIZE
+                //         + p_in_block
+                // and total_rows = total_blocks * BLOCK_SIZE * n_head_kv
+                // (== kvps * n_stream * n_head_kv by construction, so
+                // the underlying cache buffer's byte count is unchanged).
                 ggml_tensor * kv_idxs = nullptr;
                 if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
                     kv_idxs = build_inp_kv_idxs(n_head_kv);
@@ -3176,8 +3241,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     if (k_src->type != GGML_TYPE_F32) {
                         k_src = ggml_cast(ctx0, k_src, GGML_TYPE_F32);
                     }
+                    const int64_t blk_tokens_i64 =
+                        (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
                     const int64_t k_row_total =
-                        (int64_t)kv_self.kv_size_per_stream * n_head_kv * (int64_t)kv_self.n_stream;
+                        (int64_t)kv_self.paged.total_blocks() * blk_tokens_i64 * n_head_kv;
                     ggml_tensor * k_cache_2d = ggml_reshape_2d(ctx0, split_kl,
                             n_embd_head_k, k_row_total);
                     ggml_tensor * k_src_2d = ggml_reshape_2d(ctx0, k_src,
@@ -3213,8 +3280,10 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                         if (v_src->type != GGML_TYPE_F32) {
                             v_src = ggml_cast(ctx0, v_src, GGML_TYPE_F32);
                         }
+                        const int64_t blk_tokens_v_i64 =
+                            (int64_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
                         const int64_t v_row_total =
-                            (int64_t)kv_self.kv_size_per_stream * n_head_kv * (int64_t)kv_self.n_stream;
+                            (int64_t)kv_self.paged.total_blocks() * blk_tokens_v_i64 * n_head_kv;
                         ggml_tensor * v_cache_2d = ggml_reshape_2d(ctx0, split_vl,
                                 n_embd_head_v, v_row_total);
                         ggml_tensor * v_src_2d = ggml_reshape_2d(ctx0, v_src,
@@ -3373,6 +3442,18 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                             KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
                     cb(cur, "flash_attn_per_slot_kv", il_cb);
+
+                    // PHASE_NSTREAM_KV_PERF T5.6: under multi-seq unified-
+                    // stream dispatch the K/V WRITE path is paged
+                    // (SET_ROWS over a [head_dim, total_blocks*BLOCK_SIZE
+                    // *n_head_kv] view). Attach the paged block table so
+                    // the PSKV kernel reads through the same indirection.
+                    // At n_stream==1 the kernel stays in legacy mode
+                    // (src[6] stays NULL), preserving the byte path used
+                    // by single-seq workloads.
+                    if (is_multi_seq_n_stream && kv_self.n_stream > 1) {
+                        ggml_flash_attn_ext_set_block_table(cur, build_inp_block_table());
+                    }
                 } else {
                     cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

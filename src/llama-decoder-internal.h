@@ -142,6 +142,13 @@ struct llama_decoder {
     // when active; nullptr on legacy single-stream cpy path.
     struct ggml_tensor * inp_kv_idxs = nullptr; // I32 [n_tokens * n_head_kv]
 
+    // PHASE_NSTREAM_KV_PERF T5.6: per-(seq, blk_idx) physical block id for
+    // the paged KV layout. I32 [n_blocks_per_seq, n_seqs]. Populated per
+    // decode by llama_set_inputs from kv_cache.paged.block_table(seq).
+    // Consumed as src[6] of ggml_flash_attn_ext_per_slot_kv when the
+    // PSKV kernel runs in paged mode.
+    struct ggml_tensor * inp_block_table = nullptr; // I32 [n_blocks_per_seq, n_seqs]
+
     // PHASE45 D9.6f: per-seq slot allocator for the linear-attn recurrent
     // state buffer (s_l[il]); maps llama_seq_id -> slot index.
     qnext_state_slot_allocator qnext_slot_alloc;

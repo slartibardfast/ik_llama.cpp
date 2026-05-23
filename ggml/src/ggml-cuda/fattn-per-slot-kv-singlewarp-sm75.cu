@@ -134,8 +134,20 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
     // Under legacy mode (block_table == nullptr), one base is computed
     // once and the k-loop walks linearly via k*nb11. Under paged mode,
     // a per-block base is computed inside the k-loop (per ILP chunk).
+    //
+    // T5.6: the K/V tensors passed to FA keep legacy ne/nb (cache backing
+    // buffer is sized contiguous). In paged mode the kernel reinterprets
+    // the buffer as `[head_dim, BLOCK_SIZE, n_head_kv, total_blocks]` by
+    // deriving block-stride and head-within-block-stride from
+    // `nb11 * PAGED_BLOCK_SIZE_TOKENS` and `ne12` (n_head_kv). The host
+    // does NOT remap K/V tensor strides — kernel-side reinterpretation
+    // is the contract.
     const bool   paged       = (block_table != nullptr);
     const int *  bt_seq      = paged ? (block_table + seq * n_blocks_per_seq) : nullptr;
+    const int    paged_nb12  = paged ? (int)(nb11 * PAGED_BLOCK_SIZE_TOKENS)            : nb12;
+    const int    paged_nb13  = paged ? (int)(paged_nb12 * ne12)                         : nb13;
+    const int    paged_nb22  = paged ? (int)(nb21 * PAGED_BLOCK_SIZE_TOKENS)            : nb22;
+    const int    paged_nb23  = paged ? (int)(paged_nb22 * ne12)                         : nb23;
     const char * K_base_leg  = paged ? nullptr : (K_direct + nb13*seq + nb12*head_kv);
     const char * V_base_leg  = paged ? nullptr : (V_direct + nb23*seq + nb22*head_kv);
 
@@ -189,7 +201,7 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         if (paged) {
             const int block_idx  = k / PAGED_BLOCK_SIZE_TOKENS;
             const int bid        = bt_seq[block_idx];
-            K_chunk_base         = K_direct + (size_t)bid * nb13 + (size_t)head_kv * nb12;
+            K_chunk_base         = K_direct + (size_t)bid * paged_nb13 + (size_t)head_kv * paged_nb12;
             k_in_chunk_off       = k & (PAGED_BLOCK_SIZE_TOKENS - 1);  // k % 64
         } else {
             K_chunk_base         = K_base_leg;
@@ -255,8 +267,8 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         // Per-chunk V base — same paged/legacy logic as K, but using
         // V_direct and V's strides (nb22/nb23).
         const char * V_chunk_base = paged
-            ? (V_direct + (size_t)bt_seq[k / PAGED_BLOCK_SIZE_TOKENS] * nb23
-                        + (size_t)head_kv * nb22)
+            ? (V_direct + (size_t)bt_seq[k / PAGED_BLOCK_SIZE_TOKENS] * paged_nb23
+                        + (size_t)head_kv * paged_nb22)
             : V_base_leg;
         const int    v_in_chunk_off = paged ? (k & (PAGED_BLOCK_SIZE_TOKENS - 1)) : k;
 
@@ -312,8 +324,8 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
         if (paged) {
             const int block_idx = k / PAGED_BLOCK_SIZE_TOKENS;
             const int bid       = bt_seq[block_idx];
-            K_tail_base         = K_direct + (size_t)bid * nb13 + (size_t)head_kv * nb12;
-            V_tail_base         = V_direct + (size_t)bid * nb23 + (size_t)head_kv * nb22;
+            K_tail_base         = K_direct + (size_t)bid * paged_nb13 + (size_t)head_kv * paged_nb12;
+            V_tail_base         = V_direct + (size_t)bid * paged_nb23 + (size_t)head_kv * paged_nb22;
             k_tail_off          = k & (PAGED_BLOCK_SIZE_TOKENS - 1);
         } else {
             K_tail_base = K_base_leg;

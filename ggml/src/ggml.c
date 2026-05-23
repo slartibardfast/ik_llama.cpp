@@ -10307,8 +10307,27 @@ struct ggml_tensor * ggml_flash_attn_ext_per_slot_kv(
     result->src[3] = mask;
     result->src[4] = NULL;            // sinks slot (unused for per-slot-kv variant)
     result->src[5] = per_row_k_bound; // per-row K-loop bound (i32, length q->ne[1])
+    result->src[6] = NULL;            // T5.6 paged-KV block table; set via ggml_flash_attn_ext_set_block_table
 
     return result;
+}
+
+// PHASE_NSTREAM_KV_PERF T5.6: attach a paged-KV block table to a
+// ggml_flash_attn_ext_per_slot_kv tensor as src[6]. See ggml.h for
+// semantics. The block table is i32 of shape [n_blocks_per_seq, n_seqs];
+// passing NULL keeps the kernel in legacy (linear-stride) mode.
+void ggml_flash_attn_ext_set_block_table(
+        struct ggml_tensor * a,
+        struct ggml_tensor * block_table) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_PER_SLOT_KV);
+    if (!block_table) {
+        a->src[6] = NULL;
+        return;
+    }
+    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
+    a->src[6] = block_table;
 }
 
 void ggml_flash_attn_ext_add_sinks(

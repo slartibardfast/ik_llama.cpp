@@ -5153,35 +5153,41 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         kq_mask_done: ;
     }
 
-    // PHASE_NSTREAM_KV_PERF T3.3-followup: populate per-(token, head)
-    // global row indices into the K/V cache reshaped 2D as
-    // [head_dim, kvps * n_head_kv * n_stream]. Built only on the
-    // multi-seq dispatch path (inp_kv_idxs allocated in
-    // build_inp_kv_idxs). For each batch token t at stream s_t with
-    // intra-stream offset p_t = v_heads[s_t] + (t - run_start), and
-    // each head h in [0..n_head_kv):
-    //   idx[t * n_head_kv + h] = p_t + h * kvps + s_t * kvps * n_head_kv
-    // The tensor is GGML_TYPE_I64 to match the upstream ggml_set_rows
-    // ABI (CUDA kernel accepts I64 or I32; I64 is the safer choice for
-    // future-proofing large kv_size * n_head_kv * n_stream products).
+    // PHASE_NSTREAM_KV_PERF T5.6: populate per-(token, head) global row
+    // indices into the K/V cache under the **paged** layout. The cache
+    // backing buffer is reshaped (by the SET_ROWS view) as 2D
+    // [head_dim, total_blocks * BLOCK_SIZE_TOKENS * n_head_kv]; row r
+    // corresponds to (bid, h, p_in_block) = (r/(BLOCK_SIZE*n_head_kv),
+    // (r/BLOCK_SIZE) % n_head_kv, r % BLOCK_SIZE).
+    //
+    // For each batch token t at stream s_t with intra-stream position
+    // p_t = v_heads[s_t] + (t - run_start), block_idx = p_t / BLOCK_SIZE
+    // and p_in_block = p_t % BLOCK_SIZE. bid = paged.block_table(s_t)
+    // [block_idx]. Row index:
+    //   idx[t*n_head_kv + h] = bid*BLOCK_SIZE*n_head_kv
+    //                         + h*BLOCK_SIZE + p_in_block
+    //
+    // The kernel READ path (T5.5 with paged_nb12/13 derivation) reads
+    // (bid, head, p_in_block) by the SAME formula reinterpreted as
+    // byte offsets. WRITE and READ agree by construction at any
+    // block_table mapping — identity and post-defrag — since both
+    // address through the same `bid`.
     if (lctx.default_decoder.inp_kv_idxs) {
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_kv_idxs->buffer));
         const int64_t n_tokens     = batch.n_tokens;
         const uint32_t kvps        = lctx.transformer_kv.kv_size_per_stream;
         const uint32_t n_stream    = lctx.transformer_kv.n_stream;
+        const uint32_t blk_tokens  = (uint32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
         // n_head_kv is inferred from the tensor size set at build time:
         //   inp_kv_idxs->ne[0] == n_tokens * n_head_kv
         GGML_ASSERT(n_tokens > 0 && kvps > 0 && n_stream > 1);
+        GGML_ASSERT(kvps % blk_tokens == 0 &&
+                    "T5.6: kvps must be a multiple of BLOCK_SIZE_TOKENS");
         GGML_ASSERT(lctx.default_decoder.inp_kv_idxs->ne[0] % n_tokens == 0);
         const int64_t n_head_kv =
             lctx.default_decoder.inp_kv_idxs->ne[0] / n_tokens;
         int64_t * idx_data = (int64_t *) lctx.default_decoder.inp_kv_idxs->data;
 
-        // Walk the batch in contiguous-per-seq runs (split_equal). For
-        // each run, compute the intra-stream offset relative to the
-        // stream's v_heads cursor (which find_slot left at the start of
-        // this batch's allocation), then emit n_head_kv entries per
-        // token.
         int64_t i = 0;
         while (i < n_tokens) {
             llama_seq_id run_sid = (batch.n_seq_id && batch.n_seq_id[i] > 0 && batch.seq_id && batch.seq_id[i])
@@ -5193,17 +5199,47 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 if (sj != run_sid) break;
                 ++j;
             }
-            // run [i, j) belongs to stream run_sid.
             GGML_ASSERT((uint32_t)run_sid < n_stream);
-            const uint32_t stream_base = (uint32_t)run_sid * kvps * (uint32_t)n_head_kv;
             const uint32_t head_local0 = lctx.transformer_kv.v_heads[(uint32_t)run_sid];
+            const auto & btbl = lctx.transformer_kv.paged.block_table((int32_t)run_sid);
             for (int64_t t = i; t < j; ++t) {
-                const uint32_t p_t = head_local0 + (uint32_t)(t - i);
+                const uint32_t p_t         = head_local0 + (uint32_t)(t - i);
+                const uint32_t blk_idx     = p_t / blk_tokens;
+                const uint32_t p_in_block  = p_t % blk_tokens;
+                GGML_ASSERT(blk_idx < btbl.size() &&
+                            "T5.6 WRITE: block_table not large enough for written position; "
+                            "T5.2/T5.3 shadow must have pre-allocated this seq's blocks");
+                const int32_t  bid         = btbl[blk_idx];
+                const int64_t  block_base  = (int64_t)bid * (int64_t)blk_tokens * n_head_kv;
                 for (int64_t h = 0; h < n_head_kv; ++h) {
-                    idx_data[t * n_head_kv + h] = (int64_t)stream_base + (int64_t)h * kvps + (int64_t)p_t;
+                    idx_data[t * n_head_kv + h] =
+                        block_base + h * (int64_t)blk_tokens + (int64_t)p_in_block;
                 }
             }
             i = j;
+        }
+    }
+
+    // PHASE_NSTREAM_KV_PERF T5.6: populate the paged-KV block-table
+    // input tensor consumed by the PSKV kernel as src[6]. Shape
+    // [n_blocks_per_seq, n_seqs] I32. For each seq s, bt[s*nbps + i]
+    // = paged.block_table(s)[i] for i in [0, paged.n_blocks_owned_by(s));
+    // unallocated entries are padded with 0 (a valid block id whose
+    // contributions the FA mask will zero out — the kernel reads K/V
+    // unconditionally and the mask handles per-seq visibility).
+    if (lctx.default_decoder.inp_block_table) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.default_decoder.inp_block_table->buffer));
+        const int64_t nbps    = lctx.default_decoder.inp_block_table->ne[0];
+        const int64_t n_seqs  = lctx.default_decoder.inp_block_table->ne[1];
+        int32_t * bt_data     = (int32_t *) lctx.default_decoder.inp_block_table->data;
+        // Zero-pad. Cheaper than per-element writes for unallocated tail.
+        memset(bt_data, 0, (size_t)nbps * (size_t)n_seqs * sizeof(int32_t));
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            const auto & btbl = lctx.transformer_kv.paged.block_table((int32_t)s);
+            const int64_t copy_n = (int64_t)btbl.size() < nbps ? (int64_t)btbl.size() : nbps;
+            for (int64_t i = 0; i < copy_n; ++i) {
+                bt_data[s * nbps + i] = btbl[(size_t)i];
+            }
         }
     }
 

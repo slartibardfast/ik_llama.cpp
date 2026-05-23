@@ -153,6 +153,15 @@ struct llm_build_context {
     // GQA across layers).
     ggml_tensor * build_inp_kv_idxs(int64_t n_head_kv);
 
+    // PHASE_NSTREAM_KV_PERF T5.6: builds an I32 [n_blocks_per_seq, n_seqs]
+    // input tensor holding the paged-KV block table — bt[seq*nbps + i]
+    // returns the physical block id holding seq's i-th block of tokens.
+    // Consumed as src[6] of ggml_flash_attn_ext_per_slot_kv and parallel
+    // to the inp_kv_idxs WRITE-side formula. Allocated lazily on first
+    // call; reuses the cache-wide block_table geometry from
+    // kv_self.paged.total_blocks() / n_stream.
+    ggml_tensor * build_inp_block_table();
+
     ggml_tensor * build_inp_KQ_mask_swa(bool causal = true);
 
     ggml_tensor * build_inp_mean();

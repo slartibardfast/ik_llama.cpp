@@ -2454,6 +2454,16 @@ extern "C" {
             float                 max_bias,
             float                 softcap);
 
+    // PHASE_NSTREAM_KV_PERF T5.6: attach a paged-KV block table to a
+    // ggml_flash_attn_ext_per_slot_kv tensor as src[6]. The block table
+    // is i32 of shape [n_blocks_per_seq, n_seqs] and routes the PSKV
+    // kernel into its paged branch (per-block bid lookup inside the
+    // K-loop). Passing nullptr (default) keeps the kernel in legacy
+    // mode (linear k-stepping inside one seq's slab).
+    GGML_API void ggml_flash_attn_ext_set_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * block_table);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
