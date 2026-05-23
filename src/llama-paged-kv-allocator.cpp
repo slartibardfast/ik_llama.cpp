@@ -5,6 +5,7 @@
 // See llama-paged-kv-allocator.h for the binding spec references.
 
 #include "llama-paged-kv-allocator.h"
+#include "llama-paged-kv-trace.h"
 
 #include <cassert>
 
@@ -33,6 +34,10 @@ int32_t llama_paged_kv_allocator::alloc_block(int32_t seq) {
     free_list_.pop_front();
     pool_owner_[(size_t)b] = seq;
     tables_[(size_t)seq].push_back(b);
+    // T5.3 trace hook — no-op unless LLAMA_T5_TRACE=1.
+    // tick=0: allocator does not own a decode-tick counter (the caller
+    // does); event_id from the producer gives ordering.
+    llama_paged_kv_trace_event(0, seq, b, LLAMA_PAGED_KV_TRACE_ALLOC, -1);
     return b;
 }
 
@@ -46,6 +51,8 @@ void llama_paged_kv_allocator::free_seq(int32_t seq) {
     for (auto it = tbl.rbegin(); it != tbl.rend(); ++it) {
         free_list_.push_front(*it);
         pool_owner_[(size_t)*it] = -1;
+        // T5.3 trace hook.
+        llama_paged_kv_trace_event(0, seq, *it, LLAMA_PAGED_KV_TRACE_FREE, -1);
     }
     tbl.clear();
     written_tokens_[(size_t)seq] = 0;

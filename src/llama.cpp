@@ -17,6 +17,7 @@
 #include "llama-cparams.h"
 #include "llama-hparams.h"
 #include "llama-context.h"
+#include "llama-paged-kv-trace.h"
 #include "llama-quantize.h"
 
 #include "unicode.h"
@@ -2383,6 +2384,26 @@ static bool llama_kv_cache_seq_rm(
     for (uint32_t s = 0; s < cache.n_stream; ++s) {
         if (new_head_local[s] != kvps && new_head_local[s] < cache.v_heads[s]) {
             cache.v_heads[s] = new_head_local[s];
+        }
+    }
+
+    // T5.3 — partial seq_rm shadow. For each stream touched by this rm
+    // (tracked via new_head_local[s] != kvps), recount the stream's used
+    // cells and resync paged allocator state: free_seq releases all
+    // blocks; write_tokens re-allocates ceil(count/block_size) blocks.
+    // This keeps written_tokens and block_table consistent with cells[]
+    // through truncation and middle-range removal. Allocator is still
+    // dormant from kernel/build_context POV (Bundle B flips that).
+    for (uint32_t s = 0; s < cache.n_stream; ++s) {
+        if (new_head_local[s] == kvps) continue;
+        const uint32_t s_base = s * kvps;
+        uint32_t n_used = 0;
+        for (uint32_t k = 0; k < kvps; ++k) {
+            if (cache.cells[s_base + k].pos >= 0) ++n_used;
+        }
+        cache.paged.free_seq((int32_t)s);
+        if (n_used > 0) {
+            (void)cache.paged.write_tokens((int32_t)s, (int32_t)n_used);
         }
     }
 
@@ -7492,6 +7513,9 @@ void llama_backend_init(void) {
         struct ggml_context * ctx = ggml_init(params);
         ggml_free(ctx);
     }
+
+    // T5.3 — paged KV trace producer. No-op unless LLAMA_T5_TRACE=1.
+    llama_paged_kv_trace_init();
 }
 
 void llama_numa_init(enum ggml_numa_strategy numa) {
@@ -7501,6 +7525,8 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 }
 
 void llama_backend_free(void) {
+    // T5.3 — paged KV trace producer. No-op unless previously inited.
+    llama_paged_kv_trace_shutdown();
     ggml_quantize_free();
 }
 

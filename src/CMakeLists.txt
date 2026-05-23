@@ -49,6 +49,8 @@ add_library(llama
             llama-dflash.cpp
             llama-paged-kv-allocator.h
             llama-paged-kv-allocator.cpp
+            llama-paged-kv-trace.h
+            llama-paged-kv-trace.cpp
             llama-grammar.cpp
             llama-sampling.cpp
             llama-mmap.cpp

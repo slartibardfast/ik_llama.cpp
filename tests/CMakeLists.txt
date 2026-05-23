@@ -1009,7 +1009,8 @@ set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
 set(TEST_TARGET test-kv-block-allocator)
 add_executable(${TEST_TARGET}
     spec/test-kv-block-allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp)
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
 install(TARGETS ${TEST_TARGET} RUNTIME)
@@ -1061,7 +1062,8 @@ set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 set(TEST_TARGET test-paged-allocator-determinism)
 add_executable(${TEST_TARGET}
     spec/test-paged-allocator-determinism.cpp
-    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp)
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
 install(TARGETS ${TEST_TARGET} RUNTIME)
