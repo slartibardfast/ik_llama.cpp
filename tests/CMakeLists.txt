@@ -1077,6 +1077,29 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# T5.9.A.4 — paged BACKING binding tests
+set(TEST_TARGET test-pool-bounds-respected)
+add_executable(${TEST_TARGET}
+    spec/test-pool-bounds-respected.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-paged-backing-feasibility)
+add_executable(${TEST_TARGET}
+    spec/test-paged-backing-feasibility.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
