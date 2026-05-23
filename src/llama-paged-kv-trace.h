@@ -1,24 +1,23 @@
 // llama-paged-kv-trace.h
 //
-// T5.0 — stub header for the paged KV NDJSON trace producer.
+// Paged KV NDJSON trace producer header.
 //
-// The trace producer emits per-tick BlockAllocEvent records to an
-// NDJSON stream when LLAMA_T5_TRACE=1 is set. Records are consumed by
-// scripts/validate-paged-allocator-trace.py to verify the four
-// allocator invariants over a real session:
+// T5.8 closure (2026-05-23) bake-out per [[feedback_bake_measurement_env_gates]]:
+// the LLAMA_T5_TRACE runtime env-gate has been removed. The producer is
+// now compile-time-gated by the LLAMA_T5_TRACE_BUILD macro:
+//
+//   - Default build (production): LLAMA_T5_TRACE_BUILD undefined →
+//     trace_event / trace_init / trace_shutdown are inline no-ops, zero
+//     runtime cost, no env-var check.
+//   - Developer build for trace validation:
+//     -DLLAMA_T5_TRACE_BUILD=1 enables the producer (opens a file at
+//     trace_init based on LLAMA_T5_TRACE_PATH or default ./trace-paged-kv.ndjson;
+//     trace_event writes one NDJSON record per allocator op).
+//
+// Records are consumed by scripts/validate-paged-allocator-trace.py to
+// verify the four allocator invariants over a real session:
 //
 //   BlockUniquelyOwned, FreeListDisjoint, AllocLazy, DefragPreservesOwnership.
-//
-// Per PHASE_NSTREAM_KV_PERF.md §"Trace producer + validator":
-//   - Producer wired in T5.4 (allocator + WRITE path land) — until then,
-//     the entry points below are no-ops.
-//   - Validator script lands at T5.0 in
-//     /home/llm/yarn-agentic/scripts/validate-paged-allocator-trace.py
-//     and is gate-driven at T5.4 + T5.8 closure.
-//
-// Per [[feedback_bake_measurement_env_gates]]: LLAMA_T5_TRACE is a
-// measurement-only knob. It MUST be removed in the same commit that
-// bakes the verified Tier 5 behaviour (T5.8 closure).
 
 #ifndef LLAMA_PAGED_KV_TRACE_H
 #define LLAMA_PAGED_KV_TRACE_H
@@ -34,26 +33,20 @@ typedef enum llama_paged_kv_trace_op {
     LLAMA_PAGED_KV_TRACE_DEFRAG_MOVE = 2,
 } llama_paged_kv_trace_op_t;
 
-// Initialise the trace producer. Called once at llama_new_context_with_model
-// when LLAMA_T5_TRACE=1; otherwise no-op.
-//
-// Returns 0 on success, non-zero on failure to open the trace stream.
-//
-// Stub (T5.0): always returns 0; emits nothing.
-// Implementation lands at T5.4.
+#ifdef LLAMA_T5_TRACE_BUILD
+
+// Initialise the trace producer. Opens the trace file at
+// LLAMA_T5_TRACE_PATH (default: ./trace-paged-kv.ndjson). Returns 0 on
+// success, non-zero on failure.
 int llama_paged_kv_trace_init(void);
 
-// Emit one BlockAllocEvent. Called from the allocator's alloc / free /
-// defrag-move sites in T5.4.
+// Emit one BlockAllocEvent.
 //
 // tick: monotonic per-decode counter (0 at session start).
 // seq: seq id this op applies to (-1 for global ops like defrag start).
 // block_id: physical block id touched by this op.
 // op: alloc / free / defrag_move.
-// prev_block_id: only meaningful for DEFRAG_MOVE; the previous block_id
-//                of the seq's logical position before the move.
-//
-// Stub (T5.0): no-op. Implementation lands at T5.4.
+// prev_block_id: only meaningful for DEFRAG_MOVE.
 void llama_paged_kv_trace_event(
     int tick,
     int seq,
@@ -61,11 +54,16 @@ void llama_paged_kv_trace_event(
     llama_paged_kv_trace_op_t op,
     int prev_block_id);
 
-// Flush + close the trace stream. Called at context destroy when
-// LLAMA_T5_TRACE=1.
-//
-// Stub (T5.0): no-op.
+// Flush + close the trace stream.
 void llama_paged_kv_trace_shutdown(void);
+
+#else  // LLAMA_T5_TRACE_BUILD undefined — production path, no-ops.
+
+static inline int  llama_paged_kv_trace_init(void) { return 0; }
+static inline void llama_paged_kv_trace_event(int, int, int, llama_paged_kv_trace_op_t, int) {}
+static inline void llama_paged_kv_trace_shutdown(void) {}
+
+#endif  // LLAMA_T5_TRACE_BUILD
 
 #ifdef __cplusplus
 }

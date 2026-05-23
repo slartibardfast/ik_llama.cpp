@@ -1,25 +1,20 @@
 // llama-paged-kv-trace.cpp
 //
-// T5.3 — paged KV NDJSON trace producer implementation.
+// Paged KV NDJSON trace producer.
 //
-// Producer is gated on the LLAMA_T5_TRACE environment variable. When
-// LLAMA_T5_TRACE=1 at process start, _init opens the trace file
-// (LLAMA_T5_TRACE_PATH or default ./trace-paged-kv.ndjson) and every
-// allocator alloc/free emits one BlockAllocEvent line. When unset or
-// not "1", every entry point is a no-op and the allocator pays zero
-// per-event cost.
-//
-// Per [[feedback_bake_measurement_env_gates]]: this env knob is a
-// measurement-only artefact. T5.8 closure REMOVES the env gate (and
-// this file, or compiles it out behind a build flag); the validator
-// remains because it captures the binding behaviour.
+// T5.8 closure (2026-05-23) bake-out per [[feedback_bake_measurement_env_gates]]:
+// the LLAMA_T5_TRACE runtime env-gate has been removed. This file is
+// compile-time-gated by LLAMA_T5_TRACE_BUILD. In production builds the
+// header provides inline no-op stubs; this TU is only meaningful in
+// developer builds that set -DLLAMA_T5_TRACE_BUILD=1.
 
 #include "llama-paged-kv-trace.h"
+
+#ifdef LLAMA_T5_TRACE_BUILD
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
 
 namespace {
@@ -40,15 +35,9 @@ const char * op_name(llama_paged_kv_trace_op_t op) {
 }  // namespace
 
 extern "C" int llama_paged_kv_trace_init(void) {
-    const char * enabled = std::getenv("LLAMA_T5_TRACE");
-    if (!enabled || std::strcmp(enabled, "1") != 0) {
-        // Disabled — leave g_trace_fp == nullptr; events are no-ops.
-        return 0;
-    }
     std::lock_guard<std::mutex> lk(g_trace_mu);
     if (g_trace_fp) {
-        // Already initialised. Idempotent.
-        return 0;
+        return 0;  // idempotent.
     }
     const char * path = std::getenv("LLAMA_T5_TRACE_PATH");
     if (!path || path[0] == '\0') path = "trace-paged-kv.ndjson";
@@ -69,14 +58,12 @@ extern "C" void llama_paged_kv_trace_event(
         int block_id,
         llama_paged_kv_trace_op_t op,
         int prev_block_id) {
-    // Fast path: no producer initialised → no-op.
     if (!g_trace_fp) return;
 
-    // Allocate event id outside the lock (atomic).
     const int event_id = g_trace_event_id.fetch_add(1);
 
     std::lock_guard<std::mutex> lk(g_trace_mu);
-    if (!g_trace_fp) return;  // re-check after lock acquisition.
+    if (!g_trace_fp) return;
     if (op == LLAMA_PAGED_KV_TRACE_DEFRAG_MOVE) {
         std::fprintf(g_trace_fp,
                      "{\"tick\":%d,\"event_id\":%d,\"seq\":%d,"
@@ -99,3 +86,5 @@ extern "C" void llama_paged_kv_trace_shutdown(void) {
         g_trace_fp = nullptr;
     }
 }
+
+#endif  // LLAMA_T5_TRACE_BUILD
