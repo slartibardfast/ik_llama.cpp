@@ -332,7 +332,16 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     // below at the n_blocks_s <= nbps assertion. `nbps` is still
     // used below as the per-stream block-count cap.
 
-    for (int il = 0; il < n_layer; ++il) {
+    // T6.6 fix: bound by kv_self.k_l.size(), not n_layer. kv_cache_init
+    // truncates its loop to (hparams.n_layer - hparams.nextn_predict_layers)
+    // when !model.mtp (production path), so k_l has fewer entries than
+    // hparams.n_layer for Qwen 3.6 (n_layer=65, k_l.size()=64). Iterating
+    // up to n_layer reads past the vector and may dereference garbage
+    // (specifically the value 0x1ea30 was observed at il=64 under DFlash
+    // multi-slot, producing a non-null pointer that survived the nullptr
+    // skip and SEGV'd on tensor->extra access).
+    const int n_layer_kv = std::min<int>((int)n_layer, (int)kv_self.k_l.size());
+    for (int il = 0; il < n_layer_kv; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
             continue;
         }
@@ -536,7 +545,17 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
         const uint32_t off_in_blk_dst = p_dst % (uint32_t)BLOCK;
         const uint32_t off_in_blk_src = p_src % (uint32_t)BLOCK;
 
-        for (int il = 0; il < n_layer; ++il) {
+        // T6.6 fix: bound by kv_self.k_l.size(). kv_cache_init truncates
+        // its loop to (hparams.n_layer - hparams.nextn_predict_layers) when
+        // !model.mtp (production path), so k_l has fewer entries than
+        // hparams.n_layer for Qwen 3.6 (n_layer=65, k_l.size()=64). The
+        // older code iterated up to n_layer and read past the vector at
+        // il=64, dereferencing whatever happened to live there in the
+        // arena. Under DFlash multi-slot the byte at that offset is
+        // non-null garbage (consistently 0x1ea30 in two captured cores)
+        // which survives the nullptr skip and SEGV's on tensor->extra.
+        const int n_layer_kv = std::min<int>((int)n_layer, (int)kv_self.k_l.size());
+        for (int il = 0; il < n_layer_kv; ++il) {
             if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
                 continue;
             }
