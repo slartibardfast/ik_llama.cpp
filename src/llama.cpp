@@ -950,6 +950,13 @@ static bool llama_kv_cache_init(
     }
     cache.paged.init(total_pool_blocks, (int32_t)cache.n_stream);
     cache.total_pool_blocks = total_pool_blocks;
+    // T5.9.E (gap #2 fix): emit the trace producer's pool header BEFORE
+    // any ALLOC events fire. Required to bind PoolBoundsRespected in
+    // scripts/validate-paged-allocator-trace.py. No-op in production
+    // builds (LLAMA_T5_TRACE_BUILD undefined → inline no-op stub).
+    llama_paged_kv_trace_emit_pool_header(
+        total_pool_blocks,
+        (int32_t)llama_paged_kv_allocator::BLOCK_SIZE_TOKENS);
     // T5.9: at auto-sized pool (no CLI override), seed each stream's
     // block_table with the contiguous prefix
     // [s*nbps .. s*nbps + nbps-1]. This makes the kernel's

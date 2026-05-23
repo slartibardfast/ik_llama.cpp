@@ -22,6 +22,7 @@ namespace {
 std::FILE *      g_trace_fp       = nullptr;
 std::mutex       g_trace_mu;
 std::atomic<int> g_trace_event_id{0};
+bool             g_trace_pool_header_emitted = false;
 
 const char * op_name(llama_paged_kv_trace_op_t op) {
     switch (op) {
@@ -49,7 +50,19 @@ extern "C" int llama_paged_kv_trace_init(void) {
         return 1;
     }
     g_trace_event_id.store(0);
+    g_trace_pool_header_emitted = false;
     return 0;
+}
+
+extern "C" void llama_paged_kv_trace_emit_pool_header(
+        int pool_capacity, int block_size_tokens) {
+    std::lock_guard<std::mutex> lk(g_trace_mu);
+    if (!g_trace_fp) return;
+    if (g_trace_pool_header_emitted) return;  // idempotent.
+    std::fprintf(g_trace_fp,
+                 "{\"pool_capacity\":%d,\"block_size_tokens\":%d}\n",
+                 pool_capacity, block_size_tokens);
+    g_trace_pool_header_emitted = true;
 }
 
 extern "C" void llama_paged_kv_trace_event(
@@ -85,6 +98,7 @@ extern "C" void llama_paged_kv_trace_shutdown(void) {
         std::fclose(g_trace_fp);
         g_trace_fp = nullptr;
     }
+    g_trace_pool_header_emitted = false;
 }
 
 #endif  // LLAMA_T5_TRACE_BUILD

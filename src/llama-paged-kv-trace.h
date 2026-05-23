@@ -15,9 +15,16 @@
 //     trace_event writes one NDJSON record per allocator op).
 //
 // Records are consumed by scripts/validate-paged-allocator-trace.py to
-// verify the four allocator invariants over a real session:
+// verify the five allocator invariants over a real session:
 //
-//   BlockUniquelyOwned, FreeListDisjoint, AllocLazy, DefragPreservesOwnership.
+//   BlockUniquelyOwned, FreeListDisjoint, AllocLazy, DefragPreservesOwnership,
+//   PoolBoundsRespected.
+//
+// PoolBoundsRespected requires the validator know the pool capacity. The
+// producer emits a single header record at trace_emit_pool_header(N, B)
+// of the form `{"pool_capacity":N,"block_size_tokens":B}`. Caller is
+// llama_kv_cache_init once paged.init(total_pool_blocks, n_stream) has
+// run; header is idempotent (subsequent calls are no-ops).
 
 #ifndef LLAMA_PAGED_KV_TRACE_H
 #define LLAMA_PAGED_KV_TRACE_H
@@ -40,6 +47,14 @@ typedef enum llama_paged_kv_trace_op {
 // success, non-zero on failure.
 int llama_paged_kv_trace_init(void);
 
+// Emit the pool-capacity header record:
+//   {"pool_capacity":N,"block_size_tokens":B}
+// Idempotent — second and subsequent calls in the same session are
+// silently dropped. Called from llama_kv_cache_init after paged.init.
+// Required to bind PoolBoundsRespected in the validator; legacy traces
+// without this header skip that invariant.
+void llama_paged_kv_trace_emit_pool_header(int pool_capacity, int block_size_tokens);
+
 // Emit one BlockAllocEvent.
 //
 // tick: monotonic per-decode counter (0 at session start).
@@ -60,6 +75,7 @@ void llama_paged_kv_trace_shutdown(void);
 #else  // LLAMA_T5_TRACE_BUILD undefined — production path, no-ops.
 
 static inline int  llama_paged_kv_trace_init(void) { return 0; }
+static inline void llama_paged_kv_trace_emit_pool_header(int, int) {}
 static inline void llama_paged_kv_trace_event(int, int, int, llama_paged_kv_trace_op_t, int) {}
 static inline void llama_paged_kv_trace_shutdown(void) {}
 
