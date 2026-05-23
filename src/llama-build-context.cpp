@@ -277,6 +277,54 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         return tmp;
     };
 
+    // PHASE_NSTREAM_KV_PERF T5.7 paged-K-shift dispatch.
+    //
+    // Under paged layout (kv_self.n_stream > 1, matching the WRITE
+    // / READ path activation in T5.6), the K cache buffer's bytes
+    // for (stream s, head h, position p) live at:
+    //   addr = bid * BLOCK * n_head_kv * nb[1]
+    //        + h   * BLOCK * nb[1]
+    //        + (p % BLOCK) * nb[1]
+    // where bid = paged.block_table(s)[p / BLOCK] and BLOCK = 64.
+    //
+    // The legacy view-3d K-shift used strides
+    //   head_stride = nb[2] = kvps * head_dim * type_size
+    //   pos_stride  = nb[1] = head_dim * type_size
+    //   stream_offs = s * nb[3]
+    // — those address cells under the legacy [head_dim, kvps,
+    //   n_head_kv, n_stream] interpretation, which is NOT where the
+    //   bytes physically are at n_stream > 1 post-T5.6 (the SET_ROWS
+    //   WRITE path now scatters using the paged row formula).
+    //
+    // The paged path emits one rope op per (layer, stream, block) —
+    // each block_id is looked up from kv.paged.block_table(s) at
+    // graph-build time and folded into the view offset as a
+    // constant. Per-position delta semantics are preserved by
+    // slicing the existing kvps-length per-stream K-shift input
+    // for the block's 64-position window; positions with delta=0
+    // get identity rotation. This handles the boundary case (a
+    // shift range crossing a block boundary) without needing any
+    // per-block delta machinery — the spec contract
+    // FractionalBlockShiftDisallowed is satisfied because the
+    // boundary block's per-position delta vector has zeros outside
+    // the shift range.
+    //
+    // n_stream == 1 retains the legacy view-3d path because the K
+    // cache buffer at NP=1 is still written via the legacy CPY
+    // fallback in llm_build_kv_store (T5.7 pretence drop is a
+    // follow-on sub-step within Bundle B). The two paths address
+    // the buffer consistently with whichever write path produced
+    // its bytes.
+    const bool   paged_mode  = (n_stream > 1);
+    const int32_t BLOCK      = llama_paged_kv_allocator::BLOCK_SIZE_TOKENS;
+    const uint32_t nbps      = paged_mode ? (kvps / (uint32_t)BLOCK) : 0;
+    if (paged_mode) {
+        GGML_ASSERT(kvps % (uint32_t)BLOCK == 0 &&
+                "T5.7 K-shift: kvps must be a multiple of BLOCK_SIZE_TOKENS");
+        GGML_ASSERT((uint32_t)kv_self.paged.total_blocks() == nbps * n_stream &&
+                "T5.7 K-shift: paged.total_blocks() must equal nbps * n_stream");
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
             continue;
@@ -305,25 +353,54 @@ ggml_cgraph * llm_build_context::build_k_shift() {
                 if (rope_factors_extra) {
                     rope_factors_split = rope_factors_extra->splits[id];
                 }
-                for (uint32_t s = 0; s < n_stream; ++s) {
-                    const size_t head_stride   = split->nb[2];
-                    const size_t pos_stride    = split->nb[1];
-                    const size_t stream_offs   = (size_t)s * split->nb[3];
+                ggml_backend_t split_backend = (id < (int)lctx.backends.size())
+                    ? lctx.backends[id]
+                    : nullptr;
 
-                    ggml_tensor * k_view = ggml_view_3d(ctx0, split,
-                            n_embd_head_k, nhead_split, (int64_t)kvps,
-                            head_stride, pos_stride, stream_offs);
+                if (paged_mode) {
+                    const size_t nb1                  = split->nb[1];
+                    const size_t paged_nb_per_head    = (size_t)BLOCK * nb1;
+                    const size_t paged_nb_per_block   = paged_nb_per_head * (size_t)nhead_split;
+                    // Iterate over the blocks actually allocated to
+                    // this stream (AllocLazy — block_table grows on
+                    // demand). Unallocated blocks have no K data to
+                    // shift; the legacy path's identity-rotation on
+                    // unwritten cells is also a no-op semantically.
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        const auto & btbl = kv_self.paged.block_table((int32_t)s);
+                        const uint32_t n_blocks_s = (uint32_t)btbl.size();
+                        GGML_ASSERT(n_blocks_s <= nbps &&
+                                "T5.7 K-shift (graph-split): block_table exceeds nbps");
+                        for (uint32_t i = 0; i < n_blocks_s; ++i) {
+                            const int32_t bid = btbl[i];
+                            ggml_tensor * k_view = ggml_view_3d(ctx0, split,
+                                    n_embd_head_k, nhead_split, (int64_t)BLOCK,
+                                    paged_nb_per_head, nb1,
+                                    (size_t)bid * paged_nb_per_block);
+                            ggml_tensor * b_view = ggml_view_1d(ctx0,
+                                    lctx.default_decoder.inp_K_shift_per_stream[id][s],
+                                    (int64_t)BLOCK,
+                                    (size_t)i * (size_t)BLOCK * sizeof(int32_t));
+                            ggml_tensor * tmp = build_one_rope(k_view, b_view,
+                                    rope_factors_split, il, split_backend);
+                            ggml_build_forward_expand(gf, tmp);
+                        }
+                    }
+                } else {
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        const size_t head_stride   = split->nb[2];
+                        const size_t pos_stride    = split->nb[1];
+                        const size_t stream_offs   = (size_t)s * split->nb[3];
 
-                    // Pin intermediate tmp F32 tensor to this split's
-                    // device backend so cast/rope/cpy stay on one GPU
-                    // (matches where k_view's underlying storage lives).
-                    ggml_backend_t split_backend = (id < (int)lctx.backends.size())
-                        ? lctx.backends[id]
-                        : nullptr;
-                    ggml_tensor * tmp = build_one_rope(k_view,
-                            lctx.default_decoder.inp_K_shift_per_stream[id][s],
-                            rope_factors_split, il, split_backend);
-                    ggml_build_forward_expand(gf, tmp);
+                        ggml_tensor * k_view = ggml_view_3d(ctx0, split,
+                                n_embd_head_k, nhead_split, (int64_t)kvps,
+                                head_stride, pos_stride, stream_offs);
+
+                        ggml_tensor * tmp = build_one_rope(k_view,
+                                lctx.default_decoder.inp_K_shift_per_stream[id][s],
+                                rope_factors_split, il, split_backend);
+                        ggml_build_forward_expand(gf, tmp);
+                    }
                 }
             }
         } else {
@@ -331,19 +408,47 @@ ggml_cgraph * llm_build_context::build_k_shift() {
             // the parent tensor directly. n_device == 1 in this branch
             // so the inputs live at inp_K_shift_per_stream[0][s].
             const int64_t n_head_kv = hparams.n_head_kv(il);
-            for (uint32_t s = 0; s < n_stream; ++s) {
-                const size_t head_stride = kv_self.k_l[il]->nb[2];
-                const size_t pos_stride  = kv_self.k_l[il]->nb[1];
-                const size_t stream_offs = (size_t)s * kv_self.k_l[il]->nb[3];
+            if (paged_mode) {
+                const size_t nb1                  = kv_self.k_l[il]->nb[1];
+                const size_t paged_nb_per_head    = (size_t)BLOCK * nb1;
+                const size_t paged_nb_per_block   = paged_nb_per_head * (size_t)n_head_kv;
+                // Iterate over the blocks actually allocated to this
+                // stream (AllocLazy).
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const auto & btbl = kv_self.paged.block_table((int32_t)s);
+                    const uint32_t n_blocks_s = (uint32_t)btbl.size();
+                    GGML_ASSERT(n_blocks_s <= nbps &&
+                            "T5.7 K-shift (layer-split): block_table exceeds nbps");
+                    for (uint32_t i = 0; i < n_blocks_s; ++i) {
+                        const int32_t bid = btbl[i];
+                        ggml_tensor * k_view = ggml_view_3d(ctx0, kv_self.k_l[il],
+                                n_embd_head_k, n_head_kv, (int64_t)BLOCK,
+                                paged_nb_per_head, nb1,
+                                (size_t)bid * paged_nb_per_block);
+                        ggml_tensor * b_view = ggml_view_1d(ctx0,
+                                lctx.default_decoder.inp_K_shift_per_stream[0][s],
+                                (int64_t)BLOCK,
+                                (size_t)i * (size_t)BLOCK * sizeof(int32_t));
+                        ggml_tensor * tmp = build_one_rope(k_view, b_view,
+                                rope_factors, il, nullptr);
+                        ggml_build_forward_expand(gf, tmp);
+                    }
+                }
+            } else {
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    const size_t head_stride = kv_self.k_l[il]->nb[2];
+                    const size_t pos_stride  = kv_self.k_l[il]->nb[1];
+                    const size_t stream_offs = (size_t)s * kv_self.k_l[il]->nb[3];
 
-                ggml_tensor * k_view = ggml_view_3d(ctx0, kv_self.k_l[il],
-                        n_embd_head_k, n_head_kv, (int64_t)kvps,
-                        head_stride, pos_stride, stream_offs);
+                    ggml_tensor * k_view = ggml_view_3d(ctx0, kv_self.k_l[il],
+                            n_embd_head_k, n_head_kv, (int64_t)kvps,
+                            head_stride, pos_stride, stream_offs);
 
-                ggml_tensor * tmp = build_one_rope(k_view,
-                        lctx.default_decoder.inp_K_shift_per_stream[0][s],
-                        rope_factors, il, nullptr);
-                ggml_build_forward_expand(gf, tmp);
+                    ggml_tensor * tmp = build_one_rope(k_view,
+                            lctx.default_decoder.inp_K_shift_per_stream[0][s],
+                            rope_factors, il, nullptr);
+                    ggml_build_forward_expand(gf, tmp);
+                }
             }
         }
     }
