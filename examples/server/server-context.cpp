@@ -5060,7 +5060,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 }
             }
             llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
-            llama_set_draft_input_hidden_state(mtp_target, batch_mtp_hidden_state.data());
+            // batch_mtp_hidden_state is sized n_toks * n_embd (see populate
+            // loop above), and the MTP graph's inp_mtp_states tensor has
+            // shape (n_embd, n_tokens) for the WARMUP forward. The
+            // single-row setter only stores n_embd floats and the decode-
+            // time prepare_mtp_graph_inputs then memcpys ggml_nbytes(dst)
+            // = n_embd * n_tokens * sizeof(float) bytes from it, walking
+            // off the end of the (n_embd-floats-only) buffer → SIGSEGV in
+            // libc memcpy. Use the multi-row variant which packs n_slots
+            // rows back-to-back at the same buffer.
+            llama_set_draft_input_hidden_state_multi(mtp_target,
+                                                     batch_view.n_tokens,
+                                                     batch_mtp_hidden_state.data());
             mtp_update_kv_cache(mtp_target, batch_view, true);
         }
 
