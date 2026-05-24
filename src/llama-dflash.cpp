@@ -966,6 +966,9 @@ void llama_dflash_drafter_free(struct llama_dflash_drafter * /*drafter*/) {
 int32_t llama_set_dflash(struct llama_context * /*ctx*/, struct llama_dflash_drafter * /*drafter*/) {
     return LLAMA_DFLASH_NOT_IMPLEMENTED;
 }
+struct llama_dflash_drafter * llama_get_dflash_drafter(struct llama_context * /*ctx*/) {
+    return nullptr;
+}
 int32_t llama_dflash_n_source_layers(const struct llama_dflash_drafter * /*drafter*/) { return -1; }
 int32_t llama_dflash_block_size     (const struct llama_dflash_drafter * /*drafter*/) { return -1; }
 llama_token llama_dflash_mask_token_id(const struct llama_dflash_drafter * /*drafter*/) { return -1; }
