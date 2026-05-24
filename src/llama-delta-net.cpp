@@ -70,7 +70,23 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         GGML_ASSERT((uint32_t) s < qnext_state_slots);
     }
 
-    save_per_step_states = lctx.transformer_kv.save_per_step_ssm && batch.n_tokens > 1;
+    // Per-step save buffers (per_step_qkv / per_step_ssm) are sized at
+    // spec-ckpt-init time for the verify-step batch (max_tokens =
+    // drafted.size() + 1, typically 2 for MTP --draft 1). During PREFILL
+    // batch.n_tokens can far exceed that (the prompt ubatch), which
+    // overflows the ggml_view_2d into per_step_qkv / per_step_ssm in
+    // build_layer_attn_linear_core. Gate save_per_step_states on the
+    // allocated capacity to skip per-step save when it can't fit; per-
+    // step save during prefill is meaningless anyway (no draft is being
+    // verified during prefill). When skipped here, the next verify-step
+    // decode — batch sized 1+n_draft, fits — will populate the per-step
+    // buffer cleanly. Complements the PHASE45 D10 multi-slot guard in
+    // llama_spec_ckpt_init (forces GPU_FALLBACK at n_seq_max > 1) by
+    // covering the n_seq_max == 1 prefill case.
+    const int32_t per_step_cap = lctx.transformer_kv.ckpt.per_step_max_allocated;
+    save_per_step_states = lctx.transformer_kv.save_per_step_ssm
+                            && batch.n_tokens > 1
+                            && batch.n_tokens <= per_step_cap;
 }
 
 delta_net::~delta_net() = default;
