@@ -1082,6 +1082,47 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# ---------------------------------------------------------------------------
+# PHASE 46 — Multi-GPU CLIP tests.
+#
+# Two pure-spec tests (multi-backend-init, weight-split) PASS on any host;
+# two harness-driven tests (encode-equivalence, encode-latency) SKIP with
+# exit 77 when their JSON input is missing, and PASS/FAIL against the
+# JSON produced by scripts/verify-multigpu-clip.sh during the maintenance
+# window. See docs/phases/80-multimodal/PHASE46-MULTIGPU-CLIP-TENSOR-SPLIT.md
+# §10 (B.5 sub-tests) and §11.5 (B.7 perf gate).
+# ---------------------------------------------------------------------------
+
+set(TEST_TARGET test-clip-multi-backend-init)
+add_executable(${TEST_TARGET} spec/test-clip-multi-backend-init.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-clip-weight-split)
+add_executable(${TEST_TARGET} spec/test-clip-weight-split.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
+set(TEST_TARGET test-clip-encode-equivalence)
+add_executable(${TEST_TARGET} spec/test-clip-encode-equivalence.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
+set(TEST_TARGET test-clip-encode-latency)
+add_executable(${TEST_TARGET} spec/test-clip-encode-latency.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
