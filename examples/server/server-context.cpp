@@ -157,6 +157,30 @@ bool server_context::load_model(const gpt_params& params_) {
     const bool is_dflash_spec = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH;
     std::string& mmproj_path = params_base.mmproj.path;
     if (!mmproj_path.empty()) {
+        // PHASE46 B.5c: bridge CLI flags into the env-var path that
+        // clip.cpp already parses. If the user supplied --mmproj-devices
+        // / --mmproj-tensor-split / --mmproj-smf16, set the corresponding
+        // env vars before clip_init reads them. Setting the vars only
+        // when the CLI field is non-empty preserves the env-var fallback
+        // for callers that prefer the older path.
+        if (!params_base.mmproj_devices.empty()) {
+            setenv("MTMD_BACKEND_DEVICE", params_base.mmproj_devices.c_str(), 1);
+        }
+        if (!params_base.mmproj_tensor_split.empty()) {
+            setenv("MTMD_TENSOR_SPLIT", params_base.mmproj_tensor_split.c_str(), 1);
+        }
+        if (!params_base.mmproj_split_mode.empty()) {
+            setenv("MTMD_SPLIT_MODE", params_base.mmproj_split_mode.c_str(), 1);
+        }
+        // P1 default: mmproj_smf16 = true. Only set the env var when
+        // the user explicitly chose smf32 (off) so we don't trample a
+        // pre-existing env-var override.
+        if (!params_base.mmproj_smf16) {
+            setenv("MTMD_SMF32", "1", 1);
+        }
+        if (params_base.mmproj_smgs) {
+            setenv("MTMD_SMGS", "1", 1);
+        }
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu = params_base.mmproj_use_gpu;
         mparams.print_timings = false;

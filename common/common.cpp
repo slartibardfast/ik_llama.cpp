@@ -1263,6 +1263,34 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.mmproj_use_gpu = false;
         return true;
     }
+    // PHASE46 B.5c: multi-GPU CLIP CLI flag family.
+    if (arg == "--mmproj-devices") {
+        CHECK_ARG
+        params.mmproj_devices = argv[i];
+        return true;
+    }
+    if (arg == "--mmproj-tensor-split") {
+        CHECK_ARG
+        params.mmproj_tensor_split = argv[i];
+        return true;
+    }
+    if (arg == "--mmproj-split-mode") {
+        CHECK_ARG
+        params.mmproj_split_mode = argv[i];
+        return true;
+    }
+    if (arg == "--mmproj-smf16") {
+        params.mmproj_smf16 = true;
+        return true;
+    }
+    if (arg == "--mmproj-smf32") {
+        params.mmproj_smf16 = false;
+        return true;
+    }
+    if (arg == "--mmproj-smgs") {
+        params.mmproj_smgs = true;
+        return true;
+    }
     if (arg == "--mtmd-kq-type") {
         CHECK_ARG
         params.mtmd_kq_type = argv[i];
@@ -2698,6 +2726,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --image-min-tokens N",   "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)"});
     options.push_back({ "*",           "       --image-max-tokens N",   "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)" });
     options.push_back({ "*",           "       --mtmd-kq-type TYPE",    "data type for multimodality K*Q (default: %s)", params.mtmd_kq_type.c_str() });
+    // PHASE46 B.5c: multi-GPU CLIP CLI flags (peers of --tensor-split family).
+    options.push_back({ "*",           "       --mmproj-devices LIST",      "comma-separated CUDA device list for mmproj (e.g. CUDA0,CUDA1). Overrides MTMD_BACKEND_DEVICE env." });
+    options.push_back({ "*",           "       --mmproj-tensor-split LIST", "comma-separated split ratio across mmproj devices (e.g. 1,1). Overrides MTMD_TENSOR_SPLIT env." });
+    options.push_back({ "*",           "       --mmproj-split-mode MODE",   "split mode for mmproj weights (graph only in B.5; default: graph)" });
+    options.push_back({ "*",           "       --mmproj-smf16",             "f16 cross-device exchange for mmproj (default: ON)" });
+    options.push_back({ "*",           "       --mmproj-smf32",             "f32 cross-device exchange for mmproj (overrides --mmproj-smf16)" });
+    options.push_back({ "*",           "       --mmproj-smgs",              "force split-mode graph-scheduling for mmproj (default: OFF)" });
     options.push_back({ "*",           "       --no-context-shift",     "disable context-shift." });
     options.push_back({ "*",           "--context-shift (auto|on|off|0|1)", "set context-shift (default: %s)", params.ctx_shift ? "on" : "off" });
     options.push_back({ "backend" });

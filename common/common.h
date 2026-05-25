@@ -414,6 +414,17 @@ struct gpt_params {
     int image_max_tokens = -1;
     std::string mtmd_kq_type = "f32";
 
+    // PHASE46 B.5c: multi-GPU CLIP/mmproj configuration. CLI flags
+    // exposed as peers of the LM's --tensor-split / --split-mode
+    // family. Empty / default values fall back to the env-var path
+    // (MTMD_BACKEND_DEVICE / MTMD_TENSOR_SPLIT) for compat.
+    // Formal contract: PHASE46 §12.3 P1-P7 + specs/mgpu-split/.
+    std::string mmproj_devices;        // e.g. "CUDA0,CUDA1"
+    std::string mmproj_tensor_split;   // e.g. "1,1"
+    std::string mmproj_split_mode;     // e.g. "graph" (only graph supported in B.5)
+    bool mmproj_smf16 = true;          // P1: f16 cross-device exchange default ON
+    bool mmproj_smgs = false;          // P5: graph-scheduling control passthrough
+
     // embedding
     bool embedding         = false; // get only sentence embedding
     int32_t embd_normalize = 2;     // normalisation for embendings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
