@@ -4197,6 +4197,54 @@ static bool llm_load_tensors(
         }
     }
 
+    // PHASE46 B.4: populate model.mgpu_split_config from the
+    // just-assigned LM-side fields. Mirrors the same data that
+    // create_tensors_helper would otherwise build privately in B.3;
+    // moving the population here makes the struct available to ALL
+    // downstream consumers (LM-side and the future CLIP-side getter)
+    // from the moment llama_load_model_internal returns.
+    {
+        const int n_dev_canon   = (int) model.devices.size();
+        const int n_layer_canon = (int) hparams.n_layer;
+        model.mgpu_split_config = ggml_mgpu_split_config_make(
+            n_dev_canon > 0 ? n_dev_canon : 1, n_layer_canon);
+        model.mgpu_split_config.split_mode = static_cast<ggml_mgpu_split_mode>(model.split_mode);
+        model.mgpu_split_config.split_buft = model.split_buft;
+        for (int d = 0; d < n_dev_canon; ++d) {
+            model.mgpu_split_config.devices[d] = (int) model.devices[d];
+        }
+        for (int d = 0; d < (int) model.splits.size() &&
+                        d < model.mgpu_split_config.n_device; ++d) {
+            model.mgpu_split_config.splits[d] = model.splits[d];
+        }
+        // For single-device configs (no model.splits populated) set
+        // the trivial CDF [1.0] so SplitsNormalized holds at check time.
+        if (model.splits.empty() && model.mgpu_split_config.n_device == 1) {
+            model.mgpu_split_config.splits[0] = 1.0f;
+        }
+        for (int i = 0; i < n_layer_canon; ++i) {
+            model.mgpu_split_config.buft_layer[i].first  = model.buft_layer[i].buft_matrix;
+            model.mgpu_split_config.buft_layer[i].second = model.buft_layer[i].buft;
+            model.mgpu_split_config.default_layer_device[i] =
+                (int) model.default_layer_device[i];
+        }
+        model.mgpu_split_config.i_gpu_start = i_gpu_start;
+
+        const char * failed = nullptr;
+        int fails = ggml_mgpu_split_config_check(model.mgpu_split_config, &failed);
+        if (fails > 0) {
+            LLAMA_LOG_WARN("%s: mgpu_split_config check found %d failure(s), "
+                           "first: %s\n",
+                           __func__, fails, failed ? failed : "(null)");
+        } else {
+            LLAMA_LOG_INFO("%s: mgpu_split_config invariants PASS (n_device=%d, "
+                           "n_layer=%d, split_mode=%d)\n",
+                           __func__, model.mgpu_split_config.n_device,
+                           model.mgpu_split_config.n_layer,
+                           (int) model.mgpu_split_config.split_mode);
+        }
+    }
+
     if (!overrides.empty()) {
         auto & last = overrides.emplace_back();
         last.pattern = nullptr;

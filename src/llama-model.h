@@ -7,6 +7,7 @@
 #include "llama-hparams.h"
 
 #include "ggml-backend.h"
+#include "ggml-mgpu-split.h"
 
 #include <vector>
 #include <unordered_map>
@@ -494,6 +495,18 @@ struct llama_model {
 
     std::vector<float> splits;
     ggml_backend_buffer_type_t split_buft = nullptr;
+
+    // PHASE46 B.4: shared multi-GPU split-config struct. Populated by
+    // the buft-setup loop in src/llama.cpp once .splits, .split_buft,
+    // .devices, .buft_layer, .default_layer_device, .split_mode are
+    // all set. Mirrors those fields exactly; consumed by both LM
+    // (create_tensors_helper, B.3) and CLIP (B.5, via a getter on
+    // llama_model).
+    //
+    // Invariants asserted at populate time via
+    // ggml_mgpu_split_config_check (see ggml-mgpu-split.h).
+    // Formal contract: yarn-agentic specs/mgpu-split/MgpuSplitConfig.allium.
+    ggml_mgpu_split_config mgpu_split_config{};
 };
 
 struct llama_lora_weight {
