@@ -4570,6 +4570,76 @@ static inline uint64_t ggml_cuda_graph_now_us() {
     return (uint64_t) duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// PHASE_GRAPH_CACHE_ALLOC_AWARE_EVICTION (PHASE35 Step B):
+//
+// Before a cudaGraphInstantiate (either the first-time path or the
+// reinstantiate fallback after cudaGraphExecUpdate failure), check free
+// VRAM via cudaMemGetInfo. If below threshold, evict LRU cache entries
+// using the existing last_use_us field on ggml_cuda_graph until either
+// free meets threshold or only the protected (about-to-be-used)
+// topology remains. Destruction of the ggml_cuda_graph unique_ptr
+// releases the underlying cudaGraphExec + cudaGraph, returning working
+// memory to the CUDA pool.
+//
+// Default threshold 4096 MiB (env GGML_CUDA_GRAPH_MIN_FREE_MIB).
+// Set 0 to disable.
+//
+// Introduced 2026-05-25 to fix vision-encode OOM under multi-slice
+// loads on Qwen 3.6 27B + mmproj on 2× RTX 6000 (24 GiB each). The
+// existing FIFO eviction in ggml_cuda_get_graph only fires when the
+// cache hits its size cap; under our workload the OOM occurred well
+// before the cap with only ~10 entries cached, because individual
+// vision-encoder graph instantiates need significant transient
+// working memory beyond what cudaMemGetInfo's "free" can report
+// (cuBLAS workspace + pool fragmentation absorb the difference).
+// See PHASE35-GRAPH-CACHE-REDESIGN.md §"Step B".
+static size_t ggml_cuda_graph_min_free_bytes() {
+    static const size_t cached = []() -> size_t {
+        const char * env = getenv("GGML_CUDA_GRAPH_MIN_FREE_MIB");
+        long long v = 4096;  // 4 GiB default
+        if (env && *env) {
+            long long u = atoll(env);
+            if (u >= 0) v = u;
+        }
+        return (size_t) v * 1024ull * 1024ull;
+    }();
+    return cached;
+}
+
+static void ggml_cuda_evict_for_pressure(ggml_backend_cuda_context & ctx, uint64_t protect_key) {
+    const size_t min_free = ggml_cuda_graph_min_free_bytes();
+    if (min_free == 0) return;                       // explicitly disabled
+    if (ctx.cuda_graphs.size() <= 1) return;         // nothing to evict (or only the protected entry remains)
+
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    if (free_b >= min_free) return;                  // already above threshold; no eviction needed
+
+    // Build (last_use_us, topology_key) pairs for every entry EXCEPT the
+    // protect_key. Sort ascending so the oldest entries get evicted first.
+    std::vector<std::pair<uint64_t, uint64_t>> by_age;
+    by_age.reserve(ctx.cuda_graphs.size());
+    for (const auto & kv : ctx.cuda_graphs) {
+        if (kv.first == protect_key) continue;
+        if (!kv.second) continue;
+        by_age.emplace_back(kv.second->last_use_us, kv.first);
+    }
+    std::sort(by_age.begin(), by_age.end());
+
+    for (const auto & p : by_age) {
+        const bool probe = cuda_graph_probe::active();
+        const int64_t f_before = (int64_t) free_b;
+        ctx.cuda_graphs.erase(p.second);             // destructor releases cudaGraphExec + cudaGraph
+        cudaMemGetInfo(&free_b, &total_b);
+        if (probe) {
+            cuda_graph_probe::record_vram(ctx, p.second, "evict_pressure",
+                                          f_before, (int64_t) free_b);
+        }
+        if (free_b >= min_free) break;
+        if (ctx.cuda_graphs.size() <= 1) break;
+    }
+}
+
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, uint64_t topology_key, ggml_cgraph * cgraph) {
     auto it = ctx.cuda_graphs.find(topology_key);
     if (it != ctx.cuda_graphs.end()) {
@@ -4836,6 +4906,10 @@ static void update_cuda_graph_executable(ggml_cuda_graph * graph) {
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        // PHASE_GRAPH_CACHE_ALLOC_AWARE_EVICTION: relieve VRAM pressure before
+        // the reinstantiate. protect_key is this graph's own topology — don't
+        // evict ourselves.
+        if (graph->owner_ctx) ggml_cuda_evict_for_pressure(*graph->owner_ctx, graph->topology_key);
         auto t2 = std::chrono::steady_clock::now();
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         if (probe) {
@@ -4951,12 +5025,15 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             }
             {
                 const bool probe_inst = cuda_graph_probe::active();
-                int64_t free_before = 0, total = 0;
+                int64_t free_before = 0;
                 if (probe_inst) {
                     cudaDeviceSynchronize();
                     size_t f = 0, t = 0;
-                    cudaMemGetInfo(&f, &t); free_before = (int64_t) f; (void) total;
+                    cudaMemGetInfo(&f, &t); free_before = (int64_t) f; (void) t;
                 }
+                // PHASE_GRAPH_CACHE_ALLOC_AWARE_EVICTION: free VRAM headroom
+                // before the first-time instantiate of this topology.
+                ggml_cuda_evict_for_pressure(*cuda_ctx, graph->topology_key);
                 auto t0 = std::chrono::steady_clock::now();
                 CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
                 if (probe_inst) {
