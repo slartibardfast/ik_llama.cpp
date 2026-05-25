@@ -10457,9 +10457,17 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
 
     data_ctx.read_kv_cache(ctx, dest_seq_id, flags);
 
-    // PHASE_HYBRID_CHECKPOINT §5.8 Option A: tell the next llama_decode to
-    // skip its defrag-trigger check. See llama-context.h:skip_next_defrag and
-    // the defrag suppress block in llama_decode_internal for rationale.
+    // PHASE_HYBRID_CHECKPOINT §5.8 Option A. Two-part fence around the restore:
+    //  1. Cancel any defrag that was queued BEFORE the restore. It was queued
+    //     for the pre-restore cell/extra layout; running it now crashes in
+    //     build_defrag → ggml_view_3d (the original 2026-05-25 SEGV signature).
+    //     The first production-binding test of just-skip_next_defrag missed
+    //     this case because the pre-restore turn ended with fragmentation:0.15
+    //     queueing do_defrag=true, then the post-restore decode consumed it.
+    //  2. Suppress the NEXT defrag-trigger check so we don't immediately
+    //     re-queue. See llama-context.h:skip_next_defrag and the defrag
+    //     suppress block in llama_decode_internal.
+    ctx->transformer_kv.do_defrag        = false;
     ctx->transformer_kv.skip_next_defrag = true;
 
     return data_ctx.get_size_read();
