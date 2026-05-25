@@ -6701,13 +6701,25 @@ static int llama_decode_internal(
 
     // decide if we need to defrag the kv cache
     if (cparams.causal_attn && cparams.defrag_thold >= 0.0f) {
-        const float fragmentation = transformer_kv.n >= 128 ? 1.0f - float(transformer_kv.used)/float(transformer_kv.n) : 0.0f;
+        // PHASE_HYBRID_CHECKPOINT §5.8 Option A: suppress one defrag-trigger check
+        // immediately after a state restore. The restore leaves split-tensor
+        // descriptors in a state build_defrag cannot walk (verified 2026-05-25
+        // binding test: SIGSEGV in ggml_new_tensor_impl ← ggml_view_3d ← build_defrag
+        // on the first decode call after restore + kv_cache_seq_rm at p0=1536 +
+        // fragmentation 0.50). One decode batch is enough for the descriptors to
+        // settle on their post-restore layout.
+        if (transformer_kv.skip_next_defrag) {
+            LLAMA_LOG_INFO("defrag suspended for one decode batch (post-restore)\n");
+            transformer_kv.skip_next_defrag = false;
+        } else {
+            const float fragmentation = transformer_kv.n >= 128 ? 1.0f - float(transformer_kv.used)/float(transformer_kv.n) : 0.0f;
 
-        // queue defragmentation for next llama_kv_cache_update
-        if (fragmentation > cparams.defrag_thold) {
-            LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
+            // queue defragmentation for next llama_kv_cache_update
+            if (fragmentation > cparams.defrag_thold) {
+                LLAMA_LOG_INFO("fragmentation: %.2f\n", fragmentation);
 
-            llama_kv_cache_defrag(transformer_kv);
+                llama_kv_cache_defrag(transformer_kv);
+            }
         }
     }
 
@@ -10444,6 +10456,11 @@ static size_t llama_state_seq_set_data_internal(struct llama_context * ctx, llam
     llama_synchronize(ctx);
 
     data_ctx.read_kv_cache(ctx, dest_seq_id, flags);
+
+    // PHASE_HYBRID_CHECKPOINT §5.8 Option A: tell the next llama_decode to
+    // skip its defrag-trigger check. See llama-context.h:skip_next_defrag and
+    // the defrag suppress block in llama_decode_internal for rationale.
+    ctx->transformer_kv.skip_next_defrag = true;
 
     return data_ctx.get_size_read();
 }

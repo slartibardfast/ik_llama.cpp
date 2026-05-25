@@ -43,6 +43,13 @@ struct llama_kv_cache {
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
 
+    // PHASE_HYBRID_CHECKPOINT: skip one defrag-trigger check after a state restore.
+    // Setting do_defrag=true here would crash in build_defrag → ggml_view_3d on the
+    // post-restore decode (split-tensor descriptors aren't in a state defrag can
+    // walk). Set true at the end of read_kv_cache; cleared by the defrag-trigger
+    // block in llama_decode_internal on the next decode batch.
+    bool skip_next_defrag = false;
+
     // Note: The value of head isn't only used to optimize searching
     // for a free KV slot. llama_decode_internal also uses it, so it
     // cannot be freely changed after a slot has been allocated.
