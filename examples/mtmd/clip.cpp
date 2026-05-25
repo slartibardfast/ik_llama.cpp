@@ -8,6 +8,7 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-mgpu-split.h"  // PHASE46 B.5b: shared multi-GPU split infra
 //#include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -454,11 +455,38 @@ struct clip_model {
     }
 };
 
+// PHASE46 B.5b: per-tensor split state for mmproj weights row-chunked
+// across multiple devices. Mirrors src/llama-impl.h's llama_split_tensor
+// (same shape, just no llama_ prefix because this is mtmd-local). Owned
+// by clip_ctx::split_tensors so the .ggml pointer survives weight load.
+struct clip_split_tensor {
+    std::vector<ggml_tensor *> tensor_splits;   // per-device sub-tensors
+    ggml_split_tensor_t        ggml;            // C-level extra (parent->extra points here)
+};
+
 struct clip_ctx {
     clip_model model;
 
     gguf_context_ptr ctx_gguf;
     ggml_context_ptr ctx_data;
+
+    // PHASE46 B.5b: second ctx holding mmproj matmul weights that
+    // get row-chunked across devices via ggml_backend_cuda_split_buffer_type.
+    // Allocated separately (alloc_ctx_tensors_from_buft against the split
+    // buft) so each tensor's pre-populated `extra` is consulted at alloc
+    // time. 1D tensors (norms, biases) and small 2D tensors stay in
+    // ctx_data and live single-device on backend_ptrs[0]'s default buft.
+    ggml_context_ptr ctx_data_split;
+    ggml_backend_buffer_ptr buf_split;
+
+    // Owns the per-tensor split state. unique_ptr for stable extra ptr.
+    std::vector<std::unique_ptr<clip_split_tensor>> split_tensors;
+
+    // PHASE46 B.5b: per-device byte counter consumed by
+    // ggml_mgpu_create_split's mem-balance logic. Updated as each split
+    // tensor is allocated. Length = number of CUDA devices in
+    // backend_ptrs (excludes CPU fallback).
+    std::vector<size_t> mem_used_per_device;
 
     std::vector<uint8_t> buf_compute_meta;
 
@@ -3416,8 +3444,11 @@ struct clip_model_loader {
         }
 
         // create data context
+        // PHASE46 B.5b: mem_size doubled because we host two ctxs
+        // (ctx_data + ctx_data_split) whose total tensor headers can
+        // approach the gguf-tensor count in the multi-backend path.
         struct ggml_init_params params = {
-            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
+            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead() * 2,
             /*.mem_buffer =*/ NULL,
             /*.no_alloc =*/ true,
         };
@@ -3425,6 +3456,78 @@ struct clip_model_loader {
         if (!ctx_clip.ctx_data) {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
+
+        // PHASE46 B.5b: multi-device weight residency. We use the
+        // ik fork's row-chunked split via ggml_backend_cuda_split_buffer_type
+        // when multi-backend CLIP was requested AND we have >= 2 CUDA
+        // backends in backend_ptrs. Per-tensor decision: 2D matmul
+        // weights large enough to matter go into ctx_data_split (with
+        // per-tensor split sub-tensors pre-allocated); everything else
+        // stays in ctx_data on backend_ptrs[0]'s default buft.
+        //
+        // Splittable predicate: ndims >= 2 AND ne[0] >= 256 AND ne[1] >= 256
+        // AND nbytes >= 1 MiB. Captures attn / ffn matmul weights and
+        // excludes norms, biases, small embeddings.
+        bool multi_gpu_mmproj = false;
+        size_t n_cuda_in_ptrs = 0;
+#ifdef GGML_USE_CUDA
+        for (auto * bk : ctx_clip.backend_ptrs) {
+            if (bk == ctx_clip.backend_cpu) continue;
+            if (ggml_backend_is_cuda(bk)) ++n_cuda_in_ptrs;
+        }
+        if (n_cuda_in_ptrs >= 2 && std::getenv("MTMD_BACKEND_DEVICE")) {
+            multi_gpu_mmproj = true;
+            ctx_clip.ctx_data_split.reset(ggml_init(params));
+            if (!ctx_clip.ctx_data_split) {
+                throw std::runtime_error(string_format("%s: failed to init split ggml context\n", __func__));
+            }
+            ctx_clip.mem_used_per_device.assign(n_cuda_in_ptrs, 0);
+            LOG_INF("%s: B.5b multi-device weight residency enabled (n_cuda=%zu)\n",
+                    __func__, n_cuda_in_ptrs);
+        }
+#endif
+
+        // PHASE46 B.5b helper: build a splits CDF for n_cuda_in_ptrs
+        // devices (default: even). Replaceable via MTMD_TENSOR_SPLIT
+        // env var (comma-separated floats; converted to cumulative).
+        std::vector<float> mmproj_splits;
+        if (multi_gpu_mmproj) {
+            mmproj_splits.resize(n_cuda_in_ptrs, 0.0f);
+            const char * split_env = std::getenv("MTMD_TENSOR_SPLIT");
+            std::vector<float> raw;
+            if (split_env) {
+                std::string s(split_env);
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    if (comma == std::string::npos) comma = s.size();
+                    try { raw.push_back(std::stof(s.substr(pos, comma - pos))); } catch (...) {}
+                    pos = comma + 1;
+                }
+            }
+            if (raw.size() != n_cuda_in_ptrs || raw.empty()) {
+                // Default even distribution.
+                for (size_t i = 0; i < n_cuda_in_ptrs; ++i) raw.push_back(1.0f);
+                if (raw.size() > n_cuda_in_ptrs) raw.resize(n_cuda_in_ptrs);
+            }
+            float total = 0;
+            for (auto v : raw) total += (v > 0 ? v : 0);
+            if (total <= 0) total = 1.0f;
+            float cum = 0;
+            for (size_t i = 0; i < n_cuda_in_ptrs; ++i) {
+                cum += raw[i] / total;
+                mmproj_splits[i] = cum;
+            }
+            mmproj_splits.back() = 1.0f;  // belt-and-suspenders for SplitsNormalized
+        }
+
+        // PHASE46 B.5b: splittable predicate.
+        auto is_splittable = [](const ggml_tensor * t) {
+            if (ggml_n_dims(t) < 2) return false;
+            if (t->ne[0] < 256 || t->ne[1] < 256) return false;
+            if (ggml_nbytes(t) < (1u << 20)) return false;  // 1 MiB
+            return true;
+        };
 
         // helper function
         auto get_tensor = [&](const std::string & name, bool required = true) {
@@ -3434,9 +3537,54 @@ struct clip_model_loader {
             }
             if (cur) {
                 tensors_to_load.push_back(cur);
-                // add tensors to context
-                ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_data.get(), cur);
+
+                // PHASE46 B.5b decision: which ctx + split decoration?
+                ggml_context * target_ctx = ctx_clip.ctx_data.get();
+                bool do_split = multi_gpu_mmproj && is_splittable(cur);
+                if (do_split) {
+                    target_ctx = ctx_clip.ctx_data_split.get();
+                }
+
+                ggml_tensor * data_tensor = ggml_dup_tensor(target_ctx, cur);
                 ggml_set_name(data_tensor, cur->name);
+
+                if (do_split) {
+                    // Row-chunk along dim 0 across n_cuda_in_ptrs devices.
+                    // Use ggml_mgpu_create_split to compute the chunk
+                    // counts biased by current mem_used. The chunks must
+                    // be a multiple of MATRIX_ROW_PADDING (128); we use
+                    // 1 as granularity here since per-row alignment is
+                    // handled inside the split buft's get_alloc_size.
+                    std::vector<int> split_counts(n_cuda_in_ptrs, 0);
+                    ggml_mgpu_create_split(
+                        (int) cur->ne[0],  // total rows to distribute
+                        1,                  // granularity (handled downstream)
+                        n_cuda_in_ptrs,
+                        mmproj_splits.data(),
+                        ctx_clip.mem_used_per_device.data(),
+                        0,                  // verbose
+                        split_counts.data());
+
+                    auto st = std::make_unique<clip_split_tensor>();
+                    st->tensor_splits.assign(n_cuda_in_ptrs, nullptr);
+                    ggml_mgpu_alloc_split_tensors(
+                        /*split_dim=*/ 0,
+                        target_ctx,
+                        data_tensor,
+                        n_cuda_in_ptrs,
+                        split_counts.data(),
+                        st->tensor_splits.data(),
+                        ctx_clip.mem_used_per_device.data());
+
+                    st->ggml.n_device  = (int) n_cuda_in_ptrs;
+                    st->ggml.split_dim = 0;
+                    st->ggml.tensor    = data_tensor;
+                    st->ggml.splits    = st->tensor_splits.data();
+                    data_tensor->extra = (void *) &st->ggml;
+
+                    ctx_clip.split_tensors.push_back(std::move(st));
+                }
+
                 cur = data_tensor;
             }
             return cur;
@@ -3804,19 +3952,59 @@ struct clip_model_loader {
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            // PHASE46 B.5b: allocate the split context (if any) against
+            // the CUDA split buffer type. Each split tensor's pre-populated
+            // ->extra (set during get_tensor) drives the per-device
+            // sub-allocations inside the split buft's init_tensor.
+#ifdef GGML_USE_CUDA
+            if (ctx_clip.ctx_data_split) {
+                ggml_backend_buffer_type_t split_buft =
+                    ggml_backend_cuda_split_buffer_type(mmproj_splits.data());
+                ctx_clip.buf_split.reset(
+                    ggml_backend_alloc_ctx_tensors_from_buft(
+                        ctx_clip.ctx_data_split.get(), split_buft));
+                if (!ctx_clip.buf_split) {
+                    throw std::runtime_error(
+                        "PHASE46 B.5b: failed to allocate split buffer for mmproj");
+                }
+                ggml_backend_buffer_set_usage(ctx_clip.buf_split.get(),
+                                              GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                LOG_INF("%s: B.5b split-buf allocated, %zu split tensors\n",
+                        __func__, ctx_clip.split_tensors.size());
+            }
+#endif
+
             for (auto & t : tensors_to_load) {
+                // PHASE46 B.5b: look up in BOTH ctxs (ctx_data first,
+                // fall through to ctx_data_split). The data load is
+                // identical regardless of which ctx the tensor lives in
+                // — ggml_backend_tensor_set respects the tensor's
+                // assigned buffer.
                 ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+                bool from_split_ctx = false;
+                if (!cur && ctx_clip.ctx_data_split) {
+                    cur = ggml_get_tensor(ctx_clip.ctx_data_split.get(), t->name);
+                    from_split_ctx = (cur != nullptr);
+                }
+                if (!cur) {
+                    throw std::runtime_error(string_format(
+                        "PHASE46 B.5b: tensor %s not found in either ctx", t->name));
+                }
                 const size_t offset = tensor_offset[t->name];
                 fin.seekg(offset, std::ios::beg);
                 if (!fin) {
                     throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                 }
                 size_t num_bytes = ggml_nbytes(cur);
-                if (ggml_backend_buft_is_host(buft)) {
-                    // for the CPU and Metal backend, we can read directly into the tensor
+                // For split tensors (from_split_ctx + cur->extra set),
+                // ggml_backend_tensor_set routes through the split buft's
+                // per-device writers. For host-mapped bufts (CPU/Metal),
+                // direct memcpy. Otherwise read-buf + tensor_set.
+                bool host_buft = ggml_backend_buft_is_host(buft);
+                if (!from_split_ctx && host_buft) {
                     fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
                 } else {
-                    // read into a temporary buffer first, then copy to device memory
                     read_buf.resize(num_bytes);
                     fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
