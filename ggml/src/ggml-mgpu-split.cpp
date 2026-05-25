@@ -181,3 +181,128 @@ void ggml_mgpu_alloc_split_tensors(
 }
 
 } // extern "C"
+
+// ============================================================
+// ggml_mgpu_split_config helpers (PHASE46 B.2; C++ linkage)
+// ============================================================
+
+ggml_mgpu_split_config ggml_mgpu_split_config_make(int n_device, int n_layer) {
+    GGML_ASSERT(n_device >= 1);
+    GGML_ASSERT(n_layer  >= 0);
+
+    ggml_mgpu_split_config cfg;
+    cfg.n_device = n_device;
+    cfg.devices.assign(n_device, 0);
+    cfg.capacity_per_device.assign(n_device, 0);
+    cfg.mem_used_per_device.assign(n_device, 0);
+    cfg.splits.assign(n_device, 0.0f);
+    cfg.split_buft = nullptr;
+    cfg.split_mode = GGML_MGPU_SPLIT_MODE_NONE;
+    cfg.n_layer = n_layer;
+    cfg.i_gpu_start = 0;
+    cfg.buft_layer.assign(n_layer, {nullptr, nullptr});
+    cfg.default_layer_device.assign(n_layer, -1);
+    return cfg;
+}
+
+int ggml_mgpu_split_config_check(const ggml_mgpu_split_config & cfg,
+                                  const char ** out_failed_invariant_name) {
+    int failures = 0;
+    auto fail = [&](const char * name) {
+        if (failures == 0 && out_failed_invariant_name) {
+            *out_failed_invariant_name = name;
+        }
+        ++failures;
+    };
+
+    // @DevicesNonEmpty
+    if (cfg.n_device < 1) fail("DevicesNonEmpty");
+
+    // @ListLengthsMatchNDevice
+    if ((int) cfg.devices.size()              != cfg.n_device ||
+        (int) cfg.capacity_per_device.size()  != cfg.n_device ||
+        (int) cfg.mem_used_per_device.size()  != cfg.n_device ||
+        (int) cfg.splits.size()               != cfg.n_device) {
+        fail("ListLengthsMatchNDevice");
+    }
+
+    // @LayerListLengthsMatchNLayer
+    if ((int) cfg.buft_layer.size()           != cfg.n_layer ||
+        (int) cfg.default_layer_device.size() != cfg.n_layer) {
+        fail("LayerListLengthsMatchNLayer");
+    }
+
+    // @SplitsMonotonic
+    for (int i = 0; i + 1 < cfg.n_device; ++i) {
+        if (cfg.splits[i] > cfg.splits[i + 1]) {
+            fail("SplitsMonotonic");
+            break;
+        }
+    }
+
+    // @SplitsNormalized — splits ends at 1.0, all values in [0, 1].
+    // Use a small epsilon for the upper-bound check because float
+    // parsing of "1,1" may produce 0.99999... at the last entry.
+    if (cfg.n_device >= 1) {
+        const float eps = 1e-5f;
+        if (cfg.splits[cfg.n_device - 1] < 1.0f - eps ||
+            cfg.splits[cfg.n_device - 1] > 1.0f + eps) {
+            fail("SplitsNormalized");
+        }
+        for (int i = 0; i < cfg.n_device; ++i) {
+            if (cfg.splits[i] < -eps || cfg.splits[i] > 1.0f + eps) {
+                fail("SplitsNormalized");
+                break;
+            }
+        }
+    }
+
+    // @SplitBuftPresentIffGraphLikeAndMultiDevice
+    bool graph_like_multi = (cfg.n_device > 1) &&
+                            (cfg.split_mode == GGML_MGPU_SPLIT_MODE_ATTN ||
+                             cfg.split_mode == GGML_MGPU_SPLIT_MODE_GRAPH);
+    if (graph_like_multi != (cfg.split_buft != nullptr)) {
+        fail("SplitBuftPresentIffGraphLikeAndMultiDevice");
+    }
+
+    // @LayerDeviceInRange
+    for (int i = 0; i < cfg.n_layer; ++i) {
+        int d = cfg.default_layer_device[i];
+        if (d != -1 && (d < 0 || d >= cfg.n_device)) {
+            fail("LayerDeviceInRange");
+            break;
+        }
+        if (i < cfg.i_gpu_start && d != -1) {
+            fail("LayerDeviceInRange");
+            break;
+        }
+        if (i >= cfg.i_gpu_start && d == -1) {
+            fail("LayerDeviceInRange");
+            break;
+        }
+    }
+
+    // @CapacityHonored — mem_used <= capacity. (Non-strict so this
+    // check passes at construction time when both are zero.)
+    for (int i = 0; i < cfg.n_device; ++i) {
+        if (cfg.mem_used_per_device[i] > cfg.capacity_per_device[i] &&
+            cfg.capacity_per_device[i] > 0) {
+            fail("CapacityHonored");
+            break;
+        }
+    }
+
+    // @NoOrphanGpuLayers
+    for (int i = cfg.i_gpu_start; i < cfg.n_layer; ++i) {
+        if (cfg.buft_layer[i].second == nullptr) {
+            fail("NoOrphanGpuLayers");
+            break;
+        }
+        if (graph_like_multi && cfg.buft_layer[i].first != cfg.split_buft) {
+            fail("NoOrphanGpuLayers");
+            break;
+        }
+    }
+
+    return failures;
+}
