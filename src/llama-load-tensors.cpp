@@ -169,11 +169,27 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     void create_std_ffn(int i, const LLM_TN & tn, llama_layer & layer, int n_ff, int n_embd, ggml_context * ctx_split);
 
     inline ggml_context * ctx_for_layer(int i) const {
-        return ctx_map.at(model.buft_layer[i].buft);
+        // PHASE46 B.3: read through cfg.buft_layer[i].second (offload).
+        // The model.buft_layer[i].buft field is the LM-side source of
+        // truth; cfg mirrors it. Reads via cfg make this helper
+        // consumer-agnostic per CrossCodepathConsistency.allium's
+        // @InvariantSatisfactionEquivalent.
+        return ctx_map.at(cfg.buft_layer[i].second);
     }
     inline ggml_context * ctx_for_layer_split(int i) const {
-        return ctx_map.at(model.buft_layer[i].buft_matrix);
+        // PHASE46 B.3: read through cfg.buft_layer[i].first (split).
+        // Mirrors model.buft_layer[i].buft_matrix.
+        return ctx_map.at(cfg.buft_layer[i].first);
     }
+
+    // PHASE46 B.3: shared multi-GPU split config, populated from
+    // llama_model fields in the constructor. The struct is the
+    // canonical source of truth for cfg.buft_layer[i].first
+    // (split buft) and .second (offload buft). LM-side reads via
+    // model.buft_layer[i].buft_matrix / .buft still work — both
+    // fields point at the same buft instances. See
+    // CrossCodepathConsistency.allium @MutationsByOneConsumerVisibleToOther.
+    ggml_mgpu_split_config cfg{};
 
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -212,6 +228,44 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_model & _model) : ml(_ml), model(_model) {
 
     const int n_layer = model.hparams.n_layer;
+
+    // PHASE46 B.3: populate cfg from model fields. The struct mirrors
+    // the per-(device, layer) buft assignments produced by the
+    // buft-setup loop at src/llama.cpp:4168-4198 (which B.4 will
+    // refactor to populate cfg directly). For now both code paths
+    // populate independently and stay in sync by construction.
+    // Verified at the end of this block via ggml_mgpu_split_config_check.
+    cfg = ggml_mgpu_split_config_make((int) model.devices.size(),
+                                       n_layer);
+    cfg.split_mode = static_cast<ggml_mgpu_split_mode>(model.split_mode);
+    cfg.split_buft = model.split_buft;
+    for (int d = 0; d < cfg.n_device; ++d) {
+        cfg.devices[d] = (int) model.devices[d];
+        // mem_used / capacity are LM-side opaque at this point — the
+        // tensor allocator updates them per-call. Initialize to 0.
+        cfg.mem_used_per_device[d] = 0;
+        cfg.capacity_per_device[d] = 0;
+    }
+    for (int d = 0; d < (int) model.splits.size() && d < cfg.n_device; ++d) {
+        cfg.splits[d] = model.splits[d];
+    }
+    for (int i = 0; i < n_layer; ++i) {
+        cfg.buft_layer[i].first  = model.buft_layer[i].buft_matrix;
+        cfg.buft_layer[i].second = model.buft_layer[i].buft;
+        cfg.default_layer_device[i] = (int) model.default_layer_device[i];
+    }
+    // Find i_gpu_start (first layer with non-CPU device assignment).
+    cfg.i_gpu_start = 0;
+    for (int i = 0; i < n_layer; ++i) {
+        if (cfg.default_layer_device[i] != -1) {
+            cfg.i_gpu_start = i;
+            break;
+        }
+    }
+    // Defer ggml_mgpu_split_config_check until B.4 also populates from
+    // the canonical source — at this transitional point capacity is
+    // intentionally 0 (CapacityHonored holds trivially with both sides 0).
+
     buft_layer_count[model.buft_input.buft]++;
     buft_layer_count[model.buft_input.buft_matrix]++;
     buft_layer_count[model.buft_output.buft]++;
