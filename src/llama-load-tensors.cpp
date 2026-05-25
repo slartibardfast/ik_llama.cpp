@@ -3,6 +3,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "ggml.h"
+#include "ggml-mgpu-split.h"
 
 
 #include <set>
@@ -348,68 +349,22 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     }
 }
 
-static std::vector<int> create_split(int nr, int granularity, const std::vector<float> & splits, const std::vector<size_t> & mem_used,
-        bool verbose = false) {
-    GGML_ASSERT(nr % granularity == 0);
+// PHASE46 B.1 (2026-05-25): create_split() now forwards to the shared
+// ggml_mgpu_create_split() in ggml/src/ggml-mgpu-split.cpp. The behavior
+// is byte-equivalent — CreateSplitBalance.tla verifies termination,
+// non-negativity, and the sum invariant for the same algorithm.
+// CLIP (clip.cpp) consumes the shared header directly without going
+// through this LM-side wrapper.
+static std::vector<int> create_split(int nr, int granularity,
+                                     const std::vector<float> & splits,
+                                     const std::vector<size_t> & mem_used,
+                                     bool verbose = false) {
     GGML_ASSERT(!splits.empty());
-    if (granularity < 0) return std::vector<int>(splits.size(), nr);
     GGML_ASSERT(mem_used.size() == splits.size());
-    size_t tot_memory_used = 1;
-    for (auto & mem : mem_used) tot_memory_used += mem;
-    int nchunk = nr / granularity;
-    std::vector<int> result(splits.size());
-    float last_split = 0;
-    int sum = 0;
-    if (verbose) LLAMA_LOG_INFO("--- %s: %d chunks\n", __func__, nchunk);
-    for (int i = 0; i < (int)splits.size(); ++i) {
-        float p = splits[i] - last_split;
-        float p0 = p;
-        p += (p - 1.f*mem_used[i]/tot_memory_used);
-        result[i] = roundf(p*nchunk);
-        if (result[i] < 0) result[i] = 0;
-        if (verbose) LLAMA_LOG_INFO("i = %d, p0 = %g, p = %g, result = %d\n", i, p0, p, result[i]);
-        sum += result[i];
-        last_split = splits[i];
-    }
-    while (sum > nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            if (result[i] > 0) {
-                float p = splits[i] - last_split;
-                p += (p - 1.f*mem_used[i]/tot_memory_used);
-                float n_want = p*nchunk;
-                float err = result[i] - n_want;
-                if (err > best_err) {
-                    best_err = err; ibest = i;
-                }
-            }
-            last_split = splits[i];
-        }
-        GGML_ASSERT(ibest >= 0 && result[ibest] > 0);
-        --result[ibest];
-        --sum;
-    }
-    while (sum < nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            float p = splits[i] - last_split;
-            p += (p - 1.f*mem_used[i]/tot_memory_used);
-            float n_want = p*nchunk;
-            float err = n_want - result[i];
-            if (err > best_err) {
-                best_err = err; ibest = i;
-            }
-            last_split = splits[i];
-        }
-        GGML_ASSERT(ibest >= 0);
-        ++result[ibest];
-        ++sum;
-    }
-    for (auto & r : result) r *= granularity;
+    std::vector<int> result(splits.size(), 0);
+    ggml_mgpu_create_split(nr, granularity, splits.size(),
+                           splits.data(), mem_used.data(),
+                           verbose ? 1 : 0, result.data());
     return result;
 }
 

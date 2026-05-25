@@ -1533,9 +1533,11 @@ add_library(ggml
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
+            ../include/ggml-mgpu-split.h
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-mgpu-split.cpp
             ggml-quants.c
             ggml-quants.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
