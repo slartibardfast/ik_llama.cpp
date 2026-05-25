@@ -3512,9 +3512,20 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 [&](const auto & cur) {
                     // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                     if (has_recurrent) {
-                        // recurrent/hybrid: only whole-prefix checkpoints are valid; pick the latest one
-                        // that covers no more than the current n_past and still leaves tokens to decode.
-                        return cur.pos_max <= slot.n_past && cur.pos_max < pos_next;
+                        // 2026-05-25: hybrid/recurrent restore is structurally unsound in this fork.
+                        // The validity check below (cur.pos_max <= slot.n_past && cur.pos_max < pos_next)
+                        // lets the apply_checkpoint() lookup succeed and the post-restore decode then
+                        // SIGSEGVs ~13 s later (signal 11) during the post-restore delta-prefill / decode.
+                        // The 149.6 MiB blob produced by llama_state_seq_get_data(..., PARTIAL_ONLY) is
+                        // ~3x larger than the expected single-seq SSM-state math (~52 MB for 64 layers
+                        // × ~817 KB s_l per layer at --parallel 1), pointing at a multi-seq / sizing
+                        // mismatch on save vs restore that the in-place validity check cannot detect.
+                        // Force the safe "no usable hybrid/recurrent checkpoint; forcing full prompt
+                        // re-processing" path at line 3548 until the Phase-2 diagnosis lands in
+                        // PHASE_HYBRID_CHECKPOINT.md and a Phase-3 fix (targeted in-place patch,
+                        // Phase-45-aligned llama_decoder::recurrent_state_save/restore split, or
+                        // last-resort llama_memory_hybrid backport) is decided and verified.
+                        return false;
                     }
                     return cur.pos_min < pos_min_thold;
                 }
