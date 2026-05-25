@@ -5851,6 +5851,24 @@ GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, si
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+GGML_CALL bool ggml_backend_cuda_can_access_peer(int from_device, int to_device) {
+    // PHASE46 B.5 P2: explicit peer-access check before multi-GPU CLIP
+    // init proceeds. Mirrors the static ggml_cuda_set_peer_access check
+    // at line 2008 but exposes the result to non-CUDA callers (clip.cpp)
+    // through the public ggml-cuda.h API.
+    if (from_device == to_device) {
+        return true;  // trivially "peer" with self
+    }
+    int can_access_peer = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_access_peer, from_device, to_device);
+    if (err != cudaSuccess) {
+        // clear the error so subsequent CUDA calls aren't poisoned
+        cudaGetLastError();
+        return false;
+    }
+    return can_access_peer != 0;
+}
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;

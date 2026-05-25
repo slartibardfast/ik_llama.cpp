@@ -41,6 +41,15 @@ GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t *
 GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// PHASE46 B.5 P2: peer-access verification. Returns true iff
+// cudaDeviceCanAccessPeer(from_device, to_device) returns true at the
+// driver level. Multi-GPU CLIP under tensor-split requires this on
+// every (from, to) pair in the participating device set; an explicit
+// check at init time gives a clean error rather than a cryptic
+// failure during the first cross-device transfer. Formal contract:
+// yarn-agentic specs/mgpu-split/ClipCrossDeviceFlow.tla.
+GGML_API GGML_CALL bool ggml_backend_cuda_can_access_peer(int from_device, int to_device);
+
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
 // Number of cached CUDA graphs currently held by this backend's context. The

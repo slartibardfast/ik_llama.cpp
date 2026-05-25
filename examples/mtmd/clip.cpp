@@ -491,26 +491,101 @@ struct clip_ctx {
         LOG_INF("%s: have %d back-ends:\n", __func__, n_backend);
         for (int i = 0; i < n_backend; ++i) printf("  %d:  %s\n", i, ggml_backend_reg_get_name(i));
         if (ctx_params.use_gpu) {
+            // PHASE46 B.5: parse MTMD_BACKEND_DEVICE as a comma-separated
+            // device list. Single-device strings (e.g. "CUDA0") preserve
+            // the prior behavior. Multi-device strings (e.g. "CUDA0,CUDA1")
+            // initialize one backend per token, all pushed into backend_ptrs
+            // before the sched is constructed. Multi-GPU CLIP is realized
+            // by the row-chunked weight allocation in the weight-loader
+            // path; the sched then partitions the compute graph across
+            // the registered backends.
+            //
+            // PHASE46 B.5 P2 (HARD): for multi-device init, every (from, to)
+            // pair must have CUDA peer access. Verified before sched
+            // construction; refusal to start on failure.
+            //
+            // Formal contract: yarn-agentic specs/mgpu-split/ClipCrossDeviceFlow.tla
+            // (extends AsyncReduce.tla for the CLIP topology).
             auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
-                //backend = ggml_backend_init_by_name(backend_name, nullptr);
-                backend = ggml_backend_reg_init_backend_from_str(backend_name);
-                if (!backend) {
-                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                std::string spec(backend_name);
+                std::vector<std::string> tokens;
+                size_t pos = 0;
+                while (pos < spec.size()) {
+                    size_t comma = spec.find(',', pos);
+                    if (comma == std::string::npos) comma = spec.size();
+                    auto tok = spec.substr(pos, comma - pos);
+                    if (!tok.empty()) tokens.push_back(tok);
+                    pos = comma + 1;
+                }
+                if (tokens.size() >= 2) {
+                    LOG_INF("%s: multi-backend init: %d devices requested\n",
+                            __func__, (int) tokens.size());
+                }
+                for (auto & tok : tokens) {
+                    ggml_backend_t bk = ggml_backend_reg_init_backend_from_str(tok.c_str());
+                    if (!bk) {
+                        LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend\n",
+                                __func__, tok.c_str());
+                        continue;
+                    }
+                    LOG_INF("%s: CLIP back-end registered: %s\n", __func__, tok.c_str());
+                    backend_ptrs.push_back(bk);
+                    backend_buft.push_back(ggml_backend_get_default_buffer_type(bk));
+                    if (!backend) backend = bk;  // first becomes primary
+                }
+                if (backend_ptrs.size() >= 2) {
+                    // P2 gate: peer-access verification between every pair.
+                    // Extract CUDA device IDs from token strings "CUDAN".
+#ifdef GGML_USE_CUDA
+                    std::vector<int> cuda_devs;
+                    for (auto & tok : tokens) {
+                        if (tok.size() >= 5 && tok.compare(0, 4, "CUDA") == 0) {
+                            try {
+                                cuda_devs.push_back(std::stoi(tok.substr(4)));
+                            } catch (...) { /* non-integer suffix; skip */ }
+                        }
+                    }
+                    bool peer_ok = true;
+                    for (size_t i = 0; i < cuda_devs.size() && peer_ok; ++i) {
+                        for (size_t j = 0; j < cuda_devs.size(); ++j) {
+                            if (i == j) continue;
+                            if (!ggml_backend_cuda_can_access_peer(cuda_devs[i], cuda_devs[j])) {
+                                LOG_ERR("%s: P2 peer-access gate FAIL: "
+                                        "cudaDeviceCanAccessPeer(CUDA%d, CUDA%d) = false. "
+                                        "Multi-GPU CLIP requires bidirectional peer access; "
+                                        "refusing to initialize. Unset MTMD_BACKEND_DEVICE or "
+                                        "use a single device to bypass.\n",
+                                        __func__, cuda_devs[i], cuda_devs[j]);
+                                peer_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!peer_ok) {
+                        throw std::runtime_error(
+                            "PHASE46 B.5 P2 gate failed: CUDA peer access "
+                            "unavailable between requested devices");
+                    }
+                    if (!cuda_devs.empty()) {
+                        LOG_INF("%s: P2 peer-access gate PASS for %d CUDA devices\n",
+                                __func__, (int) cuda_devs.size());
+                    }
+#endif
                 }
             }
             if (!backend && n_backend > 1) {
                 backend = ggml_backend_reg_init_backend(1, nullptr);
-                //backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-                //backend = backend ? backend : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
             }
         }
 
-        if (backend) {
+        if (backend && backend_ptrs.empty()) {
+            // Single-backend fallback path: register the primary backend
+            // (multi-backend path above already pushed all of them).
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
             backend_ptrs.push_back(backend);
             backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
-        } else {
+        } else if (!backend) {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
         }
