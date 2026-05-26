@@ -485,6 +485,14 @@ static FILE * clip_capture_fp() {
     return fp;
 }
 
+#ifdef GGML_USE_CUDA
+// PHASE 46 B.5e NPC.4 Test K: forward-declare CUDA pinned host alloc.
+// cuda_runtime.h isn't in clip.cpp's include path; we link transitively
+// against libcudart via libggml.
+extern "C" int cudaMallocHost(void **ptr, size_t size);
+extern "C" int cudaFreeHost(void *ptr);
+#endif
+
 // FNV-1a 64-bit. Deterministic, fast, no dependency.
 static uint64_t clip_fnv1a64(const void * data, size_t n) {
     const uint8_t * p = (const uint8_t *) data;
@@ -516,18 +524,64 @@ static bool clip_debug_eval_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
     } else {
         FILE * fp = clip_capture_fp();
         if (fp && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
-            const size_t nbytes = ggml_nbytes(t);
-            std::vector<uint8_t> buf(nbytes);
-            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-            const uint64_t h = clip_fnv1a64(buf.data(), nbytes);
+            // PHASE 46 B.5e NPC.4 Test L: env-gated op-class skip. If
+            // CLIP_CAPTURE_SKIP_OPS contains this op's name (comma-sep),
+            // skip the read entirely. If determinism breaks when an op
+            // class is skipped, that op's output requires the fence
+            // side-effect that tensor_get-to-pageable-host provides.
+            static const char * skip_ops_env = std::getenv("CLIP_CAPTURE_SKIP_OPS");
             const char * op_name = ggml_op_name(t->op);
-            const char * t_name  = t->name[0] ? t->name : "(unnamed)";
-            std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx\n",
-                    node_idx, op_name, t_name,
-                    (long long) t->ne[0], (long long) t->ne[1],
-                    (long long) t->ne[2], (long long) t->ne[3],
-                    (unsigned long long) h);
-            std::fflush(fp);
+            bool skip = false;
+            if (skip_ops_env && skip_ops_env[0]) {
+                const char * p = std::strstr(skip_ops_env, op_name);
+                if (p) {
+                    // Crude word-boundary check: must be either start-of-string
+                    // or preceded by ',', and either end-of-string or followed
+                    // by ','. Avoids "ADD" matching "FUSED_RMS_ADD" etc.
+                    const size_t L = std::strlen(op_name);
+                    bool lb = (p == skip_ops_env) || (*(p - 1) == ',');
+                    bool rb = (p[L] == '\0') || (p[L] == ',');
+                    skip = lb && rb;
+                }
+            }
+            if (!skip) {
+                const size_t nbytes = ggml_nbytes(t);
+                // PHASE 46 B.5e NPC.4 Test K: env-gated pinned host buffer
+                // instead of std::vector (pageable). Tests whether the
+                // pageable-DtoH semantics are the load-bearing factor. If
+                // pinned breaks determinism, pageable side-effects (e.g.,
+                // implicit device-wide drain) are the actual fence.
+                static const bool s_use_pinned = std::getenv("CLIP_CAPTURE_PINNED") != nullptr;
+                if (s_use_pinned) {
+#ifdef GGML_USE_CUDA
+                    void * pinned = nullptr;
+                    cudaMallocHost(&pinned, nbytes);
+                    if (pinned) {
+                        ggml_backend_tensor_get(t, pinned, 0, nbytes);
+                        const uint64_t h = clip_fnv1a64(pinned, nbytes);
+                        const char * t_name  = t->name[0] ? t->name : "(unnamed)";
+                        std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx\n",
+                                node_idx, op_name, t_name,
+                                (long long) t->ne[0], (long long) t->ne[1],
+                                (long long) t->ne[2], (long long) t->ne[3],
+                                (unsigned long long) h);
+                        std::fflush(fp);
+                        cudaFreeHost(pinned);
+                    }
+#endif
+                } else {
+                    std::vector<uint8_t> buf(nbytes);
+                    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+                    const uint64_t h = clip_fnv1a64(buf.data(), nbytes);
+                    const char * t_name  = t->name[0] ? t->name : "(unnamed)";
+                    std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx\n",
+                            node_idx, op_name, t_name,
+                            (long long) t->ne[0], (long long) t->ne[1],
+                            (long long) t->ne[2], (long long) t->ne[3],
+                            (unsigned long long) h);
+                    std::fflush(fp);
+                }
+            }
         }
         LOG_INF("[CLIP_DBG OK   %5d]\n", node_idx++);
         return true;   // continue to next node
