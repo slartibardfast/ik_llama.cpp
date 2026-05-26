@@ -491,6 +491,10 @@ static FILE * clip_capture_fp() {
 // against libcudart via libggml.
 extern "C" int cudaMallocHost(void **ptr, size_t size);
 extern "C" int cudaFreeHost(void *ptr);
+extern "C" int cudaGetDevice(int *device);
+extern "C" int cudaSetDevice(int device);
+extern "C" int cudaGetDeviceCount(int *count);
+extern "C" int cudaDeviceSynchronize(void);
 #endif
 
 // FNV-1a 64-bit. Deterministic, fast, no dependency.
@@ -5765,6 +5769,26 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     if (batch_size != 1) {
         return false; // only support batch size of 1
     }
+
+    // PHASE 46 B.5e Test Q: pre-encode full-device sync. If encodes 2+
+    // diverge because in-flight work from the prior encode is still
+    // resident in GPU streams, this clears it. If encodes 2+ still diverge
+    // with this enabled, the state leak is in HOST-side persistent state
+    // (cuBLAS algorithm cache, sched events vector, input_memory_bufs,
+    // reduce.cu's persistent copy_buffer) and a GPU sync won't help.
+#ifdef GGML_USE_CUDA
+    if (env_truthy("CLIP_PRE_ENCODE_DEVICE_SYNC")) {
+        int saved_device = 0;
+        cudaGetDevice(&saved_device);
+        int dev_count = 0;
+        cudaGetDeviceCount(&dev_count);
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            cudaDeviceSynchronize();
+        }
+        cudaSetDevice(saved_device);
+    }
+#endif
 
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
