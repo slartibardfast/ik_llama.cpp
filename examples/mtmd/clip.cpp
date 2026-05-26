@@ -3590,6 +3590,17 @@ struct clip_model_loader {
             if (strstr(n, "qkv") != nullptr) {
                 return false;
             }
+            // PHASE 46 B.5e — exclude positional embeddings. They are
+            // reshaped → permuted → upscaled to the actual image grid
+            // (qwen3vl encoder, clip.cpp nodes 21-23 of the encode);
+            // the CUDA UPSCALE kernel reads src0->data contiguously
+            // and IMAs on row-chunked CUDA_Split storage. Empirically
+            // captured 2026-05-26 (run-20260526T101234). Position
+            // embeddings are 5-10 MiB so per-device duplication is
+            // single-digit MiB.
+            if (strstr(n, "position_embd") != nullptr) {
+                return false;
+            }
             return true;
         };
 
