@@ -578,11 +578,27 @@ static bool clip_debug_eval_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
                     ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
                     const uint64_t h = clip_fnv1a64(buf.data(), nbytes);
                     const char * t_name  = t->name[0] ? t->name : "(unnamed)";
-                    std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx\n",
+                    // PHASE 46 B.5e Phase-C: also hash src[0] (weight for
+                    // matmul ops) to verify static weights aren't mutated
+                    // between encodes.
+                    uint64_t h_s0 = 0;
+                    if (t->src[0] && t->src[0]->data &&
+                        (t->src[0]->type == GGML_TYPE_F32 ||
+                         t->src[0]->type == GGML_TYPE_F16 ||
+                         t->src[0]->type == GGML_TYPE_BF16)) {
+                        const size_t s0_nbytes = ggml_nbytes(t->src[0]);
+                        std::vector<uint8_t> s0_buf(s0_nbytes);
+                        ggml_backend_tensor_get(t->src[0], s0_buf.data(), 0, s0_nbytes);
+                        h_s0 = clip_fnv1a64(s0_buf.data(), s0_nbytes);
+                    }
+                    const void * d0 = t->src[0] ? t->src[0]->data : nullptr;
+                    const void * d1 = t->src[1] ? t->src[1]->data : nullptr;
+                    std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx data=%p s0=%p s0h=%016llx s1=%p\n",
                             node_idx, op_name, t_name,
                             (long long) t->ne[0], (long long) t->ne[1],
                             (long long) t->ne[2], (long long) t->ne[3],
-                            (unsigned long long) h);
+                            (unsigned long long) h, t->data, d0,
+                            (unsigned long long) h_s0, d1);
                     std::fflush(fp);
                 }
             }
