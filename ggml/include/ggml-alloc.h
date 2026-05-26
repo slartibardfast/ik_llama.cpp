@@ -66,6 +66,11 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// Phase 46 B.5e: expose internal buffer count + buffer handle for the
+// env-gated GGML_SCHED_ZERO_ACTIVATIONS diagnostic in ggml-backend.cpp.
+GGML_API int  ggml_gallocr_get_n_buffers(ggml_gallocr_t galloc);
+GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);

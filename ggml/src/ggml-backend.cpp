@@ -2590,6 +2590,23 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+
+    // PHASE 46 B.5e Phase-C: env-gated activation buffer zero. Tests whether
+    // the cross-encode state leak (encode 1 = correct, encodes 2/3 = specific
+    // wrong) is due to a kernel reading stale bytes from a previously-used
+    // activation buffer that the new encode hasn't fully overwritten. If
+    // zeroing here collapses encodes 2/3 to encode 1, residual GPU memory
+    // is the leak source.
+    static const bool s_zero_activations = std::getenv("GGML_SCHED_ZERO_ACTIVATIONS") != nullptr;
+    if (s_zero_activations && sched->galloc) {
+        int n = ggml_gallocr_get_n_buffers(sched->galloc);
+        for (int i = 0; i < n; i++) {
+            ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(sched->galloc, i);
+            if (buf) {
+                ggml_backend_buffer_clear(buf, 0);
+            }
+        }
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
