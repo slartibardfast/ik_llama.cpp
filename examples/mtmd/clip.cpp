@@ -455,6 +455,35 @@ struct clip_model {
     }
 };
 
+// PHASE46 B.5e DEBUG — gated by env var CLIP_DEBUG_SCHED. OFF by default.
+// Forces per-node sched evaluation so a CUDA IMA surfaces at the offending
+// node instead of at the global sync fence (ggml-cuda.cu:4499). Pair with
+// CUDA_LAUNCH_BLOCKING=1 and GGML_SCHED_DEBUG=1 for cross-reference of
+// backend assignment. Output goes to stderr; expected volume ~450 KB for a
+// 3739-node CLIP encode.
+static bool clip_debug_eval_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
+    static int node_idx = 0;
+    if (ask) {
+        const char * op_name   = ggml_op_name(t->op);
+        const char * t_name    = t->name[0] ? t->name : "(unnamed)";
+        const ggml_tensor * s0 = t->src[0];
+        const char * s0_name   = s0 ? (s0->name[0] ? s0->name : "(unnamed)") : "-";
+        const char * s0_op     = s0 ? ggml_op_name(s0->op) : "-";
+        const char * s0_buft   = (s0 && s0->buffer) ? ggml_backend_buft_name(ggml_backend_buffer_get_type(s0->buffer)) : "-";
+        LOG_INF("[CLIP_DBG NODE %5d op=%-18s name=%-32s "
+                "ne=[%5lld %5lld %5lld %5lld] "
+                "src0=%-32s src0_op=%-18s src0_buft=%s]\n",
+                node_idx, op_name, t_name,
+                (long long) t->ne[0], (long long) t->ne[1],
+                (long long) t->ne[2], (long long) t->ne[3],
+                s0_name, s0_op, s0_buft);
+        return true;   // process this node alone, sync after
+    } else {
+        LOG_INF("[CLIP_DBG OK   %5d]\n", node_idx++);
+        return true;   // continue to next node
+    }
+}
+
 // PHASE46 B.5b: per-tensor split state for mmproj weights row-chunked
 // across multiple devices. Mirrors src/llama-impl.h's llama_split_tensor
 // (same shape, just no llama_ prefix because this is mtmd-local). Owned
@@ -632,6 +661,13 @@ struct clip_ctx {
             //ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false)
         );
+
+        // PHASE46 B.5e DEBUG: install per-node eval callback when
+        // CLIP_DEBUG_SCHED is set. See clip_debug_eval_cb above.
+        if (env_truthy("CLIP_DEBUG_SCHED")) {
+            ggml_backend_sched_set_eval_callback(sched.get(), clip_debug_eval_cb, nullptr);
+            LOG_INF("%s: CLIP_DEBUG_SCHED=1 — per-node eval callback installed\n", __func__);
+        }
     }
 
     ~clip_ctx() {
