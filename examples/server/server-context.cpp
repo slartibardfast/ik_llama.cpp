@@ -169,9 +169,11 @@ bool server_context::load_model(const gpt_params& params_) {
         if (!params_base.mmproj_tensor_split.empty()) {
             setenv("MTMD_TENSOR_SPLIT", params_base.mmproj_tensor_split.c_str(), 1);
         }
-        if (!params_base.mmproj_split_mode.empty()) {
-            setenv("MTMD_SPLIT_MODE", params_base.mmproj_split_mode.c_str(), 1);
-        }
+        // PHASE 46 B.5: CLIP always uses parallel sched + split_mode_graph;
+        // the --mmproj-split-mode flag is informational only. Previously
+        // this set MTMD_SPLIT_MODE which clip.cpp read to gate graph mode,
+        // but graph mode is now unconditional.
+        (void) params_base.mmproj_split_mode;
         // P1 default: mmproj_smf16 = true. Only set the env var when
         // the user explicitly chose smf32 (off) so we don't trample a
         // pre-existing env-var override.

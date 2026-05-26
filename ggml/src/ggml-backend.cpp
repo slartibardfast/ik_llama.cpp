@@ -2431,7 +2431,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+    // PHASE 46 B.5e Phase-B diagnostic: env-gated pin of cur_copy to 0.
+    // Tests whether the cur_copy double-buffer rotation (which the audit
+    // identified as a candidate state-leak vector along with
+    // input_memory_bufs) is responsible for the cross-encode non-determinism
+    // observed on the parallel multi-backend dispatch path. If pinning to 0
+    // collapses encodes to a single hash, double-buffer rotation is the leak.
+    static const bool s_pin_copy_0 = std::getenv("GGML_SCHED_PIN_COPY_0") != nullptr;
+    if (!s_pin_copy_0) {
+        sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

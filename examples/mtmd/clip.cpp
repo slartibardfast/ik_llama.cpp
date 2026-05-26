@@ -765,30 +765,20 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
-        // PHASE 46 B.5: --mmproj-split-mode graph (via the MTMD_SPLIT_MODE env
-        // set by server-context.cpp) wires the CLIP sched into the same
-        // openmp parallel multi-backend dispatch path that the LM uses
-        // (llama.cpp:8545). Without this, CLIP runs through the sequential
-        // path at ggml-backend.cpp:2395 — multi-GPU still works via libmgpu's
-        // explicit per-device sub-graphs, but the sched's parallel-dispatch
-        // infrastructure (events double-buffering, input_memory_bufs,
-        // openmp barrier sync) is dormant. `parallel=true` populates
+        // PHASE 46 B.5: CLIP encode always uses the openmp parallel
+        // multi-backend dispatch path (ggml-backend.cpp:2181), matching
+        // what llama.cpp:8545 does for the LM sched. parallel=true populates
         // hv_tensor_copies with n_copies=GGML_SCHED_MAX_COPIES and the events
         // array; set_split_mode_graph(true, true) flips is_async and
-        // split_mode_graph so the openmp branch at line 2181 fires.
-        const char * mtmd_split_mode = std::getenv("MTMD_SPLIT_MODE");
-        const bool want_graph_mode = mtmd_split_mode && std::strcmp(mtmd_split_mode, "graph") == 0;
-
+        // split_mode_graph so the openmp branch fires for libmgpu's
+        // explicit per-device sub-graphs (has_reduce=true).
         sched.reset(
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                                    backend_ptrs.size(), 8192,
-                                   /*parallel=*/ want_graph_mode)
+                                   /*parallel=*/ true)
         );
-
-        if (want_graph_mode) {
-            ggml_backend_sched_set_split_mode_graph(sched.get(), true, /*async=*/ true);
-            LOG_INF("%s: MTMD_SPLIT_MODE=graph — split_mode_graph=true async=true (parallel sched)\n", __func__);
-        }
+        ggml_backend_sched_set_split_mode_graph(sched.get(), true, /*async=*/ true);
+        LOG_INF("%s: parallel sched, split_mode_graph=true, async=true\n", __func__);
 
         // PHASE46 B.5e DEBUG: install per-node eval callback when
         // CLIP_DEBUG_SCHED is set. See clip_debug_eval_cb above.
