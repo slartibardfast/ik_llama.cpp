@@ -463,6 +463,39 @@ struct clip_model {
 // CUDA_LAUNCH_BLOCKING=1 and GGML_SCHED_DEBUG=1 for cross-reference of
 // backend assignment. Output goes to stderr; expected volume ~450 KB for a
 // 3739-node CLIP encode.
+//
+// PHASE46 B.5e NPC-bisect — also dumps a per-node tensor-content hash to
+// the file at $CLIP_CAPTURE_HASH (one line per evaluated node). Run two or
+// more encodes with the same path target (rename between encodes), then
+// `diff` the hash streams: the first differing line is the FIRST node
+// whose value diverged across runs — the construction bug lives there.
+// Captures only F32/F16/BF16 tensors (per-device libmgpu outputs).
+static FILE * clip_capture_fp() {
+    static FILE * fp = nullptr;
+    static bool   initialized = false;
+    if (!initialized) {
+        initialized = true;
+        const char * path = std::getenv("CLIP_CAPTURE_HASH");
+        if (path && path[0]) {
+            fp = std::fopen(path, "w");
+            if (!fp) LOG_ERR("CLIP_CAPTURE_HASH: failed to open %s\n", path);
+            else     LOG_INF("CLIP_CAPTURE_HASH: dumping per-node hashes to %s\n", path);
+        }
+    }
+    return fp;
+}
+
+// FNV-1a 64-bit. Deterministic, fast, no dependency.
+static uint64_t clip_fnv1a64(const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 static bool clip_debug_eval_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
     static int node_idx = 0;
     if (ask) {
@@ -481,6 +514,21 @@ static bool clip_debug_eval_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
                 s0_name, s0_op, s0_buft);
         return true;   // process this node alone, sync after
     } else {
+        FILE * fp = clip_capture_fp();
+        if (fp && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16)) {
+            const size_t nbytes = ggml_nbytes(t);
+            std::vector<uint8_t> buf(nbytes);
+            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+            const uint64_t h = clip_fnv1a64(buf.data(), nbytes);
+            const char * op_name = ggml_op_name(t->op);
+            const char * t_name  = t->name[0] ? t->name : "(unnamed)";
+            std::fprintf(fp, "%05d %-18s %-32s %5lld,%5lld,%5lld,%5lld %016llx\n",
+                    node_idx, op_name, t_name,
+                    (long long) t->ne[0], (long long) t->ne[1],
+                    (long long) t->ne[2], (long long) t->ne[3],
+                    (unsigned long long) h);
+            std::fflush(fp);
+        }
         LOG_INF("[CLIP_DBG OK   %5d]\n", node_idx++);
         return true;   // continue to next node
     }
