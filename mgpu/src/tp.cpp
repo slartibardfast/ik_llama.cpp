@@ -254,30 +254,183 @@ extern "C" struct ggml_tensor * mgpu_build_ffn_megatron(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 — mgpu_build_attn_megatron_clip (stub)
+// Phase 4 — mgpu_build_attn_megatron_fused_qkv
 // ---------------------------------------------------------------------------
 
-extern "C" struct ggml_tensor * mgpu_build_attn_megatron_clip(
-        struct ggml_context * /*ctx*/,
-        struct ggml_tensor  * /*attn_norm*/,
-        struct ggml_tensor  * input,
-        struct ggml_tensor  * /*wq*/,
-        struct ggml_tensor  * /*wq_b*/,
-        struct ggml_tensor  * /*wk*/,
-        struct ggml_tensor  * /*wk_b*/,
-        struct ggml_tensor  * /*wv*/,
-        struct ggml_tensor  * /*wv_b*/,
-        struct ggml_tensor  * /*wo*/,
-        struct ggml_tensor  * /*wo_b*/,
-        struct ggml_tensor  * /*kq_mask*/,
-        float                 /*kq_scale*/,
-        float                 /*norm_eps*/,
-        enum mgpu_norm_type   /*norm_type*/,
-        int                   /*n_head*/,
-        int                   /*n_head_kv*/,
-        int                   /*fa_enabled*/,
-        int                   /*il*/) {
-    fprintf(stderr, "mgpu_build_attn_megatron_clip: not yet implemented (Phase 0 stub)\n");
-    GGML_ABORT("mgpu_build_attn_megatron_clip stub called — implement in Phase 4");
-    return input; // unreachable
+// Helper: apply optional RoPE to a head-sliced Q or K tensor.
+static ggml_tensor * mgpu_maybe_rope(
+        ggml_context              * ctx,
+        ggml_tensor               * t,
+        ggml_tensor               * positions,
+        const mgpu_attn_config    * cfg) {
+    if (cfg->rope_mode < 0) {
+        return t;
+    }
+    // rope_mode == GGML_ROPE_TYPE_VISION (4 per ggml/include/ggml.h) uses
+    // m-rope with sections; other modes use single-section rope_ext.
+    if (cfg->rope_mode == 4 /* GGML_ROPE_TYPE_VISION */ ||
+        cfg->rope_mode == 8 /* GGML_ROPE_TYPE_MROPE   */) {
+        int sections[GGML_MROPE_SECTIONS];
+        for (int i = 0; i < GGML_MROPE_SECTIONS && i < 4; ++i) {
+            sections[i] = cfg->rope_sections[i];
+        }
+        return ggml_rope_multi(ctx, t, positions, nullptr,
+                cfg->rope_n_dims, sections, cfg->rope_mode,
+                cfg->rope_n_ctx_orig, cfg->rope_freq_base, cfg->rope_freq_scale,
+                cfg->rope_ext_factor, cfg->rope_attn_factor,
+                cfg->rope_beta_fast, cfg->rope_beta_slow);
+    }
+    return ggml_rope_ext(ctx, t, positions, nullptr,
+            cfg->rope_n_dims, cfg->rope_mode,
+            cfg->rope_n_ctx_orig, cfg->rope_freq_base, cfg->rope_freq_scale,
+            cfg->rope_ext_factor, cfg->rope_attn_factor,
+            cfg->rope_beta_fast, cfg->rope_beta_slow);
+}
+
+// mgpu_build_attn_megatron_fused_qkv
+//
+// Head-partitioned attention with fused QKV (REPLICATE'd across devices).
+// Each device runs the full QKV matmul against its local copy of the
+// fused weight, then view-slices to get Q/K/V for its head-range only,
+// applies optional RoPE, runs attention math on its head-slice, and
+// projects through its row-parallel wo slice. Results reduce across
+// devices.
+//
+// Design rationale: fused QKV cannot be cleanly col-parallel-split
+// along dim 1 because that crosses Q/K/V concat boundaries unevenly.
+// REPLICATE keeps the full weight on each device (cheap: ~3*n_embd*n_embd
+// per layer); duplicated QKV matmul compute is small relative to the
+// wo + FFN parallelism win.
+extern "C" struct ggml_tensor * mgpu_build_attn_megatron_fused_qkv(
+        struct ggml_context             * ctx,
+        const struct mgpu_attn_config   * cfg,
+        struct ggml_tensor              * attn_norm,
+        struct ggml_tensor              * input,
+        struct ggml_tensor              * wqkv,
+        struct ggml_tensor              * wqkv_b,
+        struct ggml_tensor              * wo,
+        struct ggml_tensor              * wo_b,
+        struct ggml_tensor              * positions,
+        struct ggml_tensor              * kq_mask) {
+
+    GGML_ASSERT(wqkv && wqkv->extra);
+    GGML_ASSERT(wo   && wo->extra);
+
+    ggml_split_tensor_t * qkv_ext = (ggml_split_tensor_t *) wqkv->extra;
+    ggml_split_tensor_t * wo_ext  = (ggml_split_tensor_t *) wo->extra;
+    GGML_ASSERT(qkv_ext->n_device == wo_ext->n_device);
+    const int n_device = qkv_ext->n_device;
+
+    // Per-device head counts. Assumes heads divide evenly. (Even
+    // tensor_split is the default; uneven splits would land remainder
+    // heads on one device, which we'd need to handle here.)
+    GGML_ASSERT(cfg->n_head    % n_device == 0);
+    GGML_ASSERT(cfg->n_head_kv % n_device == 0);
+    const int n_head_dev    = cfg->n_head    / n_device;
+    const int n_head_kv_dev = cfg->n_head_kv / n_device;
+    const int n_embd_q_dev  = n_head_dev    * cfg->n_embd_head_k;
+    const int n_embd_k_dev  = n_head_kv_dev * cfg->n_embd_head_k;
+    const int n_embd_v_dev  = n_head_kv_dev * cfg->n_embd_head_v;
+
+    // Offsets within the FULL QKV matmul output (per device's local
+    // matmul produces this full layout — REPLICATE'd weights).
+    const int n_embd_q_full = cfg->n_head    * cfg->n_embd_head_k;
+    const int n_embd_k_full = cfg->n_head_kv * cfg->n_embd_head_k;
+    // V starts at Q+K offset (n_embd_v_full unused here — view-3d uses
+    // n_embd_head_v * n_head_kv_dev row count directly).
+
+    std::vector<ggml_tensor *> attn(n_device, nullptr);
+    int id_last = -1;
+
+    for (int id = 0; id < n_device; ++id) {
+        ggml_tensor * qkv_id = qkv_ext->splits[id];
+        ggml_tensor * wo_id  = wo_ext->splits[id];
+        GGML_ASSERT((!qkv_id && !wo_id) || (qkv_id && wo_id));
+        if (!qkv_id) continue;
+
+        ggml_tensor * cur = mgpu_get_input_split(ctx, input, id);
+        cur = mgpu_norm_split(ctx, cur, attn_norm, cfg->norm_eps, cfg->norm_type, id);
+        if (input->op != GGML_OP_REDUCE) {
+            cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+        }
+
+        // Full QKV matmul on this device's REPLICATE'd weight.
+        ggml_tensor * qkv_out = ggml_mul_mat(ctx, qkv_id, cur);
+        if (wqkv_b) qkv_out = ggml_add(ctx, qkv_out, wqkv_b);
+
+        // View-3d into FULL Q, K, V slices of the device-local matmul
+        // output. Standard layout: Q first (n_embd_q_full rows), then K
+        // (n_embd_k_full rows), then V (n_embd_v_full rows).
+        const size_t Fsize = sizeof(float);
+        ggml_tensor * Q_full = ggml_view_3d(ctx, qkv_out,
+                cfg->n_embd_head_k, cfg->n_head, cfg->n_pos,
+                cfg->n_embd_head_k * Fsize, qkv_out->nb[1],
+                /*offset=*/ 0);
+        ggml_tensor * K_full = ggml_view_3d(ctx, qkv_out,
+                cfg->n_embd_head_k, cfg->n_head_kv, cfg->n_pos,
+                cfg->n_embd_head_k * Fsize, qkv_out->nb[1],
+                /*offset=*/ n_embd_q_full * Fsize);
+        ggml_tensor * V_full = ggml_view_3d(ctx, qkv_out,
+                cfg->n_embd_head_v, cfg->n_head_kv, cfg->n_pos,
+                cfg->n_embd_head_v * Fsize, qkv_out->nb[1],
+                /*offset=*/ (n_embd_q_full + n_embd_k_full) * Fsize);
+
+        // Head-slice for THIS device. Each device handles heads
+        // [id*n_head_dev, (id+1)*n_head_dev). Offsets inside the per-head
+        // tensor: Q's nb[1] is the stride from head N to head N+1.
+        ggml_tensor * Q_id = ggml_view_3d(ctx, Q_full,
+                cfg->n_embd_head_k, n_head_dev, cfg->n_pos,
+                Q_full->nb[1], Q_full->nb[2],
+                /*offset=*/ id * n_head_dev * Q_full->nb[1]);
+        ggml_tensor * K_id = ggml_view_3d(ctx, K_full,
+                cfg->n_embd_head_k, n_head_kv_dev, cfg->n_pos,
+                K_full->nb[1], K_full->nb[2],
+                /*offset=*/ id * n_head_kv_dev * K_full->nb[1]);
+        ggml_tensor * V_id = ggml_view_3d(ctx, V_full,
+                cfg->n_embd_head_v, n_head_kv_dev, cfg->n_pos,
+                V_full->nb[1], V_full->nb[2],
+                /*offset=*/ id * n_head_kv_dev * V_full->nb[1]);
+
+        // Optional RoPE (applied to Q and K on the head-slice).
+        Q_id = mgpu_maybe_rope(ctx, Q_id, positions, cfg);
+        K_id = mgpu_maybe_rope(ctx, K_id, positions, cfg);
+
+        // Permute for attention math.
+        ggml_tensor * q = ggml_permute(ctx, Q_id, 0, 2, 1, 3);
+        ggml_tensor * k = ggml_permute(ctx, K_id, 0, 2, 1, 3);
+        ggml_tensor * kqv_out;
+
+        if (cfg->fa_enabled) {
+            ggml_tensor * v = ggml_permute(ctx, V_id, 0, 2, 1, 3);
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+            kqv_out = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, cfg->kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(kqv_out, GGML_PREC_F32);
+            kqv_out = ggml_reshape_2d(ctx, kqv_out,
+                    kqv_out->ne[0] * kqv_out->ne[1],
+                    kqv_out->ne[2] * kqv_out->ne[3]);
+        } else {
+            ggml_tensor * v = ggml_permute(ctx, V_id, 1, 2, 0, 3);
+            v = ggml_cont(ctx, v);
+
+            ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, cfg->kq_scale, 0.0f);
+            ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+            kqv_out = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+            kqv_out = ggml_cont_2d(ctx, kqv_out,
+                    n_embd_q_dev,           // n_head_dev * n_embd_head_k
+                    cfg->n_pos);
+        }
+
+        // wo row-parallel matmul. kqv_out has dim 0 = n_embd_q_dev
+        // (= n_embd/n_device), matching wo_id's reduction axis.
+        cur = ggml_mul_mat(ctx, wo_id, kqv_out);
+        if (wo_b) cur = ggml_add(ctx, cur, wo_b);
+
+        attn[id] = cur;
+        id_last = id;
+    }
+    GGML_ASSERT(id_last >= 0);
+
+    return ggml_reduce(ctx, attn.data(), n_device, GGML_OP_ADD);
 }

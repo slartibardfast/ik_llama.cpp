@@ -79,42 +79,90 @@ struct ggml_tensor * mgpu_build_ffn_megatron(
         enum mgpu_act         act,
         int                   il);              // layer index for naming/debug
 
-// Build the per-device attention sub-graph for CLIP (and any model that
-// has no KV cache and no RoPE).
+// Config for mgpu_build_attn_megatron. Holds shape and arch-variant
+// parameters that vary per call site. Grouped as a struct so the
+// function signature stays manageable.
 //
-// Expects wq/wk/wv to be COL_PAR, wo to be ROW_PAR. The per-device loop
-// handles: norm → Q/K/V matmuls (col-parallel) → permute → attention
-// math (FlashAttention if fa_enabled, else KQ-matmul + softmax + KQV-
-// matmul) → wo matmul (row-parallel) → collect. Reduces at the end.
+// RoPE handling:
+//   rope_mode == -1            → no RoPE applied
+//   rope_mode == 0 (NORMAL)    → standard RoPE (uses rope_n_dims, freqs)
+//   rope_mode == 1 (NEOX)      → NeoX-style RoPE
+//   rope_mode == GGML_ROPE_TYPE_VISION → M-RoPE with rope_sections
+//                                       (qwen3vl, qwen2vl)
+// (Values match GGML_ROPE_TYPE_* enum at ggml/include/ggml.h.)
+struct mgpu_attn_config {
+    // Attention shape.
+    int n_head;
+    int n_head_kv;
+    int n_embd_head_k;
+    int n_embd_head_v;
+    int n_pos;                  // sequence length / image patch count
+
+    // Norm.
+    float                  norm_eps;
+    enum mgpu_norm_type    norm_type;
+
+    // Attention math.
+    float kq_scale;
+    int   fa_enabled;           // bool: prefer ggml_flash_attn_ext
+
+    // RoPE. Set rope_mode = -1 to disable RoPE entirely.
+    int   rope_mode;
+    int   rope_n_dims;
+    int   rope_sections[4];     // m-rope only
+    int   rope_n_ctx_orig;
+    float rope_freq_base;
+    float rope_freq_scale;
+    float rope_ext_factor;
+    float rope_attn_factor;
+    float rope_beta_fast;
+    float rope_beta_slow;
+
+    // For debug naming.
+    int   il;
+};
+
+// Build the per-device attention sub-graph in Megatron-TP layout.
+//
+// Supports fused-QKV (qwen3vl style) where a single `wqkv` weight is
+// col-parallel split and view-3d-sliced per-device into Q/K/V slices.
+// The non-fused (separate wq/wk/wv) path is in a sibling function added
+// in Phase 4b when needed by non-qwen3vl architectures.
+//
+// Per-device flow:
+//   1. mgpu_get_input_split(input, id)
+//   2. mgpu_norm_split(attn_norm)
+//   3. 0xff marker (mirrors LM at line 2444)
+//   4. QKV col-parallel matmul: ggml_mul_mat(wqkv->splits[id], cur)
+//   5. View-3d-slice into Q_id, K_id, V_id at per-device offsets
+//   6. Optional RoPE on Q_id and K_id (configured per cfg->rope_*)
+//   7. Permute Q, K, V for attention math
+//   8. Attention math: FA (if cfg->fa_enabled) or KQ matmul + softmax + KQV
+//   9. wo row-parallel matmul: ggml_mul_mat(wo->splits[id], kqv_out)
+//   10. Collect into attn[id]
+// After loop: ggml_reduce(attn, n_device, GGML_OP_ADD).
 //
 // Mirrors the structural pattern at src/llama-build-context.cpp:3186-3220
-// minus KV cache / RoPE / q-norm / k-norm.
-struct ggml_tensor * mgpu_build_attn_megatron_clip(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * attn_norm,        // nullable
-        struct ggml_tensor  * input,
-        struct ggml_tensor  * wq,
-        struct ggml_tensor  * wq_b,             // nullable
-        struct ggml_tensor  * wk,
-        struct ggml_tensor  * wk_b,             // nullable
-        struct ggml_tensor  * wv,
-        struct ggml_tensor  * wv_b,             // nullable
-        struct ggml_tensor  * wo,
-        struct ggml_tensor  * wo_b,             // nullable
-        struct ggml_tensor  * kq_mask,
-        float                 kq_scale,
-        float                 norm_eps,
-        enum mgpu_norm_type   norm_type,
-        int                   n_head,
-        int                   n_head_kv,
-        int                   fa_enabled,       // bool: use ggml_flash_attn_ext
-        int                   il);
+// adapted for fused QKV. (LM uses separate wq/wk/wv; that variant is the
+// sibling function deferred to Phase 4b / Session 2.)
+struct ggml_tensor * mgpu_build_attn_megatron_fused_qkv(
+        struct ggml_context             * ctx,
+        const struct mgpu_attn_config   * cfg,
+        struct ggml_tensor              * attn_norm,    // nullable
+        struct ggml_tensor              * input,
+        struct ggml_tensor              * wqkv,         // col-parallel
+        struct ggml_tensor              * wqkv_b,       // nullable
+        struct ggml_tensor              * wo,           // row-parallel
+        struct ggml_tensor              * wo_b,         // nullable
+        struct ggml_tensor              * positions,    // nullable when rope_mode == -1
+        struct ggml_tensor              * kq_mask);     // nullable
 
-// (Phase 13) LM-style attention with KV cache, RoPE, q/k norms, and
-// arch-variant config. Signature deferred until LM port begins; the
-// header will be extended at that time.
+// (Phase 4b — deferred) Separate-Q/K/V variant for non-fused-QKV CLIP
+// architectures and LM. Header extended when implemented.
 //
-// (Phase 14) LM-style MoE FFN. Same deferral.
+// (Phase 13) LM-style attention with KV cache. Deferred to Session 2.
+//
+// (Phase 14) LM-style MoE FFN. Deferred to Session 2.
 
 #ifdef __cplusplus
 }

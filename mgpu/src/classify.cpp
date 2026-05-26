@@ -10,15 +10,28 @@ extern "C" enum mgpu_split_kind mgpu_classify_weight(const char * name) {
         return MGPU_SPLIT_NONE;
     }
 
-    // Column-parallel: input-side matmuls. The reduction axis (dim 0)
-    // stays full on each device; output features (dim 1) are split.
-    // Each device's matmul output is a per-device feature slice that
-    // flows directly into the same device's row-parallel matmul without
-    // a reduce in between.
+    // attn_qkv (fused Q|K|V along dim 1) — REPLICATE, NOT col-parallel.
+    // A naive col-parallel split of a fused [Q|K|V] weight along dim 1
+    // chunks the concat'd Q/K/V output features uniformly, which CROSSES
+    // the Q→K and K→V boundaries instead of preserving them per device.
+    // E.g. with 2 devices and Q|K|V each n_embd wide, device 0 gets
+    // [full Q | first half K], device 1 gets [second half K | full V].
+    // No per-device head-slicing works on that layout. REPLICATE keeps
+    // the full fused weight on every device; the consumer
+    // (mgpu_build_attn_megatron_fused_qkv) does a full per-device QKV
+    // matmul, then view-3d slices Q/K/V at standard offsets, then
+    // view-slices a head-range for THIS device, then attention math
+    // runs head-partitioned. The duplicated QKV matmul compute is small
+    // relative to the wo + FFN parallelism gain.
+    if (strstr(name, "attn_qkv") != nullptr)  return MGPU_SPLIT_REPLICATE;
+
+    // Column-parallel: input-side SEPARATE-Q/K/V matmuls. The reduction
+    // axis (dim 0) stays full on each device; output features (dim 1)
+    // are split. Each device produces an output-feature slice that
+    // flows directly into the same device's row-parallel matmul
+    // without a reduce in between.
     //
-    // Order matters: more-specific names checked first (avoid e.g. a
-    // misclassification of "attn_qkv" because "attn_q" is its prefix).
-    if (strstr(name, "attn_qkv") != nullptr)  return MGPU_SPLIT_COL_PAR;
+    // Order matters: more-specific names checked first.
     if (strstr(name, "attn_q.")  != nullptr)  return MGPU_SPLIT_COL_PAR;
     if (strstr(name, "attn_k.")  != nullptr)  return MGPU_SPLIT_COL_PAR;
     if (strstr(name, "attn_v.")  != nullptr)  return MGPU_SPLIT_COL_PAR;
