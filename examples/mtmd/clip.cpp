@@ -2642,6 +2642,15 @@ private:
         return cur;
     }
 
+    // PHASE 46 B.5e — sched-partition marker. Read by ggml-backend.cpp:1727;
+    // forces need_new_split=true so that weights in split_buft are accessed
+    // via the matching partition rather than the entire graph being assigned
+    // to one backend. Mirrors the LM convention at llama-build-context.cpp:1261
+    // and llama-build-context.cpp:2444.
+    static inline void mark_split(ggml_tensor * t) {
+        t->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+    }
+
     ggml_tensor * build_ffn(
             ggml_tensor * cur,
             ggml_tensor * up,
@@ -2652,6 +2661,9 @@ private:
             ggml_tensor * down_b,
             ffn_op_type type_op,
             int il) const {
+
+        // PHASE 46 B.5e — mark FFN input as a sched split boundary.
+        mark_split(cur);
 
         ggml_tensor * tmp = up ? ggml_mul_mat(ctx0, up, cur) : cur;
         cb(tmp, "ffn_up", il);
@@ -2733,6 +2745,10 @@ private:
             ggml_tensor * kq_mask,
             float kq_scale,
             int il) const {
+        // PHASE 46 B.5e — mark attention Q as a sched split boundary.
+        // Matches LM site at llama-build-context.cpp:2444. K/V follow without
+        // their own marker (LM convention).
+        mark_split(q_cur);
         // these nodes are added to the graph together so that they are not reordered
         // by doing so, the number of splits in the graph is reduced
         ggml_build_forward_expand(gf, q_cur);
@@ -3526,6 +3542,18 @@ struct clip_model_loader {
             if (ggml_n_dims(t) < 2) return false;
             if (t->ne[0] < 256 || t->ne[1] < 256) return false;
             if (ggml_nbytes(t) < (1u << 20)) return false;  // 1 MiB
+            // PHASE 46 B.5e — exclude fused-QKV weights. Their matmul output
+            // is viewed back into Q/K/V at known fixed offsets (e.g. qwen3vl
+            // clip.cpp:1152-1157), and a row-chunked split along dim 0
+            // misaligns those views with the per-device weight slice
+            // boundaries → illegal memory access on view dereference.
+            // Match by name suffix: GGUF convention is "*.attn_qkv.weight"
+            // (TN_ATTN_QKV at clip-impl.h:68). Also exclude any tensor whose
+            // name contains "qkv" defensively.
+            const char * n = t->name;
+            if (strstr(n, "qkv") != nullptr) {
+                return false;
+            }
             return true;
         };
 
