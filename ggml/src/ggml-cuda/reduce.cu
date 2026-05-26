@@ -135,6 +135,37 @@ static inline void ggml_reduce_test_f_post_sync(int saved_device) {
     ggml_cuda_set_device(saved_device);
 }
 
+// PHASE 46 B.5e Test M: peer-access memory-consistency fence after a
+// reduce. Test L (capture-bisect) localized CLIP non-determinism to
+// missing visibility of REDUCE-output peer writes — skipping REDUCE
+// reads in capture broke determinism, skipping MUL_MAT reads did not.
+// Mechanism: cudaDeviceSynchronize drains compute streams but does NOT
+// guarantee that peer writes from OTHER devices into THIS device's
+// memory are visible. cudaMemcpyAsync DtoH from device memory to a
+// pageable host buffer DOES enforce that fence — pageable DtoH is
+// effectively synchronous (the call returns only once the copy is
+// complete), and the DMA engine pulling bytes requires drained peer
+// writes. The 4-byte size keeps the cost negligible.
+//
+// Default-on; GGML_REDUCE_DISABLE_FENCE is an emergency escape hatch
+// for measurement / rollback.
+static inline void ggml_reduce_post_fence(ggml_tensor * dst, const int * devices, int n, int saved_device) {
+    static const bool s_disabled = std::getenv("GGML_REDUCE_DISABLE_FENCE") != nullptr;
+    if (s_disabled) return;
+    auto & info = ggml_cuda_info();
+    uint32_t scratch[GGML_CUDA_MAX_DEVICES] = {0};
+    for (int ii = 0; ii < n; ++ii) {
+        int i = devices[ii];
+        if (i < 0 || i >= info.device_count) continue;
+        if (!dst->src[i] || !dst->src[i]->data) continue;
+        ggml_cuda_set_device(i);
+        CUDA_CHECK(cudaMemcpyAsync(&scratch[ii], dst->src[i]->data,
+                                   sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                                   info.all_ctx[i]->stream()));
+    }
+    ggml_cuda_set_device(saved_device);
+}
+
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     auto op = (ggml_op)dst->op_params[0];
@@ -180,6 +211,9 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         ncclGroupEnd();
         ggml_cuda_set_device(ctx.device);
         ggml_reduce_test_f_post_sync(ctx.device);
+        int nccl_devs[GGML_CUDA_MAX_DEVICES];
+        for (int i = 0; i < nreduce; ++i) nccl_devs[i] = i;
+        ggml_reduce_post_fence(dst, nccl_devs, nreduce, ctx.device);
         return;
     }
 #endif
@@ -384,6 +418,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
         ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
         return;
     }
     if (false && nhave == 4 && dst->ne[1] <= 8 && ctx.p2p_enabled) {
@@ -454,6 +489,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
         ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
         return;
     }
     if (dst->ne[1] < 32 && ctx.p2p_enabled) {
@@ -608,4 +644,5 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
     }
     ggml_reduce_test_f_post_sync(ctx.device);
+    ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
 }
