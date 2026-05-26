@@ -2560,6 +2560,21 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
     for (auto & item : sched->own_cpy   ) item = false;
     for (auto & item : sched->needs_sync) item = true;
 
+    // PHASE 46 B.5e Test R: env-gated zero of persistent input_memory_bufs.
+    // These buffers are sized to max_input_size and reused across encodes;
+    // a downstream kernel that reads through the patched ptr (line 2630
+    // below) before the cross-backend copy lands could see stale bytes
+    // from a prior encode. If zeroing here collapses encodes 2/3 to the
+    // encode-1 hash, the leak is in these buffers' content.
+    static const bool s_zero_input_bufs = std::getenv("GGML_SCHED_ZERO_INPUT_BUFS") != nullptr;
+    if (s_zero_input_bufs) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (sched->input_memory_bufs[i]) {
+                ggml_backend_buffer_clear(sched->input_memory_bufs[i], 0);
+            }
+        }
+    }
+
     if (sched->split_mode_graph) {
         auto tensor_size = [] (const ggml_tensor * t) {
             auto nbytes = ggml_nbytes(t);
