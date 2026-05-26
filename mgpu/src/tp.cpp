@@ -228,21 +228,51 @@ extern "C" struct ggml_tensor * mgpu_build_ffn_megatron(
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, fused_unary);
         } else {
             // PATH B — separate matmuls, with optional biases.
+            //
+            // Bias-handling rules under Megatron-TP:
+            //   COL-parallel matmul (up, gate): per-device output is a
+            //     SLICE of the full output features. The matching bias
+            //     must also be sliced to the same feature range.
+            //     We view-1d into the full bias at the per-device offset.
+            //   ROW-parallel matmul (down): per-device output is the FULL
+            //     output shape but a partial-value sum. Adding a full
+            //     bias N times (once per device, then reduced) would
+            //     multiply the bias by N. Move down_b add to AFTER the
+            //     reduce (see end of function).
+
+            // Per-device output slice sizes for up/gate (col-parallel).
+            const int64_t up_slice_ne = split_u->ne[1];
+            // Offset (in elements) of THIS device's slice in the full bias.
+            int64_t up_b_off = 0;
+            int64_t gate_b_off = 0;
+            for (int j = 0; j < id; ++j) {
+                if (u->splits[j]) up_b_off   += u->splits[j]->ne[1];
+                if (g && g->splits[j]) gate_b_off += g->splits[j]->ne[1];
+            }
+
             ggml_tensor * up_out = ggml_mul_mat(ctx, split_u, cur);
-            if (up_b) up_out = ggml_add(ctx, up_out, up_b);
+            if (up_b) {
+                ggml_tensor * up_b_slice = ggml_view_1d(ctx, up_b, up_slice_ne,
+                        up_b_off * ggml_element_size(up_b));
+                up_out = ggml_add(ctx, up_out, up_b_slice);
+            }
 
             if (g) {
                 ggml_tensor * gate_out = ggml_mul_mat(ctx, split_g, cur);
-                if (gate_b) gate_out = ggml_add(ctx, gate_out, gate_b);
+                if (gate_b) {
+                    const int64_t gate_slice_ne = split_g->ne[1];
+                    ggml_tensor * gate_b_slice = ggml_view_1d(ctx, gate_b, gate_slice_ne,
+                            gate_b_off * ggml_element_size(gate_b));
+                    gate_out = ggml_add(ctx, gate_out, gate_b_slice);
+                }
                 cur = mgpu_activation_gated(ctx, gate_out, up_out, act);
             } else {
                 cur = mgpu_activation_unary(ctx, up_out, act);
             }
         }
 
-        // Down matmul (row-parallel) + optional bias.
+        // Down matmul (row-parallel). Bias is FULL — add AFTER reduce.
         cur = ggml_mul_mat(ctx, split_d, cur);
-        if (down_b) cur = ggml_add(ctx, cur, down_b);
 
         ffn[id] = cur;
         id_last = id;
@@ -250,7 +280,12 @@ extern "C" struct ggml_tensor * mgpu_build_ffn_megatron(
     GGML_ASSERT(id_last >= 0);
 
     // Reduce across devices (mirrors LM line 1299).
-    return ggml_reduce(ctx, ffn.data(), n_device, GGML_OP_ADD);
+    ggml_tensor * out = ggml_reduce(ctx, ffn.data(), n_device, GGML_OP_ADD);
+
+    // Add row-parallel down bias once, to the reduced result.
+    if (down_b) out = ggml_add(ctx, out, down_b);
+
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,10 +301,11 @@ static ggml_tensor * mgpu_maybe_rope(
     if (cfg->rope_mode < 0) {
         return t;
     }
-    // rope_mode == GGML_ROPE_TYPE_VISION (4 per ggml/include/ggml.h) uses
-    // m-rope with sections; other modes use single-section rope_ext.
-    if (cfg->rope_mode == 4 /* GGML_ROPE_TYPE_VISION */ ||
-        cfg->rope_mode == 8 /* GGML_ROPE_TYPE_MROPE   */) {
+    // M-RoPE / vision-rope both have the GGML_ROPE_TYPE_MROPE bit (8)
+    // set in their mode value (MROPE = 8, VISION = 24 = 8 | 16 per
+    // ggml/include/ggml.h:259-261). Dispatch by bit-test, not literal
+    // equality, so we cover both variants.
+    if (cfg->rope_mode & GGML_ROPE_TYPE_MROPE) {
         int sections[GGML_MROPE_SECTIONS];
         for (int i = 0; i < GGML_MROPE_SECTIONS && i < 4; ++i) {
             sections[i] = cfg->rope_sections[i];
@@ -423,14 +459,16 @@ extern "C" struct ggml_tensor * mgpu_build_attn_megatron_fused_qkv(
         }
 
         // wo row-parallel matmul. kqv_out has dim 0 = n_embd_q_dev
-        // (= n_embd/n_device), matching wo_id's reduction axis.
+        // (= n_embd/n_device), matching wo_id's reduction axis. Bias is
+        // FULL [n_embd] — added once AFTER the reduce (else multiplied by N).
         cur = ggml_mul_mat(ctx, wo_id, kqv_out);
-        if (wo_b) cur = ggml_add(ctx, cur, wo_b);
 
         attn[id] = cur;
         id_last = id;
     }
     GGML_ASSERT(id_last >= 0);
 
-    return ggml_reduce(ctx, attn.data(), n_device, GGML_OP_ADD);
+    ggml_tensor * out = ggml_reduce(ctx, attn.data(), n_device, GGML_OP_ADD);
+    if (wo_b) out = ggml_add(ctx, out, wo_b);
+    return out;
 }

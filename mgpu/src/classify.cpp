@@ -46,21 +46,29 @@ extern "C" enum mgpu_split_kind mgpu_classify_weight(const char * name) {
     if (strstr(name, "attn_o.")  != nullptr)  return MGPU_SPLIT_ROW_PAR;
     if (strstr(name, "ffn_down.")!= nullptr)  return MGPU_SPLIT_ROW_PAR;
 
-    // Replicate: tensors that flow into non-matmul ops (UPSCALE,
-    // RESHAPE+PERMUTE chains, NORM, etc.) or that must be locally
-    // addressable on every device. Position embeddings in vision
-    // transformers (qwen3vl etc.) go through UPSCALE; norms apply
-    // per-element. All small enough that per-device duplication is
-    // cheap.
-    if (strstr(name, "position_embd") != nullptr) return MGPU_SPLIT_REPLICATE;
-    if (strstr(name, "_norm")         != nullptr) return MGPU_SPLIT_REPLICATE;
-    if (strstr(name, ".bias")         != nullptr) return MGPU_SPLIT_REPLICATE;
-    if (strstr(name, "patch_bias")    != nullptr) return MGPU_SPLIT_REPLICATE;
-    if (strstr(name, "patch_embd")    != nullptr) return MGPU_SPLIT_REPLICATE;
-
-    // Default: leave unsplit. Safer than guessing — a missed
-    // classification of a matmul weight that should have been COL_PAR
-    // or ROW_PAR just leaves it single-device (small residency cost)
-    // rather than producing wrong-shape matmuls (IMA).
+    // Everything else stays single-device (NONE).
+    //
+    // This includes norms, biases, position embeddings, patch_*. Why
+    // NOT REPLICATE for these:
+    //
+    //   REPLICATE allocates a full per-device tensor and populates
+    //   the parent's `extra` with the split state. The parent
+    //   tensor's data pointer becomes meaningless — the actual
+    //   storage is in the per-device slices. Ops that go through
+    //   libmgpu builders (which read extras->splits[id]) handle this
+    //   correctly. Ops that go through standard ggml-cuda dispatch
+    //   (UPSCALE, RESHAPE, PERMUTE, IM2COL, NORM as a non-matmul
+    //   path, etc.) read src0->data directly and IMA on a parent
+    //   tensor in split-buft.
+    //
+    //   Empirical evidence: position_embd in CUDA_Split fires IMA at
+    //   the qwen3vl UPSCALE on node 23 of the encode regardless of
+    //   split_dim. Same logic applies to any other tensor whose
+    //   primary consumer is a non-matmul op.
+    //
+    //   For libmgpu's fused-QKV attention builder, the qkv weight
+    //   IS read via extras (per-device REPLICATE'd matmul), so qkv
+    //   stays REPLICATE above. That's the only weight kind for
+    //   which REPLICATE is currently safe in this codebase.
     return MGPU_SPLIT_NONE;
 }
