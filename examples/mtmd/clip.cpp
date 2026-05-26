@@ -9,6 +9,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-mgpu-split.h"  // PHASE46 B.5b: shared multi-GPU split infra
+#include "mgpu/classify.h"    // PHASE46 B.5e: weight-name → split-kind classifier
+#include "mgpu/tp.h"          // PHASE46 B.5e: Megatron-TP graph builders
 //#include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -1180,36 +1182,74 @@ struct clip_graph {
 
             // self-attention
             {
-                cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
-                cb(cur, "qkv_w", il);
-                cur = ggml_add(ctx0, cur, layer.qkv_b);
-                cb(cur, "qkv_b", il);
+                // PHASE 46 B.5e — when both qkv_w (REPLICATE) and o_w
+                // (ROW_PAR) carry libmgpu extras, take the Megatron-TP
+                // attention path: per-device qkv matmul + view-slice +
+                // m-rope + attention math + row-parallel wo + reduce.
+                if (layer.qkv_w && layer.qkv_w->extra && layer.o_w && layer.o_w->extra) {
+                    mgpu_attn_config cfg{};
+                    cfg.n_head         = n_head;
+                    cfg.n_head_kv      = n_head;          // qwen3vl uses MHA
+                    cfg.n_embd_head_k  = d_head;
+                    cfg.n_embd_head_v  = d_head;
+                    cfg.n_pos          = n_pos;
+                    cfg.norm_eps       = 0.0f;            // norm already applied above
+                    cfg.norm_type      = MGPU_NORM_RMS;
+                    cfg.kq_scale       = kq_scale;
+                    cfg.fa_enabled     = (ctx->flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) ? 1 : 0;
+                    cfg.rope_mode      = GGML_ROPE_TYPE_VISION; // m-rope
+                    cfg.rope_n_dims    = d_head / 2;
+                    for (int i = 0; i < 4; ++i) cfg.rope_sections[i] = mrope_sections[i];
+                    cfg.rope_n_ctx_orig = 32768;
+                    cfg.rope_freq_base  = 10000.0f;
+                    cfg.rope_freq_scale = 1.0f;
+                    cfg.rope_ext_factor = 0.0f;
+                    cfg.rope_attn_factor = 1.0f;
+                    cfg.rope_beta_fast  = 32.0f;
+                    cfg.rope_beta_slow  = 1.0f;
+                    cfg.il             = il;
+                    cur = mgpu_build_attn_megatron_fused_qkv(
+                        ctx0, &cfg,
+                        /*attn_norm=*/ nullptr,           // pre-normed above
+                        cur,
+                        layer.qkv_w, layer.qkv_b,
+                        layer.o_w,   layer.o_b,
+                        positions,
+                        /*kq_mask=*/ nullptr);
+                    cb(cur, "attn_out", il);
+                } else {
+                    // Single-device fallback (matches the pre-libmgpu path).
+                    cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
+                    cb(cur, "qkv_w", il);
+                    cur = ggml_add(ctx0, cur, layer.qkv_b);
+                    cb(cur, "qkv_b", il);
 
-                ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
-                    cur->nb[1], 0);
-                ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
-                    cur->nb[1], n_embd * sizeof(float));
-                ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
-                    cur->nb[1], 2 * n_embd * sizeof(float));
+                    ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                        cur->nb[1], 0);
+                    ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                        cur->nb[1], n_embd * sizeof(float));
+                    ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos, d_head*sizeof(float),
+                        cur->nb[1], 2 * n_embd * sizeof(float));
 
-                cb(Qcur, "Qcur", il);
-                cb(Kcur, "Kcur", il);
-                cb(Vcur, "Vcur", il);
+                    cb(Qcur, "Qcur", il);
+                    cb(Kcur, "Kcur", il);
+                    cb(Vcur, "Vcur", il);
 
-                // apply M-RoPE
-                Qcur = ggml_rope_multi(
-                    ctx0, Qcur, positions, nullptr,
-                    d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
-                Kcur = ggml_rope_multi(
-                    ctx0, Kcur, positions, nullptr,
-                    d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
+                    // apply M-RoPE
+                    Qcur = ggml_rope_multi(
+                        ctx0, Qcur, positions, nullptr,
+                        d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
+                    Kcur = ggml_rope_multi(
+                        ctx0, Kcur, positions, nullptr,
+                        d_head/2, mrope_sections, GGML_ROPE_TYPE_VISION, 32768, 10000, 1, 0, 1, 32, 1);
 
-                cb(Qcur, "Qcur_rope", il);
-                cb(Kcur, "Kcur_rope", il);
+                    cb(Qcur, "Qcur_rope", il);
+                    cb(Kcur, "Kcur_rope", il);
 
-                cur = build_attn(layer.o_w, layer.o_b,
-                    Qcur, Kcur, Vcur, nullptr, kq_scale, il);
-                cb(cur, "attn_out", il);
+                    cur = build_attn(layer.o_w, layer.o_b,
+                        Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+                    cb(cur, "attn_out", il);
+                }
             }
 
             // re-add the layer input, e.g., residual
@@ -2701,6 +2741,25 @@ private:
         // PHASE 46 B.5e — mark FFN input as a sched split boundary.
         mark_split(cur);
 
+        // PHASE 46 B.5e — when the down weight has libmgpu extras (i.e.
+        // the loader split it via mgpu_classify_weight ROW_PAR), take the
+        // Megatron-TP path: per-device col-parallel up/gate matmuls →
+        // activation → per-device row-parallel down matmul → reduce.
+        // Caller has already pre-normed `cur`, so pass ffn_norm=nullptr.
+        if (down && down->extra) {
+            mgpu_act act = MGPU_ACT_SILU;
+            switch (type_op) {
+                case FFN_SILU:       act = MGPU_ACT_SILU;       break;
+                case FFN_GELU:       act = MGPU_ACT_GELU;       break;
+                case FFN_GELU_ERF:   act = MGPU_ACT_GELU_ERF;   break;
+                case FFN_GELU_QUICK: act = MGPU_ACT_GELU_QUICK; break;
+            }
+            return mgpu_build_ffn_megatron(
+                ctx0, cur, /*ffn_norm=*/ nullptr,
+                up, up_b, gate, gate_b, down, down_b,
+                /*norm_eps=*/ 0.0f, MGPU_NORM_RMS, act, il);
+        }
+
         ggml_tensor * tmp = up ? ggml_mul_mat(ctx0, up, cur) : cur;
         cb(tmp, "ffn_up", il);
 
@@ -3573,35 +3632,21 @@ struct clip_model_loader {
             mmproj_splits.back() = 1.0f;  // belt-and-suspenders for SplitsNormalized
         }
 
-        // PHASE46 B.5b: splittable predicate.
-        auto is_splittable = [](const ggml_tensor * t) {
-            if (ggml_n_dims(t) < 2) return false;
-            if (t->ne[0] < 256 || t->ne[1] < 256) return false;
-            if (ggml_nbytes(t) < (1u << 20)) return false;  // 1 MiB
-            // PHASE 46 B.5e — exclude fused-QKV weights. Their matmul output
-            // is viewed back into Q/K/V at known fixed offsets (e.g. qwen3vl
-            // clip.cpp:1152-1157), and a row-chunked split along dim 0
-            // misaligns those views with the per-device weight slice
-            // boundaries → illegal memory access on view dereference.
-            // Match by name suffix: GGUF convention is "*.attn_qkv.weight"
-            // (TN_ATTN_QKV at clip-impl.h:68). Also exclude any tensor whose
-            // name contains "qkv" defensively.
-            const char * n = t->name;
-            if (strstr(n, "qkv") != nullptr) {
-                return false;
-            }
-            // PHASE 46 B.5e — exclude positional embeddings. They are
-            // reshaped → permuted → upscaled to the actual image grid
-            // (qwen3vl encoder, clip.cpp nodes 21-23 of the encode);
-            // the CUDA UPSCALE kernel reads src0->data contiguously
-            // and IMAs on row-chunked CUDA_Split storage. Empirically
-            // captured 2026-05-26 (run-20260526T101234). Position
-            // embeddings are 5-10 MiB so per-device duplication is
-            // single-digit MiB.
-            if (strstr(n, "position_embd") != nullptr) {
-                return false;
-            }
-            return true;
+        // PHASE 46 B.5e: per-weight split-kind classification.
+        // Replaces the prior B.5b is_splittable predicate (uniform
+        // row-parallel). The classifier returns col-parallel, row-parallel,
+        // replicate, or none — matching the LM's Megatron-TP layout.
+        // See mgpu/include/mgpu/classify.h and mgpu/src/classify.cpp.
+        auto resolve_split_kind = [](const ggml_tensor * t) {
+            // Size cutoffs first — sub-1MiB tensors aren't worth splitting
+            // regardless of name. Also skip 1D tensors (norms, biases) that
+            // would have been REPLICATE; they live in ctx_data single-device.
+            if (ggml_n_dims(t) < 2) return MGPU_SPLIT_NONE;
+            if (ggml_nbytes(t) < (1u << 20)) return MGPU_SPLIT_NONE;
+            // Both dims must be at least 256 for the split to be meaningful
+            // (heads / output features need to subdivide).
+            if (t->ne[0] < 256 || t->ne[1] < 256) return MGPU_SPLIT_NONE;
+            return mgpu_classify_weight(t->name);
         };
 
         // helper function
@@ -3613,37 +3658,72 @@ struct clip_model_loader {
             if (cur) {
                 tensors_to_load.push_back(cur);
 
-                // PHASE46 B.5b decision: which ctx + split decoration?
-                ggml_context * target_ctx = ctx_clip.ctx_data.get();
-                bool do_split = multi_gpu_mmproj && is_splittable(cur);
-                if (do_split) {
-                    target_ctx = ctx_clip.ctx_data_split.get();
-                }
+                // PHASE 46 B.5e: dispatch on the mgpu split kind. NONE →
+                // single-device residency in ctx_data. Otherwise allocate
+                // into ctx_data_split with the kind-appropriate split_dim,
+                // and decorate the tensor's `extra` so per-device graph
+                // builders (mgpu_build_ffn_megatron etc.) can see the slices.
+                mgpu_split_kind kind = multi_gpu_mmproj
+                    ? resolve_split_kind(cur)
+                    : MGPU_SPLIT_NONE;
+
+                ggml_context * target_ctx = (kind == MGPU_SPLIT_NONE)
+                    ? ctx_clip.ctx_data.get()
+                    : ctx_clip.ctx_data_split.get();
 
                 ggml_tensor * data_tensor = ggml_dup_tensor(target_ctx, cur);
                 ggml_set_name(data_tensor, cur->name);
 
-                if (do_split) {
-                    // Row-chunk along dim 0 across n_cuda_in_ptrs devices.
-                    // Use ggml_mgpu_create_split to compute the chunk
-                    // counts biased by current mem_used. The chunks must
-                    // be a multiple of MATRIX_ROW_PADDING (128); we use
-                    // 1 as granularity here since per-row alignment is
-                    // handled inside the split buft's get_alloc_size.
+                if (kind != MGPU_SPLIT_NONE) {
+                    // Determine split_dim and the dimension's size to
+                    // distribute across devices.
+                    int    split_dim         = -1;
+                    int    total_to_distrib  = 0;
+                    switch (kind) {
+                        case MGPU_SPLIT_REPLICATE:
+                            split_dim = -1;
+                            // For replicate, split_counts must be > 0 on every
+                            // device (otherwise ggml_mgpu_alloc_split_tensors
+                            // skips the device). The value is otherwise
+                            // ignored — each device gets the full ne[].
+                            total_to_distrib = (int) cur->ne[0];
+                            break;
+                        case MGPU_SPLIT_COL_PAR:
+                            split_dim = 1;
+                            total_to_distrib = (int) cur->ne[1]; // output features
+                            break;
+                        case MGPU_SPLIT_ROW_PAR:
+                            split_dim = 0;
+                            total_to_distrib = (int) cur->ne[0]; // reduction axis
+                            break;
+                        default:
+                            GGML_ABORT("unreachable");
+                    }
+
                     std::vector<int> split_counts(n_cuda_in_ptrs, 0);
-                    ggml_mgpu_create_split(
-                        (int) cur->ne[0],  // total rows to distribute
-                        1,                  // granularity (handled downstream)
-                        n_cuda_in_ptrs,
-                        mmproj_splits.data(),
-                        ctx_clip.mem_used_per_device.data(),
-                        0,                  // verbose
-                        split_counts.data());
+                    if (kind == MGPU_SPLIT_REPLICATE) {
+                        // Skip the memory-balance algorithm — every device
+                        // needs the full tensor. Mark each device with a
+                        // sentinel positive value so the allocator doesn't
+                        // skip any device.
+                        for (size_t i = 0; i < n_cuda_in_ptrs; ++i) {
+                            split_counts[i] = 1;
+                        }
+                    } else {
+                        ggml_mgpu_create_split(
+                            total_to_distrib,
+                            1,                  // granularity
+                            n_cuda_in_ptrs,
+                            mmproj_splits.data(),
+                            ctx_clip.mem_used_per_device.data(),
+                            0,                  // verbose
+                            split_counts.data());
+                    }
 
                     auto st = std::make_unique<clip_split_tensor>();
                     st->tensor_splits.assign(n_cuda_in_ptrs, nullptr);
                     ggml_mgpu_alloc_split_tensors(
-                        /*split_dim=*/ 0,
+                        split_dim,
                         target_ctx,
                         data_tensor,
                         n_cuda_in_ptrs,
@@ -3652,7 +3732,7 @@ struct clip_model_loader {
                         ctx_clip.mem_used_per_device.data());
 
                     st->ggml.n_device  = (int) n_cuda_in_ptrs;
-                    st->ggml.split_dim = 0;
+                    st->ggml.split_dim = split_dim;
                     st->ggml.tensor    = data_tensor;
                     st->ggml.splits    = st->tensor_splits.data();
                     data_tensor->extra = (void *) &st->ggml;
