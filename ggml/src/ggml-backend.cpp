@@ -2287,15 +2287,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
 
-                // PHASE 46 B.5e Phase-C diagnostic: env-gated full sched
-                // synchronize after every split. Drains ALL backends, not
-                // just the eval thread's. If determinism holds with this on,
-                // the race is in cross-backend GPU async ordering and we
-                // need finer event-based sync. If still racy with this on,
-                // the race is somewhere even coarser sync can't catch.
+                // PHASE 46 B.5e Phase-C fix (2026-05-26): drain all backends
+                // after every split in the openmp parallel multi-backend
+                // path. The existing sync points in copy_inputs are
+                // insufficient for libmgpu's per-device sub-graphs with
+                // cross-device peer writes — the next iteration's eval can
+                // race against in-flight kernels from the previous split's
+                // cross-device data flow. The thread-0-fenced barrier
+                // serializes the drain across threads.
+                //
+                // Env knob to disable (diagnostic only): GGML_SCHED_NO_DRAIN=1
                 {
-                    static const bool s_all_drain = std::getenv("GGML_SCHED_ALL_DRAIN") != nullptr;
-                    if (s_all_drain) {
+                    static const bool s_no_drain = std::getenv("GGML_SCHED_NO_DRAIN") != nullptr;
+                    if (!s_no_drain) {
                         #pragma omp barrier
                         if (ith == 0) {
                             for (int b = 0; b < sched->n_backends; b++) {
@@ -2591,14 +2595,18 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     sched->is_alloc = false;
 
-    // PHASE 46 B.5e Phase-C: env-gated activation buffer zero. Tests whether
-    // the cross-encode state leak (encode 1 = correct, encodes 2/3 = specific
-    // wrong) is due to a kernel reading stale bytes from a previously-used
-    // activation buffer that the new encode hasn't fully overwritten. If
-    // zeroing here collapses encodes 2/3 to encode 1, residual GPU memory
-    // is the leak source.
-    static const bool s_zero_activations = std::getenv("GGML_SCHED_ZERO_ACTIVATIONS") != nullptr;
-    if (s_zero_activations && sched->galloc) {
+    // PHASE 46 B.5e Phase-C fix (2026-05-26): zero gallocr activation
+    // buffers between encodes. Some kernel in the multi-device CLIP
+    // graph reads partially-initialized memory on subsequent encodes
+    // (a view-stride or kernel-not-fully-overwriting issue we haven't
+    // localized at the kernel level). Zeroing here makes the system
+    // deterministic at minimal perf cost (~3s of ~22GB cudaMemset for
+    // CLIP's activation working set).
+    //
+    // Env knob to disable (diagnostic only — restores the cross-encode
+    // state leak): GGML_SCHED_NO_ZERO_ACTIVATIONS=1
+    static const bool s_no_zero_activations = std::getenv("GGML_SCHED_NO_ZERO_ACTIVATIONS") != nullptr;
+    if (!s_no_zero_activations && sched->galloc) {
         int n = ggml_gallocr_get_n_buffers(sched->galloc);
         for (int i = 0; i < n; i++) {
             ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(sched->galloc, i);

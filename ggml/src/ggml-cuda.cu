@@ -4517,23 +4517,27 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
-    // PHASE 46 B.5e NPC.4 diagnostic env knobs (off by default):
-    //   GGML_CUDA_FULL_DEVICE_SYNC (Test H): cudaDeviceSynchronize for
-    //     the current device. Drains all streams on this device.
-    //   GGML_CUDA_PER_THREAD_SYNC (Test I): cudaStreamSynchronize on
-    //     cudaStreamPerThread (the per-thread default stream). Per CUDA
-    //     semantics this implicitly syncs with any non-non-blocking
-    //     streams the same host thread has submitted to. The capture
-    //     mode's tensor_get uses cudaStreamPerThread; this knob isolates
-    //     whether that's the distinguishing factor from named-stream sync.
-    static const bool s_test_h = std::getenv("GGML_CUDA_FULL_DEVICE_SYNC") != nullptr;
-    static const bool s_test_i = std::getenv("GGML_CUDA_PER_THREAD_SYNC") != nullptr;
-    if (s_test_h) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-    } else if (s_test_i) {
+    // PHASE 46 B.5e Phase-C fix (2026-05-26): default to cudaDeviceSynchronize.
+    // The previous default of cudaStreamSynchronize(named_stream) only drained
+    // ONE stream per device, missing peer-access writes from OTHER devices
+    // that landed on copy/event streams. For libmgpu's multi-device CLIP
+    // encoder this caused a within-encode race in the openmp parallel multi-
+    // backend dispatch path. cudaDeviceSynchronize drains ALL streams on the
+    // device — perf cost is negligible (LM uses one stream per device anyway;
+    // CLIP needs the broader drain).
+    //
+    // Env knob to revert (diagnostic only):
+    //   GGML_CUDA_STREAM_SYNC=1  — use the old cudaStreamSynchronize behavior
+    // Env knob for an alternate sync surface (diagnostic only):
+    //   GGML_CUDA_PER_THREAD_SYNC=1  — sync cudaStreamPerThread instead
+    static const bool s_stream_sync_only = std::getenv("GGML_CUDA_STREAM_SYNC") != nullptr;
+    static const bool s_per_thread_sync = std::getenv("GGML_CUDA_PER_THREAD_SYNC") != nullptr;
+    if (s_stream_sync_only) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    } else if (s_per_thread_sync) {
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     } else {
-        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     GGML_UNUSED(backend);
