@@ -154,6 +154,10 @@ if (NOT TARGET ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+# PHASE 46 B.5e — libmgpu: Megatron-TP graph builders. Layered above
+# libggml; consumed by libllama and libmtmd. Must be added before src/.
+add_subdirectory(mgpu)
+
 #
 # build the library
 #

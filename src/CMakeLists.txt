@@ -140,7 +140,7 @@ target_include_directories(llama PUBLIC . ../include)
 target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
-target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PUBLIC ggml mgpu)
 
 # DFlash drafter (sm_75): when GGML_CUDA_DFLASH is on, src/llama-dflash.cpp
 # calls into ggml-cuda/dflash kernel launchers, so libllama needs CUDA
