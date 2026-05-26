@@ -772,6 +772,44 @@ struct clip_ctx {
             ggml_backend_sched_set_eval_callback(sched.get(), clip_debug_eval_cb, nullptr);
             LOG_INF("%s: CLIP_DEBUG_SCHED=1 — per-node eval callback installed\n", __func__);
         }
+
+        // PHASE 46 B.5e Test N: a no-op eval callback that returns true on
+        // every ask. This forces ggml_backend_sched_eval (ggml-backend.cpp:
+        // 2127) into the per-node compute_async + ggml_backend_synchronize
+        // path at line 2165, but does NOT do the per-node DtoH that
+        // clip_debug_eval_cb's CLIP_CAPTURE_HASH path does. Isolates whether
+        // per-node ggml_backend_synchronize alone is sufficient for
+        // determinism, or whether the host readback is structurally
+        // load-bearing on top of it.
+        else if (env_truthy("CLIP_FORCE_EVAL_CB_NOOP")) {
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                +[](ggml_tensor * /*t*/, bool /*ask*/, void * /*ud*/) -> bool { return true; },
+                nullptr);
+            LOG_INF("%s: CLIP_FORCE_EVAL_CB_NOOP=1 — no-op per-node sync callback installed\n", __func__);
+        }
+        // PHASE 46 B.5e Test O: per-node DtoH callback (no logging, no hash).
+        // Each F32/F16/BF16 node's output is read into a thread-local scratch
+        // buffer via ggml_backend_tensor_get, which is a cudaMemcpyAsync DtoH
+        // + cudaStreamSynchronize on the source backend's stream. This is
+        // the production-shape version of the capture-mode determinism
+        // mechanism: per-node sync + per-node DtoH, without the file I/O
+        // overhead. If this restores production-mode determinism, the
+        // per-node DtoH is THE structural fence we need.
+        else if (env_truthy("CLIP_FORCE_EVAL_CB_DTOH")) {
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                +[](ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
+                    if (ask) return true;
+                    if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) {
+                        thread_local std::vector<uint8_t> buf;
+                        const size_t nbytes = ggml_nbytes(t);
+                        if (buf.size() < nbytes) buf.resize(nbytes);
+                        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+                    }
+                    return true;
+                },
+                nullptr);
+            LOG_INF("%s: CLIP_FORCE_EVAL_CB_DTOH=1 — per-node DtoH callback installed (no logging)\n", __func__);
+        }
     }
 
     ~clip_ctx() {
