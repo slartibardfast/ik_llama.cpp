@@ -2247,8 +2247,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 if (ith == split_backend_id) {
-
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    // PHASE 46 B.5e Phase-C diagnostic: env-gated critical
+                    // section around the eval phase. GGML_SCHED_EVAL_SERIALIZE=1
+                    // forces evals across openmp threads to run one-at-a-time,
+                    // effectively serializing the dispatch. If determinism
+                    // holds with this on, the race is in concurrent CPU-side
+                    // dispatch to different backends (cuda driver, pool alloc,
+                    // CUDA context state). If still racy, the bug is deeper.
+                    static const bool s_eval_serialize = std::getenv("GGML_SCHED_EVAL_SERIALIZE") != nullptr;
+                    if (s_eval_serialize) {
+                        #pragma omp critical(sched_eval)
+                        {
+                            sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                        }
+                    } else {
+                        sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    }
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -2273,6 +2287,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
 
+                // PHASE 46 B.5e Phase-C diagnostic: env-gated full sched
+                // synchronize after every split. Drains ALL backends, not
+                // just the eval thread's. If determinism holds with this on,
+                // the race is in cross-backend GPU async ordering and we
+                // need finer event-based sync. If still racy with this on,
+                // the race is somewhere even coarser sync can't catch.
+                {
+                    static const bool s_all_drain = std::getenv("GGML_SCHED_ALL_DRAIN") != nullptr;
+                    if (s_all_drain) {
+                        #pragma omp barrier
+                        if (ith == 0) {
+                            for (int b = 0; b < sched->n_backends; b++) {
+                                ggml_backend_synchronize(sched->backends[b]);
+                            }
+                        }
+                        #pragma omp barrier
+                    }
+                }
+
                 if (split->graph.nodes[0]->op == GGML_OP_REDUCE && i < sched->n_splits - 1) {
                     last_reduce = split_backend_id;
                     if (ith == split_backend_id) {
@@ -2291,8 +2324,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     #pragma omp barrier
                 }
 
-                // record the event of this copy
-                if (split->n_inputs > 0) {
+                // PHASE 46 B.5e Phase-C fix: gate the event-record on the
+                // owning thread. The original unguarded version had ALL
+                // openmp threads calling cudaEventRecord on the same event
+                // handle concurrently — per CUDA docs ("If hEvent has
+                // previously been recorded, calling cudaEventRecord() will
+                // reuse the event"), repeated records overwrite each other
+                // and earlier markers are lost. Downstream waits see only
+                // the latest record, not the intended-from-this-thread one.
+                // Gating on (ith == split_backend_id) ensures exactly one
+                // record per event per split.
+                if (split->n_inputs > 0 && ith == split_backend_id) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
@@ -2371,10 +2413,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 //    barrier.arrive_and_wait();
                 //}
 
-                // record the event of this copy
-                if (split->n_inputs > 0) {
+                // PHASE 46 B.5e Phase-C fix: gate on owning thread to avoid
+                // concurrent cudaEventRecord on the same event handle (the
+                // same race fixed in the openmp branch above).
+                if (split->n_inputs > 0 && ith == split_backend_id) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        printf("Recording event %d, %d\n", split_backend_id, sched->cur_copy);
                         ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
                 }
