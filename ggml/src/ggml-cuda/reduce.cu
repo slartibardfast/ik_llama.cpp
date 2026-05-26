@@ -192,7 +192,8 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
 #else
     constexpr bool bf16_supported = false;
 #endif
-    if (info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
+    static const bool s_skip_nccl = std::getenv("GGML_REDUCE_SKIP_NCCL") != nullptr;
+    if (!s_skip_nccl && info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
        (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
         GGML_ASSERT(info.have_nccl);
         GGML_ASSERT(info.device_count == nreduce);
