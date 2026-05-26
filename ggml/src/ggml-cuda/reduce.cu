@@ -117,6 +117,24 @@ static void copy_missing_tensors(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_set_device(ctx.device);
 }
 
+// PHASE 46 B.5e NPC.4 test F: env-gated post-reduce full-device sync on
+// every participating device. Tests whether post-reduce cross-device
+// visibility is the missing sync — capture-bisect runs were bit-
+// deterministic only because ggml_backend_tensor_get's pageable-host
+// cudaMemcpyAsync effectively performs a full-device sync. Per-stream-
+// only sync (test E) was not deterministic. Called immediately before
+// every return point in ggml_cuda_op_reduce when the env knob is set.
+static inline void ggml_reduce_test_f_post_sync(int saved_device) {
+    static const bool s_enabled = std::getenv("GGML_REDUCE_POST_DEVICE_SYNC") != nullptr;
+    if (!s_enabled) return;
+    auto & info = ggml_cuda_info();
+    for (int i = 0; i < info.device_count; ++i) {
+        ggml_cuda_set_device(i);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ggml_cuda_set_device(saved_device);
+}
+
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     auto op = (ggml_op)dst->op_params[0];
@@ -161,6 +179,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         }
         ncclGroupEnd();
         ggml_cuda_set_device(ctx.device);
+        ggml_reduce_test_f_post_sync(ctx.device);
         return;
     }
 #endif
@@ -364,6 +383,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
+        ggml_reduce_test_f_post_sync(ctx.device);
         return;
     }
     if (false && nhave == 4 && dst->ne[1] <= 8 && ctx.p2p_enabled) {
@@ -433,6 +453,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
+        ggml_reduce_test_f_post_sync(ctx.device);
         return;
     }
     if (dst->ne[1] < 32 && ctx.p2p_enabled) {
@@ -519,6 +540,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
+        ggml_reduce_test_f_post_sync(ctx.device);
         return;
     }
     auto required_size = nbytes*(nhave-1);
@@ -585,4 +607,5 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     if (ncopy > 0) {
         copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
     }
+    ggml_reduce_test_f_post_sync(ctx.device);
 }

@@ -6045,6 +6045,22 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
     }
 
+    // PHASE 46 B.5e NPC.4 test C: post-encode hash of the final embedding
+    // tensor. Sync read above forces device-stream drain, so this hash
+    // reflects whatever value the (potentially async) graph produced. Run
+    // multiple encodes with this env set and grep stderr — divergent hashes
+    // confirm the encode is non-deterministic at the embedding level.
+    if (env_truthy("CLIP_LOG_FINAL_HASH") && vec != nullptr) {
+        const size_t nbytes = ggml_nbytes(embeddings);
+        const uint8_t * p = (const uint8_t *) vec;
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < nbytes; ++i) { h ^= p[i]; h *= 0x100000001b3ULL; }
+        LOG_INF("CLIP_FINAL_HASH ne=[%lld,%lld,%lld,%lld] nbytes=%zu hash=%016llx\n",
+                (long long) embeddings->ne[0], (long long) embeddings->ne[1],
+                (long long) embeddings->ne[2], (long long) embeddings->ne[3],
+                nbytes, (unsigned long long) h);
+    }
+
     return true;
 }
 

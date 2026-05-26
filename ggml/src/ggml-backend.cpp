@@ -1191,6 +1191,7 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+    bool per_split_sync_test = false;
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2258,6 +2259,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                     }
+
+                    // PHASE 46 B.5e NPC.4 test B: env-gated per-split GPU drain.
+                    // Drains the eval thread's backend stream after each split's
+                    // eval. Tests whether the determinism bug is a cross-split
+                    // sync gap (this fixes it) or intra-split kernel-level race
+                    // (this doesn't help). Eval-callback's full-stream drain
+                    // per-NODE is what's bit-deterministic; this drains per-
+                    // SPLIT only. If deterministic with this on, the race is at
+                    // split-boundary stream ordering.
+                    if (sched->per_split_sync_test) {
+                        ggml_backend_synchronize(split_backend);
+                    }
                 }
 
                 if (split->graph.nodes[0]->op == GGML_OP_REDUCE && i < sched->n_splits - 1) {
@@ -2438,6 +2451,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
+    sched->per_split_sync_test = getenv("GGML_SCHED_PER_SPLIT_SYNC") != NULL;
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 

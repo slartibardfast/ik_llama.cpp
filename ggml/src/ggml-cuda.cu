@@ -4489,6 +4489,27 @@ GGML_CALL static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_
         printf("Why is this being invoked?\n");
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
+
+    // PHASE 46 B.5e NPC.4 test G: env-gated post-cpy_tensor_async full-device
+    // sync on both src and dst devices. Tests whether the sched's cross-
+    // device tensor handoff (cpy_tensor_async + event-wait) is the missing
+    // sync — capture's pageable-host tensor_get effectively forces this at
+    // every node. Per-stream wait (existing code) is bit-deterministic in
+    // theory but maybe not in practice for peer-access writes.
+    {
+        static const bool s_test_g = std::getenv("GGML_CPY_POST_DEVICE_SYNC") != nullptr;
+        if (s_test_g) {
+            int saved_device;
+            cudaGetDevice(&saved_device);
+            ggml_cuda_set_device(cuda_ctx_src->device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            if (cuda_ctx_dst->device != cuda_ctx_src->device) {
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+            ggml_cuda_set_device(saved_device);
+        }
+    }
     return true;
 }
 
@@ -4496,7 +4517,24 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    // PHASE 46 B.5e NPC.4 diagnostic env knobs (off by default):
+    //   GGML_CUDA_FULL_DEVICE_SYNC (Test H): cudaDeviceSynchronize for
+    //     the current device. Drains all streams on this device.
+    //   GGML_CUDA_PER_THREAD_SYNC (Test I): cudaStreamSynchronize on
+    //     cudaStreamPerThread (the per-thread default stream). Per CUDA
+    //     semantics this implicitly syncs with any non-non-blocking
+    //     streams the same host thread has submitted to. The capture
+    //     mode's tensor_get uses cudaStreamPerThread; this knob isolates
+    //     whether that's the distinguishing factor from named-stream sync.
+    static const bool s_test_h = std::getenv("GGML_CUDA_FULL_DEVICE_SYNC") != nullptr;
+    static const bool s_test_i = std::getenv("GGML_CUDA_PER_THREAD_SYNC") != nullptr;
+    if (s_test_h) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else if (s_test_i) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
     GGML_UNUSED(backend);
 }
