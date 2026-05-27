@@ -520,6 +520,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_MLOCK",            params.use_mlock);
     get_env("LLAMA_ARG_MLOCKALL",         params.use_mlockall);
     get_env("LLAMA_ARG_RT_PRIORITY",      params.rt_priority);
+    get_env("LLAMA_ARG_CPU_MASK",         params.cpu_mask);
     get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
     get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
 
@@ -1531,6 +1532,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--rt-prio") {
         CHECK_ARG
         params.rt_priority = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--cpu-mask") {
+        CHECK_ARG
+        params.cpu_mask = argv[i];
         return true;
     }
     if (arg == "-ngl" || arg == "--gpu-layers" || arg == "--n-gpu-layers") {
@@ -2764,6 +2770,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 #if defined(__linux__)
     options.push_back({ "*",           "       --mlockall",            "mlockall(MCL_CURRENT|MCL_FUTURE) — lock all process pages; requires CAP_IPC_LOCK or unlimited RLIMIT_MEMLOCK" });
     options.push_back({ "*",           "       --rt-prio N",           "set SCHED_FIFO priority N (1-99) on the dispatch thread; requires CAP_SYS_NICE. 0 = default scheduling" });
+    options.push_back({ "*",           "       --cpu-mask MASK",       "pin the dispatch thread to a CPU set. MASK is hex (0xF0) or range/list (4-7 or 0,2-5). Empty = no change" });
 #endif
     if (llama_supports_mmap()) {
         options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
@@ -3435,6 +3442,82 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 // Model utils
 //
+#if defined(__linux__)
+// Parse a CPU mask string into a cpu_set_t.
+// Supported syntaxes:
+//   "0xF0"           -> hex bitmask (bit i set => CPU i in mask)
+//   "4-7"            -> range
+//   "0,2-5,8"        -> comma-separated list (single CPUs and/or ranges)
+// Returns 0 on success with at least one CPU in the mask; -1 otherwise.
+// On parse error mid-string, returns -1 with the partial mask discarded.
+static int common_parse_cpu_mask(const std::string & str, cpu_set_t & mask) {
+    CPU_ZERO(&mask);
+    if (str.empty()) {
+        return -1;
+    }
+
+    if (str.size() > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        // Hex bitmask path. Cap at 64 bits — enough for any single-socket
+        // server CPU as of 2026. Multi-socket systems with >64 cores
+        // should use range syntax.
+        char * end = nullptr;
+        const unsigned long long val = std::strtoull(str.c_str() + 2, &end, 16);
+        if (end == str.c_str() + 2 || *end != '\0') {
+            return -1; // not pure hex
+        }
+        for (int i = 0; i < 64; ++i) {
+            if (val & (1ULL << i)) {
+                CPU_SET(i, &mask);
+            }
+        }
+    } else {
+        // Range/list path. Walk comma-separated tokens.
+        const char * p = str.c_str();
+        while (*p) {
+            char * end = nullptr;
+            const long lo = std::strtol(p, &end, 10);
+            if (end == p || lo < 0 || lo >= CPU_SETSIZE) {
+                return -1;
+            }
+            long hi = lo;
+            p = end;
+            if (*p == '-') {
+                ++p;
+                hi = std::strtol(p, &end, 10);
+                if (end == p || hi < lo || hi >= CPU_SETSIZE) {
+                    return -1;
+                }
+                p = end;
+            }
+            for (long i = lo; i <= hi; ++i) {
+                CPU_SET((int) i, &mask);
+            }
+            if (*p == ',') {
+                ++p;
+            } else if (*p != '\0') {
+                return -1;
+            }
+        }
+    }
+    return CPU_COUNT(&mask) > 0 ? 0 : -1;
+}
+
+// Format a cpu_set_t as a comma-separated CPU list for logging.
+// "4,5,6,7" or "0,2,4". Caps at CPU_SETSIZE per the cpu_set_t contract.
+static std::string common_format_cpu_mask(const cpu_set_t & mask) {
+    std::string out;
+    bool first = true;
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+        if (CPU_ISSET(i, &mask)) {
+            if (!first) out += ',';
+            out += std::to_string(i);
+            first = false;
+        }
+    }
+    return out.empty() ? std::string("<empty>") : out;
+}
+#endif // __linux__
+
 void common_apply_runtime_hardening(const gpt_params & params) {
 #if defined(__linux__)
     if (params.use_mlockall) {
@@ -3485,6 +3568,30 @@ void common_apply_runtime_hardening(const gpt_params & params) {
             }
         }
     }
+
+    if (!params.cpu_mask.empty()) {
+        cpu_set_t mask;
+        if (common_parse_cpu_mask(params.cpu_mask, mask) != 0) {
+            fprintf(stderr,
+                "%s: warning: --cpu-mask '%s' did not parse (use hex like "
+                "0xF0 or range like 4-7); ignored.\n",
+                __func__, params.cpu_mask.c_str());
+        } else {
+            const int rc = pthread_setaffinity_np(pthread_self(),
+                                                  sizeof(cpu_set_t), &mask);
+            const std::string mask_str = common_format_cpu_mask(mask);
+            if (rc == 0) {
+                fprintf(stderr,
+                    "%s: dispatch thread pinned to CPUs [%s] (mask '%s')\n",
+                    __func__, mask_str.c_str(), params.cpu_mask.c_str());
+            } else {
+                fprintf(stderr,
+                    "%s: warning: pthread_setaffinity_np([%s]) failed: %s "
+                    "(rc=%d) — continuing with default affinity.\n",
+                    __func__, mask_str.c_str(), strerror(rc), rc);
+            }
+        }
+    }
 #else
     if (params.use_mlockall) {
         fprintf(stderr,
@@ -3494,6 +3601,11 @@ void common_apply_runtime_hardening(const gpt_params & params) {
     if (params.rt_priority > 0) {
         fprintf(stderr,
             "%s: warning: --rt-prio is Linux-only on this build; ignored.\n",
+            __func__);
+    }
+    if (!params.cpu_mask.empty()) {
+        fprintf(stderr,
+            "%s: warning: --cpu-mask is Linux-only on this build; ignored.\n",
             __func__);
     }
 #endif

@@ -370,6 +370,7 @@ struct gpt_params {
     bool use_mlock         = false; // use mlock to keep model in memory
     bool use_mlockall      = false; // mlockall(MCL_CURRENT|MCL_FUTURE) for full process — paging-free RT determinism (Linux only)
     int  rt_priority       = 0;     // SCHED_FIFO priority for the dispatch thread (1-99); 0 = disabled. Requires CAP_SYS_NICE.
+    std::string cpu_mask;           // CPU affinity mask for the dispatch thread; hex ("0xF0") or range ("4-7,12-15"). Empty = no change. Linux only.
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool infill            = false; // use infill mode

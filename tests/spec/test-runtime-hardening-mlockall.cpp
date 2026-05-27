@@ -1,12 +1,12 @@
 // test-runtime-hardening-mlockall.cpp
 //
 // Binding test for common_apply_runtime_hardening() — covers the
-// --mlockall (C-1) and --rt-prio (C-2) paths added 2026-05-27 as part
-// of PHASE_NP8_FLAKE code-level RT mitigations.
+// --mlockall (C-1), --rt-prio (C-2), and --cpu-mask (C-3) paths added
+// 2026-05-27 as part of PHASE_NP8_FLAKE code-level RT mitigations.
 //
 // What this test asserts:
-//   T1. Calling common_apply_runtime_hardening() with use_mlockall=false
-//       and rt_priority=0 is a no-op (no crash, no side effect).
+//   T1. Calling common_apply_runtime_hardening() with all knobs at
+//       defaults is a no-op (no crash, no side effect).
 //   T2. Calling with use_mlockall=true on Linux either succeeds (process
 //       pages locked, VmLck > 0) or fails gracefully with a warning
 //       (does not crash, does not abort).
@@ -16,6 +16,13 @@
 //       gracefully with EPERM; either way, no crash.
 //   T5. Out-of-range rt_priority is rejected with a warning (no crash,
 //       no policy change).
+//   T6. cpu_mask "0xF0" parses to {4,5,6,7}; applied as affinity if
+//       the test runs on a host with ≥8 logical CPUs (affinity
+//       set should succeed unconditionally — unlike mlockall/rt-prio,
+//       setaffinity does NOT require privileges).
+//   T7. cpu_mask "4-7" range syntax parses identically to "0xF0".
+//   T8. Malformed cpu_mask is rejected with a warning (no crash, no
+//       affinity change).
 //
 // What this test does NOT assert:
 //   - That mlockall actually succeeds in CI environments. Locking memory
@@ -167,6 +174,94 @@ int main() {
         report("T5 out-of-range rt_priority on non-Linux", true, "n/a");
 #endif
     }
+
+#if defined(__linux__)
+    // Save the test process's original affinity so we can restore between
+    // T6/T7. setaffinity is unprivileged — no EPERM path to handle.
+    cpu_set_t orig_mask;
+    CPU_ZERO(&orig_mask);
+    pthread_getaffinity_np(pthread_self(), sizeof(orig_mask), &orig_mask);
+    const int n_online = sysconf(_SC_NPROCESSORS_ONLN);
+
+    auto cpus_in_mask_as_string = [](const cpu_set_t & m) {
+        std::string s;
+        for (int i = 0; i < 32; ++i) {
+            if (CPU_ISSET(i, &m)) {
+                if (!s.empty()) s += ",";
+                s += std::to_string(i);
+            }
+        }
+        return s.empty() ? std::string("<empty>") : s;
+    };
+
+    // T6 — hex mask "0xF0" → CPUs {4,5,6,7}. Requires ≥8 logical CPUs
+    // for the affinity call to succeed (otherwise the kernel returns
+    // EINVAL because the mask contains no online CPU).
+    if (n_online >= 8) {
+        gpt_params params;
+        params.cpu_mask = "0xF0";
+        common_apply_runtime_hardening(params);
+        cpu_set_t got;
+        CPU_ZERO(&got);
+        pthread_getaffinity_np(pthread_self(), sizeof(got), &got);
+        const bool ok = CPU_ISSET(4, &got) && CPU_ISSET(5, &got) &&
+                        CPU_ISSET(6, &got) && CPU_ISSET(7, &got) &&
+                        !CPU_ISSET(0, &got) && !CPU_ISSET(3, &got);
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+            "actual affinity after '0xF0' = {%s}",
+            cpus_in_mask_as_string(got).c_str());
+        report("T6 cpu_mask='0xF0' pins to {4,5,6,7}", ok, detail);
+
+        // restore for T7
+        pthread_setaffinity_np(pthread_self(), sizeof(orig_mask), &orig_mask);
+    } else {
+        report("T6 cpu_mask='0xF0'", true, "skipped (<8 online CPUs)");
+    }
+
+    // T7 — range mask "4-7" → CPUs {4,5,6,7}. Must produce identical
+    // affinity to T6.
+    if (n_online >= 8) {
+        gpt_params params;
+        params.cpu_mask = "4-7";
+        common_apply_runtime_hardening(params);
+        cpu_set_t got;
+        CPU_ZERO(&got);
+        pthread_getaffinity_np(pthread_self(), sizeof(got), &got);
+        const bool ok = CPU_ISSET(4, &got) && CPU_ISSET(5, &got) &&
+                        CPU_ISSET(6, &got) && CPU_ISSET(7, &got) &&
+                        !CPU_ISSET(0, &got) && !CPU_ISSET(3, &got);
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+            "actual affinity after '4-7' = {%s}",
+            cpus_in_mask_as_string(got).c_str());
+        report("T7 cpu_mask='4-7' matches '0xF0'", ok, detail);
+
+        // restore
+        pthread_setaffinity_np(pthread_self(), sizeof(orig_mask), &orig_mask);
+    } else {
+        report("T7 cpu_mask='4-7'", true, "skipped (<8 online CPUs)");
+    }
+
+    // T8 — malformed mask is rejected.
+    {
+        gpt_params params;
+        params.cpu_mask = "garbage!!";
+        cpu_set_t before;
+        CPU_ZERO(&before);
+        pthread_getaffinity_np(pthread_self(), sizeof(before), &before);
+        common_apply_runtime_hardening(params);
+        cpu_set_t after;
+        CPU_ZERO(&after);
+        pthread_getaffinity_np(pthread_self(), sizeof(after), &after);
+        // CPU_EQUAL: 1 if equal, 0 otherwise
+        const bool unchanged = CPU_EQUAL(&before, &after);
+        report("T8 malformed cpu_mask is rejected", unchanged,
+               "affinity unchanged");
+    }
+#else
+    report("T6-T8 cpu_mask tests on non-Linux", true, "n/a");
+#endif
 
     printf("test-runtime-hardening-mlockall: %s (%d FAIL)\n",
            fail_count == 0 ? "PASS" : "FAIL", fail_count);
