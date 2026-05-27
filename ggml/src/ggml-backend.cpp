@@ -2,6 +2,9 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <cassert>
 #include <climits>
@@ -49,6 +52,8 @@ extern "C" void ggml_backend_sched_dispatch_thread_reset(void) {
     std::lock_guard<std::mutex> lock(g_sched_dispatch_thread_mu);
     g_sched_dispatch_thread_ids.clear();
 }
+// ggml_backend_sched_outer_capture_disabled is defined later, after
+// the full ggml_backend_sched struct is in scope.
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -1220,7 +1225,16 @@ struct ggml_backend_sched {
     bool debug;
     bool has_reduce = false;
     bool per_split_sync_test = false;
+
+    // PHASE_CUDA_NATIVE_DISPATCH C4: sticky flag set when outer
+    // cudaStreamBeginCapture or EndCapture fails. Subsequent dispatches
+    // fall back to eager (the C1 path); the sched stays usable.
+    bool outer_capture_disabled = false;
 };
+
+extern "C" bool ggml_backend_sched_outer_capture_disabled(ggml_backend_sched_t sched) {
+    return sched != nullptr && sched->outer_capture_disabled;
+}
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
     int int_op = (int)op;
@@ -2249,7 +2263,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 break;
             }
         }
-        (void) first_reduce;  // reserved for C4 capture-mode ordering
+        (void) first_reduce;  // reserved for C5 cache-key device_layout
+
+        // PHASE_CUDA_NATIVE_DISPATCH C4: outer cudaStreamBeginCapture
+        // (Relaxed) wraps the entire single-threaded dispatch when:
+        //   - at least one CUDA backend is present
+        //   - every split's backend is CUDA (PD3: production has no
+        //     mid-dispatch CPU splits; C6 hoists CPU work cleanly)
+        //   - outer_capture_disabled has not been set by a prior
+        //     capture failure
+        // Cross-stream join + fan-in handled by
+        // ggml_cuda_outer_capture_begin / _end_and_launch in ggml-cuda.
+#ifdef GGML_USE_CUDA
+        ggml_backend_t cuda_backends[GGML_SCHED_MAX_BACKENDS];
+        int n_cuda = 0;
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (ggml_backend_is_cuda(sched->backends[i])) {
+                cuda_backends[n_cuda++] = sched->backends[i];
+            }
+        }
+        bool any_non_cuda_split = false;
+        for (int i = 0; i < sched->n_splits; ++i) {
+            if (!ggml_backend_is_cuda(sched->backends[sched->splits[i].backend_id])) {
+                any_non_cuda_split = true;
+                break;
+            }
+        }
+        const bool try_outer_capture = (n_cuda > 0) && !any_non_cuda_split
+                                       && !sched->outer_capture_disabled;
+        bool capture_active = false;
+        if (try_outer_capture) {
+            capture_active = ggml_cuda_outer_capture_begin(
+                cuda_backends[0],
+                n_cuda > 1 ? &cuda_backends[1] : nullptr,
+                n_cuda - 1);
+            if (!capture_active) {
+                sched->outer_capture_disabled = true;
+            }
+        }
+#endif
 
         struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -2304,6 +2356,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
             }
         }
+
+#ifdef GGML_USE_CUDA
+        // PHASE_CUDA_NATIVE_DISPATCH C4: end outer capture and launch
+        // the captured multi-device cudaGraph_t. On any failure (capture
+        // invalidation, instantiate error, launch error), the eager-
+        // dispatch results are already in flight on the per-backend
+        // streams; we mark outer_capture_disabled and let subsequent
+        // dispatches use the C1 eager path.
+        if (capture_active) {
+            bool ok = ggml_cuda_outer_capture_end_and_launch(
+                cuda_backends[0],
+                n_cuda > 1 ? &cuda_backends[1] : nullptr,
+                n_cuda - 1);
+            if (!ok) {
+                sched->outer_capture_disabled = true;
+            }
+        }
+#endif
 
         for (auto status : sched->statuses) {
             if (status != GGML_STATUS_SUCCESS) return status;

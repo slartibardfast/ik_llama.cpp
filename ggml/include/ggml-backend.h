@@ -225,6 +225,11 @@ extern "C" {
     GGML_API size_t               ggml_backend_sched_dispatch_thread_count(void);
     GGML_API void                 ggml_backend_sched_dispatch_thread_reset(void);
 
+    // PHASE_CUDA_NATIVE_DISPATCH C4: returns true iff outer-capture mode
+    // has been disabled on this sched (sticky after first capture failure).
+    // Tests assert this stays false across N dispatches on a healthy build.
+    GGML_API bool                 ggml_backend_sched_outer_capture_disabled(ggml_backend_sched_t sched);
+
     //
     // Utils
     //

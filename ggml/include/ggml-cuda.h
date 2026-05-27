@@ -81,6 +81,38 @@ GGML_API GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t bac
 GGML_API void ggml_cuda_outer_capture_set(bool active);
 GGML_API bool ggml_cuda_outer_capture_active(void);
 
+// PHASE_CUDA_NATIVE_DISPATCH C4: outer-capture orchestration.
+//
+// _begin starts a multi-device capture rooted on primary_backend's
+// stream, then pulls each backend in secondary_backends into the
+// capture via cross-stream event-chain (cudaEventRecord on primary,
+// cudaStreamWaitEvent on each secondary). On success, sets the C3
+// outer-capture flag so per-backend ggml_backend_cuda_graph_compute
+// short-circuits its own capture/launch. Returns false if any
+// participating backend is not a CUDA backend or if
+// cudaStreamBeginCapture fails; caller MUST dispatch eagerly on false.
+//
+// _end_and_launch issues fan-in event-chain (every secondary backend
+// records its completion event; primary stream waits on each), then
+// cudaStreamEndCapture + cudaGraphInstantiate + cudaGraphLaunch +
+// cudaGraphDestroy + cudaGraphExecDestroy. Returns false on any
+// failure; on false return the caller's eager dispatch results are
+// already in flight. Clears the C3 outer-capture flag.
+//
+// Counter: ggml_cuda_outer_capture_count() returns the number of
+// successful _begin → _end_and_launch round-trips since process start
+// (or since the last _count_reset).
+GGML_API bool   ggml_cuda_outer_capture_begin(
+                    ggml_backend_t   primary_backend,
+                    ggml_backend_t * secondary_backends,
+                    int              n_secondary);
+GGML_API bool   ggml_cuda_outer_capture_end_and_launch(
+                    ggml_backend_t   primary_backend,
+                    ggml_backend_t * secondary_backends,
+                    int              n_secondary);
+GGML_API size_t ggml_cuda_outer_capture_count(void);
+GGML_API void   ggml_cuda_outer_capture_count_reset(void);
+
 // CUDA graph cache instrumentation surface. All functions return 0 / -1
 // when GGML_CUDA_GRAPH_PROBE is unset or when the underlying probe step
 // has not yet landed. Tests treat any zero return as RED.

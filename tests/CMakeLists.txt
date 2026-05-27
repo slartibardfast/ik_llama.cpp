@@ -230,6 +230,14 @@ if (GGML_CUDA)
     # across 100 iterations.
     llama_build_and_test(test-single-threaded-dispatch.cpp)
 
+    # PHASE_CUDA_NATIVE_DISPATCH C4 — outer cudaStreamBeginCapture wrap.
+    # Drives ggml_cuda_outer_capture_begin/_end_and_launch directly on a
+    # 2-CUDA-backend setup. Asserts:
+    #   - outer_capture_count() advances by N after N round-trips
+    #   - output is bit-identical across N captured replays
+    # Requires 2 CUDA devices; skip otherwise.
+    llama_build_and_test(test-multi-device-graph-capture.cpp)
+
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.
     llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)

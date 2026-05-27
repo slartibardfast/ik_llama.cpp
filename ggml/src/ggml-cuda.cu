@@ -5951,6 +5951,142 @@ extern "C" bool ggml_cuda_outer_capture_active(void) {
     return g_outer_capture_active;
 }
 
+// PHASE_CUDA_NATIVE_DISPATCH C4: outer-capture orchestration.
+// State that persists across _begin → _end_and_launch on the same
+// dispatcher thread (thread-local with C1's single-dispatcher
+// invariant).
+static thread_local cudaStream_t   g_outer_primary_stream     = nullptr;
+static thread_local int            g_outer_primary_device     = -1;
+static thread_local cudaEvent_t    g_outer_primary_join_event = nullptr;
+static std::atomic<size_t>         g_outer_capture_success_count{0};
+
+extern "C" size_t ggml_cuda_outer_capture_count(void) {
+    return g_outer_capture_success_count.load(std::memory_order_relaxed);
+}
+
+extern "C" void ggml_cuda_outer_capture_count_reset(void) {
+    g_outer_capture_success_count.store(0, std::memory_order_relaxed);
+}
+
+extern "C" bool ggml_cuda_outer_capture_begin(
+        ggml_backend_t   primary_backend,
+        ggml_backend_t * secondary_backends,
+        int              n_secondary) {
+    if (primary_backend == nullptr || !ggml_backend_is_cuda(primary_backend)) return false;
+    for (int i = 0; i < n_secondary; ++i) {
+        if (secondary_backends[i] == nullptr || !ggml_backend_is_cuda(secondary_backends[i])) {
+            return false;
+        }
+    }
+
+    auto * primary_ctx = (ggml_backend_cuda_context *) primary_backend->context;
+    cudaStream_t primary_stream = primary_ctx->stream();
+
+    ggml_cuda_set_device(primary_ctx->device);
+    cudaError_t err = cudaStreamBeginCapture(primary_stream, cudaStreamCaptureModeRelaxed);
+    if (err != cudaSuccess) {
+        // Don't propagate via CUDA_CHECK — give the caller a clean false.
+        return false;
+    }
+
+    // Pull every secondary backend's stream into the capture by
+    // recording on primary then waiting on each secondary. The join
+    // event must be one captured by the BeginCapture call, so record
+    // first then waits chain off it.
+    cudaEvent_t join_event = primary_ctx->copy_event;  // pre-allocated at C2
+    GGML_ASSERT(join_event != nullptr);
+    err = cudaEventRecord(join_event, primary_stream);
+    if (err != cudaSuccess) {
+        // Capture is left in an invalidated state; try to close it.
+        cudaGraph_t graph_to_discard = nullptr;
+        cudaStreamEndCapture(primary_stream, &graph_to_discard);
+        if (graph_to_discard) cudaGraphDestroy(graph_to_discard);
+        return false;
+    }
+    for (int i = 0; i < n_secondary; ++i) {
+        auto * ctx_i = (ggml_backend_cuda_context *) secondary_backends[i]->context;
+        ggml_cuda_set_device(ctx_i->device);
+        err = cudaStreamWaitEvent(ctx_i->stream(), join_event, 0);
+        if (err != cudaSuccess) {
+            cudaGraph_t graph_to_discard = nullptr;
+            cudaStreamEndCapture(primary_stream, &graph_to_discard);
+            if (graph_to_discard) cudaGraphDestroy(graph_to_discard);
+            return false;
+        }
+    }
+    ggml_cuda_set_device(primary_ctx->device);
+
+    g_outer_primary_stream     = primary_stream;
+    g_outer_primary_device     = primary_ctx->device;
+    g_outer_primary_join_event = join_event;
+    g_outer_capture_active     = true;
+    return true;
+}
+
+extern "C" bool ggml_cuda_outer_capture_end_and_launch(
+        ggml_backend_t   primary_backend,
+        ggml_backend_t * secondary_backends,
+        int              n_secondary) {
+    if (primary_backend == nullptr || !ggml_backend_is_cuda(primary_backend)) return false;
+    if (!g_outer_capture_active) return false;
+
+    auto * primary_ctx = (ggml_backend_cuda_context *) primary_backend->context;
+    cudaStream_t primary_stream = g_outer_primary_stream;
+
+    // Fan-in: every secondary records its completion event on its own
+    // stream; primary waits on each. Ensures the final cudaStreamEnd
+    // Capture sees a graph whose terminal node depends on every
+    // backend's last kernel.
+    for (int i = 0; i < n_secondary; ++i) {
+        auto * ctx_i = (ggml_backend_cuda_context *) secondary_backends[i]->context;
+        ggml_cuda_set_device(ctx_i->device);
+        cudaError_t err = cudaEventRecord(ctx_i->copy_event, ctx_i->stream());
+        if (err != cudaSuccess) {
+            g_outer_capture_active = false;
+            cudaGraph_t graph_to_discard = nullptr;
+            cudaStreamEndCapture(primary_stream, &graph_to_discard);
+            if (graph_to_discard) cudaGraphDestroy(graph_to_discard);
+            return false;
+        }
+        ggml_cuda_set_device(primary_ctx->device);
+        err = cudaStreamWaitEvent(primary_stream, ctx_i->copy_event, 0);
+        if (err != cudaSuccess) {
+            g_outer_capture_active = false;
+            cudaGraph_t graph_to_discard = nullptr;
+            cudaStreamEndCapture(primary_stream, &graph_to_discard);
+            if (graph_to_discard) cudaGraphDestroy(graph_to_discard);
+            return false;
+        }
+    }
+
+    g_outer_capture_active = false;  // before EndCapture, so any
+                                     // graph_compute callback during
+                                     // teardown sees inert state.
+
+    ggml_cuda_set_device(primary_ctx->device);
+    cudaGraph_t captured = nullptr;
+    cudaError_t end_err = cudaStreamEndCapture(primary_stream, &captured);
+    if (end_err != cudaSuccess || captured == nullptr) {
+        if (captured) cudaGraphDestroy(captured);
+        return false;
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t inst_err = cudaGraphInstantiate(&exec, captured, nullptr, nullptr, 0);
+    if (inst_err != cudaSuccess) {
+        cudaGraphDestroy(captured);
+        return false;
+    }
+
+    cudaError_t launch_err = cudaGraphLaunch(exec, primary_stream);
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(captured);
+    if (launch_err != cudaSuccess) return false;
+
+    g_outer_capture_success_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) return false;
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
