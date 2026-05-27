@@ -1,16 +1,21 @@
 // test-runtime-hardening-mlockall.cpp
 //
-// Binding test for common_apply_runtime_hardening() — specifically the
-// --mlockall path added 2026-05-27 as part of PHASE_NP8_FLAKE code-level
-// RT mitigations (C-1).
+// Binding test for common_apply_runtime_hardening() — covers the
+// --mlockall (C-1) and --rt-prio (C-2) paths added 2026-05-27 as part
+// of PHASE_NP8_FLAKE code-level RT mitigations.
 //
 // What this test asserts:
 //   T1. Calling common_apply_runtime_hardening() with use_mlockall=false
-//       is a no-op (no crash, no mlockall side effect).
+//       and rt_priority=0 is a no-op (no crash, no side effect).
 //   T2. Calling with use_mlockall=true on Linux either succeeds (process
 //       pages locked, VmLck > 0) or fails gracefully with a warning
 //       (does not crash, does not abort).
 //   T3. Calling repeatedly is safe (idempotent).
+//   T4. Calling with rt_priority in [1, sched_get_priority_max(SCHED_FIFO)]
+//       either succeeds (sched policy becomes SCHED_FIFO) or fails
+//       gracefully with EPERM; either way, no crash.
+//   T5. Out-of-range rt_priority is rejected with a warning (no crash,
+//       no policy change).
 //
 // What this test does NOT assert:
 //   - That mlockall actually succeeds in CI environments. Locking memory
@@ -34,6 +39,8 @@
 #if defined(__linux__)
 #include <unistd.h>
 #include <sys/mman.h>  // munlockall (used in cleanup)
+#include <pthread.h>
+#include <sched.h>
 #endif
 
 static long read_vmlck_kb() {
@@ -108,6 +115,57 @@ int main() {
         common_apply_runtime_hardening(params);
         common_apply_runtime_hardening(params);  // second call
         report("T3 second call is idempotent", true, "no crash");
+    }
+
+    // T4 — rt_priority in valid range. Either succeeds (we now have
+    // SCHED_FIFO) or fails EPERM (test runs unprivileged). Both PASS.
+    {
+        gpt_params params;
+#if defined(__linux__)
+        const int target_prio = sched_get_priority_min(SCHED_FIFO);
+        params.rt_priority = target_prio > 0 ? target_prio : 1;
+        common_apply_runtime_hardening(params);
+        int policy = 0;
+        struct sched_param sp = {};
+        pthread_getschedparam(pthread_self(), &policy, &sp);
+        char detail[128];
+        if (policy == SCHED_FIFO) {
+            snprintf(detail, sizeof(detail),
+                "policy=SCHED_FIFO prio=%d (priority elevation succeeded)",
+                sp.sched_priority);
+            // Restore SCHED_OTHER so subsequent tests see default scheduling.
+            struct sched_param zp = {};
+            pthread_setschedparam(pthread_self(), SCHED_OTHER, &zp);
+        } else {
+            snprintf(detail, sizeof(detail),
+                "policy=%d (unchanged; EPERM expected unprivileged)", policy);
+        }
+        report("T4 rt_priority in-range does not crash", true, detail);
+#else
+        params.rt_priority = 1;
+        common_apply_runtime_hardening(params);
+        report("T4 rt_priority on non-Linux is documented warn", true, "n/a");
+#endif
+    }
+
+    // T5 — out-of-range rt_priority logs warning and leaves policy alone.
+    {
+        gpt_params params;
+        params.rt_priority = 9999;  // clearly out of SCHED_FIFO range
+        common_apply_runtime_hardening(params);
+#if defined(__linux__)
+        int policy = 0;
+        struct sched_param sp = {};
+        pthread_getschedparam(pthread_self(), &policy, &sp);
+        const bool ok = (policy != SCHED_FIFO);
+        char detail[128];
+        snprintf(detail, sizeof(detail),
+            "policy=%d (must NOT be SCHED_FIFO=%d after out-of-range request)",
+            policy, SCHED_FIFO);
+        report("T5 out-of-range rt_priority is rejected", ok, detail);
+#else
+        report("T5 out-of-range rt_priority on non-Linux", true, "n/a");
+#endif
     }
 
     printf("test-runtime-hardening-mlockall: %s (%d FAIL)\n",

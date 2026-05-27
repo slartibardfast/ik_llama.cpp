@@ -64,6 +64,8 @@
 #if defined(__linux__)
 #include <sys/mman.h>   // mlockall, munlockall, MCL_CURRENT, MCL_FUTURE
 #include <sys/resource.h> // getrlimit, RLIMIT_MEMLOCK
+#include <pthread.h>    // pthread_setschedparam, SCHED_FIFO
+#include <sched.h>      // sched_get_priority_{min,max}
 #include <errno.h>
 #endif
 
@@ -517,6 +519,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_CACHE_TYPE_V",     params.cache_type_v);
     get_env("LLAMA_ARG_MLOCK",            params.use_mlock);
     get_env("LLAMA_ARG_MLOCKALL",         params.use_mlockall);
+    get_env("LLAMA_ARG_RT_PRIORITY",      params.rt_priority);
     get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
     get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
 
@@ -1523,6 +1526,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--mlockall") {
         params.use_mlockall = true;
+        return true;
+    }
+    if (arg == "--rt-prio") {
+        CHECK_ARG
+        params.rt_priority = std::stoi(argv[i]);
         return true;
     }
     if (arg == "-ngl" || arg == "--gpu-layers" || arg == "--n-gpu-layers") {
@@ -2755,6 +2763,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     }
 #if defined(__linux__)
     options.push_back({ "*",           "       --mlockall",            "mlockall(MCL_CURRENT|MCL_FUTURE) — lock all process pages; requires CAP_IPC_LOCK or unlimited RLIMIT_MEMLOCK" });
+    options.push_back({ "*",           "       --rt-prio N",           "set SCHED_FIFO priority N (1-99) on the dispatch thread; requires CAP_SYS_NICE. 0 = default scheduling" });
 #endif
     if (llama_supports_mmap()) {
         options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
@@ -3450,10 +3459,41 @@ void common_apply_runtime_hardening(const gpt_params & params) {
                 __func__, strerror(e), e);
         }
     }
+
+    if (params.rt_priority > 0) {
+        const int min_p = sched_get_priority_min(SCHED_FIFO);
+        const int max_p = sched_get_priority_max(SCHED_FIFO);
+        if (params.rt_priority < min_p || params.rt_priority > max_p) {
+            fprintf(stderr,
+                "%s: warning: --rt-prio %d out of SCHED_FIFO range [%d, %d]; "
+                "ignored.\n", __func__, params.rt_priority, min_p, max_p);
+        } else {
+            struct sched_param sp = {};
+            sp.sched_priority = params.rt_priority;
+            const int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+            if (rc == 0) {
+                fprintf(stderr,
+                    "%s: dispatch thread set to SCHED_FIFO priority %d "
+                    "(range [%d, %d])\n",
+                    __func__, params.rt_priority, min_p, max_p);
+            } else {
+                fprintf(stderr,
+                    "%s: warning: pthread_setschedparam(SCHED_FIFO, %d) failed: %s "
+                    "(rc=%d) — continuing with default scheduling. Grant "
+                    "CAP_SYS_NICE to the service or raise RLIMIT_RTPRIO.\n",
+                    __func__, params.rt_priority, strerror(rc), rc);
+            }
+        }
+    }
 #else
     if (params.use_mlockall) {
         fprintf(stderr,
             "%s: warning: --mlockall is Linux-only on this build; ignored.\n",
+            __func__);
+    }
+    if (params.rt_priority > 0) {
+        fprintf(stderr,
+            "%s: warning: --rt-prio is Linux-only on this build; ignored.\n",
             __func__);
     }
 #endif
