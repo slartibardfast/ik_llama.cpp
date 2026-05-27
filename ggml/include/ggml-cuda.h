@@ -113,6 +113,38 @@ GGML_API bool   ggml_cuda_outer_capture_end_and_launch(
 GGML_API size_t ggml_cuda_outer_capture_count(void);
 GGML_API void   ggml_cuda_outer_capture_count_reset(void);
 
+// PHASE_CUDA_NATIVE_DISPATCH C5: split end-and-launch into end-capture
+// + launch-exec so the sched can cache the instantiated graph. On cache
+// hit the sched skips _begin entirely and calls _launch_exec on the
+// cached cudaGraphExec_t handle (replayed against the primary stream
+// with the same cross-stream join + fan-in baked into the captured
+// graph at C4).
+//
+// _end_capture: fan-in event-chain + cudaStreamEndCapture +
+//   cudaGraphInstantiate. Returns the instantiated executable via
+//   out_exec (caller owns; destroy with ggml_cuda_outer_capture_destroy
+//   _exec when evicting). Returns false on any failure; clears the
+//   outer-capture flag either way.
+// _launch_exec: cudaGraphLaunch(exec, primary->stream()). Increments
+//   the capture counter. Returns false on launch error.
+// _destroy_exec: cudaGraphExecDestroy. Called by the sched on
+//   eviction / sched_free.
+//
+// Opaque to consumers: use the ggml_cuda_graph_exec_t alias rather
+// than dereferencing.
+typedef void * ggml_cuda_graph_exec_t;
+
+GGML_API bool ggml_cuda_outer_capture_end_capture(
+                    ggml_backend_t            primary_backend,
+                    ggml_backend_t          * secondary_backends,
+                    int                       n_secondary,
+                    ggml_cuda_graph_exec_t  * out_exec);
+GGML_API bool ggml_cuda_outer_capture_launch_exec(
+                    ggml_backend_t           primary_backend,
+                    ggml_cuda_graph_exec_t   exec);
+GGML_API void ggml_cuda_outer_capture_destroy_exec(
+                    ggml_cuda_graph_exec_t   exec);
+
 // CUDA graph cache instrumentation surface. All functions return 0 / -1
 // when GGML_CUDA_GRAPH_PROBE is unset or when the underlying probe step
 // has not yet landed. Tests treat any zero return as RED.

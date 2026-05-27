@@ -21,6 +21,7 @@
 #include <thread>
 #include <mutex>
 #include <unordered_set>
+#include <unordered_map>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -1230,10 +1231,57 @@ struct ggml_backend_sched {
     // cudaStreamBeginCapture or EndCapture fails. Subsequent dispatches
     // fall back to eager (the C1 path); the sched stays usable.
     bool outer_capture_disabled = false;
+
+    // PHASE_CUDA_NATIVE_DISPATCH C5: cache of cudaGraphExec_t handles
+    // keyed by topology hash. On dispatch with an active outer capture:
+    //   - cache hit  → cudaGraphLaunch(cached_exec, primary_stream)
+    //   - cache miss → capture + end_capture + store + launch
+    // Sized at MAX_OUTER_GRAPHS; oldest entries evicted FIFO when full.
+    // sched_free destroys every entry via ggml_cuda_outer_capture_
+    // destroy_exec.
+    static constexpr size_t MAX_OUTER_GRAPHS = 16;
+    std::unordered_map<uint64_t, void *> outer_graphs;
+    std::vector<uint64_t>                outer_graphs_age;  // FIFO list of keys
 };
 
 extern "C" bool ggml_backend_sched_outer_capture_disabled(ggml_backend_sched_t sched) {
     return sched != nullptr && sched->outer_capture_disabled;
+}
+
+// PHASE_CUDA_NATIVE_DISPATCH C5: topology hash for the outer-graph
+// cache. Hashes over (n_splits, per-split (backend_id, n_inputs,
+// first_op, n_nodes)) which captures the multi-device dispatch shape.
+// Same-topology graphs (varying tensor shapes) share an entry; CUDA
+// graph update at instantiate-time absorbs shape variation within the
+// same topology.
+static uint64_t ggml_backend_sched_outer_topology_key(ggml_backend_sched_t sched) {
+    uint64_t h = 0xcbf29ce484222325ULL;  // FNV-1a offset
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 0x100000001b3ULL;
+    };
+    mix((uint64_t) sched->n_splits);
+    mix((uint64_t) sched->n_backends);
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto * sp = &sched->splits[i];
+        mix((uint64_t) sp->backend_id);
+        mix((uint64_t) sp->n_inputs);
+        mix((uint64_t) sp->graph.n_nodes);
+        if (sp->graph.n_nodes > 0 && sp->graph.nodes[0]) {
+            mix((uint64_t) sp->graph.nodes[0]->op);
+        }
+    }
+    return h;
+}
+
+static void ggml_backend_sched_outer_graphs_clear(ggml_backend_sched_t sched) {
+#ifdef GGML_USE_CUDA
+    for (auto & kv : sched->outer_graphs) {
+        ggml_cuda_outer_capture_destroy_exec(kv.second);
+    }
+#endif
+    sched->outer_graphs.clear();
+    sched->outer_graphs_age.clear();
 }
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2291,15 +2339,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         const bool try_outer_capture = (n_cuda > 0) && !any_non_cuda_split
                                        && !sched->outer_capture_disabled;
-        bool capture_active = false;
+
+        // PHASE_CUDA_NATIVE_DISPATCH C5: cache lookup.
+        // Hit → cudaGraphLaunch the cached executable; skip the
+        // dispatch loop AND the begin/end_capture round-trip.
+        // Miss → begin capture, dispatch normally, end_capture,
+        // instantiate, store, launch.
+        bool                     capture_active   = false;
+        bool                     cache_hit        = false;
+        ggml_cuda_graph_exec_t   cached_exec      = nullptr;
+        uint64_t                 outer_topo_key   = 0;
         if (try_outer_capture) {
-            capture_active = ggml_cuda_outer_capture_begin(
-                cuda_backends[0],
-                n_cuda > 1 ? &cuda_backends[1] : nullptr,
-                n_cuda - 1);
-            if (!capture_active) {
-                sched->outer_capture_disabled = true;
+            outer_topo_key = ggml_backend_sched_outer_topology_key(sched);
+            auto it = sched->outer_graphs.find(outer_topo_key);
+            if (it != sched->outer_graphs.end()) {
+                cached_exec = it->second;
+                cache_hit   = true;
+            } else {
+                capture_active = ggml_cuda_outer_capture_begin(
+                    cuda_backends[0],
+                    n_cuda > 1 ? &cuda_backends[1] : nullptr,
+                    n_cuda - 1);
+                if (!capture_active) {
+                    sched->outer_capture_disabled = true;
+                }
             }
+        }
+
+        if (cache_hit) {
+            // Replay the cached graph; skip the dispatch loop and the
+            // statuses-check sweep. Set every backend's status to
+            // SUCCESS so the post-loop sweep is a no-op.
+            ggml_cuda_outer_capture_launch_exec(cuda_backends[0], cached_exec);
+            return GGML_STATUS_SUCCESS;
         }
 #endif
 
@@ -2358,19 +2430,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
 #ifdef GGML_USE_CUDA
-        // PHASE_CUDA_NATIVE_DISPATCH C4: end outer capture and launch
-        // the captured multi-device cudaGraph_t. On any failure (capture
-        // invalidation, instantiate error, launch error), the eager-
-        // dispatch results are already in flight on the per-backend
-        // streams; we mark outer_capture_disabled and let subsequent
-        // dispatches use the C1 eager path.
+        // PHASE_CUDA_NATIVE_DISPATCH C4 + C5: end outer capture →
+        // instantiate → store in cache → launch. On any failure, mark
+        // outer_capture_disabled (sticky) and let subsequent dispatches
+        // use the C1 eager path.
         if (capture_active) {
-            bool ok = ggml_cuda_outer_capture_end_and_launch(
+            ggml_cuda_graph_exec_t exec = nullptr;
+            bool ok = ggml_cuda_outer_capture_end_capture(
                 cuda_backends[0],
                 n_cuda > 1 ? &cuda_backends[1] : nullptr,
-                n_cuda - 1);
+                n_cuda - 1,
+                &exec);
             if (!ok) {
                 sched->outer_capture_disabled = true;
+            } else {
+                // FIFO evict if cache is full.
+                if (sched->outer_graphs.size() >= ggml_backend_sched::MAX_OUTER_GRAPHS
+                        && !sched->outer_graphs_age.empty()) {
+                    const uint64_t victim = sched->outer_graphs_age.front();
+                    sched->outer_graphs_age.erase(sched->outer_graphs_age.begin());
+                    auto vit = sched->outer_graphs.find(victim);
+                    if (vit != sched->outer_graphs.end()) {
+                        ggml_cuda_outer_capture_destroy_exec(vit->second);
+                        sched->outer_graphs.erase(vit);
+                    }
+                }
+                sched->outer_graphs[outer_topo_key] = exec;
+                sched->outer_graphs_age.push_back(outer_topo_key);
+
+                if (!ggml_cuda_outer_capture_launch_exec(cuda_backends[0], exec)) {
+                    sched->outer_capture_disabled = true;
+                }
             }
         }
 #endif
@@ -2501,6 +2591,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    // PHASE_CUDA_NATIVE_DISPATCH C5: release cached outer-capture
+    // cudaGraphExec_t handles before tearing down per-backend state
+    // (which would invalidate the handles' streams).
+    ggml_backend_sched_outer_graphs_clear(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

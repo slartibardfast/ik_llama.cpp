@@ -238,6 +238,12 @@ if (GGML_CUDA)
     # Requires 2 CUDA devices; skip otherwise.
     llama_build_and_test(test-multi-device-graph-capture.cpp)
 
+    # PHASE_CUDA_NATIVE_DISPATCH C5 — split end-capture / launch-exec /
+    # destroy-exec API used by the sched outer-graph cache. Captures
+    # once, replays N times via _launch_exec, asserts bit-identical
+    # output across all replays.
+    llama_build_and_test(test-multi-device-graph-cache.cpp)
+
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.
     llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)
