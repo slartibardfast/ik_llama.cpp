@@ -4,17 +4,33 @@
 // /home/llm/yarn-agentic/specs/kv-cache/n_stream_layer.allium and
 // /home/llm/yarn-agentic/specs/multislot/StreamIsolation.tla.
 //
-// Verifies the structural invariants the 4D port (PHASE_NSTREAM_KV_4D.md
-// N1+N2) and the T3.2 multi-seq allocator deliver:
+// Lineage:
+//   - PHASE_NSTREAM_KV.md (closed 2026-05-20, submodule 16b608d1)
+//     landed N1+N2: K/V became 4D
+//     [head_dim, kv_size_per_stream, n_head_kv, n_stream].
+//   - PHASE_NSTREAM_KV_PERF.md Tier 5 (T5.9 paged BACKING) reshaped
+//     the same 4D K/V tensors to
+//     [head_dim, BLOCK_SIZE_TOKENS, n_head_kv, total_pool_blocks].
+//     Total bytes preserved; per-stream identity is now encoded by
+//     llama_paged_kv_allocator::seed_identity_per_stream() (block
+//     IDs [s*nbps, s*nbps + nbps - 1] for stream s, where
+//     nbps = total_pool_blocks / n_stream).
+//
+// This file asserts the *current* (post-T5.9) invariants:
 //
 //   1. Foundation: llama_kv_cache::n_stream is initialised to
-//      max(1, n_seq_max); v_heads is sized to n_stream. (PASS on HEAD —
-//      this slice landed in submodule commit 969d156e.)
-//   2. KVTensorIsFourD: every layer's k_l[il] and v_l[il] tensors have
-//      ne[3] == n_stream. (PASS after N1; PASS on HEAD now.)
-//   3. StreamPartition (kv_size_per_stream): k_l[il]->ne[1] equals
-//      kv_size / n_stream. (PASS after N1; PASS on HEAD now.)
-//   4. PHASE_NSTREAM_KV_PERF T3.2 — multi-seq find_slot: when called
+//      max(1, n_seq_max); v_heads is sized to n_stream.
+//   2. KVTensorIsPaged4D: every layer's k_l[il] and v_l[il] tensors
+//      have ne[3] == total_pool_blocks.
+//   3. StreamPartition (block-major): k_l[il]->ne[1] equals
+//      llama_paged_kv_allocator::BLOCK_SIZE_TOKENS.
+//   4. PagedStreamIdentity: for each stream s in [0, n_stream),
+//      paged.block_table(s) equals [s*nbps, ..., s*nbps + nbps - 1]
+//      where nbps = total_pool_blocks / n_stream. This is the
+//      structural replacement for the pre-T5.9 "ne[3] == n_stream"
+//      check — same semantic invariant (per-stream identity),
+//      expressed against the paged data model.
+//   5. PHASE_NSTREAM_KV_PERF T3.2 — multi-seq find_slot: when called
 //      with a multi-seq batch (contiguous-per-seq tokens covering
 //      multiple distinct seq_ids), each run is allocated into its own
 //      stream's slice. Cells in stream s carry the expected pos and
@@ -75,21 +91,26 @@ void test_foundation_n_stream_and_v_heads(const llama_kv_cache & cache,
                 cache.n_stream, cache.v_heads.size());
 }
 
-// The binding "RED test" for N1: assert that K/V tensors carry the
-// per-stream axis as ne[3]. FAILS on HEAD; PASSES after the 4D port.
-void test_kv_tensors_have_n_stream_axis(const llama_kv_cache & cache) {
+// Under T5.9 paged BACKING, K/V are 4D
+// [head_dim, BLOCK_SIZE_TOKENS, n_head_kv, total_pool_blocks].
+// Stream identity is preserved by paged.seed_identity_per_stream()
+// (block IDs [s*nbps, s*nbps+nbps-1] for stream s). The ne[3] axis
+// carries the physical pool extent, not n_stream directly.
+void test_kv_tensors_are_paged_4d(const llama_kv_cache & cache) {
     if (cache.k_l.empty()) FAIL_AT("k_l is empty");
     if (cache.v_l.empty()) FAIL_AT("v_l is empty");
+
+    const int64_t expected_ne3 = static_cast<int64_t>(cache.total_pool_blocks);
 
     for (size_t il = 0; il < cache.k_l.size(); ++il) {
         const ggml_tensor * k = cache.k_l[il];
         if (!k) continue;  // some layers may have null entries (non-attn)
         const int64_t ne3 = k->ne[3];
-        if (ne3 != static_cast<int64_t>(cache.n_stream)) {
+        if (ne3 != expected_ne3) {
             FAIL_AT(
-                "expected k_l[%zu]->ne[3] == n_stream(%u), got %lld "
-                "— 4D per-stream layout from N1 is not yet wired",
-                il, cache.n_stream,
+                "expected k_l[%zu]->ne[3] == total_pool_blocks(%d), got %lld "
+                "— T5.9 paged-BACKING shape regressed",
+                il, cache.total_pool_blocks,
                 static_cast<long long>(ne3));
         }
     }
@@ -98,24 +119,26 @@ void test_kv_tensors_have_n_stream_axis(const llama_kv_cache & cache) {
         const ggml_tensor * v = cache.v_l[il];
         if (!v) continue;
         const int64_t ne3 = v->ne[3];
-        if (ne3 != static_cast<int64_t>(cache.n_stream)) {
+        if (ne3 != expected_ne3) {
             FAIL_AT(
-                "expected v_l[%zu]->ne[3] == n_stream(%u), got %lld",
-                il, cache.n_stream,
+                "expected v_l[%zu]->ne[3] == total_pool_blocks(%d), got %lld",
+                il, cache.total_pool_blocks,
                 static_cast<long long>(ne3));
         }
     }
 
-    std::fprintf(stdout, "KVTensorIsFourD: all %zu k_l / v_l slabs have ne[3] == %u\n",
-                cache.k_l.size(), cache.n_stream);
+    std::fprintf(stdout,
+                "KVTensorIsPaged4D: all %zu k_l / v_l slabs have "
+                "ne[3] == total_pool_blocks(%d)\n",
+                cache.k_l.size(), cache.total_pool_blocks);
 }
 
-// StreamPartition's structural form: the per-stream position-count is
-// kv_size / n_stream. The N2.a axis order is
-// [head_dim, kv_size_per_stream, n_head_kv, n_stream] so ne[1] carries
-// the per-stream position-count axis. Some models expose null k_l
-// entries for non-attention layers (recurrent, MTP head, has_kv=false),
-// so this asserts against the FIRST non-null tensor rather than k_l[0].
+// StreamPartition under T5.9: K/V are block-major, so ne[1] carries
+// BLOCK_SIZE_TOKENS (not kvps). Per-stream position-count is encoded
+// indirectly via the block_table: stream s sees nbps blocks ×
+// BLOCK_SIZE_TOKENS tokens. Some models expose null k_l entries for
+// non-attention layers (recurrent, MTP head, has_kv=false), so this
+// asserts against the FIRST non-null tensor rather than k_l[0].
 void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
     const ggml_tensor * k_probe = nullptr;
     size_t              k_probe_il = 0;
@@ -124,18 +147,76 @@ void test_per_stream_slice_dimension(const llama_kv_cache & cache) {
     }
     if (!k_probe) FAIL_AT("no non-null k_l[il] tensor in any layer");
 
-    const int64_t expected_per_stream = cache.size / cache.n_stream;
+    const int64_t expected_block = static_cast<int64_t>(
+        llama_paged_kv_allocator::BLOCK_SIZE_TOKENS);
     const int64_t actual = k_probe->ne[1];
-    if (actual != expected_per_stream) {
+    if (actual != expected_block) {
         FAIL_AT(
-            "expected k_l[%zu]->ne[1] == kv_size/n_stream (%lld), got %lld "
-            "— StreamPartition position-count axis not yet per-stream",
+            "expected k_l[%zu]->ne[1] == BLOCK_SIZE_TOKENS(%lld), got %lld "
+            "— T5.9 block-major position axis regressed",
             k_probe_il,
-            static_cast<long long>(expected_per_stream),
+            static_cast<long long>(expected_block),
             static_cast<long long>(actual));
     }
-    std::fprintf(stdout, "StreamPartition: k_l[%zu]->ne[1] == %lld (=kv_size/n_stream)\n",
+    std::fprintf(stdout,
+                "StreamPartition: k_l[%zu]->ne[1] == %lld "
+                "(=BLOCK_SIZE_TOKENS)\n",
                 k_probe_il, static_cast<long long>(actual));
+}
+
+// PagedStreamIdentity — T5.9 replacement for the pre-T5.9 "ne[3] ==
+// n_stream" assertion. seed_identity_per_stream() seeds each stream's
+// block_table with a contiguous prefix
+// [s*nbps, s*nbps+1, ..., s*nbps+nbps-1] where
+// nbps = total_pool_blocks / n_stream. This produces byte-identity to
+// the T5.8 stream-major layout because the kernel's
+// `bid * paged_nb_per_block` lands at the same bytes as T5.8's
+// `s * nb[3]_old + k * paged_nb_per_block`.
+//
+// Identity seeding only fires at auto-sized pool
+// (cparams.kv_pool_blocks == 0). At explicit --kv-pool-blocks override
+// the seeding is skipped (per llama.cpp:967), so this test silently
+// passes when the pool is overridden. The default test configuration
+// (n_ctx = 256 * n_parallel, no pool override) hits the auto-sized
+// branch.
+void test_paged_stream_identity(const llama_kv_cache & cache) {
+    if (cache.n_stream == 0) FAIL_AT("n_stream == 0");
+    if (cache.total_pool_blocks <= 0) {
+        FAIL_AT("total_pool_blocks <= 0 (%d)", cache.total_pool_blocks);
+    }
+    if ((uint32_t)cache.total_pool_blocks % cache.n_stream != 0) {
+        FAIL_AT(
+            "total_pool_blocks(%d) not divisible by n_stream(%u) — "
+            "auto-sizing invariant broken",
+            cache.total_pool_blocks, cache.n_stream);
+    }
+
+    const int32_t nbps =
+        cache.total_pool_blocks / static_cast<int32_t>(cache.n_stream);
+
+    for (uint32_t s = 0; s < cache.n_stream; ++s) {
+        const auto & tbl = cache.paged.block_table(static_cast<int32_t>(s));
+        if (static_cast<int32_t>(tbl.size()) != nbps) {
+            FAIL_AT(
+                "stream %u block_table size %zu != nbps %d — "
+                "seed_identity_per_stream did not run (or was reset)",
+                s, tbl.size(), nbps);
+        }
+        for (int32_t k = 0; k < nbps; ++k) {
+            const int32_t expect_bid = static_cast<int32_t>(s) * nbps + k;
+            if (tbl[(size_t)k] != expect_bid) {
+                FAIL_AT(
+                    "stream %u block_table[%d] expected %d got %d — "
+                    "per-stream identity broken at slot %d",
+                    s, k, expect_bid, tbl[(size_t)k], k);
+            }
+        }
+    }
+
+    std::fprintf(stdout,
+                "PagedStreamIdentity: n_stream=%u, nbps=%d, "
+                "block_table[s] == [s*nbps, s*nbps+nbps-1] for all s\n",
+                cache.n_stream, nbps);
 }
 
 // PHASE_NSTREAM_KV_PERF T3.2: drive llama_kv_cache_find_slot with a
@@ -289,8 +370,9 @@ int main(int argc, char** argv) {
     llama_kv_cache & cache = ctx->transformer_kv;
 
     test_foundation_n_stream_and_v_heads(cache, args.n_parallel);
-    test_kv_tensors_have_n_stream_axis(cache);
+    test_kv_tensors_are_paged_4d(cache);
     test_per_stream_slice_dimension(cache);
+    test_paged_stream_identity(cache);
     test_multi_seq_find_slot(cache);
 
     llama_free(ctx);
