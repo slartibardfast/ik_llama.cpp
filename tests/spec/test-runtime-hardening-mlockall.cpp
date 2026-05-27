@@ -259,6 +259,51 @@ int main() {
         report("T8 malformed cpu_mask is rejected", unchanged,
                "affinity unchanged");
     }
+
+    // T9 — empirical: pthread_create(attr=NULL) inherits the creator's
+    // CPU affinity mask. Critical for ggml workers (line 26910 of ggml.c
+    // passes NULL attr) — proves they pick up whatever --cpu-mask sets
+    // on the main thread BEFORE graph compute fires.
+    if (n_online >= 8) {
+        gpt_params params;
+        params.cpu_mask = "0xF0";
+        common_apply_runtime_hardening(params);
+
+        // Spawn a child thread mimicking ggml's exact call pattern.
+        struct child_ctx { cpu_set_t mask; };
+        child_ctx ctx{};
+        CPU_ZERO(&ctx.mask);
+        auto child_fn = [](void * arg) -> void * {
+            auto * c = static_cast<child_ctx *>(arg);
+            pthread_getaffinity_np(pthread_self(), sizeof(c->mask), &c->mask);
+            return nullptr;
+        };
+        pthread_t child = 0;
+        const int rc = pthread_create(&child, /*attr=*/nullptr,
+                                      child_fn, &ctx);
+        if (rc == 0) {
+            pthread_join(child, nullptr);
+            const bool inherits = CPU_ISSET(4, &ctx.mask) &&
+                                  CPU_ISSET(5, &ctx.mask) &&
+                                  CPU_ISSET(6, &ctx.mask) &&
+                                  CPU_ISSET(7, &ctx.mask) &&
+                                  !CPU_ISSET(0, &ctx.mask) &&
+                                  !CPU_ISSET(3, &ctx.mask);
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                "child thread affinity = {%s} (parent set to {4,5,6,7})",
+                cpus_in_mask_as_string(ctx.mask).c_str());
+            report("T9 pthread_create(NULL) inherits cpu_mask", inherits, detail);
+        } else {
+            report("T9 pthread_create(NULL) inherits cpu_mask", false,
+                   "could not create child thread");
+        }
+
+        // restore
+        pthread_setaffinity_np(pthread_self(), sizeof(orig_mask), &orig_mask);
+    } else {
+        report("T9 pthread_create inheritance", true, "skipped (<8 online CPUs)");
+    }
 #else
     report("T6-T8 cpu_mask tests on non-Linux", true, "n/a");
 #endif
