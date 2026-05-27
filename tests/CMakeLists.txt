@@ -216,6 +216,11 @@ if (GGML_CUDA)
     llama_build_and_test(test-cuda-graph-update-state-mutation.cpp)
     llama_build_and_test(test-cuda-graph-comparator-op-params.cpp)
     llama_build_and_test(test-cuda-pool-graceful-oom.cpp)
+    # PHASE_CUDA_NATIVE_DISPATCH C0 — calibration framework binding test.
+    # Covers idempotent calibrate, env overrides, no-ops-registered,
+    # synthetic-probe registration, deterministic results, cache
+    # round-trip, FORCE_RECALIBRATE bypass.
+    llama_build_and_test(test-cuda-calibration-framework.cpp)
 
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.

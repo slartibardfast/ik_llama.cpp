@@ -5870,6 +5870,13 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
     }
 #endif
 
+    // PHASE_CUDA_NATIVE_DISPATCH C0: calibrated dispatch.
+    // Probes each registered calibrated op (if any) at the bucket sizes
+    // and stores the thresholds in ctx->calibration_table. Loads cache
+    // on hit. At C0 no ops are registered yet — C8/C9/C10/C11 register
+    // their ops. Idempotent + side-effect-free when no ops registered.
+    ggml_cuda_calibrate(ctx);
+
     return cuda_backend;
 }
 

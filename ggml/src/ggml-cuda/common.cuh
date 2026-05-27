@@ -27,6 +27,10 @@
 #include <vector>
 #include <unordered_map>
 
+// PHASE_CUDA_NATIVE_DISPATCH C0: calibration_table field on
+// ggml_backend_cuda_context (see end of struct definition below).
+#include "ggml-cuda-calibration.h"
+
 #if defined(GGML_USE_HIPBLAS)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
@@ -966,6 +970,14 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // PHASE_CUDA_NATIVE_DISPATCH C0: per-context calibrated dispatch
+    // table. Populated by ggml_cuda_calibrate() at context init (called
+    // from ggml_backend_cuda_init after p2p access setup). Each
+    // registered calibrated op reads ctx->calibration_table.thresholds
+    // [op_id] at dispatch time to route between its default and alt
+    // strategy. See ggml-cuda/calibration.h.
+    ggml_cuda_calibration_table calibration_table;
 };
 
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
