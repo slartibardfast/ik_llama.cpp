@@ -2348,9 +2348,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 break;
             }
         }
+        // PHASE_CUDA_NATIVE_DISPATCH C14 post-merge finding: outer
+        // capture requires the per-backend cross-sync events
+        // (sched->events[b][c]) to be allocated; otherwise
+        // ggml_backend_sched_copy_inputs falls back to
+        // ggml_backend_synchronize → cudaDeviceSynchronize, which is
+        // illegal inside cudaStreamBeginCapture. The build flag
+        // GGML_SCHED_MAX_COPIES=1 leaves events un-allocated; only
+        // n_copies > 1 (parallel=true + MAX_COPIES > 1) lights up
+        // event-based ordering. Gate outer capture on this.
         const bool try_outer_capture = (n_cuda > 0)
                                        && cpu_is_prefix_only
                                        && first_cuda_split < sched->n_splits
+                                       && sched->n_copies > 1
                                        && !sched->outer_capture_disabled;
 
         // PHASE_CUDA_NATIVE_DISPATCH C6: run leading CPU splits
