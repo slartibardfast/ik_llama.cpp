@@ -930,6 +930,19 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+# test-runtime-hardening-mlockall: binding test for the --mlockall flag
+# and common_apply_runtime_hardening() helper added 2026-05-27 as part
+# of the PHASE_NP8_FLAKE code-level RT mitigations (C-1). Treats EPERM
+# (unprivileged mlockall) as PASS — the test asserts the helper does
+# not crash and is idempotent, not that the runtime has CAP_IPC_LOCK.
+set(TEST_TARGET test-runtime-hardening-mlockall)
+add_executable(${TEST_TARGET} spec/test-runtime-hardening-mlockall.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+target_link_libraries(${TEST_TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
 # test-n-stream-kv-layout: model-driven test of the 4D per-stream KV
 # layout. FAIL expected on HEAD (K/V tensors are still 3D); PASS after
 # the N1 4D port lands. This is the binding RED test for N1. Requires

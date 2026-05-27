@@ -61,6 +61,12 @@
 #include <future>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>   // mlockall, munlockall, MCL_CURRENT, MCL_FUTURE
+#include <sys/resource.h> // getrlimit, RLIMIT_MEMLOCK
+#include <errno.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -510,6 +516,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_CACHE_TYPE_K",     params.cache_type_k);
     get_env("LLAMA_ARG_CACHE_TYPE_V",     params.cache_type_v);
     get_env("LLAMA_ARG_MLOCK",            params.use_mlock);
+    get_env("LLAMA_ARG_MLOCKALL",         params.use_mlockall);
     get_env("LLAMA_ARG_K_CACHE_HADAMARD", params.k_cache_hadamard);
     get_env("LLAMA_ARG_V_CACHE_HADAMARD", params.v_cache_hadamard);
 
@@ -1512,6 +1519,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--mlock") {
         params.use_mlock = true;
+        return true;
+    }
+    if (arg == "--mlockall") {
+        params.use_mlockall = true;
         return true;
     }
     if (arg == "-ngl" || arg == "--gpu-layers" || arg == "--n-gpu-layers") {
@@ -2742,6 +2753,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
     }
+#if defined(__linux__)
+    options.push_back({ "*",           "       --mlockall",            "mlockall(MCL_CURRENT|MCL_FUTURE) — lock all process pages; requires CAP_IPC_LOCK or unlimited RLIMIT_MEMLOCK" });
+#endif
     if (llama_supports_mmap()) {
         options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
@@ -3412,7 +3426,44 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 // Model utils
 //
+void common_apply_runtime_hardening(const gpt_params & params) {
+#if defined(__linux__)
+    if (params.use_mlockall) {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+            // Report the post-lock limit for audit (RLIMIT_MEMLOCK is the
+            // soft cap on locked memory if CAP_IPC_LOCK is not held).
+            struct rlimit rl = {0, 0};
+            getrlimit(RLIMIT_MEMLOCK, &rl);
+            fprintf(stderr,
+                "%s: mlockall(MCL_CURRENT|MCL_FUTURE) succeeded; "
+                "RLIMIT_MEMLOCK soft=%llu hard=%llu\n",
+                __func__,
+                (unsigned long long) rl.rlim_cur,
+                (unsigned long long) rl.rlim_max);
+        } else {
+            const int e = errno;
+            fprintf(stderr,
+                "%s: warning: mlockall(MCL_CURRENT|MCL_FUTURE) failed: %s "
+                "(errno=%d) — continuing without page lock. Set "
+                "RLIMIT_MEMLOCK to unlimited or grant CAP_IPC_LOCK to "
+                "the service.\n",
+                __func__, strerror(e), e);
+        }
+    }
+#else
+    if (params.use_mlockall) {
+        fprintf(stderr,
+            "%s: warning: --mlockall is Linux-only on this build; ignored.\n",
+            __func__);
+    }
+#endif
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    // Apply runtime hardening as early as possible so MCL_FUTURE catches
+    // the model load + context allocation. Safe no-op if not requested.
+    common_apply_runtime_hardening(params);
+
     llama_init_result iparams;
     auto mparams = common_model_params_to_llama(params);
 

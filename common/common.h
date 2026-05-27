@@ -368,6 +368,7 @@ struct gpt_params {
     bool logits_all        = false; // return logits for all tokens in the batch
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock         = false; // use mlock to keep model in memory
+    bool use_mlockall      = false; // mlockall(MCL_CURRENT|MCL_FUTURE) for full process — paging-free RT determinism (Linux only)
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool infill            = false; // use infill mode
@@ -637,6 +638,13 @@ struct llama_init_result {
 };
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);
+
+// Apply opt-in runtime hardening from the parsed gpt_params (currently:
+// mlockall(MCL_CURRENT|MCL_FUTURE) if use_mlockall is set). Logs warnings
+// on EPERM / unsupported platform and continues; does NOT abort. Safe to
+// call multiple times. Best invoked early, before any large allocations,
+// so MCL_FUTURE catches the model load.
+void common_apply_runtime_hardening(const gpt_params & params);
 
 struct llama_model_params   common_model_params_to_llama  (const gpt_params & params);
 struct llama_context_params common_context_params_to_llama(const gpt_params & params);
