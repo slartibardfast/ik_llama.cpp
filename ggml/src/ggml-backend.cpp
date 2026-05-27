@@ -2323,6 +2323,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // Cross-stream join + fan-in handled by
         // ggml_cuda_outer_capture_begin / _end_and_launch in ggml-cuda.
 #ifdef GGML_USE_CUDA
+        // PHASE_CUDA_NATIVE_DISPATCH C6: hoist leading CPU splits out of
+        // outer capture. PD3 confirmed production has no mid-dispatch
+        // CPU splits — all CPU work is upstream. The outer-capture
+        // wrap can still activate as long as CPU is a contiguous prefix
+        // (or empty). Leading CPU splits run sync on the host before
+        // BeginCapture.
         ggml_backend_t cuda_backends[GGML_SCHED_MAX_BACKENDS];
         int n_cuda = 0;
         for (int i = 0; i < sched->n_backends; ++i) {
@@ -2330,15 +2336,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 cuda_backends[n_cuda++] = sched->backends[i];
             }
         }
-        bool any_non_cuda_split = false;
+
+        int first_cuda_split = sched->n_splits;  // sentinel: no CUDA splits
         for (int i = 0; i < sched->n_splits; ++i) {
-            if (!ggml_backend_is_cuda(sched->backends[sched->splits[i].backend_id])) {
-                any_non_cuda_split = true;
+            if (ggml_backend_is_cuda(sched->backends[sched->splits[i].backend_id])) {
+                first_cuda_split = i;
                 break;
             }
         }
-        const bool try_outer_capture = (n_cuda > 0) && !any_non_cuda_split
+        bool cpu_is_prefix_only = true;
+        for (int i = first_cuda_split + 1; i < sched->n_splits; ++i) {
+            if (!ggml_backend_is_cuda(sched->backends[sched->splits[i].backend_id])) {
+                cpu_is_prefix_only = false;
+                break;
+            }
+        }
+        const bool try_outer_capture = (n_cuda > 0)
+                                       && cpu_is_prefix_only
+                                       && first_cuda_split < sched->n_splits
                                        && !sched->outer_capture_disabled;
+
+        // PHASE_CUDA_NATIVE_DISPATCH C6: run leading CPU splits
+        // synchronously BEFORE BeginCapture. PD3 guarantees CPU work
+        // is a strict prefix in production; cpu_is_prefix_only above
+        // gates entry. Cache hits also need the CPU prefix to run on
+        // every dispatch — the captured graph does NOT include CPU
+        // work.
+        std::vector<int32_t>  ids_pre;
+        std::vector<uint32_t> unique_ids_pre;
+        ggml_tensor *         last_ids_tensor_pre = nullptr;
+        if (try_outer_capture && first_cuda_split > 0) {
+            for (int i = 0; i < first_cuda_split; ++i) {
+                auto * split = &sched->splits[i];
+                const int sbid = split->backend_id;
+                ggml_backend_t sbe = sched->backends[sbid];
+                if (split->n_inputs > 0) {
+                    ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync,
+                                                   ids_pre, unique_ids_pre, last_ids_tensor_pre);
+                }
+                sched->statuses[sbid] = ggml_backend_sched_eval(sched, sbe, split);
+                if (sched->statuses[sbid] != GGML_STATUS_SUCCESS) return sched->statuses[sbid];
+                ggml_backend_synchronize(sbe);  // CPU dispatch is sync; ensures host-visible
+            }
+        }
 
         // PHASE_CUDA_NATIVE_DISPATCH C5: cache lookup.
         // Hit → cudaGraphLaunch the cached executable; skip the
@@ -2368,8 +2408,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (cache_hit) {
             // Replay the cached graph; skip the dispatch loop and the
-            // statuses-check sweep. Set every backend's status to
-            // SUCCESS so the post-loop sweep is a no-op.
+            // statuses-check sweep.
             ggml_cuda_outer_capture_launch_exec(cuda_backends[0], cached_exec);
             return GGML_STATUS_SUCCESS;
         }
@@ -2381,7 +2420,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         std::vector<uint32_t> unique_ids;
         ggml_tensor *         last_ids_tensor = nullptr;
 
-        for (int i = 0; i < sched->n_splits; i++) {
+        // PHASE_CUDA_NATIVE_DISPATCH C6: when outer-capture is active,
+        // the CPU prefix has already executed sync. The dispatch loop
+        // starts at the first CUDA split. When outer-capture is not
+        // active (try_outer_capture==false, or _begin failed), the
+        // loop covers every split (CPU + CUDA mixed) as before.
+        int loop_start = 0;
+#ifdef GGML_USE_CUDA
+        if (capture_active) loop_start = first_cuda_split;
+#endif
+
+        for (int i = loop_start; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
             int64_t tim1 = ggml_time_us();
 #endif
