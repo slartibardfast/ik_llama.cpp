@@ -63,6 +63,16 @@ int main() {
     backends.push_back(cpu);
     bufts.push_back(ggml_backend_cpu_buffer_type());
 
+    // PHASE_CUDA_NATIVE_DISPATCH C2: bind eager init of the four PD1
+    // lazy-create surfaces on every CUDA backend. C1 made these races
+    // race-free (single dispatcher thread); C2 makes them unreachable.
+    for (auto * be : backends) {
+        if (ggml_backend_is_cuda(be) && !ggml_backend_cuda_eager_init_complete(be)) {
+            FAIL_AT("CUDA backend has non-pre-allocated lazy fields after init "
+                    "(C2 NoLazyInitInDispatchPath violated)");
+        }
+    }
+
     // Match the production CLIP encoder sched shape: parallel=true,
     // split_mode_graph=true, async=true. This forces the multi-backend
     // dispatch branch when n_backends > 2.

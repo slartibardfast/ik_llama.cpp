@@ -4467,11 +4467,11 @@ GGML_CALL static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_
 #endif
         }
 
-        // record event on src stream after the copy
+        // record event on src stream after the copy. copy_event is
+        // pre-allocated at ggml_backend_cuda_init (C2); the lazy-create
+        // branch that used to live here is now structurally unreachable.
         ggml_cuda_set_device(cuda_ctx_src->device);
-        if (!cuda_ctx_src->copy_event) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
-        }
+        GGML_ASSERT(cuda_ctx_src->copy_event != nullptr);
         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
@@ -5877,7 +5877,62 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
     // their ops. Idempotent + side-effect-free when no ops registered.
     ggml_cuda_calibrate(ctx);
 
+    // PHASE_CUDA_NATIVE_DISPATCH C2: eager pre-allocation of the four
+    // PD1 lazy-create surfaces (copy_event, streams, cublas_handles,
+    // pools). C1 made these branches race-free (single dispatcher
+    // thread); C2 makes them unreachable from the dispatch path.
+    // Spec: specs/cuda-native-dispatch/single_threaded_dispatch.allium
+    // (NoLazyInitInDispatchPath contract).
+    {
+        const int n_dev = ggml_backend_cuda_get_device_count();
+
+        ggml_cuda_set_device(ctx->device);
+        if (ctx->copy_event == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx->copy_event, cudaEventDisableTiming));
+        }
+
+        for (int d = 0; d < n_dev && d < GGML_CUDA_MAX_DEVICES; ++d) {
+            ggml_cuda_set_device(d);
+
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (ctx->streams[d][s] == nullptr) {
+                    CUDA_CHECK(cudaStreamCreateWithFlags(&ctx->streams[d][s], cudaStreamNonBlocking));
+                }
+            }
+
+            if (ctx->cublas_handles[d] == nullptr) {
+                // CUBLAS_WORKSPACE_CONFIG must be set before first
+                // cuBLAS call for deterministic SGEMM/GemmEx. setenv()
+                // with overwrite=0 preserves caller-supplied values.
+                setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
+                CUBLAS_CHECK(cublasCreate(&ctx->cublas_handles[d]));
+                CUBLAS_CHECK(cublasSetMathMode(ctx->cublas_handles[d], CUBLAS_DEFAULT_MATH));
+            }
+
+            if (ctx->pools[d] == nullptr) {
+                ctx->pools[d] = ggml_backend_cuda_context::new_pool_for_device(d);
+            }
+        }
+
+        ggml_cuda_set_device(ctx->device);  // restore
+    }
+
     return cuda_backend;
+}
+
+GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx->copy_event == nullptr) return false;
+    const int n_dev = ggml_backend_cuda_get_device_count();
+    for (int d = 0; d < n_dev && d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->streams[d][s] == nullptr) return false;
+        }
+        if (ctx->cublas_handles[d] == nullptr) return false;
+        if (ctx->pools[d] == nullptr) return false;
+    }
+    return true;
 }
 
 GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {

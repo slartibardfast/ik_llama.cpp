@@ -905,10 +905,11 @@ struct ggml_backend_cuda_context {
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
-        if (streams[device][stream] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
-        }
+        // PHASE_CUDA_NATIVE_DISPATCH C2: pre-allocated at
+        // ggml_backend_cuda_init. A null here means eager-init was
+        // skipped or this context was created outside that path.
+        GGML_ASSERT(streams[device][stream] != nullptr &&
+                    "stream not pre-allocated — ggml_cuda_eager_init missing?");
         return streams[device][stream];
     }
 
@@ -933,21 +934,10 @@ struct ggml_backend_cuda_context {
     cudaStream_t draft_stream() { return draft_stream(device); }
 
     cublasHandle_t cublas_handle(int device) {
-        if (cublas_handles[device] == nullptr) {
-            // CUBLAS_WORKSPACE_CONFIG must be set before first cuBLAS call
-            // for deterministic SGEMM/GemmEx. setenv() with overwrite=0
-            // preserves caller-supplied values; production bakes the
-            // canonical :4096:8 setting that cuBLAS docs require.
-            setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
-            ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            // Determinism: disable TF32 fast path so F32 SGEMM/GemmEx
-            // doesn't switch accumulator precision based on cuBLAS's shape
-            // heuristic. Baked on; the prior LLAMA_FATTN_SHAPE_INVARIANT_
-            // DISPATCH gate is removed.
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device],
-                CUBLAS_DEFAULT_MATH));
-        }
+        // PHASE_CUDA_NATIVE_DISPATCH C2: pre-allocated at
+        // ggml_backend_cuda_init (with CUBLAS_WORKSPACE_CONFIG=:4096:8
+        // and CUBLAS_DEFAULT_MATH for determinism).
+        GGML_ASSERT(cublas_handles[device] != nullptr);
         return cublas_handles[device];
     }
 
@@ -961,9 +951,9 @@ struct ggml_backend_cuda_context {
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device);
 
     ggml_cuda_pool & pool(int device) {
-        if (pools[device] == nullptr) {
-            pools[device] = new_pool_for_device(device);
-        }
+        // PHASE_CUDA_NATIVE_DISPATCH C2: pre-allocated at
+        // ggml_backend_cuda_init.
+        GGML_ASSERT(pools[device] != nullptr);
         return *pools[device];
     }
 

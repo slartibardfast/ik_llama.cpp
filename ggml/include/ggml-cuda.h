@@ -57,6 +57,17 @@ GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback,
 // shapes vary. Exposed for tests that bound cache growth.
 GGML_API GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t backend);
 
+// PHASE_CUDA_NATIVE_DISPATCH C2: introspection hook for the eager-init
+// invariant. Returns true iff the four PD1 lazy-create surfaces are
+// already populated on this backend's context:
+//   - copy_event (single cudaEvent_t per context)
+//   - streams[device][stream] for device < device_count, stream < MAX_STREAMS
+//   - cublas_handles[device] for device < device_count
+//   - pools[device] for device < device_count
+// Tests assert this returns true immediately after ggml_backend_cuda_init.
+// Returns false if backend is null or not a CUDA backend.
+GGML_API GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t backend);
+
 // CUDA graph cache instrumentation surface. All functions return 0 / -1
 // when GGML_CUDA_GRAPH_PROBE is unset or when the underlying probe step
 // has not yet landed. Tests treat any zero return as RED.
