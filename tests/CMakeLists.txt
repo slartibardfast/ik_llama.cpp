@@ -253,6 +253,14 @@ if (GGML_CUDA)
     #   - sched->outer_capture_disabled never goes true mid-test
     llama_build_and_test(test-libmgpu-subgraph-capture.cpp)
 
+    # PHASE_CUDA_NATIVE_DISPATCH C8-C11 — bind that all four calibrated
+    # ops (MATMUL_STREAM_SPLIT, REDUCE_CROSS_DEVICE, PEER_COPY, GRAPH_
+    # CAPTURE) are registered at module load via the static-initializer
+    # in op_calibration_probes.cu, calibrate to SIZE_MAX on the default-
+    # wins stub probes, and produce deterministic thresholds across
+    # fresh backends.
+    llama_build_and_test(test-calibration-ops-registered.cpp)
+
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.
     llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)
