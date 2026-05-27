@@ -68,6 +68,19 @@ GGML_API GGML_CALL size_t ggml_backend_cuda_graph_cache_size(ggml_backend_t back
 // Returns false if backend is null or not a CUDA backend.
 GGML_API GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t backend);
 
+// PHASE_CUDA_NATIVE_DISPATCH C3: outer-capture state.
+// C4's wrapper around ggml_backend_sched_compute_splits issues
+// cudaStreamBeginCapture(Relaxed) on the primary backend's stream
+// and sets this flag; cudaStreamEndCapture clears it. Per-backend
+// ggml_backend_cuda_graph_compute reads the flag and skips its own
+// capture / instantiate / launch lifecycle, letting kernels stream
+// into the outer captured graph instead.
+//
+// Thread-local: C1's HostThreadIsExactlyOne invariant guarantees a
+// single dispatcher thread owns this state.
+GGML_API void ggml_cuda_outer_capture_set(bool active);
+GGML_API bool ggml_cuda_outer_capture_active(void);
+
 // CUDA graph cache instrumentation surface. All functions return 0 / -1
 // when GGML_CUDA_GRAPH_PROBE is unset or when the underlying probe step
 // has not yet landed. Tests treat any zero return as RED.

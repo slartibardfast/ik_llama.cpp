@@ -5163,12 +5163,27 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
 
+    // PHASE_CUDA_NATIVE_DISPATCH C3: in-capture awareness. When C4's
+    // outer wrapper has issued cudaStreamBeginCapture(Relaxed) on the
+    // primary backend's stream, skip this backend's own capture/launch
+    // lifecycle entirely — kernels enqueued via evaluate_and_capture_
+    // cuda_graph still launch on this backend's stream and (under
+    // cudaStreamCaptureModeRelaxed + the event-chain edges C4 inserts)
+    // get folded into the outer captured cudaGraph_t.
+    //
+    // C3 alone is inert: ggml_cuda_outer_capture_active() always
+    // returns false until C4 wires the flag. The gate exists so that
+    // C4 lands without further graph_compute changes.
+    const bool in_outer_capture = ggml_cuda_outer_capture_active();
+
     static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
 
     // Disable CUDA graphs in presence of env var, old GPU, use-case which is changing too rapidly,
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
-    bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph;
+    bool use_cuda_graph = !disable_cuda_graphs_due_to_env
+                          && cuda_ctx->use_cuda_graph
+                          && !in_outer_capture;
 
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
@@ -5918,6 +5933,22 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
     }
 
     return cuda_backend;
+}
+
+// PHASE_CUDA_NATIVE_DISPATCH C3: outer-capture state.
+// Thread-local because C1's HostThreadIsExactlyOne invariant binds a
+// single dispatcher thread. C4 will set this flag at the outer
+// cudaStreamBeginCapture (just before walking compute_splits) and
+// clear it at the outer cudaStreamEndCapture. graph_compute reads
+// the flag and short-circuits its own capture lifecycle.
+static thread_local bool g_outer_capture_active = false;
+
+extern "C" void ggml_cuda_outer_capture_set(bool active) {
+    g_outer_capture_active = active;
+}
+
+extern "C" bool ggml_cuda_outer_capture_active(void) {
+    return g_outer_capture_active;
 }
 
 GGML_CALL bool ggml_backend_cuda_eager_init_complete(ggml_backend_t backend) {
