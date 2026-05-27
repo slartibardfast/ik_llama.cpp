@@ -17,7 +17,6 @@
 #include <set>
 #include <array>
 #include <chrono>
-#include <barrier>
 #include <thread>
 #include <mutex>
 #include <unordered_set>
@@ -1214,7 +1213,6 @@ struct ggml_backend_sched {
 
     uint32_t op_offload[(GGML_OP_COUNT + 31)/32];
 
-    std::vector<std::thread> workers;
     std::vector<ggml_status> statuses;
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
@@ -1225,7 +1223,6 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
-    bool per_split_sync_test = false;
 
     // PHASE_CUDA_NATIVE_DISPATCH C4: sticky flag set when outer
     // cudaStreamBeginCapture or EndCapture fails. Subsequent dispatches
@@ -2588,7 +2585,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
-    sched->per_split_sync_test = getenv("GGML_SCHED_PER_SPLIT_SYNC") != NULL;
+    // PHASE_CUDA_NATIVE_DISPATCH C12: GGML_SCHED_PER_SPLIT_SYNC was a
+    // Phase-46 NPC.4 diagnostic; the per-split drain it gated is
+    // structurally unnecessary under C1's single-threaded dispatch.
+    // Knob deleted; field removed from the struct.
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -2627,7 +2627,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
 
-    sched->workers.reserve(sched->n_backends);
     sched->statuses.resize(sched->n_backends, GGML_STATUS_SUCCESS);
     sched->backend_splits.resize(sched->n_backends);
 
@@ -2683,15 +2682,15 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // PHASE 46 B.5e Phase-C fix (2026-05-26): zero gallocr activation
     // buffers between encodes. Some kernel in the multi-device CLIP
     // graph reads partially-initialized memory on subsequent encodes
-    // (a view-stride or kernel-not-fully-overwriting issue we haven't
-    // localized at the kernel level). Zeroing here makes the system
-    // deterministic at minimal perf cost (~3s of ~22GB cudaMemset for
-    // CLIP's activation working set).
+    // (view-stride / kernel-not-fully-overwriting issue not localized
+    // at the kernel level). Zeroing makes the system deterministic at
+    // minimal perf cost (~3s of ~22GB cudaMemset for CLIP's activation
+    // working set).
     //
-    // Env knob to disable (diagnostic only — restores the cross-encode
-    // state leak): GGML_SCHED_NO_ZERO_ACTIVATIONS=1
-    static const bool s_no_zero_activations = std::getenv("GGML_SCHED_NO_ZERO_ACTIVATIONS") != nullptr;
-    if (!s_no_zero_activations && sched->galloc) {
+    // PHASE_CUDA_NATIVE_DISPATCH C12: env knob escape
+    // GGML_SCHED_NO_ZERO_ACTIVATIONS deleted. Behavior is hardcoded;
+    // disabling it would restore a known cross-encode state leak.
+    if (sched->galloc) {
         int n = ggml_gallocr_get_n_buffers(sched->galloc);
         for (int i = 0; i < n; i++) {
             ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(sched->galloc, i);
