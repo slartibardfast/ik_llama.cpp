@@ -222,6 +222,14 @@ if (GGML_CUDA)
     # round-trip, FORCE_RECALIBRATE bypass.
     llama_build_and_test(test-cuda-calibration-framework.cpp)
 
+    # PHASE_CUDA_NATIVE_DISPATCH C1 — single-threaded compute_splits.
+    # Binds HostThreadIsExactlyOne over the lifetime of N graph computes
+    # on a multi-backend (2× CUDA) sched configured for split-mode graph
+    # + has_reduce — the path that used to enter the openmp parallel
+    # block. Asserts ggml_backend_sched_dispatch_thread_count() == 1
+    # across 100 iterations.
+    llama_build_and_test(test-single-threaded-dispatch.cpp)
+
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.
     llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)

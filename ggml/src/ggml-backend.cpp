@@ -16,11 +16,39 @@
 #include <chrono>
 #include <barrier>
 #include <thread>
+#include <mutex>
+#include <unordered_set>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
 
 #define IK_PRINT_TIMING 0
+
+// PHASE_CUDA_NATIVE_DISPATCH C1: dispatch-thread observation hook.
+// Implementation backs ggml_backend_sched_dispatch_thread_count() in the
+// public API (ggml-backend.h). The set captures every host thread that
+// has entered the multi-backend dispatch path since process start (or
+// since the last *_reset()). Binding invariant: count is always 1 in a
+// healthy build (single host dispatcher thread, per
+// specs/cuda-native-dispatch/single_threaded_dispatch.allium).
+static std::mutex                            g_sched_dispatch_thread_mu;
+static std::unordered_set<std::thread::id>   g_sched_dispatch_thread_ids;
+
+static inline void ggml_backend_sched_dispatch_thread_observe(void) {
+    const std::thread::id tid = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(g_sched_dispatch_thread_mu);
+    g_sched_dispatch_thread_ids.insert(tid);
+}
+
+extern "C" size_t ggml_backend_sched_dispatch_thread_count(void) {
+    std::lock_guard<std::mutex> lock(g_sched_dispatch_thread_mu);
+    return g_sched_dispatch_thread_ids.size();
+}
+
+extern "C" void ggml_backend_sched_dispatch_thread_reset(void) {
+    std::lock_guard<std::mutex> lock(g_sched_dispatch_thread_mu);
+    g_sched_dispatch_thread_ids.clear();
+}
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -2176,33 +2204,44 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
+    // PHASE_CUDA_NATIVE_DISPATCH C1 — single-threaded dispatch invariant.
+    // Records the dispatcher thread id. Bound by
+    // ggml_backend_sched_dispatch_thread_count() == 1 (one host thread
+    // for the entire process lifetime). The observation covers both the
+    // multi-backend branch (rewritten in C1) and the fallback sequential
+    // path below — both are single-threaded.
+    ggml_backend_sched_dispatch_thread_observe();
+
     for (auto & item : sched->needs_sync) item = true;
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
+        // PHASE_CUDA_NATIVE_DISPATCH C1: single-host-thread dispatch.
+        //
+        // The dispatcher walks the split sequence on one thread. Each
+        // split's eval enqueues kernels async on its backend's CUDA
+        // stream; cross-backend dependencies are carried by the existing
+        // ggml_backend_event_record/event_wait calls inside
+        // ggml_backend_sched_copy_inputs. CUDA streams on different
+        // devices still execute concurrently — host parallelism is NOT
+        // needed for device concurrency.
+        //
+        // Replaces (deleted in this commit): the openmp parallel
+        // num_threads(n_backends) block and the std::barrier worker-
+        // thread fallback. Both raced on host-side CUDA context lazy
+        // fields (PD1: cuda_graphs, pools, cublas_handles, streams) and
+        // required Phase-46 mitigations (per-split full-backend drain,
+        // event-record thread-gating, GGML_SCHED_EVAL_SERIALIZE critical
+        // section). All four mitigations are obsolete here: one thread
+        // means no host-side concurrency to coordinate.
+        //
+        // Bound by:
+        //   specs/cuda-native-dispatch/single_threaded_dispatch.allium
+        //   specs/cuda-native-dispatch/CUDANativeDispatch.tla
+        //   tests/test-single-threaded-dispatch.cpp
 
         for (auto & s : sched->statuses) s = GGML_STATUS_SUCCESS;
 
         int first_reduce = -1;
-        bool work_done = false;
-#ifdef GGML_USE_OPENMP
-        //This may not be available in old OpenMP versions
-        //if (int nlevels = omp_get_max_active_levels(); nlevels < 2) {
-        //    omp_set_max_active_levels(nlevels+1);
-        //    //printf("%s: Setting omp max active levels to 2\n", __func__);
-        //}
-        bool has_cpu_work = false;
-        for (int i = 0; i < sched->n_backends; ++i) {
-            if (!sched->backend_splits[i].empty()) {
-                auto split = sched->backend_splits[i].front();
-                if (ggml_backend_is_cpu(sched->backends[split->backend_id])) {
-                    //printf("CPU backend %d has %d splits\n", split->backend_id, (int)sched->backend_splits[i].size());
-                    if (sched->backend_splits[i].size() > 1) {
-                        has_cpu_work = true;
-                        break;
-                    }
-                }
-            }
-        }
         for (int i = 0; i < sched->n_splits; i++) {
             auto split = &sched->splits[i];
             if (split->graph.n_nodes == 1 && split->graph.nodes[0]->op == GGML_OP_REDUCE) {
@@ -2210,233 +2249,66 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 break;
             }
         }
+        (void) first_reduce;  // reserved for C4 capture-mode ordering
 
-        if (!has_cpu_work) {
-        #pragma omp parallel num_threads(sched->n_backends)
-        {
+        struct ggml_backend_sched_split * splits = sched->splits;
 
-            int last_reduce = first_reduce;
-            int ith = omp_get_thread_num();
+        std::vector<int32_t>  ids;
+        std::vector<uint32_t> unique_ids;
+        ggml_tensor *         last_ids_tensor = nullptr;
 
-            struct ggml_backend_sched_split * splits = sched->splits;
-
-            std::vector<int32_t> ids;
-            std::vector<uint32_t> unique_ids;
-            ggml_tensor * last_ids_tensor = nullptr;
-
-            for (int i = 0; i < sched->n_splits; i++) {
+        for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
-                int64_t tim1 = ggml_time_us();
+            int64_t tim1 = ggml_time_us();
 #endif
-                struct ggml_backend_sched_split * split = &splits[i];
-                int split_backend_id = split->backend_id;
-                ggml_backend_t split_backend = sched->backends[split_backend_id];
+            struct ggml_backend_sched_split * split = &splits[i];
+            const int split_backend_id = split->backend_id;
+            ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-                bool needs_barrier = split->n_inputs > 0 || split->graph.nodes[0]->op == GGML_OP_REDUCE;
+            if (split->n_inputs > 0) {
+                ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync,
+                                               ids, unique_ids, last_ids_tensor);
+            }
 
-                if (needs_barrier) {
-                    #pragma omp barrier
-                }
+            sched->statuses[split_backend_id] = ggml_backend_sched_eval(sched, split_backend, split);
+            if (sched->statuses[split_backend_id] != GGML_STATUS_SUCCESS) break;
 
-                if (split->n_inputs > 0) {
-                    int copy_thread = last_reduce >= 0 ? last_reduce : 0;
-                    if (ith == copy_thread) {
-                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
-                    }
-                    #pragma omp barrier
-                }
-
-                if (ith == split_backend_id) {
-                    // PHASE 46 B.5e Phase-C diagnostic: env-gated critical
-                    // section around the eval phase. GGML_SCHED_EVAL_SERIALIZE=1
-                    // forces evals across openmp threads to run one-at-a-time,
-                    // effectively serializing the dispatch. If determinism
-                    // holds with this on, the race is in concurrent CPU-side
-                    // dispatch to different backends (cuda driver, pool alloc,
-                    // CUDA context state). If still racy, the bug is deeper.
-                    static const bool s_eval_serialize = std::getenv("GGML_SCHED_EVAL_SERIALIZE") != nullptr;
-                    if (s_eval_serialize) {
-                        #pragma omp critical(sched_eval)
-                        {
-                            sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
-                        }
-                    } else {
-                        sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
-                    }
-
-                    if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
+            if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
+                sched->needs_sync[split_backend_id] = true;
+            } else {
+                for (int j = 0; j < split->n_inputs; ++j) {
+                    if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
                         sched->needs_sync[split_backend_id] = true;
-                    } else {
-                        for (int j = 0; j < split->n_inputs; ++j) {
-                            if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
-                                sched->needs_sync[split_backend_id] = true;
-                            }
-                        }
-                    }
-
-                    // PHASE 46 B.5e NPC.4 test B: env-gated per-split GPU drain.
-                    // Drains the eval thread's backend stream after each split's
-                    // eval. Tests whether the determinism bug is a cross-split
-                    // sync gap (this fixes it) or intra-split kernel-level race
-                    // (this doesn't help). Eval-callback's full-stream drain
-                    // per-NODE is what's bit-deterministic; this drains per-
-                    // SPLIT only. If deterministic with this on, the race is at
-                    // split-boundary stream ordering.
-                    if (sched->per_split_sync_test) {
-                        ggml_backend_synchronize(split_backend);
-                    }
-                }
-
-                // PHASE 46 B.5e Phase-C fix (2026-05-26): drain all backends
-                // after every split in the openmp parallel multi-backend
-                // path. The existing sync points in copy_inputs are
-                // insufficient for libmgpu's per-device sub-graphs with
-                // cross-device peer writes — the next iteration's eval can
-                // race against in-flight kernels from the previous split's
-                // cross-device data flow. The thread-0-fenced barrier
-                // serializes the drain across threads.
-                //
-                // Env knob to disable (diagnostic only): GGML_SCHED_NO_DRAIN=1
-                {
-                    static const bool s_no_drain = std::getenv("GGML_SCHED_NO_DRAIN") != nullptr;
-                    if (!s_no_drain) {
-                        #pragma omp barrier
-                        if (ith == 0) {
-                            for (int b = 0; b < sched->n_backends; b++) {
-                                ggml_backend_synchronize(sched->backends[b]);
-                            }
-                        }
-                        #pragma omp barrier
-                    }
-                }
-
-                if (split->graph.nodes[0]->op == GGML_OP_REDUCE && i < sched->n_splits - 1) {
-                    last_reduce = split_backend_id;
-                    if (ith == split_backend_id) {
-                        auto node = split->graph.nodes[0];
-                        int n = node->op_params[1];
-                        // After reduce, every participating backend has async
-                        // peer writes to drain on the next consumer read. The
-                        // pre-fix clear-to-false here was the optimization that
-                        // caused the race; mark sticky-true instead.
-                        for (int j = 0; j < n; ++j) {
-                            if (node->src[j]) {
-                                sched->needs_sync[j] = true;
-                            }
-                        }
-                    }
-                    #pragma omp barrier
-                }
-
-                // PHASE 46 B.5e Phase-C fix: gate the event-record on the
-                // owning thread. The original unguarded version had ALL
-                // openmp threads calling cudaEventRecord on the same event
-                // handle concurrently — per CUDA docs ("If hEvent has
-                // previously been recorded, calling cudaEventRecord() will
-                // reuse the event"), repeated records overwrite each other
-                // and earlier markers are lost. Downstream waits see only
-                // the latest record, not the intended-from-this-thread one.
-                // Gating on (ith == split_backend_id) ensures exactly one
-                // record per event per split.
-                if (split->n_inputs > 0 && ith == split_backend_id) {
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
                 }
             }
-        }
-        work_done = true;
-        }
-#endif
-        if (!work_done) {
 
-        std::barrier barrier(sched->n_backends);
-        auto compute = [sched, &barrier, first_reduce] (int ith) {
-
-            struct ggml_backend_sched_split * splits = sched->splits;
-
-            std::vector<int32_t> ids;
-            std::vector<uint32_t> unique_ids;
-            ggml_tensor * last_ids_tensor = nullptr;
-
-            int last_reduce = first_reduce;
-
-            for (int i = 0; i < sched->n_splits; i++) {
-#if IK_PRINT_TIMING
-                int64_t tim1 = ggml_time_us();
-#endif
-                struct ggml_backend_sched_split * split = &splits[i];
-                int split_backend_id = split->backend_id;
-                ggml_backend_t split_backend = sched->backends[split_backend_id];
-
-                bool needs_barrier = split->n_inputs > 0 || split->graph.nodes[0]->op == GGML_OP_REDUCE;
-
-                if (needs_barrier) {
-                    barrier.arrive_and_wait();
-                }
-
-                if (split->n_inputs > 0) {
-                    int copy_thread = last_reduce >= 0 ? last_reduce : 0;
-                    if (ith == copy_thread) {
-                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
-                    }
-                    barrier.arrive_and_wait();
-                }
-
-                if (ith == split_backend_id) {
-
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
-                    if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
-                        sched->needs_sync[split_backend_id] = true;
-                    } else {
-                        for (int j = 0; j < split->n_inputs; ++j) {
-                            if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
-                                sched->needs_sync[split_backend_id] = true;
-                            }
-                        }
-                    }
-                }
-
-                if (split->graph.nodes[0]->op == GGML_OP_REDUCE && i < sched->n_splits - 1) {
-                    last_reduce = split_backend_id;
-                    barrier.arrive_and_wait();
-                    if (ith == split_backend_id) {
-                        auto node = split->graph.nodes[0];
-                        int n = node->op_params[1];
-                        // After reduce, every participating backend has async
-                        // peer writes to drain on the next consumer read; see
-                        // openmp path above. Mark sticky-true.
-                        for (int j = 0; j < n; ++j) {
-                            if (node->src[j]) {
-                                sched->needs_sync[j] = true;
-                            }
-                        }
-                    }
-                }
-                //if (needs_barrier) {
-                //    barrier.arrive_and_wait();
-                //}
-
-                // PHASE 46 B.5e Phase-C fix: gate on owning thread to avoid
-                // concurrent cudaEventRecord on the same event handle (the
-                // same race fixed in the openmp branch above).
-                if (split->n_inputs > 0 && ith == split_backend_id) {
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
+            // After a reduce, every participating backend has async peer
+            // writes that the next consumer read must sync against. Sticky
+            // needs_sync ensures copy_inputs re-syncs each subsequent read.
+            if (split->graph.nodes[0]->op == GGML_OP_REDUCE && i < sched->n_splits - 1) {
+                auto node = split->graph.nodes[0];
+                int n = node->op_params[1];
+                for (int j = 0; j < n; ++j) {
+                    if (node->src[j]) {
+                        sched->needs_sync[j] = true;
                     }
                 }
             }
-        };
 
-        for (int i = 0; i < sched->n_backends; ++i) sched->workers.emplace_back(compute, i);
-        for (auto & w : sched->workers) w.join();
-        sched->workers.clear();
+            // Cross-backend producer event: consumer splits with n_inputs > 0
+            // event_wait on this in copy_inputs. With a single dispatcher
+            // thread there is no concurrent-record race (the Phase-46
+            // ith == split_backend_id gating is now structural).
+            if (split->n_inputs > 0 && sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
+            }
         }
+
         for (auto status : sched->statuses) {
             if (status != GGML_STATUS_SUCCESS) return status;
         }
         return GGML_STATUS_SUCCESS;
-
     }
 
     struct ggml_backend_sched_split * splits = sched->splits;

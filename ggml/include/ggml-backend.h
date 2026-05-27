@@ -215,6 +215,16 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
 
+    // PHASE_CUDA_NATIVE_DISPATCH C1: dispatch-thread introspection hook.
+    // Records the calling thread's id into a process-wide set every time
+    // ggml_backend_sched_compute_splits enters its multi-backend dispatch
+    // path. Tests assert size() == 1 (one dispatcher thread for the entire
+    // process lifetime). Always present in the build; cost is one
+    // unordered_set insert + mutex lock per graph_compute on the multi-
+    // backend path (~negligible vs eval cost).
+    GGML_API size_t               ggml_backend_sched_dispatch_thread_count(void);
+    GGML_API void                 ggml_backend_sched_dispatch_thread_reset(void);
+
     //
     // Utils
     //
