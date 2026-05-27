@@ -244,6 +244,15 @@ if (GGML_CUDA)
     # output across all replays.
     llama_build_and_test(test-multi-device-graph-cache.cpp)
 
+    # PHASE_CUDA_NATIVE_DISPATCH C7 — sched-integrated outer capture on
+    # a libmgpu-shape graph (cross-device GGML_OP_REDUCE). Asserts:
+    #   - outer_capture_count advances with the dispatch loop firing
+    #     OR (if multi-backend branch didn't trigger) the sequential
+    #     fallback produces deterministic output
+    #   - output bit-identical across all iters
+    #   - sched->outer_capture_disabled never goes true mid-test
+    llama_build_and_test(test-libmgpu-subgraph-capture.cpp)
+
     # mtp_fused_draft.allium — RED-first scaffolding. Each test fails
     # to compile or link until its referenced API symbols land.
     llama_build_and_test(mtp-fused/test-mtp-fused-symbols.cpp)
