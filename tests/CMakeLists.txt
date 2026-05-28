@@ -1164,6 +1164,15 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# Spec test for CrossCodepathConsistency.allium — structural invariants
+# of the LM ⇔ CLIP cross-codepath contract over a shared mgpu_split_config.
+set(TEST_TARGET test-mgpu-split-cross-codepath)
+add_executable(${TEST_TARGET} spec/test-mgpu-split-cross-codepath.cpp)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 set(TEST_TARGET test-clip-encode-equivalence)
 add_executable(${TEST_TARGET} spec/test-clip-encode-equivalence.cpp)
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
