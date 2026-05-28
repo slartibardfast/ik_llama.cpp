@@ -8511,6 +8511,15 @@ struct llama_context * llama_init_from_model(
 #endif
             ctx->default_decoder.sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
 
+            // PHASE_PERF_R3_FOLLOWUP (interim): LM autoregressive
+            // single-stream decode has no cross-encode state-leak
+            // surface, so the PHASE 46 B.5e activation-zero-on-reset
+            // (which costs ~6.7% of per-step wall time at ctx=256k) is
+            // not needed here. Empirically validated: 18/18 byte-
+            // identical LM TG reps without the clear. Multi-GPU CLIP
+            // (a different sched) keeps the default zero_on_reset=true.
+            ggml_backend_sched_set_zero_on_reset(ctx->default_decoder.sched, false);
+
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->default_decoder.sched));
             }
@@ -8529,6 +8538,7 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->default_decoder.sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    ggml_backend_sched_set_zero_on_reset(ctx->default_decoder.sched, false);
                     gf_success = ggml_backend_sched_reserve(ctx->default_decoder.sched, gf);
                 }
                 if (!gf_success) {

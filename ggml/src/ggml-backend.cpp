@@ -1167,6 +1167,17 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // PERF (PHASE_PERF_R3_FOLLOWUP): per-sched opt-out for the
+    // Phase 46 B.5e activation-zero-on-reset (lines below in
+    // ggml_backend_sched_reset). Default true preserves the multi-GPU
+    // CLIP determinism fix. LM single-stream decoder sets false via
+    // ggml_backend_sched_set_zero_on_reset(): empirically validated
+    // 2026-05-28 (18/18 byte-identical LM TG reps without the clear,
+    // 3/10 vs 7/10 split for multi-GPU CLIP without the clear).
+    // Removing the clear from LM recovers 17.6 percentage points on
+    // the R1 ctx-allocation tax (-25.9% TG at ctx=256k → -8.3%).
+    bool zero_on_reset;
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -2594,6 +2605,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
+    // Default true preserves PHASE 46 B.5e behavior (clear gallocr
+    // activation buffers on reset). Callers that know the cross-encode
+    // state-leak surface doesn't apply (e.g. LM autoregressive
+    // single-stream decoder) flip this to false via
+    // ggml_backend_sched_set_zero_on_reset().
+    sched->zero_on_reset = true;
+
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
     // PHASE_CUDA_NATIVE_DISPATCH C12: GGML_SCHED_PER_SPLIT_SYNC was a
     // Phase-46 NPC.4 diagnostic; the per-split drain it gated is
@@ -2694,13 +2712,16 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     // graph reads partially-initialized memory on subsequent encodes
     // (view-stride / kernel-not-fully-overwriting issue not localized
     // at the kernel level). Zeroing makes the system deterministic at
-    // minimal perf cost (~3s of ~22GB cudaMemset for CLIP's activation
-    // working set).
+    // minimal perf cost for CLIP (one encode per image).
     //
-    // PHASE_CUDA_NATIVE_DISPATCH C12: env knob escape
-    // GGML_SCHED_NO_ZERO_ACTIVATIONS deleted. Behavior is hardcoded;
-    // disabling it would restore a known cross-encode state leak.
-    if (sched->galloc) {
+    // PHASE_PERF_R3_FOLLOWUP (2026-05-28): gated on sched->zero_on_reset
+    // (default true preserves CLIP determinism). LM autoregressive
+    // single-stream decoder calls ggml_backend_sched_set_zero_on_reset
+    // (sched, false) at init: empirically validated 18/18 byte-identical
+    // LM TG reps without the clear (vs 3/10 vs 7/10 split for multi-GPU
+    // CLIP without it), and clearing on every per-token decode step
+    // cost ~6.7% of per-step wall time at ctx=256k.
+    if (sched->zero_on_reset && sched->galloc) {
         int n = ggml_gallocr_get_n_buffers(sched->galloc);
         for (int i = 0; i < n; i++) {
             ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(sched->galloc, i);
@@ -2709,6 +2730,10 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
             }
         }
     }
+}
+
+void ggml_backend_sched_set_zero_on_reset(ggml_backend_sched_t sched, bool zero) {
+    sched->zero_on_reset = zero;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
