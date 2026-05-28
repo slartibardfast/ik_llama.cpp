@@ -38,6 +38,24 @@
 #include <random>
 #include <algorithm>
 #include <src/llama-impl.h>
+#include <dlfcn.h>
+
+// Opt-in nsys profile-range bracketing via SIGUSR1/SIGUSR2.
+// Enabled when env var LLAMA_NSYS_PROFILE_RANGE=1 is set at startup.
+// Uses dlsym(cudart) so there is no link-time dependency.
+static void (*g_nsys_profiler_start)() = nullptr;
+static void (*g_nsys_profiler_stop)()  = nullptr;
+static void nsys_load_profiler() {
+    if (g_nsys_profiler_start) return;
+    void * h = dlopen("libcudart.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!h) h = dlopen("libcudart.so.13", RTLD_LAZY | RTLD_GLOBAL);
+    if (!h) h = dlopen("libcudart.so.12", RTLD_LAZY | RTLD_GLOBAL);
+    if (!h) return;
+    g_nsys_profiler_start = (void(*)())dlsym(h, "cudaProfilerStart");
+    g_nsys_profiler_stop  = (void(*)())dlsym(h, "cudaProfilerStop");
+}
+static void nsys_on_sigusr1(int) { if (g_nsys_profiler_start) g_nsys_profiler_start(); }
+static void nsys_on_sigusr2(int) { if (g_nsys_profiler_stop)  g_nsys_profiler_stop();  }
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
 #include <sqlite_modern_cpp.h>
 
@@ -458,6 +476,14 @@ int main(int argc, char ** argv) {
 
     // parse arguments from environment variables
     gpt_params_parse_from_env(params);
+
+    // Opt-in nsys profile-range bracketing (SIGUSR1=start, SIGUSR2=stop).
+    if (const char * v = std::getenv("LLAMA_NSYS_PROFILE_RANGE"); v && v[0] == '1') {
+        nsys_load_profiler();
+        signal(SIGUSR1, nsys_on_sigusr1);
+        signal(SIGUSR2, nsys_on_sigusr2);
+        LOG_INFO("LLAMA_NSYS_PROFILE_RANGE=1 — SIGUSR1=cudaProfilerStart, SIGUSR2=cudaProfilerStop", {});
+    }
 
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
