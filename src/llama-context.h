@@ -123,6 +123,30 @@ struct llama_kv_cache {
 
     std::vector<llama_kv_cell> cells;
 
+    // PERF (PHASE_PERF_R3_FOLLOWUP): O(1) per-seq max-pos cache.
+    // The naive scan in llama_kv_cache_seq_pos_max iterates all
+    // cache.size cells per call; at ctx=256k that's a 262k-entry
+    // walk every decode step, dominating per-step CPU time
+    // (35× growth vs ctx=8k confirmed by per-function CPU sampling).
+    //
+    // Maintained incrementally on insert; invalidated on
+    // erase/clear/shift; lazily rebuilt on the next query.
+    // For append-only single-seq decode (the dominant workload)
+    // the cache stays clean and every query is O(1).
+    mutable std::map<llama_seq_id, llama_pos> seq_pos_max_cache;
+    mutable bool seq_pos_max_dirty = true;
+
+    inline void seq_pos_max_note_insert(llama_seq_id sid, llama_pos pos) {
+        if (pos < 0) return;
+        auto it = seq_pos_max_cache.find(sid);
+        if (it == seq_pos_max_cache.end()) {
+            seq_pos_max_cache.emplace(sid, pos);
+        } else if (it->second < pos) {
+            it->second = pos;
+        }
+    }
+    inline void seq_pos_max_invalidate() { seq_pos_max_dirty = true; }
+
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)

@@ -1448,6 +1448,7 @@ bool llama_kv_cache_find_slot(
                         cache.used += 1;
                     }
                     cache.cells[seq_id].pos = batch.pos[i];
+                    cache.seq_pos_max_note_insert(seq_id, batch.pos[i]);
                     // NOTE: seq_ids are not inserted here; they are handled when the input tensors are set
                 } else {
                     // too big seq_id
@@ -1637,8 +1638,9 @@ bool llama_kv_cache_find_slot(
                 const uint32_t batch_idx = run.tok_start + i;
                 cache.cells[scan.base + scan.head_local + i].pos = batch.pos[batch_idx];
                 for (int32_t j = 0; j < batch.n_seq_id[batch_idx]; ++j) {
-                    cache.cells[scan.base + scan.head_local + i].seq_id.insert(
-                        batch.seq_id[batch_idx][j]);
+                    const llama_seq_id sid = batch.seq_id[batch_idx][j];
+                    cache.cells[scan.base + scan.head_local + i].seq_id.insert(sid);
+                    cache.seq_pos_max_note_insert(sid, batch.pos[batch_idx]);
                 }
             }
             cache.v_heads[scan.stream_id] = scan.head_local;
@@ -1701,7 +1703,9 @@ bool llama_kv_cache_find_slot(
     for (uint32_t i = 0; i < n_tokens; i++) {
         cache.cells[base + head_local + i].pos = batch.pos[i];
         for (int32_t j = 0; j < batch.n_seq_id[i]; j++) {
-            cache.cells[base + head_local + i].seq_id.insert(batch.seq_id[i][j]);
+            const llama_seq_id sid = batch.seq_id[i][j];
+            cache.cells[base + head_local + i].seq_id.insert(sid);
+            cache.seq_pos_max_note_insert(sid, batch.pos[i]);
         }
     }
 
@@ -1717,6 +1721,7 @@ bool llama_kv_cache_find_slot(
             cache.cells[base + head_local + i].pos = -1;
             cache.cells[base + head_local + i].seq_id.clear();
         }
+        cache.seq_pos_max_invalidate();
         LLAMA_LOG_ERROR(
             "%s: paged KV pool exhausted (single-seq path) at "
             "stream=%u n_tokens=%u (n_free=%d total_pool_blocks=%d). "
@@ -2427,6 +2432,8 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    cache.seq_pos_max_cache.clear();
+    cache.seq_pos_max_dirty = false;
     // PHASE_NSTREAM_KV_4D N1: also reset per-stream heads.
     for (uint32_t s = 0; s < cache.n_stream; ++s) {
         cache.v_heads[s] = 0;
@@ -2510,6 +2517,7 @@ static bool llama_kv_cache_seq_rm(
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+    cache.seq_pos_max_invalidate();
     // PHASE_NSTREAM_KV_4D N1: also update per-stream v_heads.
     for (uint32_t s = 0; s < cache.n_stream; ++s) {
         if (new_head_local[s] != kvps && new_head_local[s] < cache.v_heads[s]) {
@@ -2567,6 +2575,7 @@ static void llama_kv_cache_seq_cp(
             cache.do_copy = true;
 
             cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
+            cache.seq_pos_max_invalidate();
         }
         return;
     }
@@ -2583,6 +2592,7 @@ static void llama_kv_cache_seq_cp(
         cache.cells[seq_id_dst].src = seq_id_src;
         cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
         cache.do_copy = true;
+        cache.seq_pos_max_invalidate();
     }
 
     // otherwise, this is the KV cache of a Transformer-like model
@@ -2594,6 +2604,7 @@ static void llama_kv_cache_seq_cp(
             cache.cells[i].seq_id.insert(seq_id_dst);
         }
     }
+    cache.seq_pos_max_invalidate();
 }
 
 static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id seq_id) {
@@ -2625,6 +2636,7 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+    cache.seq_pos_max_invalidate();
     for (uint32_t s = 0; s < cache.n_stream; ++s) {
         if (new_head_local[s] != kvps && new_head_local[s] < cache.v_heads[s]) {
             cache.v_heads[s] = new_head_local[s];
@@ -2654,6 +2666,7 @@ static void llama_kv_cache_seq_add(
             llama_kv_cell & cell = cache.cells[seq_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos += delta;
+                cache.seq_pos_max_invalidate();
             }
         }
         return;
@@ -2686,6 +2699,7 @@ static void llama_kv_cache_seq_add(
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     cache.head = new_head != cache.size ? new_head : 0;
+    cache.seq_pos_max_invalidate();
     // PHASE_NSTREAM_KV_4D N1: update per-stream v_heads.
     if (cache.n_stream > 1) {
         for (uint32_t s = 0; s < cache.n_stream; ++s) {
@@ -2721,6 +2735,7 @@ static void llama_kv_cache_seq_div(
             llama_kv_cell & cell = cache.cells[seq_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                cache.seq_pos_max_invalidate();
             }
         }
         return;
@@ -2737,18 +2752,33 @@ static void llama_kv_cache_seq_div(
             }
         }
     }
+    cache.seq_pos_max_invalidate();
 }
 
 static llama_pos llama_kv_cache_seq_pos_max(struct llama_kv_cache & cache, llama_seq_id seq_id) {
-    llama_pos result = 0;
-
-    for (uint32_t i = 0; i < cache.size; ++i) {
-        if (cache.cells[i].has_seq_id(seq_id)) {
-            result = std::max(result, cache.cells[i].pos);
+    // PERF: O(1) lookup via cache.seq_pos_max_cache; the cache is
+    // maintained incrementally on insert and invalidated on
+    // erase/clear/shift. The lazy O(n_ctx) rebuild below only fires
+    // on the first query after an invalidating mutation.
+    // See PHASE_PERF_R3_FOLLOWUP for measurement (35× growth in
+    // CPU samples at ctx=256k vs ctx=8k confirmed pre-patch).
+    if (cache.seq_pos_max_dirty) {
+        cache.seq_pos_max_cache.clear();
+        for (uint32_t i = 0; i < cache.size; ++i) {
+            if (cache.cells[i].pos < 0) continue;
+            for (auto sid : cache.cells[i].seq_id) {
+                auto it = cache.seq_pos_max_cache.find(sid);
+                if (it == cache.seq_pos_max_cache.end()) {
+                    cache.seq_pos_max_cache.emplace(sid, cache.cells[i].pos);
+                } else if (it->second < cache.cells[i].pos) {
+                    it->second = cache.cells[i].pos;
+                }
+            }
         }
+        cache.seq_pos_max_dirty = false;
     }
-
-    return result;
+    auto it = cache.seq_pos_max_cache.find(seq_id);
+    return (it == cache.seq_pos_max_cache.end()) ? 0 : it->second;
 }
 
 static llama_pos llama_kv_cache_seq_pos_min(struct llama_kv_cache & cache, llama_seq_id seq_id) {
@@ -6973,6 +7003,8 @@ static int llama_encode_internal(
 
 // find holes from the beginning of the KV cache and fill them by moving data from the end of the cache
 static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
+    // PERF cache invalidation: defrag rewrites cells' pos/seq_id mapping.
+    lctx.transformer_kv.seq_pos_max_invalidate();
     auto & transformer_kv = lctx.transformer_kv;
 
     const auto & hparams = lctx.model.hparams;
@@ -9184,6 +9216,7 @@ bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
             const llama_pos accepted_pos = n_past + accepted_step;
             if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
+                kv.seq_pos_max_note_insert(seq_id, accepted_pos);
             }
             llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
             return true;
