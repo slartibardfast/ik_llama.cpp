@@ -840,6 +840,30 @@ struct clip_ctx {
                 nullptr);
             LOG_INF("%s: CLIP_FORCE_EVAL_CB_DTOH=1 — per-node DtoH callback installed (no logging)\n", __func__);
         }
+        // PHASE_R1_CLIP_RACE Phase A finding (2026-05-28): no-op sync
+        // callback installed BY DEFAULT for the multi-backend CLIP sched.
+        // Forces ggml_backend_sched_eval (ggml-backend.cpp:2234-2270) into
+        // the per-node compute_async + ggml_backend_synchronize path,
+        // eliminating the cross-stream timing-variance race that left
+        // CLIP non-deterministic 10/10 encodes without it.
+        //
+        // Empirical basis: per-node hash bisect 2026-05-28 11:58Z:
+        //   without callback:  10/10 distinct embedding hashes
+        //   with callback:     2/2 identical (1714/1714 nodes byte-identical)
+        //
+        // Per-node sync IS the determinism primitive (Phase 46 Tests
+        // L/M/O established this; the Phase 46 closure shipped narrower
+        // mitigations that were partial). Cost: ~20-30% slower CLIP
+        // encode (acceptable since CLIP is per-image, not per-token).
+        //
+        // Escape hatch: CLIP_DISABLE_SYNC_FENCE=1 reverts to the
+        // pre-fix async-multi-stream dispatch. Use only for measurement.
+        else if (!env_truthy("CLIP_DISABLE_SYNC_FENCE")) {
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                +[](ggml_tensor * /*t*/, bool /*ask*/, void * /*ud*/) -> bool { return true; },
+                nullptr);
+            LOG_INF("%s: per-node sync fence installed (default; CLIP_DISABLE_SYNC_FENCE to disable)\n", __func__);
+        }
     }
 
     ~clip_ctx() {
@@ -6201,6 +6225,29 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 (long long) embeddings->ne[0], (long long) embeddings->ne[1],
                 (long long) embeddings->ne[2], (long long) embeddings->ne[3],
                 nbytes, (unsigned long long) h);
+    }
+
+    // PHASE_R1_CLIP_RACE Phase A discriminator: env-gated repeat to
+    // bench whether CLIP-alone (no LM between encodes) is deterministic.
+    // CLIP_BENCH_REPEAT_N=N: when N>1, repeat the encode N-1 more
+    // times in a tight back-to-back loop inside the same process.
+    // CLIP_LOG_FINAL_HASH=1 then emits N hashes per request. If all
+    // N hashes within a single request are identical, the cross-encode
+    // variance we see across separate chat requests is driven by the
+    // LM completion (or other inter-request state) between encodes.
+    // The static thread_local guard prevents infinite recursion.
+    if (const char * env = std::getenv("CLIP_BENCH_REPEAT_N")) {
+        const int N = atoi(env);
+        if (N > 1) {
+            static thread_local bool in_repeat = false;
+            if (!in_repeat) {
+                in_repeat = true;
+                for (int rep = 1; rep < N; ++rep) {
+                    clip_image_batch_encode(ctx, n_threads, imgs_c_ptr, vec);
+                }
+                in_repeat = false;
+            }
+        }
     }
 
     return true;

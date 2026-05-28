@@ -8511,13 +8511,11 @@ struct llama_context * llama_init_from_model(
 #endif
             ctx->default_decoder.sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
 
-            // PHASE_PERF_R3_FOLLOWUP (interim): LM autoregressive
-            // single-stream decode has no cross-encode state-leak
-            // surface, so the PHASE 46 B.5e activation-zero-on-reset
-            // (which costs ~6.7% of per-step wall time at ctx=256k) is
-            // not needed here. Empirically validated: 18/18 byte-
-            // identical LM TG reps without the clear. Multi-GPU CLIP
-            // (a different sched) keeps the default zero_on_reset=true.
+            // LM single-stream decoder opts out of the B.5e
+            // buffer-clear: workload has no cross-encode state-leak
+            // surface; clearing on every per-token step costs ~6.7%
+            // wall-time at ctx=256k. CLIP sched (separate) keeps
+            // default true (paired with its per-node sync fence).
             ggml_backend_sched_set_zero_on_reset(ctx->default_decoder.sched, false);
 
             if (pipeline_parallel) {

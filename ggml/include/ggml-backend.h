@@ -206,13 +206,14 @@ extern "C" {
     // Reset all assignments and allocators - must be called before changing the node backends
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
-    // PHASE_PERF_R3_FOLLOWUP (interim measure): when zero == false,
-    // ggml_backend_sched_reset skips clearing the gallocr activation
-    // buffers. Default true preserves the PHASE 46 B.5e multi-GPU CLIP
-    // determinism fix. Callers whose workload has no cross-encode
-    // state-leak surface (e.g. LM single-stream autoregressive decode)
-    // set false to recover the per-reset memset cost. To be removed
-    // once the underlying CLIP race is properly localized + fixed.
+    // Opt-out from the PHASE 46 B.5e activation-buffer clear in
+    // ggml_backend_sched_reset. Default true. LM single-stream
+    // decoder sets false because it has no cross-encode state-leak
+    // surface; clearing per per-token decode step costs ~6.7% wall
+    // time at ctx=256k. Multi-backend CLIP sched keeps default true
+    // (paired with the per-node sync fence — both required for
+    // full CLIP determinism). See ggml-backend.cpp for the empirical
+    // matrix.
     GGML_API void                 ggml_backend_sched_set_zero_on_reset(ggml_backend_sched_t sched, bool zero);
 
     // Set a callback to be called for each resulting node during graph compute
