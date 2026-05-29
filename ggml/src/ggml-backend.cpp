@@ -1269,9 +1269,21 @@ struct ggml_backend_sched {
     // Sized at MAX_OUTER_GRAPHS; oldest entries evicted FIFO when full.
     // sched_free destroys every entry via ggml_cuda_outer_capture_
     // destroy_exec.
+    //
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): MUST be parallel std::vector, NOT
+    // std::unordered_map, for the SAME calloc reason documented on
+    // outer_topo_seen below: ggml_backend_sched is calloc'd in sched_new with no
+    // C++ construction, so a std::unordered_map lands with bucket_count()==0.
+    // find() survives on an empty table (libstdc++ small-size linear scan skips
+    // the modulo), but the first insert (outer_graphs[key]=exec) computes
+    // hash % bucket_count == % 0 → SIGFPE inside compute_splits on the second
+    // encode (the capture pass). Parallel vectors are calloc-safe (zeroed ==
+    // valid empty) and MAX_OUTER_GRAPHS is tiny, so a linear scan is free.
+    // outer_graph_keys is also the FIFO eviction order (insertion order), so it
+    // subsumes the former outer_graphs_age.
     static constexpr size_t MAX_OUTER_GRAPHS = 16;
-    std::unordered_map<uint64_t, void *> outer_graphs;
-    std::vector<uint64_t>                outer_graphs_age;  // FIFO list of keys
+    std::vector<uint64_t>                outer_graph_keys;   // FIFO order; parallel to execs
+    std::vector<void *>                  outer_graph_execs;  // captured cudaGraphExec per key
     // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): topology keys seen at least once.
     // The FIRST dispatch of a topology runs eager (no capture) to grow every
     // size-keyed device allocator (VMM op-scratch pool, reduce copy_buffer,
@@ -1321,12 +1333,12 @@ static uint64_t ggml_backend_sched_outer_topology_key(ggml_backend_sched_t sched
 
 static void ggml_backend_sched_outer_graphs_clear(ggml_backend_sched_t sched) {
 #ifdef GGML_USE_CUDA
-    for (auto & kv : sched->outer_graphs) {
-        ggml_cuda_outer_capture_destroy_exec(kv.second);
+    for (void * exec : sched->outer_graph_execs) {
+        ggml_cuda_outer_capture_destroy_exec(exec);
     }
 #endif
-    sched->outer_graphs.clear();
-    sched->outer_graphs_age.clear();
+    sched->outer_graph_keys.clear();
+    sched->outer_graph_execs.clear();
     sched->outer_topo_seen.clear();
 }
 
@@ -2155,7 +2167,18 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
             // if there are multiple inputs for the split, and we have already synchronized this backend, no need to do it again.
             if (!synced_on_input) {
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                // PHASE_CLIP_CAPTURE_SYNC: on the capture/replay pre-stage
+                // (USER_ONLY) the sched event was last recorded INSIDE a
+                // cudaStreamBeginCapture region, which leaves it invalid for a
+                // host cudaEventSynchronize ("invalid argument", ggml-cuda.cu
+                // :5713) on the next (cache-hit) dispatch. Drain the consumer
+                // device directly instead — the pre-stage runs outside capture,
+                // so a device sync is legal and guarantees the prior graph launch
+                // (primary stream + C4 fan-in over every secondary) finished
+                // reading input_cpy before the host overwrites it. The non-capture
+                // path keeps the event-based sync byte-for-byte.
+                if (input_class != COPY_INPUTS_USER_ONLY &&
+                        sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -2169,7 +2192,18 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // skip it in the pre-capture user-only staging pass.
             if (input_class == COPY_INPUTS_USER_ONLY) continue;
             // wait for the split backend to finish using the input before overwriting it
-            if (needs_sync[split_backend_id]) {
+            // PHASE_CLIP_CAPTURE_SYNC: this WAR guard makes the consumer wait on
+            // its OWN sched event, last recorded in the PRIOR (uncaptured) encode.
+            // Inside capture that is an illegal cross-stream dependency on
+            // uncaptured work (ggml-cuda.cu:5686) — the observed crash. It is also
+            // unnecessary under capture: the warm encode fully drains (per-node
+            // sync) before BeginCapture, intra-launch reuse of input_cpy is
+            // serialized by the consumer's main stream (copy + eval share it), and
+            // successive replays serialize on the launch stream + C4 fan-in. The
+            // real producer->consumer RAW edge is carried by cpy_tensor_async's own
+            // copy_event (captured). Skip it only on the in-capture intermediate
+            // pass; every other path keeps the guard byte-for-byte.
+            if (input_class != COPY_INPUTS_INTERMEDIATE_ONLY && needs_sync[split_backend_id]) {
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
@@ -2492,11 +2526,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         uint64_t                 outer_topo_key   = 0;
         if (try_outer_capture) {
             outer_topo_key = ggml_backend_sched_outer_topology_key(sched);
-            auto it = sched->outer_graphs.find(outer_topo_key);
-            if (it != sched->outer_graphs.end()) {
-                cached_exec = it->second;
-                cache_hit   = true;
-            } else {
+            for (size_t gi = 0; gi < sched->outer_graph_keys.size(); ++gi) {
+                if (sched->outer_graph_keys[gi] == outer_topo_key) {
+                    cached_exec = (ggml_cuda_graph_exec_t) sched->outer_graph_execs[gi];
+                    cache_hit   = true;
+                    break;
+                }
+            }
+            if (!cache_hit) {
                 bool seen = false;
                 for (uint64_t k : sched->outer_topo_seen) {
                     if (k == outer_topo_key) { seen = true; break; }
@@ -2632,19 +2669,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (!ok) {
                 sched->outer_capture_disabled = true;
             } else {
-                // FIFO evict if cache is full.
-                if (sched->outer_graphs.size() >= ggml_backend_sched::MAX_OUTER_GRAPHS
-                        && !sched->outer_graphs_age.empty()) {
-                    const uint64_t victim = sched->outer_graphs_age.front();
-                    sched->outer_graphs_age.erase(sched->outer_graphs_age.begin());
-                    auto vit = sched->outer_graphs.find(victim);
-                    if (vit != sched->outer_graphs.end()) {
-                        ggml_cuda_outer_capture_destroy_exec(vit->second);
-                        sched->outer_graphs.erase(vit);
-                    }
+                // FIFO evict if cache is full (front == oldest insertion).
+                if (sched->outer_graph_keys.size() >= ggml_backend_sched::MAX_OUTER_GRAPHS
+                        && !sched->outer_graph_keys.empty()) {
+                    ggml_cuda_outer_capture_destroy_exec(
+                        (ggml_cuda_graph_exec_t) sched->outer_graph_execs.front());
+                    sched->outer_graph_keys.erase(sched->outer_graph_keys.begin());
+                    sched->outer_graph_execs.erase(sched->outer_graph_execs.begin());
                 }
-                sched->outer_graphs[outer_topo_key] = exec;
-                sched->outer_graphs_age.push_back(outer_topo_key);
+                sched->outer_graph_keys.push_back(outer_topo_key);
+                sched->outer_graph_execs.push_back(exec);
 
                 if (!ggml_cuda_outer_capture_launch_exec(cuda_backends[0], exec)) {
                     sched->outer_capture_disabled = true;

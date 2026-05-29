@@ -4461,7 +4461,18 @@ GGML_CALL static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_
                 return true;
 #else
                 ggml_cuda_set_device(cuda_ctx_src->device);
-                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+                // PHASE_CLIP_CAPTURE_SYNC: cudaMemcpyPeerAsync is PROHIBITED
+                // during stream capture ("operation not permitted when stream is
+                // capturing", ggml-cuda.cu:4464). With peer access enabled (set
+                // at init, ggml_cuda_set_peer_access) a 1D linear DtoD copy on
+                // the src stream performs the identical direct peer transfer via
+                // UVA and IS capturable. Use it only while a capture is active;
+                // the non-capture path keeps cudaMemcpyPeerAsync byte-for-byte.
+                if (ggml_cuda_outer_capture_active()) {
+                    CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+                } else {
+                    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+                }
 #endif
             }
 #endif
