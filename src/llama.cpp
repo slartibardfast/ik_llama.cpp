@@ -7017,15 +7017,28 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
     //const int64_t t_start = ggml_time_us();
 
-    // number of cells moved
+    // PHASE_HYBRID_CHECKPOINT §5.12: n_moves counts CELLS moved, NOT contiguous
+    // runs. The T5.9 build_defrag rewrite emits tensors per MOVED CELL (per
+    // position; run-batching was dropped for the paged block_table layout), so a
+    // run spanning many cells emits many sets of view/cpy tensors. The pre-T5.9
+    // cap counted runs, which no longer bounds the tensor count — a large-context
+    // checkpoint restore moved ~849 cells across ~417 runs, emitting ~163k tensors
+    // that overflowed the defrag graph's metadata arena (buf_compute_meta) so
+    // ggml_new_object returned NULL and build_defrag SIGSEGV'd in ggml_view_3d.
     uint32_t n_moves = 0;
 
-    // each move requires 6*n_layer tensors (see build_defrag)
-    //   - source view, destination view, copy operation
-    //   - x2 for keys and values
-    //const uint32_t max_moves = model.max_nodes()/(6*n_layer);
-    // TODO: tmp fix https://github.com/ggerganov/llama.cpp/issues/6685#issuecomment-2057579516
-    const uint32_t max_moves = (lctx.model.max_nodes(1) - 2*n_layer)/(6*n_layer);
+    // Each moved cell emits up to 6 tensors per cache layer per device (src+dst
+    // view + cpy, x2 for K and V). Bound CELLS so the worst-case emission fits the
+    // metadata arena (sized for max_nodes; note max_nodes(1)==max_nodes(n_ubatch)
+    // for qwen35 since 32*n_tensors dominates). n_dev keeps multi-GPU split
+    // contexts bounded; using n_layer (vs the ~n_layer/full_attention_interval
+    // attention layers that actually emit) leaves ~4x headroom for the hybrid case.
+    // Multiple decode passes converge a heavily-fragmented cache (defrag is rare).
+    const uint32_t n_dev = std::max<uint32_t>(1u,
+        (lctx.model.split_mode == LLAMA_SPLIT_MODE_GRAPH && !lctx.model.devices.empty())
+            ? (uint32_t)lctx.model.devices.size() : 1u);
+    const uint32_t max_moves = std::max<uint32_t>(1u,
+        (lctx.model.max_nodes(1) - 2*n_layer)/(6*n_layer*n_dev));
 
     // determine which KV cells to move where
     //
@@ -7100,7 +7113,6 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
             nf = 0;
             uint32_t k1 = ks;
-            bool cont = false;
             bool stop = false;
 
             // forward move scan within stream's [k1, kvps).
@@ -7109,11 +7121,6 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
                 auto & cell1 = transformer_kv.cells[i1];
 
                 if (cell1.is_empty() || ids[i1] != n_kv) {
-                    if (n_moves == max_moves) {
-                        stop = true;
-                        break;
-                    }
-                    cont = false;
                     continue;
                 }
 
@@ -7121,18 +7128,22 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
                 transformer_kv.cells[i0 + nf] = cell1;
                 cell1 = llama_kv_cell();
 
-                if (!cont) {
-                    n_moves++;
-                    cont = true;
+                // PHASE_HYBRID_CHECKPOINT §5.12: count CELLS moved (build_defrag
+                // emits per moved cell) and stop the instant the cap is reached.
+                // A partially-filled hole is consistent — ids[] reflects exactly
+                // the moves made; a later defrag pass continues compaction.
+                ++n_moves;
+                ++nf;
+                if (n_moves >= max_moves) {
+                    stop = true;
+                    break;
                 }
-
-                nf++;
                 if (nf == nh) {
                     break;
                 }
             }
 
-            if (stop || n_moves == max_moves) {
+            if (stop || n_moves >= max_moves) {
                 yielded = true;
                 break;
             }
