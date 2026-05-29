@@ -6195,6 +6195,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+#ifdef GGML_USE_CUDA
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): report whether the C4 outer
+    // capture engaged on this encode. The 2026-05-29 MAX_COPIES=2 window
+    // could not confirm capture fired from logs; this makes it observable.
+    // count == 0 across an encode means dispatch fell back to the eager
+    // C1 path (no captured graph) — the verification asserts count > 0.
+    LOG_INF("%s: outer_capture_count=%zu after encode\n", __func__,
+            ggml_cuda_outer_capture_count());
+#endif
+
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 

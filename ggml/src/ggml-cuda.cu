@@ -4513,7 +4513,20 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     // Behavior is hardcoded; under C1+C4 dispatch the captured graph
     // makes the broader sync semantically equivalent to the narrow
     // ones anyway, and the diagnostic variants are no longer needed.
-    CUDA_CHECK(cudaDeviceSynchronize());
+    //
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): cudaDeviceSynchronize is
+    // ILLEGAL inside an active cudaStreamBeginCapture region. When the
+    // C4 outer capture is active (MAX_COPIES=2), the per-node fence the
+    // CLIP eval-callback drives reaches here mid-capture and aborts the
+    // process. Under capture the host-side drain is also unnecessary:
+    // the captured graph replays bit-identically and the cross-device
+    // ordering this drain provided is carried by the in-graph event
+    // edges (reduce.cu copy_event record/wait + the C4 begin/end
+    // fan-in). So skip the drain while capturing; the graph owns
+    // ordering. The non-capture path is unchanged.
+    if (!ggml_cuda_outer_capture_active()) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 
     GGML_UNUSED(backend);
 }

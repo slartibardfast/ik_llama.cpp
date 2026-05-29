@@ -10,6 +10,12 @@
 
 #include <chrono>
 
+// PHASE_CLIP_CAPTURE_SYNC (2026-05-29): reduce.cu does not include
+// ggml-cuda.h; forward-declare the C4 outer-capture guard so the post-
+// fence can skip its capture-illegal pageable DtoH while a capture is
+// active. Defined extern "C" in ggml-cuda.cu.
+extern "C" bool ggml_cuda_outer_capture_active(void);
+
 template <typename T, int block_size>
 static __global__ void k_add(int nelem, const T * __restrict__ src, T * __restrict__ dst) {
     int i = blockIdx.x*block_size + threadIdx.x;
@@ -152,6 +158,16 @@ static inline void ggml_reduce_test_f_post_sync(int saved_device) {
 static inline void ggml_reduce_post_fence(ggml_tensor * dst, const int * devices, int n, int saved_device) {
     static const bool s_disabled = std::getenv("GGML_REDUCE_DISABLE_FENCE") != nullptr;
     if (s_disabled) return;
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): a pageable-host cudaMemcpyAsync
+    // is ILLEGAL inside an active cudaStreamBeginCapture region. Under the
+    // C4 outer capture (MAX_COPIES=2) the ring/p2p/generic reduce paths
+    // already carry the cross-device write-visibility this fence provides
+    // via their copy_event record/wait edges (the ne[1]<32 p2p path runs
+    // with no post-fence at all and was determinism-validated). So skip the
+    // host fence while capturing; the in-graph event edges own visibility.
+    // The non-capture path is unchanged. (NCCL path: see PHASE_CLIP_CAPTURE
+    // _SYNC R1 — verified by the 10/10 byte-identical encode gate.)
+    if (ggml_cuda_outer_capture_active()) return;
     auto & info = ggml_cuda_info();
     uint32_t scratch[GGML_CUDA_MAX_DEVICES] = {0};
     for (int ii = 0; ii < n; ++ii) {

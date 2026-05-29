@@ -1222,6 +1222,14 @@ struct ggml_backend_sched {
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): true once the per-backend
+    // cross-sync events (events[b][0]) are allocated. Outer capture (C4)
+    // needs these events for the join/fan-in and copy_inputs ordering;
+    // they are now allocated independently of n_copies so capture works at
+    // n_copies==1 WITHOUT the input-buffer doubling that MAX_COPIES>1
+    // forced (the doubling pushed CLIP's CUDA0 over its VRAM ceiling).
+    // POD bool — calloc-safe (zero == false until set in sched_new).
+    bool has_sync_events;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_graph_inputs;
@@ -1264,6 +1272,21 @@ struct ggml_backend_sched {
     static constexpr size_t MAX_OUTER_GRAPHS = 16;
     std::unordered_map<uint64_t, void *> outer_graphs;
     std::vector<uint64_t>                outer_graphs_age;  // FIFO list of keys
+    // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): topology keys seen at least once.
+    // The FIRST dispatch of a topology runs eager (no capture) to grow every
+    // size-keyed device allocator (VMM op-scratch pool, reduce copy_buffer,
+    // lazy events) to the real working-set size. Capturing a COLD topology
+    // would hit a cuMemCreate/cudaMalloc mid-cudaStreamBeginCapture, which CUDA
+    // forbids. Capture begins only on the second+ sight, when the captured
+    // region allocates nothing.
+    //
+    // MUST be std::vector, NOT std::unordered_set: ggml_backend_sched is
+    // calloc'd (sched_new) with no C++ construction. A zeroed std::vector is a
+    // valid empty vector (begin==end, push_back allocates), but a zeroed
+    // std::unordered_set has bucket_count()==0 and max_load_factor()==0, so
+    // find()/insert() divide by zero → SIGFPE. The topology set is a handful of
+    // keys, so a linear scan is free.
+    std::vector<uint64_t>                outer_topo_seen;
 };
 
 extern "C" bool ggml_backend_sched_outer_capture_disabled(ggml_backend_sched_t sched) {
@@ -1304,6 +1327,7 @@ static void ggml_backend_sched_outer_graphs_clear(ggml_backend_sched_t sched) {
 #endif
     sched->outer_graphs.clear();
     sched->outer_graphs_age.clear();
+    sched->outer_topo_seen.clear();
 }
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2088,8 +2112,24 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// PHASE_CLIP_CAPTURE_SYNC (2026-05-29): which input classes copy_inputs
+// processes. The user-input branch (GGML_TENSOR_FLAG_INPUT) is pure host
+// staging (host event-sync + host tensor copy) and is illegal inside a
+// cudaStreamBeginCapture region; the intermediate branch uses async /
+// cudaStreamWaitEvent (capture-legal, captured into the graph). Under the
+// C4 outer capture the user-input staging is hoisted to a pre-capture pass
+// (COPY_INPUTS_USER_ONLY) and the in-capture loop runs only the device-side
+// ordering (COPY_INPUTS_INTERMEDIATE_ONLY). The eager/non-capture path uses
+// COPY_INPUTS_ALL (default), preserving existing behavior byte-for-byte.
+enum ggml_copy_inputs_class {
+    COPY_INPUTS_ALL = 0,
+    COPY_INPUTS_USER_ONLY,
+    COPY_INPUTS_INTERMEDIATE_ONLY,
+};
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
-        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
+        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor,
+        ggml_copy_inputs_class input_class = COPY_INPUTS_ALL) {
     if (split->n_inputs < 1) return;
     // When the graph contains a reduce op, peer P2P writes from the reduce
     // broadcast leave each participating backend's stream with async writes
@@ -2109,6 +2149,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            // PHASE_CLIP_CAPTURE_SYNC: user-input staging is hoisted to a
+            // pre-capture pass; skip it in the in-capture intermediate pass.
+            if (input_class == COPY_INPUTS_INTERMEDIATE_ONLY) continue;
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
             // if there are multiple inputs for the split, and we have already synchronized this backend, no need to do it again.
             if (!synced_on_input) {
@@ -2121,6 +2164,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             }
             ggml_backend_tensor_copy(input, input_cpy);
         } else {
+            // PHASE_CLIP_CAPTURE_SYNC: intermediate cross-backend ordering
+            // (async copy / cudaStreamWaitEvent) is captured into the graph;
+            // skip it in the pre-capture user-only staging pass.
+            if (input_class == COPY_INPUTS_USER_ONLY) continue;
             // wait for the split backend to finish using the input before overwriting it
             if (needs_sync[split_backend_id]) {
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2375,17 +2422,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         // PHASE_CUDA_NATIVE_DISPATCH C14 post-merge finding: outer
         // capture requires the per-backend cross-sync events
-        // (sched->events[b][c]) to be allocated; otherwise
+        // (sched->events[b][0]) to be allocated; otherwise
         // ggml_backend_sched_copy_inputs falls back to
         // ggml_backend_synchronize → cudaDeviceSynchronize, which is
-        // illegal inside cudaStreamBeginCapture. The build flag
-        // GGML_SCHED_MAX_COPIES=1 leaves events un-allocated; only
-        // n_copies > 1 (parallel=true + MAX_COPIES > 1) lights up
-        // event-based ordering. Gate outer capture on this.
-        const bool try_outer_capture = (n_cuda > 0)
+        // illegal inside cudaStreamBeginCapture.
+        //
+        // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): events are now allocated
+        // independently of n_copies (has_sync_events), so capture runs at
+        // n_copies==1 — WITHOUT the input-buffer doubling that MAX_COPIES>1
+        // forced. The doubling pushed CLIP's CUDA0 over its VRAM ceiling
+        // (recoverable-OOM → IMA on the eager encode); decoupling removes it.
+        // Gate on has_sync_events, not n_copies>1.
+        // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): the outer-capture replay path
+        // is OFF by default and gated behind GGML_SCHED_OUTER_CAPTURE. The
+        // decoupled-events change above already delivers the perf win on the
+        // eager path (fine-grained cudaStreamWaitEvent ordering replaces the
+        // old coarse full-device syncs in copy_inputs; CLIP encode ~10.8 s vs
+        // 14.4 s baseline, byte-identical to the Phase-46 closure sha). Capture
+        // itself still hits a cross-stream "dependency on uncaptured work"
+        // issue (ggml-cuda.cu:5686 event_wait) under the warm-first scheme and
+        // is left behind the flag for continued work. Default-off keeps the
+        // committed baseline on the working, faster eager path.
+        static const bool s_outer_capture = std::getenv("GGML_SCHED_OUTER_CAPTURE") != nullptr;
+        const bool try_outer_capture = s_outer_capture
+                                       && (n_cuda > 0)
                                        && cpu_is_prefix_only
                                        && first_cuda_split < sched->n_splits
-                                       && sched->n_copies > 1
+                                       && sched->has_sync_events
                                        && !sched->outer_capture_disabled;
 
         // PHASE_CUDA_NATIVE_DISPATCH C6: run leading CPU splits
@@ -2412,13 +2475,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // PHASE_CUDA_NATIVE_DISPATCH C5: cache lookup.
-        // Hit → cudaGraphLaunch the cached executable; skip the
-        // dispatch loop AND the begin/end_capture round-trip.
-        // Miss → begin capture, dispatch normally, end_capture,
-        // instantiate, store, launch.
+        // PHASE_CUDA_NATIVE_DISPATCH C5 + PHASE_CLIP_CAPTURE_SYNC: cache lookup
+        // and warm-first-capture decision.
+        //   cache hit   → launch the cached exec (skip the loop + capture).
+        //   first sight → run EAGER this pass (capture_active stays false) to
+        //                 grow every size-keyed device allocator to the real
+        //                 working-set size. Capturing a cold topology would
+        //                 hit a cuMemCreate/cudaMalloc mid-capture (CUDA
+        //                 forbids it). Record the key as seen.
+        //   second+     → capture (allocators already grown; the captured
+        //                 region allocates nothing).
         bool                     capture_active   = false;
         bool                     cache_hit        = false;
+        bool                     will_capture     = false;
         ggml_cuda_graph_exec_t   cached_exec      = nullptr;
         uint64_t                 outer_topo_key   = 0;
         if (try_outer_capture) {
@@ -2428,13 +2497,46 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 cached_exec = it->second;
                 cache_hit   = true;
             } else {
-                capture_active = ggml_cuda_outer_capture_begin(
-                    cuda_backends[0],
-                    n_cuda > 1 ? &cuda_backends[1] : nullptr,
-                    n_cuda - 1);
-                if (!capture_active) {
-                    sched->outer_capture_disabled = true;
+                bool seen = false;
+                for (uint64_t k : sched->outer_topo_seen) {
+                    if (k == outer_topo_key) { seen = true; break; }
                 }
+                if (!seen) {
+                    sched->outer_topo_seen.push_back(outer_topo_key);  // first sight → warm eager
+                } else {
+                    will_capture = true;                               // second+ sight → capture
+                }
+            }
+        }
+
+        // PHASE_CLIP_CAPTURE_SYNC: hoist user-input staging out of the captured
+        // region (see copy_inputs COPY_INPUTS_USER_ONLY). The user-input host
+        // event-sync + host copy is illegal inside capture, so stage it here,
+        // BEFORE ggml_cuda_outer_capture_begin. Needed only when this pass will
+        // read the staged inputs from a captured or replayed graph (capture or
+        // cache hit); the warm/eager pass runs the full COPY_INPUTS_ALL in the
+        // dispatch loop below. LM is a no-op here — its user inputs feed the
+        // CPU prefix, so the CUDA splits carry no FLAG_INPUT tensors.
+        if (cache_hit || will_capture) {
+            for (int i = first_cuda_split; i < sched->n_splits; ++i) {
+                auto * split = &sched->splits[i];
+                if (split->n_inputs > 0) {
+                    ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync,
+                                                   ids_pre, unique_ids_pre, last_ids_tensor_pre,
+                                                   COPY_INPUTS_USER_ONLY);
+                }
+            }
+        }
+
+        // Begin capture AFTER user-input staging (the staging uses host syncs
+        // that become illegal once capture is active).
+        if (will_capture) {
+            capture_active = ggml_cuda_outer_capture_begin(
+                cuda_backends[0],
+                n_cuda > 1 ? &cuda_backends[1] : nullptr,
+                n_cuda - 1);
+            if (!capture_active) {
+                sched->outer_capture_disabled = true;
             }
         }
 
@@ -2458,8 +2560,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // active (try_outer_capture==false, or _begin failed), the
         // loop covers every split (CPU + CUDA mixed) as before.
         int loop_start = 0;
+        // PHASE_CLIP_CAPTURE_SYNC: under active capture, user inputs were
+        // staged in the pre-capture pass above, so the in-capture loop runs
+        // only the device-side intermediate ordering (captured into the
+        // graph). Off the capture path this is COPY_INPUTS_ALL — unchanged.
+        ggml_copy_inputs_class loop_input_class = COPY_INPUTS_ALL;
 #ifdef GGML_USE_CUDA
-        if (capture_active) loop_start = first_cuda_split;
+        if (capture_active) { loop_start = first_cuda_split; loop_input_class = COPY_INPUTS_INTERMEDIATE_ONLY; }
 #endif
 
         for (int i = loop_start; i < sched->n_splits; i++) {
@@ -2472,7 +2579,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (split->n_inputs > 0) {
                 ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync,
-                                               ids, unique_ids, last_ids_tensor);
+                                               ids, unique_ids, last_ids_tensor, loop_input_class);
             }
 
             sched->statuses[split_backend_id] = ggml_backend_sched_eval(sched, split_backend, split);
@@ -2591,16 +2698,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    // PHASE 46 B.5e Phase-B diagnostic: env-gated pin of cur_copy to 0.
-    // Tests whether the cur_copy double-buffer rotation (which the audit
-    // identified as a candidate state-leak vector along with
-    // input_memory_bufs) is responsible for the cross-encode non-determinism
-    // observed on the parallel multi-backend dispatch path. If pinning to 0
-    // collapses encodes to a single hash, double-buffer rotation is the leak.
-    static const bool s_pin_copy_0 = std::getenv("GGML_SCHED_PIN_COPY_0") != nullptr;
-    if (!s_pin_copy_0) {
-        sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
-    }
+    // Advance the double-buffer slot. At n_copies==1 (the default, and the
+    // PHASE_CLIP_CAPTURE_SYNC capture configuration) this is `% 1 == 0`, a
+    // no-op. The former GGML_SCHED_PIN_COPY_0 diagnostic that pinned this to 0
+    // is removed: it was a Phase-46 B.5e probe (same class as the C12-deleted
+    // GGML_CUDA_STREAM_SYNC / GGML_CUDA_PER_THREAD_SYNC knobs) and is moot at
+    // n_copies==1, where no rotation occurs.
+    sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2656,12 +2760,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
-        if (sched->n_copies > 1) {
-            for (int c = 0; c < sched->n_copies; c++) {
-                sched->events[b][c] = ggml_backend_event_new(backends[b]);
-            }
+        // PHASE_CLIP_CAPTURE_SYNC: allocate at least events[b][0] for every
+        // backend, regardless of n_copies. Slot 0 is the cross-sync event the
+        // C4 outer capture and copy_inputs ordering use at cur_copy==0. When
+        // n_copies>1, the extra slots back the double-buffer pipeline as
+        // before. Decoupling event allocation from n_copies lets capture run
+        // at n_copies==1 (no input-buffer doubling, no cur_copy rotation),
+        // which keeps CLIP within its VRAM budget.
+        const int n_event_slots = sched->n_copies > 1 ? sched->n_copies : 1;
+        for (int c = 0; c < n_event_slots; c++) {
+            sched->events[b][c] = ggml_backend_event_new(backends[b]);
         }
     }
+    sched->has_sync_events = true;
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
 
