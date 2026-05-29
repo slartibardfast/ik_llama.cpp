@@ -943,23 +943,14 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
-# test-n-stream-kv-layout: model-driven test of the 4D per-stream KV
-# layout. FAIL expected on HEAD (K/V tensors are still 3D); PASS after
-# the N1 4D port lands. This is the binding RED test for N1. Requires
-# a model path passed as argv[1]; skipped (exit 77) without one.
-set(TEST_TARGET test-n-stream-kv-layout)
-add_executable(${TEST_TARGET} spec/test-n-stream-kv-layout.cpp)
-target_include_directories(${TEST_TARGET} PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/ggml/include
-    ${CMAKE_SOURCE_DIR}/ggml/src)
-target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
-install(TARGETS ${TEST_TARGET} RUNTIME)
-# CTest label "spec" — default `ctest` runs do not require a model;
-# invoke via `ctest -L spec -V -- MODEL_PATH=...` or run the binary directly.
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
-set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+# test-n-stream-kv-layout RETIRED 2026-05-29: model-driven, non-hermetic,
+# never run in CI (SKIP 77 without a model), and its CPU-only setup
+# (n_gpu_layers=0) can no longer reach the GPU/split paged-4D layout it
+# asserted (PHASE46 B.4 split-config check + T5.9 paged refresh broke its
+# preconditions). The invariant it duplicated (KVTensorIsPaged4D /
+# StreamPartition) is the gated source of truth in
+# specs/kv-cache/n_stream_layer.allium + specs/mgpu-split/CrossCodepathConsistency.allium.
+# See PHASE_HYBRID_CHECKPOINT.md §5.13 follow-up.
 
 # P0.B.S4 property tests — derived from the five new Allium specs in
 # specs/{graphs,kv-cache,dispatch,dflash,composition}/ (PHASE_NSTREAM_KV_PERF.md).
