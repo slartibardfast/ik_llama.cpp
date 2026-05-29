@@ -6790,7 +6790,26 @@ static int llama_decode_internal(
             LLAMA_LOG_INFO("defrag suspended for one decode batch (post-restore)\n");
             transformer_kv.skip_next_defrag = false;
         } else {
-            const float fragmentation = transformer_kv.n >= 128 ? 1.0f - float(transformer_kv.used)/float(transformer_kv.n) : 0.0f;
+            // Fragmentation = holes WITHIN the occupied range, not 1 - used/n.
+            // `transformer_kv.n` is the kernel-padded attention window (floored
+            // at `pad`, e.g. 256), so a contiguous cache early in decode
+            // (used=31, n=256) read ~0.88 and triggered a defrag EVERY token —
+            // each defrag reset the scheduler, forcing a full graph rebuild and
+            // disabling graph reuse (PHASE_TU102 H2, root-caused 2026-05-29).
+            // cell_max is the exact highest-occupied cell+1, so a contiguous
+            // cache reads 0 and only real holes (e.g. from seq_rm) trigger a
+            // pass. Single-stream only (production --parallel 1); the
+            // n_stream>1 paged layout has per-stream regions whose inter-region
+            // gaps are not fragmentation, so it keeps the prior metric pending
+            // stream-aware accounting.
+            float fragmentation;
+            if (transformer_kv.n_stream > 1) {
+                fragmentation = transformer_kv.n >= 128 ? 1.0f - float(transformer_kv.used)/float(transformer_kv.n) : 0.0f;
+            } else {
+                const uint32_t pad = llama_kv_cache_get_padding(cparams);
+                const uint32_t cell_max = llama_kv_cache_cell_max(transformer_kv, pad);
+                fragmentation = cell_max >= 128 ? 1.0f - float(transformer_kv.used)/float(cell_max) : 0.0f;
+            }
 
             // queue defragmentation for next llama_kv_cache_update
             if (fragmentation > cparams.defrag_thold) {
