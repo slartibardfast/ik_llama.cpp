@@ -9302,6 +9302,24 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
     if (ok && seq_id >= 0 && p0 <= 0 && p1 < 0 &&
         ctx->default_decoder.qnext_slot_alloc.n_slots > 0) {
         ctx->default_decoder.qnext_slot_alloc.release(seq_id);
+
+        // PHASE_PROMPT_CACHE_ISOLATION Task C — cross-conversation recurrent-state leak fix.
+        // qwen3next stores its per-seq recurrent state in a dedicated V-cache tail (see the
+        // comment near the kv_size_per_stream layout above) indexed by v_heads. On a full-clear
+        // context-switch the attention cells are evicted by seq_rm above, but v_heads still
+        // points into the prior conversation's recurrent V-tail, so the next (unrelated) prompt
+        // binds and inherits that state — the leak. Resetting head + the seq's stream v_head
+        // forces the next decode to bind a fresh (zero) recurrent V-tail region. Vector localized
+        // by the 2026-05-30 micro-probe (head/v_heads -> 0/5; cells[].src and s_l-zeroing were
+        // NOT the vector; standalone paged.free_seq crashes the block-table invariant). Fires only
+        // on the full-clear (no-reuse) path — partial-prefix reuse uses p0>0 and is untouched, so
+        // the prefix-reuse fast path and checkpoint/prompt-cache restores are unaffected.
+        auto & kv = ctx->transformer_kv;
+        kv.head = 0;
+        const uint32_t stream = (kv.n_stream > 1) ? (uint32_t) seq_id : 0u;
+        if (stream < kv.v_heads.size()) {
+            kv.v_heads[stream] = 0u;
+        }
     }
     return ok;
 }
