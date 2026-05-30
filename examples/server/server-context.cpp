@@ -902,6 +902,9 @@ void server_context::copy_data_to_cached_prompt(const server_tokens & tokens, se
     slot.server_cached_prompt.n_discarded_prompt = slot.n_discarded_prompt;
     slot.server_cached_prompt.n_kept_prompt = slot.n_kept_prompt;
     slot.server_cached_prompt.think_tokens = slot.params.think_tokens;
+    // PHASE_PROMPT_CACHE_ISOLATION: stamp the isolation salt so saved entries
+    // carry it and load() compares this request's salt against cached ones.
+    slot.server_cached_prompt.cache_salt = slot.params.cache_salt;
 }
 
 server_slot* server_context::get_available_slot(const server_task& task) {
@@ -1016,6 +1019,11 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         if (prompt_cache && !prompt_cache->states.empty()) {
             const int64_t t_start = ggml_time_us();
             copy_data_to_cached_prompt(tokens, *ret);
+            // PHASE_PROMPT_CACHE_ISOLATION: the restore/match comparison must use
+            // the INCOMING request's salt (task), not the resident context's
+            // (ret->params, which copy_data_to_cached_prompt just stamped). A save
+            // carries the resident salt; a load matches by the new request's salt.
+            ret->server_cached_prompt.cache_salt = task.params.cache_salt;
 
             ret->prompt_load(*prompt_cache, task.tokens);
             prompt_cache->update();
@@ -1061,6 +1069,9 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
     slot.params.oaicompat = task.params.oaicompat;
     slot.params.oaicompat_cmpl_id =task.params.oaicompat_cmpl_id;
+    // PHASE_PROMPT_CACHE_ISOLATION: carry the header-derived prompt-cache salt
+    // (set on task.params in the handler; not part of the JSON body).
+    slot.params.cache_salt = task.params.cache_salt;
 
     slot.oai_resp_thinking_block_started = false;
     slot.oai_resp_text_block_started = false;

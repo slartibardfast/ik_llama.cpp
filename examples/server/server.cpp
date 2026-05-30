@@ -1089,7 +1089,8 @@ int main(int argc, char ** argv) {
         const std::vector<raw_buffer>& files,
         const std::function<bool()>& is_connection_closed,
         httplib::Response& res,
-        oaicompat_type oaicompat) -> void {
+        oaicompat_type oaicompat,
+        const std::string& cache_salt) -> void {
             GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
             const auto completion_id = gen_chatcmplid();
@@ -1137,6 +1138,10 @@ int main(int argc, char ** argv) {
                     task.params.oaicompat = oaicompat;
                     task.params.oaicompat_cmpl_id = completion_id;
                     task.params.oaicompat_model = oaicompat_model_name;
+                    // PHASE_PROMPT_CACHE_ISOLATION: scope prompt-cache reuse to
+                    // requests carrying the same salt (X-Prompt-Cache-Salt header,
+                    // nginx-injected from cookie/auth). Never sent to the model.
+                    task.params.cache_salt = cache_salt;
                     tasks.push_back(std::move(task));
                 }
 
@@ -1269,7 +1274,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_NONE);
+            OAICOMPAT_TYPE_NONE,
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_completions_oai = [&ctx_server, &handle_completions_impl](const httplib::Request& req, httplib::Response& res) {
@@ -1283,7 +1289,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_COMPLETION);
+            OAICOMPAT_TYPE_COMPLETION,
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_models = [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
@@ -1317,7 +1324,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_CHAT);
+            OAICOMPAT_TYPE_CHAT,
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_responses = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
@@ -1332,7 +1340,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_RESP);
+            OAICOMPAT_TYPE_RESP,
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_anthropic_messages = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
@@ -1351,7 +1360,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_ANTHROPIC);
+            OAICOMPAT_TYPE_ANTHROPIC,
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_anthropic_count_tokens = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
@@ -1393,7 +1403,8 @@ int main(int argc, char ** argv) {
             files,
             req.is_connection_closed,
             res,
-            OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
+            OAICOMPAT_TYPE_NONE, // infill is not OAI compatible
+            req.get_header_value("X-Prompt-Cache-Salt"));
     };
 
     const auto handle_tokenize = [&ctx_server](const httplib::Request & req, httplib::Response & res) {

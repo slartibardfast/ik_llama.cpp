@@ -1095,8 +1095,20 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
     auto it_best = states.end();
 
+    // PHASE_PROMPT_CACHE_ISOLATION: a cached prompt is reuse-eligible only when
+    // (1) its isolation salt matches this request's salt, and (2) the shared
+    // prefix is large enough to be both worth reusing and real shared context
+    // rather than a chat-template coincidence. 2048 ties reuse to meaningful
+    // prefill savings and aligns with the default batch size; below it the
+    // fuzzy Dice similarity could otherwise restore an unrelated conversation's
+    // (non-rewindable, for the hybrid) recurrent state. See the phase doc.
+    static constexpr size_t MIN_CACHE_REUSE_LCP = 2048;
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->cache_salt != prompt.cache_salt) {
+            continue; // isolation boundary: different tenant/session salt
+        }
         server_tokens tokens;
         if (think_tokens.exclude) {
             tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
@@ -1105,6 +1117,9 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
             tokens = std::move(it->tokens);
         }
         const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
+        if (lcp_cur.first < MIN_CACHE_REUSE_LCP) {
+            continue; // shared prefix too short to safely/usefully reuse
+        }
         const float f_keep_cur = float(lcp_cur.first) / tokens.size();
         const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
         if (sim_best < sim_cur) {
@@ -1183,6 +1198,7 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         /*.think_tokens                   =*/ prompt.think_tokens,
         /*.data            =*/ std::move(state_data),
         /*.checkpoints     =*/ prompt.checkpoints,
+        /*.cache_salt      =*/ prompt.cache_salt,
     };
 
     return &cur;

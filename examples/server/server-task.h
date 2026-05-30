@@ -51,6 +51,13 @@ struct slot_params {
     bool include_usage = false;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
 
+    // Opaque prompt-cache isolation key (vLLM cache_salt model). Set from the
+    // X-Prompt-Cache-Salt header (nginx-injected from cookie/auth). A cached
+    // prompt is only reuse-eligible by a request with a byte-equal salt. Never
+    // tokenized or sent to the model. Empty = global pool (back-compat).
+    // See docs/active/PHASE_PROMPT_CACHE_ISOLATION.md.
+    std::string cache_salt;
+
     int32_t  n_keep = 0; // number of tokens to keep from initial prompt
     int32_t  n_discard = 0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t  n_predict = -1; // new tokens to predict
@@ -387,6 +394,10 @@ struct server_prompt {
 
     std::list<server_prompt_checkpoint> checkpoints;
 
+    // Prompt-cache isolation key; reuse requires a byte-equal salt (see
+    // slot_params::cache_salt). Empty = global pool.
+    std::string cache_salt;
+
     size_t size() const;
 
     int n_tokens() const {
@@ -400,7 +411,8 @@ struct server_prompt {
             n_discarded_prompt,
             think_tokens,
             data,
-            checkpoints
+            checkpoints,
+            cache_salt
         };
     }
 
