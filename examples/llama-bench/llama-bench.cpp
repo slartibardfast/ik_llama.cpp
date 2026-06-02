@@ -3187,6 +3187,8 @@ int main(int argc, char ** argv) {
         p_err->print_footer();
     }
 
+    fprintf(stderr, "OUTER_CAPTURE_COUNT=%zu\n", ggml_cuda_outer_capture_count());
+
     llama_backend_free();
 
     return 0;

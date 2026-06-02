@@ -9,6 +9,8 @@
 #include "ggml-common.h"
 
 #include <chrono>
+#include <unordered_map>
+#include <utility>
 
 // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): reduce.cu does not include
 // ggml-cuda.h; forward-declare the C4 outer-capture guard so the post-
@@ -92,6 +94,14 @@ static __global__ void k_reduce_add_T(copy_task task) {
         auto src = (T *)task.ptrs[j];
         src[i] = dst[i];
     }
+    // PHASE_LM_DECODE_CAPTURE (2026-06-02): the loop above does cross-device PEER WRITES
+    // (src[i]=dst[i] into the peer's buffer). Under the outer decode capture there is no host
+    // device-drain to flush them, and stream-completion alone doesn't guarantee the peer writes
+    // have propagated across NVLink to the consumer device -> the captured graph's downstream read
+    // races ahead -> IMA. A system-scope fence makes these writes visible to all devices before
+    // this thread completes, so the captured event edge (which waits on kernel completion) observes
+    // them. Eager keeps the device-drain too; negligible cost on the tiny decode reduce.
+    __threadfence_system();
 }
 
 static void copy_missing_tensors(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
@@ -130,9 +140,22 @@ static void copy_missing_tensors(ggml_backend_cuda_context & ctx, ggml_tensor * 
 // cudaMemcpyAsync effectively performs a full-device sync. Per-stream-
 // only sync (test E) was not deterministic. Called immediately before
 // every return point in ggml_cuda_op_reduce when the env knob is set.
-static inline void ggml_reduce_test_f_post_sync(int saved_device) {
-    static const bool s_enabled = std::getenv("GGML_REDUCE_POST_DEVICE_SYNC") != nullptr;
-    if (!s_enabled) return;
+static inline void ggml_reduce_eager_device_drain(int saved_device) {
+    // PHASE_LM_DECODE_CAPTURE (2026-06-01): post-reduce cross-device drain, now
+    // DEFAULT-ON for eager. A multi-GPU reduce lands peer writes from OTHER devices
+    // onto this device's memory via copy/event streams; a per-stream sync (and the
+    // pageable-DtoH post-fence) does NOT drain those, so the next consumer can read
+    // before the peer writes land. With NCCL removed, the ring (prefill) + one-shot
+    // (decode) paths own nhave==2 for the first time and the gap surfaced as an eager
+    // IMA (CUDA_CHECK abort in the next mul_mat_q). A full per-device cudaDeviceSync is
+    // the proven-sufficient fix (B.5e: per-stream FAILED, device-sync PASSED); verified
+    // eager pp64/pp512 clean at 207.8 t/s (no regression — reduce is not the prefill
+    // bottleneck). ILLEGAL under capture (host sync; the MAX_COPIES=2 CLIP collision)
+    // so SKIPPED there — the captured path carries visibility via in-graph event edges.
+    // GGML_REDUCE_NO_DEVICE_DRAIN opts out.
+    if (ggml_cuda_outer_capture_active()) return;
+    static const bool s_disabled = std::getenv("GGML_REDUCE_NO_DEVICE_DRAIN") != nullptr;
+    if (s_disabled) return;
     auto & info = ggml_cuda_info();
     for (int i = 0; i < info.device_count; ++i) {
         ggml_cuda_set_device(i);
@@ -182,6 +205,37 @@ static inline void ggml_reduce_post_fence(ggml_tensor * dst, const int * devices
     ggml_cuda_set_device(saved_device);
 }
 
+#ifdef GGML_USE_NCCL
+// PHASE_LM_OUTER_CAPTURE (B): register the cross-device reduce buffers with their NCCL
+// comm so ncclAllReduce takes NCCL's on-stream, proxy-free path — the only NCCL path
+// that is graph-capturable (the unregistered path does host/proxy work that aborts
+// cuGraphLaunch). ncclCommRegister is host+device setup → illegal inside an active
+// cudaStreamBeginCapture, so we register ONLY on the non-capture (warm/first-sight)
+// dispatch and reuse the handle while capturing. Reduce buffers are gallocr-stable
+// across decode tokens, so this is one-time per (comm,buffer). Dispatch is the single
+// CUDA-native thread (HostThreadIsExactlyOne), so the static cache needs no lock.
+static void ggml_reduce_ensure_nccl_registered(ncclComm_t comm, void * buff, size_t size) {
+    if (comm == nullptr || buff == nullptr || size == 0) return;
+    static std::unordered_map<ncclComm_t,
+                              std::unordered_map<void *, std::pair<void *, size_t>>> s_reg;
+    auto & per_comm = s_reg[comm];
+    auto it = per_comm.find(buff);
+    if (it != per_comm.end() && it->second.second >= size) return;  // already registered, big enough
+    if (it != per_comm.end()) {                                     // addr reused with a larger tensor
+        ncclCommDeregister(comm, it->second.first);
+        per_comm.erase(it);
+    }
+    void * handle = nullptr;
+    ncclResult_t st = ncclCommRegister(comm, buff, size, &handle);
+    if (st == ncclSuccess) {
+        per_comm[buff] = { handle, size };
+    } else {
+        fprintf(stderr, "ggml_reduce: ncclCommRegister(%p, %zu) failed, status %d\n",
+                buff, size, (int) st);
+    }
+}
+#endif
+
 void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     auto op = (ggml_op)dst->op_params[0];
@@ -209,11 +263,29 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     constexpr bool bf16_supported = false;
 #endif
     static const bool s_skip_nccl = std::getenv("GGML_REDUCE_SKIP_NCCL") != nullptr;
-    if (!s_skip_nccl && info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
+    // PHASE_LM_DECODE_CAPTURE §1: NCCL's all-reduce is NOT graph-capturable on Turing
+    // (NVLS — its only proxy-free, graph-safe path — is Hopper+; the Ring fallback runs a
+    // host proxy that segfaults cuGraphLaunch). So while the outer decode capture is active,
+    // skip NCCL and fall through to the event-synced direct-peer one-shot path (reduce.cu:556),
+    // which is capture-legal (event record/wait + kernel launches only, no host malloc/sync).
+    // Eager prefill (capture inactive) keeps using NCCL.
+    if (!s_skip_nccl && !ggml_cuda_outer_capture_active() &&
+        info.have_nccl && dst->type != GGML_TYPE_Q8_0 && nhave == nreduce && (nhave == 2 || dst->ne[1] < 32) &&
        (dst->type != GGML_TYPE_BF16 || bf16_supported)) {
         GGML_ASSERT(info.have_nccl);
         GGML_ASSERT(info.device_count == nreduce);
         auto data_type = dst->type == GGML_TYPE_F32 ? ncclFloat : dst->type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
+        // Register the (in-place) reduce buffers so the all-reduce below is graph-capturable.
+        // Only on the non-capture pass; under capture the handles from the warm pass are reused.
+        if (!ggml_cuda_outer_capture_active()) {
+            const size_t reg_bytes = ggml_nbytes(dst);
+            for (int i = 0; i < nreduce; ++i) {
+                if (!dst->src[i] || !dst->src[i]->data) continue;
+                ggml_cuda_set_device(i);
+                ggml_reduce_ensure_nccl_registered(info.nccl_coms[i], dst->src[i]->data, reg_bytes);
+            }
+            ggml_cuda_set_device(ctx.device);
+        }
         ncclGroupStart();
         for (int i = 0; i < nreduce; ++i) {
             ggml_cuda_set_device(i);
@@ -227,7 +299,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         }
         ncclGroupEnd();
         ggml_cuda_set_device(ctx.device);
-        ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_eager_device_drain(ctx.device);
         int nccl_devs[GGML_CUDA_MAX_DEVICES];
         for (int i = 0; i < nreduce; ++i) nccl_devs[i] = i;
         ggml_reduce_post_fence(dst, nccl_devs, nreduce, ctx.device);
@@ -434,7 +506,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
-        ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_eager_device_drain(ctx.device);
         ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
         return;
     }
@@ -505,7 +577,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
-        ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_eager_device_drain(ctx.device);
         ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
         return;
     }
@@ -593,7 +665,7 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
         if (ncopy > 0) {
             copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
         }
-        ggml_reduce_test_f_post_sync(ctx.device);
+        ggml_reduce_eager_device_drain(ctx.device);
         return;
     }
     auto required_size = nbytes*(nhave-1);
@@ -660,6 +732,6 @@ void ggml_cuda_op_reduce([[maybe_unused]] ggml_backend_cuda_context & ctx, ggml_
     if (ncopy > 0) {
         copy_missing_tensors(ctx, dst, nhave, ncopy, idx, copy_idx);
     }
-    ggml_reduce_test_f_post_sync(ctx.device);
+    ggml_reduce_eager_device_drain(ctx.device);
     ggml_reduce_post_fence(dst, idx, nhave, ctx.device);
 }

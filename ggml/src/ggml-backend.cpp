@@ -1284,6 +1284,13 @@ struct ggml_backend_sched {
     static constexpr size_t MAX_OUTER_GRAPHS = 16;
     std::vector<uint64_t>                outer_graph_keys;   // FIFO order; parallel to execs
     std::vector<void *>                  outer_graph_execs;  // captured cudaGraphExec per key
+    // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): region-address hash captured
+    // alongside each exec. A cached exec is PURE-REPLAYED only when the current
+    // dispatch's region hash equals the stored one (gallocr re-planned to the
+    // same addresses, R1≈98% in steady decode); a mismatch means a node moved,
+    // so the exec is stale and the graph is re-captured + re-instantiated and
+    // this entry replaced. Parallel to outer_graph_keys/execs (calloc-safe).
+    std::vector<uint64_t>                outer_graph_hashes; // region hash per key
     // PHASE_CLIP_CAPTURE_SYNC (2026-05-29): topology keys seen at least once.
     // The FIRST dispatch of a topology runs eager (no capture) to grow every
     // size-keyed device allocator (VMM op-scratch pool, reduce copy_buffer,
@@ -1299,6 +1306,19 @@ struct ggml_backend_sched {
     // find()/insert() divide by zero → SIGFPE. The topology set is a handful of
     // keys, so a linear scan is free.
     std::vector<uint64_t>                outer_topo_seen;
+
+    // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): R1 measurement. Pure replay
+    // (launch the cached exec without re-capturing) is only valid if the
+    // captured region's node addresses are byte-stable token-to-token. This
+    // probe hashes every CUDA-split node's (data, op, type, ne, src.data) each
+    // captured dispatch and counts how often it matches the previous token —
+    // i.e. how often a replay WOULD be valid. Observability only: the safe
+    // re-capture-per-token path is unchanged. calloc-zero is the valid initial
+    // state (hash 0, !valid, counters 0).
+    uint64_t outer_region_hash_prev  = 0;
+    bool     outer_region_hash_valid = false;
+    size_t   outer_replay_eligible   = 0;
+    size_t   outer_recapture_needed  = 0;
 };
 
 extern "C" bool ggml_backend_sched_outer_capture_disabled(ggml_backend_sched_t sched) {
@@ -1331,6 +1351,33 @@ static uint64_t ggml_backend_sched_outer_topology_key(ggml_backend_sched_t sched
     return h;
 }
 
+// PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): hash the captured region's node
+// addresses + shapes (the CUDA splits, [loop_start, n_splits)). Two consecutive
+// dispatches producing the SAME hash means gallocr re-planned to identical
+// addresses → a pure replay of the cached exec is valid. A changed hash means
+// at least one node moved → the cached exec would launch with a stale address
+// (the "cache IMA") and a re-capture is required. R1 = eligible / total.
+static uint64_t ggml_backend_sched_outer_region_hash(ggml_backend_sched_t sched, int loop_start) {
+    uint64_t h = 0xcbf29ce484222325ULL;  // FNV-1a offset
+    auto mix = [&h](uint64_t v) { h ^= v; h *= 0x100000001b3ULL; };
+    for (int i = loop_start; i < sched->n_splits; ++i) {
+        const auto * sp = &sched->splits[i];
+        for (int j = 0; j < sp->graph.n_nodes; ++j) {
+            const ggml_tensor * node = sp->graph.nodes[j];
+            mix((uint64_t)(uintptr_t) node->data);
+            mix((uint64_t) node->op);
+            mix((uint64_t) node->type);
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                mix((uint64_t) node->ne[d]);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                mix((uint64_t)(uintptr_t)(node->src[s] ? node->src[s]->data : nullptr));
+            }
+        }
+    }
+    return h;
+}
+
 static void ggml_backend_sched_outer_graphs_clear(ggml_backend_sched_t sched) {
 #ifdef GGML_USE_CUDA
     for (void * exec : sched->outer_graph_execs) {
@@ -1339,6 +1386,7 @@ static void ggml_backend_sched_outer_graphs_clear(ggml_backend_sched_t sched) {
 #endif
     sched->outer_graph_keys.clear();
     sched->outer_graph_execs.clear();
+    sched->outer_graph_hashes.clear();
     sched->outer_topo_seen.clear();
 }
 
@@ -1943,7 +1991,14 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                                 tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                                 ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             }
-                            if (sched->n_copies > 1) {
+                            // PHASE_LM_DECODE_CAPTURE (2026-06-02): also protect input copies under
+                            // split_mode_graph (outer decode capture) even at n_copies==1. The outer
+                            // capture HOISTS the host->device input staging out of the captured graph
+                            // and stages once; without FLAG_OUTPUT, gallocr reuses the copy buffer for
+                            // an activation mid-graph and clobbers the staged value (e.g. inp_kv_idxs
+                            // -> garbage KV-write index -> OOB IMA). Eager (no capture) re-stages per
+                            // loop so it tolerated reuse; capture cannot.
+                            if (sched->n_copies > 1 || sched->split_mode_graph) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1970,7 +2025,10 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            // PHASE_LM_DECODE_CAPTURE (2026-06-02): see the matching note above —
+                            // protect cross-backend input copies under split_mode_graph at n_copies==1
+                            // so the outer-capture-hoisted staging isn't clobbered by gallocr reuse.
+                            if (sched->n_copies > 1 || sched->split_mode_graph) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -2137,6 +2195,11 @@ enum ggml_copy_inputs_class {
     COPY_INPUTS_ALL = 0,
     COPY_INPUTS_USER_ONLY,
     COPY_INPUTS_INTERMEDIATE_ONLY,
+    // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): replay-only refresh of host-source
+    // (CPU->CUDA) non-FLAG_INPUT intermediates (e.g. inp_embd). Their copy is the
+    // uncapturable sync fallback, so a pure graph replay (which skips the dispatch
+    // loop) leaves them stale. Run this BEFORE launch on a cache-hit replay.
+    COPY_INPUTS_HOST_INTERMEDIATE_ONLY,
 };
 
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
@@ -2191,6 +2254,20 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // (async copy / cudaStreamWaitEvent) is captured into the graph;
             // skip it in the pre-capture user-only staging pass.
             if (input_class == COPY_INPUTS_USER_ONLY) continue;
+            // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): on a pure REPLAY the in-capture
+            // loop (which copies host-source intermediates like inp_embd via the
+            // uncapturable sync fallback below) is skipped, so the replayed graph would
+            // read the capture-token's stale embedding. The dedicated replay refresh
+            // (COPY_INPUTS_HOST_INTERMEDIATE_ONLY) re-copies ONLY host-source (CPU->CUDA)
+            // intermediates before launch — CUDA-source intermediates are captured in
+            // the graph and refreshed by the replay itself, FLAG_INPUTs by the USER_ONLY
+            // pass. capture is inactive on replay, so the host copy + device drain is legal.
+            if (input_class == COPY_INPUTS_HOST_INTERMEDIATE_ONLY) {
+                if (!ggml_backend_buffer_is_host(input->buffer)) continue;  // CUDA-source: in-graph
+                ggml_backend_synchronize(split_backend);            // WAR drain (prior replay already synced; belt-and-suspenders)
+                ggml_backend_tensor_copy(input, input_cpy);         // refresh host-source intermediate (e.g. inp_embd)
+                continue;
+            }
             // wait for the split backend to finish using the input before overwriting it
             // PHASE_CLIP_CAPTURE_SYNC: this WAR guard makes the consumer wait on
             // its OWN sched event, last recorded in the PRIOR (uncaptured) encode.
@@ -2204,7 +2281,13 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // copy_event (captured). Skip it only on the in-capture intermediate
             // pass; every other path keeps the guard byte-for-byte.
             if (input_class != COPY_INPUTS_INTERMEDIATE_ONLY && needs_sync[split_backend_id]) {
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                // PHASE_LM_DECODE_CAPTURE (2026-06-02): on the USER_ONLY pre-capture stage the sched
+                // event may have been recorded INSIDE the prior token's cudaStreamBeginCapture region,
+                // which makes a host cudaStreamWaitEvent on it invalid -> CUDA error abort in
+                // ggml_backend_cuda_event_wait. Drain the consumer device directly instead (legal
+                // pre-capture, sufficient). Mirrors the FLAG_INPUT event_synchronize handling above;
+                // the non-capture (ALL) path keeps the event wait byte-for-byte.
+                if (input_class != COPY_INPUTS_USER_ONLY && sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
@@ -2478,10 +2561,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // is left behind the flag for continued work. Default-off keeps the
         // committed baseline on the working, faster eager path.
         static const bool s_outer_capture = std::getenv("GGML_SCHED_OUTER_CAPTURE") != nullptr;
+        // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): capture/replay targets the
+        // per-token DECODE forward ONLY. Prefill is compute-bound (capture buys
+        // ~nothing) and shape-varying: in production each prompt length is a
+        // distinct topology seen once → first-sight eager, never captured. Only a
+        // synthetic repeated-identical prefill (e.g. llama-bench -r 2) reaches the
+        // 2nd/3rd sight that captures then REPLAYS — and replaying a captured
+        // prefill graph aborts (ggml-cuda.cu:157). Two same-length requests could
+        // hit it in production, so gate prefill out structurally. The first CUDA
+        // split's head op runs on the [n_embd, n_tokens] activations, so its
+        // nodes[0]->ne[1] is the batch size: 1 for decode, >1 for prefill.
+        bool outer_is_decode_batch = false;
+        if (first_cuda_split < sched->n_splits) {
+            const auto & g = sched->splits[first_cuda_split].graph;
+            if (g.n_nodes > 0 && g.nodes[0] != nullptr) {
+                outer_is_decode_batch = (g.nodes[0]->ne[1] == 1);
+            }
+        }
         const bool try_outer_capture = s_outer_capture
                                        && (n_cuda > 0)
                                        && cpu_is_prefix_only
                                        && first_cuda_split < sched->n_splits
+                                       && outer_is_decode_batch
                                        && sched->has_sync_events
                                        && !sched->outer_capture_disabled;
 
@@ -2519,17 +2620,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         //                 forbids it). Record the key as seen.
         //   second+     → capture (allocators already grown; the captured
         //                 region allocates nothing).
-        bool                     capture_active   = false;
-        bool                     cache_hit        = false;
-        bool                     will_capture     = false;
-        ggml_cuda_graph_exec_t   cached_exec      = nullptr;
-        uint64_t                 outer_topo_key   = 0;
+        bool                     capture_active     = false;
+        bool                     cache_hit          = false;
+        bool                     will_capture       = false;
+        ggml_cuda_graph_exec_t   cached_exec        = nullptr;
+        uint64_t                 outer_topo_key     = 0;
+        uint64_t                 cached_region_hash = 0;
+        int                      cached_slot        = -1;   // cache index of the topo-key hit
+        uint64_t                 region_hash        = 0;    // this dispatch's region-address hash
         if (try_outer_capture) {
             outer_topo_key = ggml_backend_sched_outer_topology_key(sched);
             for (size_t gi = 0; gi < sched->outer_graph_keys.size(); ++gi) {
                 if (sched->outer_graph_keys[gi] == outer_topo_key) {
-                    cached_exec = (ggml_cuda_graph_exec_t) sched->outer_graph_execs[gi];
-                    cache_hit   = true;
+                    cached_exec        = (ggml_cuda_graph_exec_t) sched->outer_graph_execs[gi];
+                    cached_region_hash = sched->outer_graph_hashes[gi];
+                    cached_slot        = (int) gi;
+                    cache_hit          = true;
                     break;
                 }
             }
@@ -2544,6 +2650,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     will_capture = true;                               // second+ sight → capture
                 }
             }
+        }
+
+        // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): region-address hash for the
+        // replay decision (below) + R1 ratio logging. Pure replay of the cached
+        // exec is valid iff this hash equals the one stored with the exec.
+        if (try_outer_capture && (will_capture || cache_hit)) {
+            region_hash = ggml_backend_sched_outer_region_hash(sched, first_cuda_split);
+            bool match = sched->outer_region_hash_valid && region_hash == sched->outer_region_hash_prev;
+            if (sched->outer_region_hash_valid) {
+                if (match) sched->outer_replay_eligible++;
+                else       sched->outer_recapture_needed++;
+            }
+            static const bool dbg_r1 = std::getenv("GGML_OUTER_R1_DEBUG") != nullptr;
+            if (dbg_r1) {
+                fprintf(stderr, "[R1] match=%d hash=%016llx eligible=%zu recapture=%zu\n",
+                        (int) match, (unsigned long long) region_hash,
+                        sched->outer_replay_eligible, sched->outer_recapture_needed);
+            }
+            sched->outer_region_hash_prev  = region_hash;
+            sched->outer_region_hash_valid = true;
         }
 
         // PHASE_CLIP_CAPTURE_SYNC: hoist user-input staging out of the captured
@@ -2563,6 +2689,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                    COPY_INPUTS_USER_ONLY);
                 }
             }
+            // PHASE_LM_DECODE_CAPTURE C2 (2026-06-02): on a REPLAY (cache_hit) the
+            // dispatch loop is skipped, so host-source (CPU->CUDA) non-FLAG_INPUT
+            // intermediates (e.g. inp_embd, the per-token embedding) are never
+            // refreshed — their copy is the uncapturable sync fallback, not in the
+            // graph. Re-copy them here. On a CAPTURE token (will_capture) the in-loop
+            // INTERMEDIATE pass does this, so skip here to leave the capture path
+            // byte-identical to its known-good state (double-staging perturbs the
+            // reduce needs_sync state and crashed prefill capture).
+            if (cache_hit) {
+                for (int i = first_cuda_split; i < sched->n_splits; ++i) {
+                    auto * split = &sched->splits[i];
+                    if (split->n_inputs > 0) {
+                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync,
+                                                       ids_pre, unique_ids_pre, last_ids_tensor_pre,
+                                                       COPY_INPUTS_HOST_INTERMEDIATE_ONLY);
+                    }
+                }
+            }
+            // PHASE_LM_DECODE_CAPTURE (2026-06-02): drain the staged host->device input copies
+            // before BeginCapture/replay. ggml_backend_tensor_copy may issue the copy on a
+            // copy/memcpy stream distinct from the captured graph's compute stream; without this
+            // drain the captured SET_ROWS can read inp_kv_idxs before its staging copy lands ->
+            // garbage index -> astronomically OOB q4_0 KV write (the C1 IMA). Capture is inactive
+            // here (before _begin), so a full device sync is legal.
+            for (int ci = 0; ci < n_cuda; ++ci) {
+                ggml_backend_synchronize(cuda_backends[ci]);
+            }
+        }
+
+        // PHASE_LM_DECODE_CAPTURE C2 DIAG: one-shot dump of the CUDA splits' inputs
+        // to find per-token inputs that the captured graph reads but pure replay
+        // does not refresh (cross-backend non-FLAG_INPUT intermediates copied via
+        // the sync ggml_backend_tensor_copy fallback are NOT captured).
+        if ((will_capture || cache_hit) && std::getenv("GGML_OUTER_DUMP_SPLITS") != nullptr) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                fprintf(stderr, "[SPLITS] n_splits=%d first_cuda_split=%d\n", sched->n_splits, first_cuda_split);
+                for (int i = first_cuda_split; i < sched->n_splits; ++i) {
+                    auto * sp = &sched->splits[i];
+                    ggml_backend_t sb = sched->backends[sp->backend_id];
+                    fprintf(stderr, "[SPLITS] split %d backend=%s n_inputs=%d n_nodes=%d op0=%s\n",
+                            i, ggml_backend_name(sb), sp->n_inputs, sp->graph.n_nodes,
+                            sp->graph.n_nodes ? ggml_op_name(sp->graph.nodes[0]->op) : "-");
+                    for (int j = 0; j < sp->n_inputs; ++j) {
+                        ggml_tensor * in = sp->inputs[j];
+                        ggml_backend_t ib = ggml_backend_sched_get_tensor_backend(sched, in);
+                        fprintf(stderr, "[SPLITS]   in[%d] %-24s flag_input=%d src_backend=%s cross=%d host=%d\n",
+                                j, in->name, (int)((in->flags & GGML_TENSOR_FLAG_INPUT) != 0),
+                                ib ? ggml_backend_name(ib) : "?", (int)(ib != sb),
+                                (int) ggml_backend_buffer_is_host(in->buffer));
+                    }
+                }
+            }
+        }
+
+        // PHASE_LM_DECODE_CAPTURE C2: hash-gated replay decision, BEFORE begin.
+        //   cache hit + region hash MATCHES → PURE REPLAY: launch the cached exec,
+        //     no capture. The decode win — one cudaGraphLaunch replaces the
+        //     per-token re-record of ~6310 nodes (R1≈98% in steady decode).
+        //   cache hit + region hash MISMATCH → the cached exec is stale (gallocr
+        //     moved a node); fall through to re-capture and replace this entry
+        //     (cudaGraphExecUpdate is unnecessary — the mismatch path is rare, so
+        //     a clean re-instantiate via end_capture is simpler and safe).
+        // GGML_OUTER_NO_REPLAY forces recapture every token (no pure replay) —
+        // a safety/diagnostic toggle to isolate replay-specific correctness bugs
+        // from capture-in-general bugs.
+        static const bool s_no_replay = std::getenv("GGML_OUTER_NO_REPLAY") != nullptr;
+        if (cache_hit && !s_no_replay && region_hash == cached_region_hash) {
+            ggml_cuda_outer_capture_launch_exec(cuda_backends[0], cached_exec);
+            ggml_backend_synchronize(cuda_backends[0]);  // drain: determinism + WAR vs next token's input staging
+            return GGML_STATUS_SUCCESS;
+        }
+        if (cache_hit) {
+            will_capture = true;   // stale (or no-replay): re-capture; cached_slot marks the entry to replace
+            cache_hit    = false;
         }
 
         // Begin capture AFTER user-input staging (the staging uses host syncs
@@ -2575,13 +2777,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (!capture_active) {
                 sched->outer_capture_disabled = true;
             }
-        }
-
-        if (cache_hit) {
-            // Replay the cached graph; skip the dispatch loop and the
-            // statuses-check sweep.
-            ggml_cuda_outer_capture_launch_exec(cuda_backends[0], cached_exec);
-            return GGML_STATUS_SUCCESS;
         }
 #endif
 
@@ -2649,7 +2844,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // event_wait on this in copy_inputs. With a single dispatcher
             // thread there is no concurrent-record race (the Phase-46
             // ith == split_backend_id gating is now structural).
-            if (split->n_inputs > 0 && sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            // PHASE_LM_DECODE_CAPTURE (2026-06-02): NOT under outer capture. A
+            // cudaEventRecord on a capturing stream is captured as a graph node
+            // and leaves the event handle invalid for any later host-side
+            // cudaStreamWaitEvent ("Event is not valid ... graph capture no
+            // longer running", cudaErrorInvalidValue -> CUDA_CHECK abort,
+            // compute-sanitizer). The in-capture loop runs INTERMEDIATE_ONLY,
+            // which never event_waits on this sched event (the cross-backend RAW
+            // edge is carried by cpy_tensor_async's own captured copy_event, and
+            // the C4 fan-in records copy_event, not this one) — so the record is
+            // both unused in-capture and poisons the handle for the next
+            // non-capturing (COPY_INPUTS_ALL) token's event_wait. Skip it.
+            if (split->n_inputs > 0 && !capture_active && sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
             }
         }
@@ -2660,28 +2866,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // outer_capture_disabled (sticky) and let subsequent dispatches
         // use the C1 eager path.
         if (capture_active) {
-            ggml_cuda_graph_exec_t exec = nullptr;
+            // PHASE_LM_DECODE_CAPTURE C2: end capture → instantiate (no launch) →
+            // store/replace in the topology cache with this token's region hash →
+            // launch the fresh exec → drain. Subsequent same-topology, same-address
+            // tokens take the pure-replay path above. The post-launch synchronize
+            // (matching the former end_and_launch) guarantees the exec is never in
+            // flight when a later token replaces/destroys it — no use-after-free.
+            ggml_cuda_graph_exec_t new_exec = nullptr;
             bool ok = ggml_cuda_outer_capture_end_capture(
                 cuda_backends[0],
                 n_cuda > 1 ? &cuda_backends[1] : nullptr,
                 n_cuda - 1,
-                &exec);
-            if (!ok) {
+                &new_exec);
+            if (!ok || new_exec == nullptr) {
                 sched->outer_capture_disabled = true;
             } else {
-                // FIFO evict if cache is full (front == oldest insertion).
-                if (sched->outer_graph_keys.size() >= ggml_backend_sched::MAX_OUTER_GRAPHS
-                        && !sched->outer_graph_keys.empty()) {
-                    ggml_cuda_outer_capture_destroy_exec(
-                        (ggml_cuda_graph_exec_t) sched->outer_graph_execs.front());
-                    sched->outer_graph_keys.erase(sched->outer_graph_keys.begin());
-                    sched->outer_graph_execs.erase(sched->outer_graph_execs.begin());
+                if (cached_slot >= 0) {
+                    // stale entry → replace in place
+                    ggml_cuda_outer_capture_destroy_exec((ggml_cuda_graph_exec_t) sched->outer_graph_execs[cached_slot]);
+                    sched->outer_graph_execs[cached_slot]  = (void *) new_exec;
+                    sched->outer_graph_hashes[cached_slot] = region_hash;
+                } else {
+                    // new topology → FIFO insert, evict oldest when full
+                    if (sched->outer_graph_keys.size() >= ggml_backend_sched::MAX_OUTER_GRAPHS) {
+                        ggml_cuda_outer_capture_destroy_exec((ggml_cuda_graph_exec_t) sched->outer_graph_execs.front());
+                        sched->outer_graph_keys.erase(sched->outer_graph_keys.begin());
+                        sched->outer_graph_execs.erase(sched->outer_graph_execs.begin());
+                        sched->outer_graph_hashes.erase(sched->outer_graph_hashes.begin());
+                    }
+                    sched->outer_graph_keys.push_back(outer_topo_key);
+                    sched->outer_graph_execs.push_back((void *) new_exec);
+                    sched->outer_graph_hashes.push_back(region_hash);
                 }
-                sched->outer_graph_keys.push_back(outer_topo_key);
-                sched->outer_graph_execs.push_back(exec);
-
-                if (!ggml_cuda_outer_capture_launch_exec(cuda_backends[0], exec)) {
+                if (!ggml_cuda_outer_capture_launch_exec(cuda_backends[0], new_exec)) {
                     sched->outer_capture_disabled = true;
+                } else {
+                    ggml_backend_synchronize(cuda_backends[0]);  // drain (determinism + safe replace next token)
                 }
             }
         }

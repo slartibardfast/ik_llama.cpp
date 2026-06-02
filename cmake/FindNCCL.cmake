@@ -52,37 +52,27 @@ find_package_handle_standard_args(NCCL DEFAULT_MSG NCCL_INCLUDE_DIRS NCCL_LIBRAR
 if(NCCL_FOUND)  # obtaining NCCL version and some sanity checks
   set (NCCL_HEADER_FILE "${NCCL_INCLUDE_DIRS}/nccl.h")
   message (STATUS "Determining NCCL version from ${NCCL_HEADER_FILE}...")
-  set (OLD_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
-  list (APPEND CMAKE_REQUIRED_INCLUDES ${NCCL_INCLUDE_DIRS})
-  include(CheckCXXSymbolExists)
-  check_cxx_symbol_exists(NCCL_VERSION_CODE nccl.h NCCL_VERSION_DEFINED)
 
-  if (NCCL_VERSION_DEFINED)
-    set(file "${PROJECT_BINARY_DIR}/detect_nccl_version.cc")
-    file(WRITE ${file} "
-      #include <iostream>
-      #include <nccl.h>
-      int main()
-      {
-        std::cout << NCCL_MAJOR << '.' << NCCL_MINOR << '.' << NCCL_PATCH << std::endl;
-        int x;
-        ncclGetVersion(&x);
-        return x == NCCL_VERSION_CODE;
-      }
-")
-    try_run(NCCL_VERSION_MATCHED compile_result ${PROJECT_BINARY_DIR} ${file}
-          RUN_OUTPUT_VARIABLE NCCL_VERSION_FROM_HEADER
-          CMAKE_FLAGS  "-DINCLUDE_DIRECTORIES=${NCCL_INCLUDE_DIRS}"
-          LINK_LIBRARIES ${NCCL_LIBRARIES})
-    if (NOT NCCL_VERSION_MATCHED)
-      message(FATAL_ERROR "Found NCCL header version and library version do not match! \
-(include: ${NCCL_INCLUDE_DIRS}, library: ${NCCL_LIBRARIES}) Please set NCCL_INCLUDE_DIR and NCCL_LIB_DIR manually.")
-    endif()
+  # Parse the version straight from the header. The previous approach used
+  # check_cxx_symbol_exists(NCCL_VERSION_CODE) + a try_run, which false-negatives
+  # whenever the bare symbol-check can't compile nccl.h (it transitively needs the
+  # CUDA headers, absent from CMAKE_REQUIRED_INCLUDES here). That misreported a
+  # modern NCCL (e.g. 2.30.4 -> NCCL_VERSION_CODE 23004) as "< 2.3.5-5". A header
+  # string-parse is robust and needs no compile/link/run.
+  file(STRINGS "${NCCL_HEADER_FILE}" _nccl_ver_defs
+       REGEX "^[ \t]*#define[ \t]+NCCL_(MAJOR|MINOR|PATCH)[ \t]+[0-9]+")
+  if (_nccl_ver_defs)
+    string(REGEX MATCH "NCCL_MAJOR[ \t]+([0-9]+)" _ "${_nccl_ver_defs}")
+    set(_nccl_major "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "NCCL_MINOR[ \t]+([0-9]+)" _ "${_nccl_ver_defs}")
+    set(_nccl_minor "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "NCCL_PATCH[ \t]+([0-9]+)" _ "${_nccl_ver_defs}")
+    set(_nccl_patch "${CMAKE_MATCH_1}")
+    set(NCCL_VERSION_FROM_HEADER "${_nccl_major}.${_nccl_minor}.${_nccl_patch}")
     message(STATUS "NCCL version: ${NCCL_VERSION_FROM_HEADER}")
   else()
-    message(STATUS "NCCL version < 2.3.5-5")
+    message(STATUS "NCCL version: unknown (no NCCL_MAJOR define in ${NCCL_HEADER_FILE})")
   endif ()
-  set (CMAKE_REQUIRED_INCLUDES ${OLD_CMAKE_REQUIRED_INCLUDES})
 
   message(STATUS "Found NCCL (include: ${NCCL_INCLUDE_DIRS}, library: ${NCCL_LIBRARIES})")
   mark_as_advanced(NCCL_ROOT_DIR NCCL_INCLUDE_DIRS NCCL_LIBRARIES)

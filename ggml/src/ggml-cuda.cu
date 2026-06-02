@@ -4376,6 +4376,11 @@ GGML_CALL static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // PHASE_LM_DECODE_CAPTURE (2026-06-02): match set_tensor_async — the stream
+    // lives on cuda_ctx->device, but a prior op on another backend may have left
+    // a different current device. CUDA 13.3 rejects the cross-context memcpy
+    // ("CUDA Stream does not belong to the expected context", compute-sanitizer).
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -4536,7 +4541,9 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     // fan-in). So skip the drain while capturing; the graph owns
     // ordering. The non-capture path is unchanged.
     if (!ggml_cuda_outer_capture_active()) {
-        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaError_t se = cudaDeviceSynchronize();
+        if (se != cudaSuccess) fprintf(stderr, "[SYNC-DIAG] cudaDeviceSynchronize: %s\n", cudaGetErrorString(se));
+        CUDA_CHECK(se);
     }
 
     GGML_UNUSED(backend);
@@ -5687,6 +5694,13 @@ static void ggml_backend_cuda_event_free(ggml_backend_event_t event) {
 static void ggml_backend_cuda_event_record(ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)event->backend->context;
 
+    // PHASE_LM_DECODE_CAPTURE (2026-06-02): cuda_ctx->stream() lives on cuda_ctx->device;
+    // the current device (set by a prior op on another backend) may differ. CUDA 13.3
+    // rejects a cross-context stream op ("CUDA Stream does not belong to the expected
+    // context", surfaced by compute-sanitizer). Eagerly it limps; under outer capture this
+    // dispatch-loop event_record (ggml-backend.cpp) captures a malformed/dropped node, so a
+    // downstream wait gets no edge → missing cross-backend dependency → IMA. Set the device.
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
@@ -5694,6 +5708,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(event->backend)) {
+        ggml_cuda_set_device(cuda_ctx->device);  // see event_record: stream must match current context
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
@@ -6078,9 +6093,15 @@ extern "C" bool ggml_cuda_outer_capture_end_and_launch(
     }
 
     cudaError_t launch_err = cudaGraphLaunch(exec, primary_stream);
+    cudaError_t sync_err   = cudaStreamSynchronize(primary_stream);  // drain before destroy (stability)
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(captured);
-    if (launch_err != cudaSuccess) return false;
+    if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+        fprintf(stderr, "[CAP-DIAG] e&l launch=%s sync=%s\n",
+                cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
+        cudaGetLastError();
+        return false;
+    }
 
     g_outer_capture_success_count.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -6132,14 +6153,24 @@ extern "C" bool ggml_cuda_outer_capture_end_capture(
     cudaGraph_t captured = nullptr;
     cudaError_t end_err = cudaStreamEndCapture(primary_stream, &captured);
     if (end_err != cudaSuccess || captured == nullptr) {
+        fprintf(stderr, "[CAP-DIAG] EndCapture failed: %s (captured=%p)\n",
+                cudaGetErrorString(end_err), (void*) captured);
+        cudaGetLastError();  // clear sticky error so the next sync doesn't abort
         if (captured) cudaGraphDestroy(captured);
         return false;
     }
 
     cudaGraphExec_t exec = nullptr;
-    cudaError_t inst_err = cudaGraphInstantiate(&exec, captured, nullptr, nullptr, 0);
+    cudaGraphNode_t err_node = nullptr;
+    char inst_log[2048] = {0};
+    cudaError_t inst_err = cudaGraphInstantiate(&exec, captured, &err_node, inst_log, sizeof(inst_log) - 1);
     cudaGraphDestroy(captured);  // template no longer needed once instantiated
-    if (inst_err != cudaSuccess) return false;
+    if (inst_err != cudaSuccess) {
+        fprintf(stderr, "[CAP-DIAG] Instantiate failed: %s | err_node=%p | log=%s\n",
+                cudaGetErrorString(inst_err), (void*) err_node, inst_log);
+        cudaGetLastError();
+        return false;
+    }
 
     *out_exec = (ggml_cuda_graph_exec_t) exec;
     return true;
@@ -6156,7 +6187,11 @@ extern "C" bool ggml_cuda_outer_capture_launch_exec(
 
     ggml_cuda_set_device(primary_ctx->device);
     cudaError_t launch_err = cudaGraphLaunch((cudaGraphExec_t) exec, primary_stream);
-    if (launch_err != cudaSuccess) return false;
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "[CAP-DIAG] GraphLaunch failed: %s\n", cudaGetErrorString(launch_err));
+        cudaGetLastError();
+        return false;
+    }
 
     g_outer_capture_success_count.fetch_add(1, std::memory_order_relaxed);
     return true;
