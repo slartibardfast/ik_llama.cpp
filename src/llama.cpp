@@ -3913,6 +3913,19 @@ static bool llm_load_tensors(
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     model.buft_input = llama_default_buffer_type_cpu(true);
 
+    // PHASE_LM_DECODE_CAPTURE C2 groundwork (2026-06-02): opt-in placing the input
+    // layer (token_embd) on a GPU. Upstream keeps it on CPU because the get_rows
+    // gather is cheap (no perf benefit — confirmed: replay-decode is GPU-bound).
+    // The point is STRUCTURAL: with token_embd on GPU the embedding get_rows runs
+    // on-device, inp_embd becomes a captured CUDA-source intermediate, and the
+    // lone CPU dispatch split disappears (first_cuda_split -> 0) — prerequisite
+    // plumbing for an on-GPU persistent decode loop. Gather is deterministic, so
+    // output stays byte-identical; costs token_embd's VRAM on GPU0. Default OFF.
+    if (std::getenv("GGML_EMBD_ON_GPU") != nullptr && n_gpu_layers > n_layer && !model.devices.empty()) {
+        model.buft_input = llama_default_buffer_type_offload(model, 0);
+        LLAMA_LOG_INFO("%s: GGML_EMBD_ON_GPU — placing token_embd (input layer) on GPU 0\n", __func__);
+    }
+
     model.buft_layer.resize(n_layer);
 
     // assign cpu layers
