@@ -2464,5 +2464,23 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
     // documented batch-invariance bugs (slot-parity / cross-warp partial)
     // and are retained only as historical reference in this file's
     // earlier kernels block. Production dispatch is hardcoded singlewarp.
+    //
+    // PHASE_FATTN_KV_SPLIT_SM75 bring-up (2026-06-06): KV-split decode path,
+    // env-gated GGML_FATTN_KV_SPLIT=1 until the byte-identity matrix passes
+    // (phase doc step 3), then becomes the decode default with singlewarp as
+    // the GGML_FATTN_SINGLEWARP=1 rollback. Decode-only (ne01==1), paged-only
+    // (block_table = src[6] present): logical-k chunking is translation-free
+    // under the per-slot paged layout; legacy unified KV keeps singlewarp.
+    {
+        static const bool s_kv_split = std::getenv("GGML_FATTN_KV_SPLIT") != nullptr;
+        const ggml_tensor * block_table = dst->src[6];
+        if (s_kv_split && Q->ne[1] == 1 && block_table && block_table->data &&
+            (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) && K->type == V->type) {
+            extern void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
+                    ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+            ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(ctx, dst);
+            return;
+        }
+    }
     ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(ctx, dst);
 }
