@@ -284,14 +284,16 @@ static __global__ void flash_attn_per_slot_kv_split_merge(
 // decode (Q->ne[1] == 1), paged KV (block_table non-null), Dk = Dv = 256,
 // K/V type in {Q4_0, F16}.
 void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst);  // self-declaration (-Wmissing-declarations)
+void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * per_row_k_bound = dst->src[5];
+    // src[5] (per_row_k_bound) is decorative — the mask is the validity
+    // primitive (see singlewarp CY.F.17); intentionally not read here.
     const ggml_tensor * block_table     = dst->src[6];
-    GGML_UNUSED(per_row_k_bound);   // decorative (mask is the validity primitive)
 
     GGML_ASSERT(Q->ne[1] == 1 && "split path is decode-only (ne01 == 1)");
     GGML_ASSERT(block_table && block_table->type == GGML_TYPE_I32);
