@@ -2465,16 +2465,19 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
     // and are retained only as historical reference in this file's
     // earlier kernels block. Production dispatch is hardcoded singlewarp.
     //
-    // PHASE_FATTN_KV_SPLIT_SM75 bring-up (2026-06-06): KV-split decode path,
-    // env-gated GGML_FATTN_KV_SPLIT=1 until the byte-identity matrix passes
-    // (phase doc step 3), then becomes the decode default with singlewarp as
-    // the GGML_FATTN_SINGLEWARP=1 rollback. Decode-only (ne01==1), paged-only
-    // (block_table = src[6] present): logical-k chunking is translation-free
-    // under the per-slot paged layout; legacy unified KV keeps singlewarp.
+    // PHASE_FATTN_KV_SPLIT_SM75 (default since 2026-06-07): KV-split is the
+    // decode path — all gates closed (f64 ref + invariance units 42/42, NPC
+    // matrix NP{1,2,4,8}, depth series 3x{824,15.8k,44.7k} single-SHA,
+    // capture==eager bytes + R1 98.4%, sanitizer suite, 6.3x at 44k).
+    // GGML_FATTN_SINGLEWARP=1 rolls back to the singlewarp chain (NPC hashes
+    // differ between the two chains — determinism re-baseline on any switch).
+    // Decode-only (ne01==1), paged-only (block_table = src[6] present):
+    // logical-k chunking is translation-free under the per-slot paged layout;
+    // legacy unified KV, prefill (ne01>1) and other KV types keep singlewarp.
     {
-        static const bool s_kv_split = std::getenv("GGML_FATTN_KV_SPLIT") != nullptr;
+        static const bool s_singlewarp_rollback = std::getenv("GGML_FATTN_SINGLEWARP") != nullptr;
         const ggml_tensor * block_table = dst->src[6];
-        if (s_kv_split && Q->ne[1] == 1 && block_table && block_table->data &&
+        if (!s_singlewarp_rollback && Q->ne[1] == 1 && block_table && block_table->data &&
             (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) && K->type == V->type) {
             extern void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
                     ggml_backend_cuda_context & ctx, ggml_tensor * dst);
