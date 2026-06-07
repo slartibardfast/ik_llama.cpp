@@ -76,12 +76,25 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
     constexpr int V_PER_THREAD = Dv / WARP_SIZE;  // 8
 
     const int lane    = threadIdx.x;
-    const int warp    = threadIdx.y;               // q-head within the GQA group
     const int chunk   = blockIdx.x;
-    const int head_kv = blockIdx.y;
     const int seq     = blockIdx.z;
-    const int gqa     = blockDim.y;                // gqa_ratio (= ne02/ne12)
-    const int head    = head_kv * gqa + warp;      // q-head index
+    // Two launch layouts, chosen by the wrapper — bit-identical outputs (the
+    // kernel has no cross-warp interaction; per-head arithmetic is placement-
+    // independent):
+    //   grouped (deep, n_chunks>1):  grid.y = ne12, block.y = gqa — the GQA
+    //     warps share the CTA so L1 serves the 6x K/V line dedup.
+    //   spread (shallow, n_chunks==1): grid.y = ne02, block.y = 1 — one warp
+    //     per CTA across SMs; L1 dedup is worthless at <=1 chunk and the
+    //     grouped layout would bottleneck 12 warps on 2 SMs' LSU pipes
+    //     (measured 112 vs 83.5 us against singlewarp at ne11=256).
+    int head, head_kv;
+    if (blockDim.y == 1) {
+        head    = blockIdx.y;
+        head_kv = head / (ne02 / ne12);
+    } else {
+        head_kv = blockIdx.y;
+        head    = head_kv * blockDim.y + threadIdx.y;
+    }
 
     const int k_begin = chunk * PSKV_SPLIT_CHUNK_TOKENS;
     if (k_begin >= ne11) return;                   // inactive chunk (merge clamps)
@@ -183,20 +196,65 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
         return phi;
     };
 
-    // ILP-4 main loop over the chunk, canonical ascending k.
+    // ILP-4 main loop over the chunk, canonical ascending k. The K-dot is
+    // interleaved across the 4 rows with shared per-i address math — the
+    // singlewarp kernel's proven shape (4 independent dependency chains in
+    // flight; ~35% faster per iteration than sequential row-dots, measured
+    // 112→~85 µs at ne11=256). Bit-safety: each row's accumulator still sums
+    // i ascending and accumulators never mix, so produced bits are identical
+    // to the sequential form (verified: unit 42/42 + depth-SHA reproduction).
     for (int k = k_begin; k < k_end_align; k += ILP_W) {
         const char * K_base; const char * V_base; int off;
         kv_bases(k, K_base, V_base, off);   // BLOCK=64 is a multiple of 4: one lookup per quad
 
+        float partial_a = 0.0f, partial_b = 0.0f, partial_c = 0.0f, partial_d = 0.0f;
+        if constexpr (type_K == GGML_TYPE_Q4_0) {
+            const block_q4_0 * K_row_a = (const block_q4_0 *)(K_base + (size_t)(off  )*nb11);
+            const block_q4_0 * K_row_b = (const block_q4_0 *)(K_base + (size_t)(off+1)*nb11);
+            const block_q4_0 * K_row_c = (const block_q4_0 *)(K_base + (size_t)(off+2)*nb11);
+            const block_q4_0 * K_row_d = (const block_q4_0 *)(K_base + (size_t)(off+3)*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const int blk_idx  = d / K_qk;
+                const int blk_off  = d % K_qk;
+                const int byte_idx = blk_off & (K_qk/2 - 1);
+                const int shift    = blk_off / (K_qk/2);
+
+                const block_q4_0 * blk_a = K_row_a + blk_idx;
+                const block_q4_0 * blk_b = K_row_b + blk_idx;
+                const block_q4_0 * blk_c = K_row_c + blk_idx;
+                const block_q4_0 * blk_d = K_row_d + blk_idx;
+                const int q_nib_a = (blk_a->qs[byte_idx] >> (shift*4)) & 0xF;
+                const int q_nib_b = (blk_b->qs[byte_idx] >> (shift*4)) & 0xF;
+                const int q_nib_c = (blk_c->qs[byte_idx] >> (shift*4)) & 0xF;
+                const int q_nib_d = (blk_d->qs[byte_idx] >> (shift*4)) & 0xF;
+                partial_a += __half2float(blk_a->d) * (float)(q_nib_a - 8) * Q_reg[i];
+                partial_b += __half2float(blk_b->d) * (float)(q_nib_b - 8) * Q_reg[i];
+                partial_c += __half2float(blk_c->d) * (float)(q_nib_c - 8) * Q_reg[i];
+                partial_d += __half2float(blk_d->d) * (float)(q_nib_d - 8) * Q_reg[i];
+            }
+        } else {
+            const half * K_row_a = (const half *)(K_base + (size_t)(off  )*nb11);
+            const half * K_row_b = (const half *)(K_base + (size_t)(off+1)*nb11);
+            const half * K_row_c = (const half *)(K_base + (size_t)(off+2)*nb11);
+            const half * K_row_d = (const half *)(K_base + (size_t)(off+3)*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d = lane + i*WARP_SIZE;
+                partial_a += __half2float(K_row_a[d]) * Q_reg[i];
+                partial_b += __half2float(K_row_b[d]) * Q_reg[i];
+                partial_c += __half2float(K_row_c[d]) * Q_reg[i];
+                partial_d += __half2float(K_row_d[d]) * Q_reg[i];
+            }
+        }
+
         float kq_arr[ILP_W];
-        #pragma unroll
-        for (int s = 0; s < ILP_W; ++s) {
-            kq_arr[s] = dot_k_row(K_base, off + s);
-        }
-        #pragma unroll
-        for (int s = 0; s < ILP_W; ++s) {
-            kq_arr[s] = warp_reduce_sum(kq_arr[s]) + slope * __half2float(maskh[k + s]);
-        }
+        kq_arr[0] = warp_reduce_sum(partial_a) + slope * __half2float(maskh[k  ]);
+        kq_arr[1] = warp_reduce_sum(partial_b) + slope * __half2float(maskh[k+1]);
+        kq_arr[2] = warp_reduce_sum(partial_c) + slope * __half2float(maskh[k+2]);
+        kq_arr[3] = warp_reduce_sum(partial_d) + slope * __half2float(maskh[k+3]);
+
         #pragma unroll
         for (int s = 0; s < ILP_W; ++s) {
             const float phi = softmax_step(kq_arr[s]);
@@ -350,8 +408,12 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
         part_ml.alloc(n_part);
     }
 
-    const dim3 grid1((unsigned)n_chunks, (unsigned)ne12, (unsigned)ne13);
-    const dim3 block1(WARP_SIZE, (unsigned)gqa, 1);
+    // Layout: grouped (GQA warps share a CTA — L1 dedup) at depth; spread
+    // (one warp per CTA across SMs) at a single chunk. Bit-identical either
+    // way — see the kernel comment.
+    const bool spread = n_chunks == 1;
+    const dim3 grid1((unsigned)n_chunks, (unsigned)(spread ? ne02 : ne12), (unsigned)ne13);
+    const dim3 block1(WARP_SIZE, (unsigned)(spread ? 1 : gqa), 1);
     const dim3 grid2((unsigned)ne02, 1, (unsigned)ne13);
     const dim3 block2(WARP_SIZE, 1, 1);
 
@@ -473,8 +535,9 @@ extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
         const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
         const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-        const dim3 grid1((unsigned)n_chunks, (unsigned)n_kv_heads, (unsigned)n_seqs);
-        const dim3 block1(WARP_SIZE, (unsigned)gqa, 1);
+        const bool spread = n_chunks == 1; // mirror the production wrapper's layout rule
+        const dim3 grid1((unsigned)n_chunks, (unsigned)(spread ? n_heads_q : n_kv_heads), (unsigned)n_seqs);
+        const dim3 block1(WARP_SIZE, (unsigned)(spread ? 1 : gqa), 1);
         const dim3 grid2((unsigned)n_heads_q, 1, (unsigned)n_seqs);
         const dim3 block2(WARP_SIZE, 1, 1);
 
