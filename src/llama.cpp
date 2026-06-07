@@ -2545,6 +2545,22 @@ static bool llama_kv_cache_seq_rm(
         }
     }
 
+    // PHASE_HYBRID_STATE_RESTORE G2 instrument: src state after seq_rm.
+    {
+        static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
+        if (dbg_paged) {
+            const uint32_t n_slots = llama_kv_qnext_state_slots(cache);
+            if (n_slots > 0) {
+                fprintf(stderr, "[paged-dbg] seq_rm exit: seq=%d [p0=%d p1=%d] n_free=%d src[0..%u)=",
+                        (int) seq_id, (int) p0, (int) p1, cache.paged.n_free(), n_slots);
+                for (uint32_t s = 0; s < n_slots && s < 8; ++s) {
+                    fprintf(stderr, "%d ", (int) cache.cells[s].src);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2593,6 +2609,16 @@ static void llama_kv_cache_seq_cp(
         cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
         cache.do_copy = true;
         cache.seq_pos_max_invalidate();
+
+        // PHASE_HYBRID_STATE_RESTORE G2 instrument: seq_cp src propagation —
+        // the resolved src is only asserted < cache.size, not < n_slots; an
+        // out-of-qnext-range value here poisons the next save.
+        static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
+        if (dbg_paged) {
+            fprintf(stderr, "[paged-dbg] seq_cp qnext: dst=%d gets src=%d (n_slots=%u)%s\n",
+                    (int) seq_id_dst, (int) seq_id_src, llama_kv_qnext_state_slots(cache),
+                    llama_kv_qnext_seq_id_in_range(cache, seq_id_src) ? "" : "  <-- OUT OF QNEXT RANGE");
+        }
     }
 
     // otherwise, this is the KV cache of a Transformer-like model
@@ -7382,6 +7408,12 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
             for (uint32_t i = 0; i < transformer_kv.size; ++i) {
                 transformer_kv.cells[i].src = i;
             }
+
+            // PHASE_HYBRID_STATE_RESTORE G2 instrument.
+            static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
+            if (dbg_paged) {
+                fprintf(stderr, "[paged-dbg] do_copy complete: all cells[].src reset to identity\n");
+            }
         }
     }
 
@@ -9654,6 +9686,17 @@ struct llama_data_write {
                             s_offset = (size_t) src_seq_id * s_size_row;
                         }
                     }
+                    // PHASE_HYBRID_STATE_RESTORE G1/G2 instrument: the silent
+                    // s_rows=0 save is the cascade root — log the src value that
+                    // caused it (first layer only; all layers share the mapping).
+                    static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
+                    if (dbg_paged && il == 0 && seq_id != -1) {
+                        fprintf(stderr, "[paged-dbg] save qnext: seq=%d cells[seq].src=%d n_slots=%u -> s_rows=%u%s\n",
+                                (int) seq_id,
+                                (uint32_t) seq_id < transformer_kv.size ? (int) transformer_kv.cells[seq_id].src : -999,
+                                n_slots, s_rows,
+                                s_rows == 0 ? "  <-- SILENT RECURRENT-STATE OMISSION" : "");
+                    }
                 }
 
                 write(&s_rows, sizeof(s_rows));
@@ -10181,15 +10224,42 @@ struct llama_data_read {
         uint32_t cell_count;
         read_to(&cell_count, sizeof(cell_count));
 
+        // PHASE_HYBRID_STATE_RESTORE G1 instrument (LLAMA_PAGED_DEBUG): paged-pool
+        // block conservation across restore failures. Leak hypothesis: a restore
+        // failing AFTER read_kv_cache_meta committed cells+blocks may under-free
+        // in the seq_rm cleanup — n_free(post-cleanup) must equal n_free(entry).
+        static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
+        const int32_t nf_entry = dbg_paged ? ctx->transformer_kv.paged.n_free() : 0;
+        if (dbg_paged) {
+            fprintf(stderr, "[paged-dbg] restore entry: seq=%d cells=%u flags=%u n_free=%d/%d\n",
+                    (int) seq_id, cell_count, (unsigned) flags,
+                    nf_entry, ctx->transformer_kv.paged.total_blocks());
+        }
+
         bool res = read_kv_cache_meta(ctx, cell_count, seq_id) && read_kv_cache_data(ctx, cell_count, seq_id, flags);
 
         if (!res) {
+            if (dbg_paged) {
+                fprintf(stderr, "[paged-dbg] restore FAILED pre-cleanup: seq=%d n_free=%d\n",
+                        (int) seq_id, ctx->transformer_kv.paged.n_free());
+            }
             if (seq_id == -1) {
                 llama_kv_cache_clear(ctx);
             } else {
                 llama_kv_cache_seq_rm(ctx, seq_id, -1, -1);
             }
+            if (dbg_paged) {
+                const int32_t nf_post = ctx->transformer_kv.paged.n_free();
+                fprintf(stderr, "[paged-dbg] restore FAILED post-cleanup: seq=%d n_free=%d (entry %d, LEAK_DELTA=%d)\n",
+                        (int) seq_id, nf_post, nf_entry, nf_entry - nf_post);
+            }
             throw std::runtime_error("failed to restore kv cache");
+        }
+        if (dbg_paged && seq_id >= 0 && (uint32_t) seq_id < ctx->transformer_kv.size) {
+            fprintf(stderr, "[paged-dbg] restore OK: seq=%d cells[seq].src=%d n_slots=%u n_free=%d\n",
+                    (int) seq_id, (int) ctx->transformer_kv.cells[seq_id].src,
+                    llama_kv_qnext_state_slots(ctx->transformer_kv),
+                    ctx->transformer_kv.paged.n_free());
         }
     }
 };
