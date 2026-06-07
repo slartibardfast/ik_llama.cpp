@@ -358,3 +358,148 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
 
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ============================================================================
+// Test launcher (extern "C") — consumed by
+// tests/dflash-speculative/test-fattn-per-slot-kv-split-sm75.cpp.
+//
+// Host-buffer mirror of the production wrapper above: identical grid math and
+// launch parameters, plain cudaMalloc instead of the ggml pool. Lives in this
+// TU because the kernels are file-static. Decode-only (1 token), max_bias = 0
+// (production setting), softcap unsupported (asserted off in the wrapper).
+//
+// Paged pool layout (must match the kernel's kv_bases lambda):
+//   row k of block bid, kv-head h lives at
+//   pool + bid*paged_nb13 + h*paged_nb12 + (k%64)*nb11
+//   nb11 = 8*sizeof(block_q4_0) = 144 B (q4_0) or 512 B (f16) for D=256.
+// ============================================================================
+
+extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
+        const float *, const void *, const void *, const uint16_t *,
+        const int32_t *, int, int, int, int, int, int, int, float,
+        float *);  // self-declaration (-Wmissing-declarations)
+
+extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
+        const float    * Q_h,           // [256 * n_heads_q * n_seqs] f32, 1 token
+        const void     * K_pool_h,      // n_blocks_pool * paged_nb13 bytes
+        const void     * V_pool_h,      // same shape (nb21 == nb11)
+        const uint16_t * mask_h,        // f16 bits, [ne11] per seq, seq-major
+        const int32_t  * block_table_h, // [n_seqs * n_blocks_per_seq]
+        int n_blocks_pool,
+        int n_blocks_per_seq,
+        int n_heads_q,
+        int n_kv_heads,
+        int n_seqs,
+        int ne11,
+        int kv_is_q4_0,                 // 1 = q4_0 K/V, 0 = f16 K/V
+        float scale,
+        float * dst_h)                  // [256 * n_heads_q * n_seqs] f32
+{
+    constexpr int Dk = 256, Dv = 256;
+    const int gqa = n_heads_q / n_kv_heads;
+    if (n_heads_q % n_kv_heads != 0 || gqa < 1 || gqa > 8) return -2;
+    if (ne11 > n_blocks_per_seq * PSKV_SPLIT_PAGED_BLOCK_TOKENS) return -3;
+
+    const size_t nb11 = kv_is_q4_0 ? (size_t)(Dk/QK4_0)*sizeof(block_q4_0)
+                                   : (size_t)Dk*sizeof(half);
+    const size_t paged_nb12 = nb11 * PSKV_SPLIT_PAGED_BLOCK_TOKENS;
+    const size_t paged_nb13 = paged_nb12 * n_kv_heads;
+
+    const int n_chunks = (ne11 + PSKV_SPLIT_CHUNK_TOKENS - 1) / PSKV_SPLIT_CHUNK_TOKENS;
+    const size_t n_part = (size_t)n_seqs * n_chunks * n_heads_q;
+
+    const size_t sz_Q    = (size_t)Dk * n_heads_q * n_seqs * sizeof(float);
+    const size_t sz_pool = (size_t)n_blocks_pool * paged_nb13;
+    const size_t sz_mask = (size_t)ne11 * n_seqs * sizeof(uint16_t);
+    const size_t sz_bt   = (size_t)n_seqs * n_blocks_per_seq * sizeof(int32_t);
+    const size_t sz_dst  = (size_t)Dv * n_heads_q * n_seqs * sizeof(float);
+
+    char   * Q_d = nullptr, * K_d = nullptr, * V_d = nullptr, * M_d = nullptr;
+    int    * bt_d = nullptr;
+    float  * dst_d = nullptr;
+    float  * part_O_d = nullptr;
+    float2 * part_ml_d = nullptr;
+
+    cudaError_t err = cudaSuccess;
+    err = cudaMalloc(&Q_d,  sz_Q);    if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&K_d,  sz_pool); if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&V_d,  sz_pool); if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&M_d,  sz_mask); if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&bt_d, sz_bt);   if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&dst_d, sz_dst); if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&part_O_d,  n_part * Dv * sizeof(float));  if (err != cudaSuccess) goto cleanup;
+    err = cudaMalloc(&part_ml_d, n_part * sizeof(float2));      if (err != cudaSuccess) goto cleanup;
+
+    err = cudaMemcpy(Q_d,  Q_h,           sz_Q,    cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(K_d,  K_pool_h,      sz_pool, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(V_d,  V_pool_h,      sz_pool, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(M_d,  mask_h,        sz_mask, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
+    err = cudaMemcpy(bt_d, block_table_h, sz_bt,   cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
+
+    {
+        const float max_bias = 0.0f;
+        const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_heads_q));
+        const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+        const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+        const dim3 grid1((unsigned)n_chunks, (unsigned)n_kv_heads, (unsigned)n_seqs);
+        const dim3 block1(WARP_SIZE, (unsigned)gqa, 1);
+        const dim3 grid2((unsigned)n_heads_q, 1, (unsigned)n_seqs);
+        const dim3 block2(WARP_SIZE, 1, 1);
+
+        const int t_nb31 = (int)(ne11 * sizeof(uint16_t)); // per-token mask stride (decode: ×0)
+        const int t_nb33 = (int)(ne11 * sizeof(uint16_t)); // per-seq mask stride
+        const int t_nb01 = (int)(Dk * sizeof(float));
+        const int t_nb02 = (int)(Dk * sizeof(float));
+        const int t_nb03 = (int)(Dk * n_heads_q * sizeof(float));
+
+        auto launch = [&](auto kpartial) {
+            kpartial<<<grid1, block1>>>(
+                Q_d, K_d, V_d, M_d,
+                bt_d, n_blocks_per_seq,
+                part_O_d, part_ml_d,
+                scale, max_bias, m0, m1, n_head_log2,
+                n_heads_q, ne11, n_kv_heads,
+                t_nb31, t_nb33,
+                t_nb01, t_nb02, t_nb03,
+                (int)nb11,
+                (int)nb11,
+                n_chunks);
+        };
+        if (kv_is_q4_0) {
+            launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>);
+        } else {
+            launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_F16, GGML_TYPE_F16>);
+        }
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto cleanup;
+
+        flash_attn_per_slot_kv_split_merge<256><<<grid2, block2>>>(
+            part_O_d, part_ml_d, dst_d,
+            /*ne01=*/1, n_heads_q, n_chunks, n_chunks);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto cleanup;
+
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto cleanup;
+    }
+
+    err = cudaMemcpy(dst_h, dst_d, sz_dst, cudaMemcpyDeviceToHost);
+
+cleanup:
+    if (Q_d)       cudaFree(Q_d);
+    if (K_d)       cudaFree(K_d);
+    if (V_d)       cudaFree(V_d);
+    if (M_d)       cudaFree(M_d);
+    if (bt_d)      cudaFree(bt_d);
+    if (dst_d)     cudaFree(dst_d);
+    if (part_O_d)  cudaFree(part_O_d);
+    if (part_ml_d) cudaFree(part_ml_d);
+
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fattn_per_slot_kv_split_sm75_test_launch CUDA error: %s\n",
+                cudaGetErrorString(err));
+        return -1;
+    }
+    return 0;
+}

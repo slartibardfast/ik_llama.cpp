@@ -343,6 +343,20 @@ if (GGML_CUDA)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
 
+    # PHASE_FATTN_KV_SPLIT_SM75 step 3 — KV-split decode kernel unit tests:
+    # f64 reference (q4_0 + f16), rep-determinism, padding/chunk-count
+    # invariance at straddle lengths, block-table permutation invariance,
+    # and batch invariance. The launcher
+    # `fattn_per_slot_kv_split_sm75_test_launch` is implemented in
+    # ggml/src/ggml-cuda/fattn-per-slot-kv-split-sm75.cu.
+    set(TEST_TARGET test-fattn-per-slot-kv-split-sm75)
+    add_executable(${TEST_TARGET}
+        dflash-speculative/test-fattn-per-slot-kv-split-sm75.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main")
+
     # NP-invariance unit test on the production dispatch path
     # (specs/deltanet/fattn-per-slot-kv-sm75.md §15.7). Drives the
     # ggml_flash_attn_ext_per_slot_kv op through the CUDA backend with
