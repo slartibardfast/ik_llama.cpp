@@ -53,8 +53,10 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
         const char * __restrict__ mask,
         const int  * __restrict__ block_table,     // REQUIRED non-null (paged only)
         const int                 n_blocks_per_seq,
-        float      * __restrict__ part_O,          // [seq][chunk][q_head][Dv]
-        float2     * __restrict__ part_ml,         // [seq][chunk][q_head] {m, l}
+        float      * __restrict__ part_O,          // [seq][chunk][q_head][Dv] (nullptr when n_chunks==1)
+        float2     * __restrict__ part_ml,         // [seq][chunk][q_head] {m, l} (nullptr when n_chunks==1)
+        float      * __restrict__ dst,             // direct output (single-chunk fast path)
+        const int                 ne01,            // n_tokens (= 1 at decode; dst stride term)
         const float scale,
         const float max_bias,
         const float m0,
@@ -210,6 +212,22 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
         accum_v_row(V_base, off, phi);
     }
 
+    // Single-chunk fast path: the merge fold over one chunk is the bit-exact
+    // identity (corr_old = 0 from the -FLT_MAX/2 init, corr_cur = expf(0) = 1,
+    // dst = O * (1/l) == VKQ * (1/kqsum)), so normalize and write dst directly —
+    // saves the merge launch + the part_O/part_ml scratch round-trip. Produced
+    // bytes are identical to the merge path (bound by unit-test scenario C:
+    // ne11 vs ne11+1024 byte-identity crosses this branch).
+    if (gridDim.x == 1) {
+        const float inv_sum = 1.0f / kqsum;
+        #pragma unroll
+        for (int i = 0; i < V_PER_THREAD; ++i) {
+            const int d = lane + i*WARP_SIZE;
+            dst[(size_t)d + (size_t)head * Dv + (size_t)seq * Dv * ne02 * ne01] = VKQ[i] * inv_sum;
+        }
+        return;
+    }
+
     // Emit the partial: O (unnormalized), m, l.
     const size_t pidx = ((size_t)seq * n_chunks + chunk) * ne02 + head;
     float * O_out = part_O + pidx * Dv;
@@ -223,7 +241,8 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
 #else
     NO_DEVICE_CODE;
     (void)Q; (void)K_direct; (void)V_direct; (void)mask; (void)block_table;
-    (void)n_blocks_per_seq; (void)part_O; (void)part_ml; (void)scale; (void)max_bias;
+    (void)n_blocks_per_seq; (void)part_O; (void)part_ml; (void)dst; (void)ne01;
+    (void)scale; (void)max_bias;
     (void)m0; (void)m1; (void)n_head_log2; (void)ne02; (void)ne11; (void)ne12;
     (void)nb31; (void)nb33; (void)nb01; (void)nb02; (void)nb03; (void)nb11; (void)nb21;
     (void)n_chunks;
@@ -321,9 +340,15 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
     const int n_chunks = (ne11 + PSKV_SPLIT_CHUNK_TOKENS - 1) / PSKV_SPLIT_CHUNK_TOKENS;
 
     // Scratch from the pool: partial O + (m,l) per (seq, chunk, q-head).
-    const size_t n_part = (size_t)ne13 * n_chunks * ne02;
-    ggml_cuda_pool_alloc<float>  part_O (ctx.pool(), n_part * 256);
-    ggml_cuda_pool_alloc<float2> part_ml(ctx.pool(), n_part);
+    // Single-chunk decode writes dst directly in the partial kernel (bit-exact
+    // identity fold) — no scratch, no merge launch.
+    ggml_cuda_pool_alloc<float>  part_O (ctx.pool());
+    ggml_cuda_pool_alloc<float2> part_ml(ctx.pool());
+    if (n_chunks > 1) {
+        const size_t n_part = (size_t)ne13 * n_chunks * ne02;
+        part_O.alloc(n_part * 256);
+        part_ml.alloc(n_part);
+    }
 
     const dim3 grid1((unsigned)n_chunks, (unsigned)ne12, (unsigned)ne13);
     const dim3 block1(WARP_SIZE, (unsigned)gqa, 1);
@@ -337,7 +362,9 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
             (const char *) Q->data, (const char *) K->data, (const char *) V->data,
             (const char *) mask->data,
             (const int *) block_table->data, n_bps,
-            part_O.get(), part_ml.get(),
+            n_chunks > 1 ? part_O.get() : nullptr,
+            n_chunks > 1 ? part_ml.get() : nullptr,
+            (float *) dst->data, (int)Q->ne[1],
             scale, max_bias, m0, m1, n_head_log2,
             ne02, ne11, ne12,
             (int)mask->nb[1], (int)mask->nb[3],
@@ -352,9 +379,11 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
         launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_F16, GGML_TYPE_F16>);
     }
 
-    flash_attn_per_slot_kv_split_merge<256><<<grid2, block2, 0, ctx.stream()>>>(
-        part_O.get(), part_ml.get(), (float *) dst->data,
-        (int)Q->ne[1], ne02, n_chunks, n_chunks);
+    if (n_chunks > 1) {
+        flash_attn_per_slot_kv_split_merge<256><<<grid2, block2, 0, ctx.stream()>>>(
+            part_O.get(), part_ml.get(), (float *) dst->data,
+            (int)Q->ne[1], ne02, n_chunks, n_chunks);
+    }
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -427,8 +456,10 @@ extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
     err = cudaMalloc(&M_d,  sz_mask); if (err != cudaSuccess) goto cleanup;
     err = cudaMalloc(&bt_d, sz_bt);   if (err != cudaSuccess) goto cleanup;
     err = cudaMalloc(&dst_d, sz_dst); if (err != cudaSuccess) goto cleanup;
-    err = cudaMalloc(&part_O_d,  n_part * Dv * sizeof(float));  if (err != cudaSuccess) goto cleanup;
-    err = cudaMalloc(&part_ml_d, n_part * sizeof(float2));      if (err != cudaSuccess) goto cleanup;
+    if (n_chunks > 1) { // single-chunk: partial writes dst directly, no scratch
+        err = cudaMalloc(&part_O_d,  n_part * Dv * sizeof(float));  if (err != cudaSuccess) goto cleanup;
+        err = cudaMalloc(&part_ml_d, n_part * sizeof(float2));      if (err != cudaSuccess) goto cleanup;
+    }
 
     err = cudaMemcpy(Q_d,  Q_h,           sz_Q,    cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
     err = cudaMemcpy(K_d,  K_pool_h,      sz_pool, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto cleanup;
@@ -458,6 +489,7 @@ extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
                 Q_d, K_d, V_d, M_d,
                 bt_d, n_blocks_per_seq,
                 part_O_d, part_ml_d,
+                dst_d, /*ne01=*/1,
                 scale, max_bias, m0, m1, n_head_log2,
                 n_heads_q, ne11, n_kv_heads,
                 t_nb31, t_nb33,
@@ -474,11 +506,13 @@ extern "C" int fattn_per_slot_kv_split_sm75_test_launch(
         err = cudaGetLastError();
         if (err != cudaSuccess) goto cleanup;
 
-        flash_attn_per_slot_kv_split_merge<256><<<grid2, block2>>>(
-            part_O_d, part_ml_d, dst_d,
-            /*ne01=*/1, n_heads_q, n_chunks, n_chunks);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) goto cleanup;
+        if (n_chunks > 1) {
+            flash_attn_per_slot_kv_split_merge<256><<<grid2, block2>>>(
+                part_O_d, part_ml_d, dst_d,
+                /*ne01=*/1, n_heads_q, n_chunks, n_chunks);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto cleanup;
+        }
 
         err = cudaDeviceSynchronize();
         if (err != cudaSuccess) goto cleanup;
