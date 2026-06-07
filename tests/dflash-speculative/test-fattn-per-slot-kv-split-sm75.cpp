@@ -419,13 +419,18 @@ int main() {
         }
 
         // --- mixed batches: A, B, E ---
+        // The all-single-chunk n_seqs=8 batch (every L <= 1024, ne11 <= 1024)
+        // exercises the SPREAD launch layout at the production NP=8 decode
+        // shape — the cell where the 2026-06-07 post-flip NPC matrix diverged.
         {
             const std::vector<std::vector<int>> batches = quick
                 ? std::vector<std::vector<int>>{{1500, 70}}
                 : std::vector<std::vector<int>>{
                       {1500, 70},
                       {2049, 1024, 63, 4096},
-                      {4097, 3000, 2048, 1025, 1024, 1023, 65, 1}};
+                      {4097, 3000, 2048, 1025, 1024, 1023, 65, 1},
+                      {824, 612, 1024, 333, 95, 1001, 730, 64},
+                      {1023, 1024, 960, 64, 512, 896, 128, 700}};
             for (const auto & lens : batches) {
                 SplitConfig c;
                 c.q4_0       = q4 != 0;
@@ -442,9 +447,32 @@ int main() {
                          q4 ? "q4_0" : "f16", c.n_seqs, c.ne11);
                 run_accuracy_and_rep(c, label);
                 run_batch_invariance(c, label);
+                // Crosses the spread (single-chunk) and grouped (padded
+                // multi-chunk) launch layouts at the full batch shape.
+                run_padding_invariance(c, 1024, label);
                 n_cfg++;
                 if (g_fail_fast && g_fail) goto done;
             }
+        }
+
+        // --- per-GPU head shape (12 q-heads / 2 kv-heads — what each GPU of
+        // the 2-way graph split actually runs), all-single-chunk n_seqs=8 ---
+        {
+            SplitConfig c;
+            c.q4_0       = q4 != 0;
+            c.n_heads_q  = 12;
+            c.n_kv_heads = 2;
+            c.n_seqs     = 8;
+            c.seq_len    = {824, 612, 1024, 333, 95, 1001, 730, 64};
+            c.ne11       = 1024;
+            c.build(rng);
+            char label[96];
+            snprintf(label, sizeof(label), "%s perGPU 12/2 n_seqs=8", q4 ? "q4_0" : "f16");
+            run_accuracy_and_rep(c, label);
+            run_batch_invariance(c, label);
+            run_padding_invariance(c, 1024, label);
+            n_cfg++;
+            if (g_fail_fast && g_fail) goto done;
         }
 
         // --- gqa=1 sanity (block (32,1,1) launch shape) ---
