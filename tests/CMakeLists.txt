@@ -1133,6 +1133,19 @@ install(TARGETS ${TEST_TARGET} RUNTIME)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
 
+# PHASE_HYBRID_STATE_RESTORE — paged resync reclaim (single-stream conservation
+# + identity). Models the seq_rm resync that was gated off for n_stream==1.
+set(TEST_TARGET test-paged-resync-reclaim)
+add_executable(${TEST_TARGET}
+    spec/test-paged-resync-reclaim.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-paged-kv-trace.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TEST_TARGET} RUNTIME)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY LABELS "spec")
+
 set(TEST_TARGET test-paged-backing-feasibility)
 add_executable(${TEST_TARGET}
     spec/test-paged-backing-feasibility.cpp

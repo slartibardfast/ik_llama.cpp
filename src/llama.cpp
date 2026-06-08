@@ -2506,7 +2506,17 @@ static bool llama_kv_cache_seq_rm(
                 }
                 if (new_head == cache.size) new_head = i;
                 // PHASE_NSTREAM_KV_4D N1: per-stream tracker.
-                if (cache.n_stream > 1) {
+                // PHASE_HYBRID_STATE_RESTORE (2026-06-07): this update was
+                // gated under n_stream>1, which left new_head_local[0]==kvps
+                // for single-stream — so the paged-allocator resync below
+                // (free_seq + write_tokens) NEVER ran for --parallel 1. The
+                // paged reservation then only ever grew (write_tokens at
+                // decode) and was never reclaimed, so the pool monotonically
+                // filled until n_free==0 → find_slot fails → restore fails →
+                // persistent HTTP 413 at depth on a non-full cache. At
+                // n_stream==1, kvps==kv_size so s==0, p==i — the tracking is
+                // valid; run it unconditionally.
+                {
                     const uint32_t s = i / kvps;
                     const uint32_t p = i % kvps;
                     if (p < new_head_local[s]) new_head_local[s] = p;
@@ -2550,13 +2560,39 @@ static bool llama_kv_cache_seq_rm(
         static const bool dbg_paged = std::getenv("LLAMA_PAGED_DEBUG") != nullptr;
         if (dbg_paged) {
             const uint32_t n_slots = llama_kv_qnext_state_slots(cache);
+            fprintf(stderr, "[paged-dbg] seq_rm exit: seq=%d [p0=%d p1=%d] n_free=%d used=%u",
+                    (int) seq_id, (int) p0, (int) p1, cache.paged.n_free(), cache.used);
             if (n_slots > 0) {
-                fprintf(stderr, "[paged-dbg] seq_rm exit: seq=%d [p0=%d p1=%d] n_free=%d src[0..%u)=",
-                        (int) seq_id, (int) p0, (int) p1, cache.paged.n_free(), n_slots);
+                fprintf(stderr, " src[0..%u)=", n_slots < 8 ? n_slots : 8);
                 for (uint32_t s = 0; s < n_slots && s < 8; ++s) {
                     fprintf(stderr, "%d ", (int) cache.cells[s].src);
                 }
-                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "\n");
+
+            // G2 decisive measurement: on a FULL clear (p0<=0, p1==max) that
+            // leaves the paged pool >half consumed, the survivors must be cells
+            // the clear loop skipped — dump their (pos, seq_id set) to classify
+            // them: orphan (pos>=0, empty set), phantom seq (set not {seq_id}),
+            // or a miscount. Recount survivors directly from cells[].
+            const bool full_clear = (p0 <= 0) && (p1 == std::numeric_limits<llama_pos>::max());
+            if (full_clear && seq_id >= 0 && cache.paged.n_free() < cache.paged.total_blocks() / 2) {
+                uint32_t n_pos_ge0 = 0, n_orphan = 0, n_phantom = 0;
+                for (uint32_t i = 0; i < cache.size; ++i) {
+                    if (cache.cells[i].pos < 0) continue;
+                    ++n_pos_ge0;
+                    if (cache.cells[i].seq_id.empty()) ++n_orphan;
+                    else if (!cache.cells[i].has_seq_id(seq_id)) ++n_phantom;
+                }
+                fprintf(stderr, "[paged-dbg] FULL-CLEAR SURVIVORS: pos>=0=%u orphan(empty-seqid)=%u phantom(other-seq)=%u\n",
+                        n_pos_ge0, n_orphan, n_phantom);
+                uint32_t shown = 0;
+                for (uint32_t i = 0; i < cache.size && shown < 6; ++i) {
+                    if (cache.cells[i].pos < 0) continue;
+                    fprintf(stderr, "[paged-dbg]   survivor cell %u: pos=%d nseq=%zu\n",
+                            i, (int) cache.cells[i].pos, cache.cells[i].seq_id.size());
+                    ++shown;
+                }
             }
         }
     }
