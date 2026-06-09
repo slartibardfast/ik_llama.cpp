@@ -37,8 +37,12 @@ void ggml_cuda_op_mul_mat_q(
     // PHASE_LAUNCH_FUSION_SWEEP #195 — small-batch Q4_0 carve-out: route
     // ne11 <= K to the byte-identical read-once GEMV. Output is bit-for-bit
     // identical to mul_mat_q_case<Q4_0> (split_k=4), so np-invariance holds.
+    // ne00 % MMQ_ITER_K == 0 (=> nb % blocks_per_iter == 0) is required by the
+    // GEMV's tiled load and also keeps clear of MMQ's K<1024 uninitialized-dst
+    // domain; all production Q4_0 K-dims (5120, 17408) satisfy it.
     if (src0->type == GGML_TYPE_Q4_0 && ggml_cuda_m1_gemv_enabled() &&
-        src1_ncols <= (int64_t) ggml_cuda_m1_gemv_threshold()) {
+        src1_ncols <= (int64_t) ggml_cuda_m1_gemv_threshold() &&
+        ne00 % MMQ_ITER_K == 0) {
         ggml_cuda_mul_mat_q4_0_gemv_faithful(args, stream);
         return;
     }

@@ -50,33 +50,36 @@ static __device__ __forceinline__ float gemv_block_partial(
 }
 
 // ---------------------------------------------------------------------------
-// v1 kernel — one WARP per output row, MWARP columns looped inside (read-once:
-// each lane reads its block's weights once per group and reuses across columns).
-// Memory-coalesced: at group g, the 32 lanes read the 32 consecutive blocks
-// [32g, 32g+32) of row i (consecutive 18-byte Q4_0 blocks). The float fold is
-// done ORDERED on lane 0 — gather each lane's per-block term in ascending block
-// order via __shfl and accumulate into the 4 split-K chunk partials — because
-// byte-identity forbids a tree warp-reduce. dst = p0+((p1+p2)+p3).
+// v2 kernel — one WARP per 32-row tile, lane = row (each lane folds its OWN row
+// sequentially, so the byte-identical serial fold runs 32-way parallel — no
+// single-lane bottleneck). Weights are staged through SMEM so the GLOBAL reads
+// stay coalesced (each row's KTILE contiguous blocks copied by the full warp)
+// while the per-row fold reads from SMEM. y-blocks broadcast across the 32 rows.
+// Requires nb % KTILE == 0 (true: production K are multiples of 256 => nb%8==0).
+// dst(i,j) = p0 + ((p1+p2)+p3), one (float(dot32)*dA)*dB add per 32-block.
 // ---------------------------------------------------------------------------
+#define GEMV_NWARPS 4
+#define GEMV_KTILE  8   // == MMQ_ITER_K/QK4_0 = blocks_per_iter; nb is a multiple
+
 template <int MMAX>
-static __global__ void mmq_gemv_faithful_q4_0_kernel(
+static __global__ void __launch_bounds__(WARP_SIZE*GEMV_NWARPS, 2)
+mmq_gemv_faithful_q4_0_kernel(
         const char * __restrict__ x, const char * __restrict__ y, float * __restrict__ dst,
         const int ne00, const int ne01, const int stride01, const int ne11, const int stride11, const int ne0) {
 
-    const int lane = threadIdx.x;                                // 0..31
-    const int i    = blockIdx.x*blockDim.y + threadIdx.y;        // output row (one warp per row)
-    if (i >= ne01) {
-        return;
-    }
+    __shared__ block_q4_0 sw[GEMV_NWARPS][WARP_SIZE][GEMV_KTILE];  // [warp][row_in_tile][block]
 
-    const block_q4_0     * wrow = (const block_q4_0 *)(x + (int64_t)i*stride01);
-    const block_q8_1_mmq * Y    = (const block_q8_1_mmq *) y;
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;                                  // 0..31 = row within the 32-row tile
+    const int row0 = (blockIdx.x*GEMV_NWARPS + warp)*WARP_SIZE;    // first row of this warp's tile
+    const int row  = row0 + lane;                                  // this lane's output row
 
-    const int nb  = ne00 / QK4_0;        // Q4_0 blocks along K
-    const int bpi = MMQ_ITER_K / QK4_0;  // 8 (blocks_per_iter)
+    const block_q8_1_mmq * Y = (const block_q8_1_mmq *) y;
 
-    // The 4 split-K chunk stops (lo_{s+1} == hi_s, so chunks are contiguous
-    // [0,hi0)[hi0,hi1)[hi1,hi2)[hi2,hi3); blocks [hi3,nb) are dropped).
+    const int nb = ne00 / QK4_0;
+    const int bpi = GEMV_KTILE;  // blocks_per_iter
+
+    // 4 split-K chunk stops (contiguous; [hi3,nb) dropped).
     int hi[4];
     #pragma unroll
     for (int s = 0; s < 4; ++s) {
@@ -92,41 +95,52 @@ static __global__ void mmq_gemv_faithful_q4_0_kernel(
         for (int s = 0; s < 4; ++s) p[j][s] = 0.0f;
     }
 
-    for (int g0 = 0; g0 < nb; g0 += WARP_SIZE) {
-        const int kb    = g0 + lane;
-        const bool live = kb < nb;
-        const block_q4_0 * wb = live ? &wrow[kb] : wrow;  // safe addr; term gated by `live`
-        const int k128 = kb >> 2;
-        const int sub  = kb & 3;
+    // 18 bytes/block * KTILE = 144 bytes = 36 ints per row, copied coalesced.
+    constexpr int INTS_PER_TILE_ROW = (GEMV_KTILE * sizeof(block_q4_0)) / sizeof(int);  // 36
 
+    for (int kt0 = 0; kt0 < nb; kt0 += GEMV_KTILE) {
+        // Coalesced cooperative load: for each of the 32 rows, the full warp
+        // copies that row's KTILE contiguous blocks (36 ints) into SMEM.
         #pragma unroll
-        for (int j = 0; j < MMAX; ++j) {
-            if (j >= ne11) break;
-            const block_q8_1_mmq * yb = live ? &Y[(int64_t)k128*stride11 + j] : Y;
-            const float    dB = live ? __low2float(yb->ds4[sub]) : 0.0f;
-            const int8_t * a  = yb->qs + sub*QK8_1;
-            const float    X  = live ? gemv_block_partial(wb, a) : 0.0f;  // float(dot32)*dA
-
-            // Ordered fold on lane 0: ascending block order, into chunk partials.
-            // p += X*dB contracts to fma(X, dB, p) — matches MMQ's reduction.
+        for (int r = 0; r < WARP_SIZE; ++r) {
+            const int grow = row0 + r;
+            if (grow >= ne01) continue;
+            const int * gsrc = (const int *)(x + (int64_t)grow*stride01 + (int64_t)kt0*sizeof(block_q4_0));
+            int * sdst = (int *) &sw[warp][r][0];
             #pragma unroll
-            for (int t = 0; t < WARP_SIZE; ++t) {
-                const float Xt  = __shfl_sync(0xFFFFFFFF, X,  t, WARP_SIZE);
-                const float dBt = __shfl_sync(0xFFFFFFFF, dB, t, WARP_SIZE);
-                const int   kbt = g0 + t;
-                if (lane == 0 && kbt < hi[3]) {
-                    const int s = (kbt < hi[0]) ? 0 : (kbt < hi[1]) ? 1 : (kbt < hi[2]) ? 2 : 3;
-                    p[j][s] += Xt * dBt;
+            for (int c = lane; c < INTS_PER_TILE_ROW; c += WARP_SIZE) {
+                sdst[c] = gsrc[c];
+            }
+        }
+        __syncwarp();
+
+        // Fold: this lane owns `row`; sum its KTILE blocks into chunk partials.
+        if (row < ne01) {
+            #pragma unroll
+            for (int b = 0; b < GEMV_KTILE; ++b) {
+                const int kb = kt0 + b;
+                if (kb >= hi[3]) break;                              // dropped tail
+                const int s = (kb < hi[0]) ? 0 : (kb < hi[1]) ? 1 : (kb < hi[2]) ? 2 : 3;
+                const block_q4_0 * wb = &sw[warp][lane][b];
+                const int k128 = kb >> 2, sub = kb & 3;
+                #pragma unroll
+                for (int j = 0; j < MMAX; ++j) {
+                    if (j >= ne11) break;
+                    const block_q8_1_mmq * yb = &Y[(int64_t)k128*stride11 + j];
+                    const float    dB = __low2float(yb->ds4[sub]);
+                    const int8_t * a  = yb->qs + sub*QK8_1;
+                    p[j][s] += gemv_block_partial(wb, a) * dB;       // fma(X, dB, p)
                 }
             }
         }
+        __syncwarp();  // protect SMEM reuse next tile
     }
 
-    if (lane == 0) {
+    if (row < ne01) {
         #pragma unroll
         for (int j = 0; j < MMAX; ++j) {
             if (j >= ne11) break;
-            dst[(int64_t)j*ne0 + i] = p[j][0] + ((p[j][1] + p[j][2]) + p[j][3]);
+            dst[(int64_t)j*ne0 + row] = p[j][0] + ((p[j][1] + p[j][2]) + p[j][3]);
         }
     }
 }
@@ -134,9 +148,9 @@ static __global__ void mmq_gemv_faithful_q4_0_kernel(
 void ggml_cuda_mul_mat_q4_0_gemv_faithful(const mmq_args & args, cudaStream_t stream) {
     const int ne01 = (int) args.ne01;  // output rows
     const int ne11 = (int) args.ne11;  // M columns
-    const int nwarps = 8;
-    const dim3 block(WARP_SIZE, nwarps, 1);
-    const dim3 grid((ne01 + nwarps - 1) / nwarps, 1, 1);
+    const int rows_per_block = GEMV_NWARPS * WARP_SIZE;
+    const dim3 block(WARP_SIZE, GEMV_NWARPS, 1);
+    const dim3 grid((ne01 + rows_per_block - 1) / rows_per_block, 1, 1);
     const int K = (int) args.ne00, s01 = (int) args.stride01, s11 = (int) args.stride11, n0 = (int) args.ne0;
     // Instantiate the smallest MMAX >= ne11 (the carve-out threshold caps ne11).
     auto launch = [&](auto mmax_tag) {
