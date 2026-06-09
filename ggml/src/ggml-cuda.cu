@@ -2758,6 +2758,23 @@ static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     }
 }
 
+// PHASE_LAUNCH_FUSION_SWEEP path B — route small-batch DECODE quantized matmuls
+// to the self-batch-invariant MMVQ GEMV instead of force-dispatching MMQ. MMVQ
+// is byte-identical across ncols (each output column is an independent GEMV
+// reduction), so np1==npK holds for the whole decode range ne11 <= MMVQ_MAX_BATCH_SIZE
+// (=8) — the crossover sits at 8, above the NPC np range, so no slot ever crosses
+// the MMVQ/MMQ boundary mid-decode. MMVQ is ~+27% faster than MMQ at decode (#194).
+// Output differs from the previous MMQ path by ~ULP => requires a one-time NPC
+// re-baseline; default-off until that lands + deploy is approved.
+static int g_decode_mmvq = -1;
+extern "C" void ggml_cuda_decode_mmvq_set_enabled(int e) { g_decode_mmvq = e ? 1 : 0; }
+extern "C" int  ggml_cuda_decode_mmvq_enabled(void) {
+    if (g_decode_mmvq < 0) {
+        g_decode_mmvq = std::getenv("GGML_CUDA_DECODE_MMVQ") != nullptr ? 1 : 0;
+    }
+    return g_decode_mmvq;
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
@@ -2802,8 +2819,20 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // When MMQ is available, suppress MMVQ/DMMV so MMQ is chosen regardless
     // of batch size.
     if (use_mul_mat_q) {
-        use_mul_mat_vec_q          = false;
-        use_dequantize_mul_mat_vec = false;
+        // PHASE_LAUNCH_FUSION_SWEEP path B: keep MMVQ (don't force MMQ) for the
+        // small-batch decode range ne11 <= MMVQ_MAX_BATCH_SIZE. MMVQ is faster
+        // and byte-identical across ncols, so np-invariance holds across the
+        // whole decode range. Default-off until the NPC re-baseline lands.
+        const bool decode_mmvq = ggml_cuda_decode_mmvq_enabled()
+            && use_mul_mat_vec_q                                  // MMVQ eligible (type ok, ne11<=8)
+            && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        if (decode_mmvq) {
+            use_mul_mat_q              = false;                   // MMVQ wins
+            use_dequantize_mul_mat_vec = false;
+        } else {
+            use_mul_mat_vec_q          = false;
+            use_dequantize_mul_mat_vec = false;
+        }
     }
     // For non-quantized F16/BF16/F32 weights: also suppress the dmmv
     // fast-path at M=1, so M=1 routes through cuBLAS like M>1. Without
