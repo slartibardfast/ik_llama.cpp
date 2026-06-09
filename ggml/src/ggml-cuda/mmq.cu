@@ -6,6 +6,7 @@
 //
 
 #include "mmq.cuh"
+#include "mmq-gemv-faithful.cuh"
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
@@ -32,6 +33,15 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
 
     const mmq_args args = {src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, nb01, src1_padded_row_size, src1_ncols, ne11, nrows_dst};
+
+    // PHASE_LAUNCH_FUSION_SWEEP #195 — small-batch Q4_0 carve-out: route
+    // ne11 <= K to the byte-identical read-once GEMV. Output is bit-for-bit
+    // identical to mul_mat_q_case<Q4_0> (split_k=4), so np-invariance holds.
+    if (src0->type == GGML_TYPE_Q4_0 && ggml_cuda_m1_gemv_enabled() &&
+        src1_ncols <= (int64_t) ggml_cuda_m1_gemv_threshold()) {
+        ggml_cuda_mul_mat_q4_0_gemv_faithful(args, stream);
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
