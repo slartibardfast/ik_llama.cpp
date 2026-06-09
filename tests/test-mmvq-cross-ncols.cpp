@@ -80,7 +80,40 @@ int main() {
                wi>=0?"":"");
         if (ncols>1 && diff!=0) rc = 1;
     }
+    // PER-COLUMN check: at ncols=8 with ALL columns = the SAME activation, every
+    // output column must be byte-identical (np-invariance needs slot-in-any-column
+    // == np=1). The np=8 NPC failure was a fixed COLUMN diverging (varying slot).
+    printf("[mmvq per-column @ ncols=8] all 8 cols = same activation; each col vs col0\n");
+    {
+        const int ncols = 8;
+        std::vector<float> Af((size_t)ncols*K);
+        for (int j = 0; j < ncols; ++j) for (int k = 0; k < K; ++k) Af[(size_t)j*K+k] = col0[k];
+        struct ggml_init_params ip = { (size_t)64*1024*1024, nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, ncols);
+        ggml_tensor * yt = ggml_mul_mat(ctx, w, a);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_tensor_set(w, Wq.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(a, Af.data(), 0, ggml_nbytes(a));
+        ggml_cgraph * gf = ggml_new_graph(ctx); ggml_build_forward_expand(gf, yt);
+        ggml_backend_graph_compute(backend, gf);
+        std::vector<float> dst((size_t)ncols*N);
+        ggml_backend_tensor_get(yt, dst.data(), 0, sizeof(float)*dst.size());
+        for (int j = 0; j < ncols; ++j) {
+            int diff=0; float maxabs=0;
+            for (int i = 0; i < N; ++i) {
+                uint32_t a0,aj; std::memcpy(&a0,&dst[i],4); std::memcpy(&aj,&dst[(size_t)j*N+i],4);
+                if (a0!=aj){ float d=std::fabs(dst[i]-dst[(size_t)j*N+i]); if(d>maxabs)maxabs=d; diff++; }
+            }
+            printf("  col=%-2d : %s (%d/%d differ vs col0, max_abs=%.3e)\n", j,
+                   diff==0?"BYTE-IDENTICAL":"DIFFERS", diff, N, maxabs);
+            if (diff!=0) rc=1;
+        }
+        ggml_backend_buffer_free(buf); ggml_free(ctx);
+    }
+
     ggml_backend_free(backend);
-    printf(rc==0 ? "ALL OK\n" : "MMVQ NOT byte-identical across ncols\n");
+    printf(rc==0 ? "ALL OK\n" : "MMVQ NOT byte-identical across ncols/columns\n");
     return rc;
 }
