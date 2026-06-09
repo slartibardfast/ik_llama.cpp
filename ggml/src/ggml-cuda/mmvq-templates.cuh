@@ -457,9 +457,16 @@ static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
     if (args.force_rpcb1 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
         nwarps = 4;
     } else if (args.ids_data == nullptr && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
-        nwarps = args.ncols_y <= 4 ? 4 : 2;
+        // PHASE_LAUNCH_FUSION_SWEEP path B: pin nwarps=4 across ALL ncols_y
+        // (was ncols_y<=4?4:2). Dropping to nwarps=2 at ncols_y>4 changes
+        // blocks_per_iter + the tmp_shared cross-warp reduction order, so
+        // ncols_y=8 diverged ~1 ULP from ncols_y∈{1,2,4} — breaking np1≡np8
+        // for the force-MMVQ decode carve-out (verified: test-mmvq-cross-ncols
+        // + the NP=8 NPC FAIL). Pinning 4 makes the reduction ncols-independent;
+        // mirrors the force_rpcb1 pin above (same documented hazard).
+        nwarps = 4;
     } else if (args.ne2 < 2 && ggml_cuda_info().devices[id].cc < CC_RDNA2) {
-        nwarps = args.ncols_y <= 4 ? 4 : 2;
+        nwarps = 4;
     }
     switch (nwarps) {
         case 1:
