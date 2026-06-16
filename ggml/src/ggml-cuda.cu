@@ -1714,7 +1714,13 @@ static void ggml_cuda_op_mul_mat_cublas(
     // algo isn't supported for the requested compute/data type combination.
     // The accompanying env knob still controls the pinned-HMMA replacement
     // path; this algo pin is independent and always-on.
-    static const cublasGemmAlgo_t s_cublas_algo = CUBLAS_GEMM_ALGO0_TENSOR_OP;
+    // perf/256k: LLAMA_CUBLAS_FAST_ALGO=1 abandons the determinism pin and lets
+    // cuBLAS heuristically pick the shape-optimal algo (ALGO0 forfeits all
+    // per-shape tuning → GEMM ~30x below TC peak; measured 2026-06-16).
+    static const cublasGemmAlgo_t s_cublas_algo = []() {
+        const char * e = std::getenv("LLAMA_CUBLAS_FAST_ALGO");
+        return (e && e[0] == '1') ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_ALGO0_TENSOR_OP;
+    }();
     static const bool s_force_sid_cublas = []() {
         const char * e = std::getenv("LLAMA_FATTN_SHAPE_INVARIANT_DISPATCH");
         return e && e[0] == '1' && e[1] == '\0';
@@ -2434,7 +2440,10 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     // Determinism: same algo pin as ggml_cuda_op_mul_mat_cublas above —
     // ALGO0_TENSOR_OP unconditional to defeat the batch-shape-adaptive
     // algo selection that breaks NPC at NP cluster boundaries.
-    static const cublasGemmAlgo_t s_cublas_algo_b = CUBLAS_GEMM_ALGO0_TENSOR_OP;
+    static const cublasGemmAlgo_t s_cublas_algo_b = []() {
+        const char * e = std::getenv("LLAMA_CUBLAS_FAST_ALGO");
+        return (e && e[0] == '1') ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_ALGO0_TENSOR_OP;
+    }();
 
     GGML_ASSERT(!ggml_is_transposed(src0));
     GGML_ASSERT(!ggml_is_transposed(src1));
@@ -5021,7 +5030,35 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
 
                 if (ggml_is_noop(node)) continue;
 
+                // GGML_OP_PROFILE=1 — per-op-type GPU wall-time attribution
+                // (WSL2 has no nsys/CUPTI). Syncs around each op, so it is a
+                // diagnostic-only path; do not leave enabled in production.
+                static const bool s_op_profile = std::getenv("GGML_OP_PROFILE") != nullptr;
+                struct CudaOpProf {
+                    std::map<std::string,double> us; std::map<std::string,long> cnt;
+                    ~CudaOpProf() {
+                        if (us.empty()) return;
+                        std::vector<std::pair<std::string,double>> v(us.begin(), us.end());
+                        std::sort(v.begin(), v.end(), [](auto&a, auto&b){ return a.second > b.second; });
+                        double tot = 0; for (auto&p : v) tot += p.second;
+                        fprintf(stderr, "\n=== GGML_OP_PROFILE (GPU wall) ===\n");
+                        for (auto&p : v) fprintf(stderr, "  %-34s %12.1f ms  %6.1f%%  n=%ld\n",
+                            p.first.c_str(), p.second/1000.0, 100.0*p.second/tot, cnt[p.first]);
+                        fprintf(stderr, "  %-34s %12.1f ms\n", "TOTAL", tot/1000.0);
+                    }
+                };
+                static CudaOpProf s_prof;
+                int64_t s_prof_t0 = 0;
+                if (s_op_profile) { cudaStreamSynchronize(cuda_ctx->stream()); s_prof_t0 = ggml_time_us(); }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, cgraph, i);
+
+                if (s_op_profile) {
+                    cudaStreamSynchronize(cuda_ctx->stream());
+                    const char * nm = ggml_op_name(node->op);
+                    s_prof.us[nm] += (double)(ggml_time_us() - s_prof_t0);
+                    s_prof.cnt[nm] += 1;
+                }
                 if (g_cuda_pool_alloc_failed) {
                     // Recoverable pool OOM: a kernel-launch path
                     // returned early because pool->alloc returned
