@@ -151,6 +151,14 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
                 const int q_nib    = (blk->qs[byte_idx] >> (shift*4)) & 0xF;
                 partial += __half2float(blk->d) * (float)(q_nib - 8) * Q_reg[i];
             }
+        } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+            const block_q8_0 * K_row = (const block_q8_0 *)(K_base + (size_t)off*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const block_q8_0 * blk = K_row + d / K_qk;
+                partial += __half2float(blk->d) * (float)blk->qs[d % K_qk] * Q_reg[i];
+            }
         } else {
             const half * K_row = (const half *)(K_base + (size_t)off*nb11);
             #pragma unroll
@@ -173,6 +181,14 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
                 const int shift    = blk_off / (K_qk/2);
                 const int q_nib    = (blk->qs[byte_idx] >> (shift*4)) & 0xF;
                 VKQ[i] += phi * __half2float(blk->d) * (float)(q_nib - 8);
+            }
+        } else if constexpr (type_V == GGML_TYPE_Q8_0) {
+            const block_q8_0 * V_row = (const block_q8_0 *)(V_base + (size_t)off*nb21);
+            #pragma unroll
+            for (int i = 0; i < V_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const block_q8_0 * blk = V_row + d / K_qk;
+                VKQ[i] += phi * __half2float(blk->d) * (float)blk->qs[d % K_qk];
             }
         } else {
             const half * V_row = (const half *)(V_base + (size_t)off*nb21);
@@ -233,6 +249,25 @@ static __global__ void flash_attn_per_slot_kv_split_partial(
                 partial_b += __half2float(blk_b->d) * (float)(q_nib_b - 8) * Q_reg[i];
                 partial_c += __half2float(blk_c->d) * (float)(q_nib_c - 8) * Q_reg[i];
                 partial_d += __half2float(blk_d->d) * (float)(q_nib_d - 8) * Q_reg[i];
+            }
+        } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+            const block_q8_0 * K_row_a = (const block_q8_0 *)(K_base + (size_t)(off  )*nb11);
+            const block_q8_0 * K_row_b = (const block_q8_0 *)(K_base + (size_t)(off+1)*nb11);
+            const block_q8_0 * K_row_c = (const block_q8_0 *)(K_base + (size_t)(off+2)*nb11);
+            const block_q8_0 * K_row_d = (const block_q8_0 *)(K_base + (size_t)(off+3)*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d       = lane + i*WARP_SIZE;
+                const int blk_idx = d / K_qk;
+                const int blk_off = d % K_qk;
+                const block_q8_0 * blk_a = K_row_a + blk_idx;
+                const block_q8_0 * blk_b = K_row_b + blk_idx;
+                const block_q8_0 * blk_c = K_row_c + blk_idx;
+                const block_q8_0 * blk_d = K_row_d + blk_idx;
+                partial_a += __half2float(blk_a->d) * (float)blk_a->qs[blk_off] * Q_reg[i];
+                partial_b += __half2float(blk_b->d) * (float)blk_b->qs[blk_off] * Q_reg[i];
+                partial_c += __half2float(blk_c->d) * (float)blk_c->qs[blk_off] * Q_reg[i];
+                partial_d += __half2float(blk_d->d) * (float)blk_d->qs[blk_off] * Q_reg[i];
             }
         } else {
             const half * K_row_a = (const half *)(K_base + (size_t)(off  )*nb11);
@@ -376,7 +411,7 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
     GGML_ASSERT(block_table && block_table->type == GGML_TYPE_I32);
     GGML_ASSERT(Q->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16);
     GGML_ASSERT(K->type == V->type);
-    GGML_ASSERT(K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16);
+    GGML_ASSERT(K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_F16);
 
     float scale, max_bias, softcap;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -437,6 +472,8 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
     };
     if (K->type == GGML_TYPE_Q4_0) {
         launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>);
+    } else if (K->type == GGML_TYPE_Q8_0) {
+        launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>);
     } else {
         launch(flash_attn_per_slot_kv_split_partial<256, 256, GGML_TYPE_F16, GGML_TYPE_F16>);
     }

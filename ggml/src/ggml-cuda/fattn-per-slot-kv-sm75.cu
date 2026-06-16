@@ -2478,7 +2478,7 @@ void ggml_cuda_flash_attn_ext_per_slot_kv_sm75(
         static const bool s_singlewarp_rollback = std::getenv("GGML_FATTN_SINGLEWARP") != nullptr;
         const ggml_tensor * block_table = dst->src[6];
         if (!s_singlewarp_rollback && Q->ne[1] == 1 && block_table && block_table->data &&
-            (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) && K->type == V->type) {
+            (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_F16) && K->type == V->type) {
             extern void ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(
                     ggml_backend_cuda_context & ctx, ggml_tensor * dst);
             ggml_cuda_flash_attn_ext_per_slot_kv_split_sm75(ctx, dst);

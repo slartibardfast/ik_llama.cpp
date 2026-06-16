@@ -243,6 +243,25 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 partial_c += k_val_c * Q_reg[i];
                 partial_d += k_val_d * Q_reg[i];
             }
+        } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+            const block_q8_0 * K_row_a = (const block_q8_0 *)(K_chunk_base + (k_in_chunk_off  )*nb11);
+            const block_q8_0 * K_row_b = (const block_q8_0 *)(K_chunk_base + (k_in_chunk_off+1)*nb11);
+            const block_q8_0 * K_row_c = (const block_q8_0 *)(K_chunk_base + (k_in_chunk_off+2)*nb11);
+            const block_q8_0 * K_row_d = (const block_q8_0 *)(K_chunk_base + (k_in_chunk_off+3)*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const int blk_idx  = d / K_qk;   // K_qk = 32 = QK8_0
+                const int blk_off  = d % K_qk;
+                const block_q8_0 * blk_a = K_row_a + blk_idx;
+                const block_q8_0 * blk_b = K_row_b + blk_idx;
+                const block_q8_0 * blk_c = K_row_c + blk_idx;
+                const block_q8_0 * blk_d = K_row_d + blk_idx;
+                partial_a += __half2float(blk_a->d) * (float)blk_a->qs[blk_off] * Q_reg[i];
+                partial_b += __half2float(blk_b->d) * (float)blk_b->qs[blk_off] * Q_reg[i];
+                partial_c += __half2float(blk_c->d) * (float)blk_c->qs[blk_off] * Q_reg[i];
+                partial_d += __half2float(blk_d->d) * (float)blk_d->qs[blk_off] * Q_reg[i];
+            }
         } else {
             const half * K_row_a = (const half *)(K_chunk_base + (k_in_chunk_off  )*nb11);
             const half * K_row_b = (const half *)(K_chunk_base + (k_in_chunk_off+1)*nb11);
@@ -304,6 +323,16 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                     const float v_val  = d_scale * (float)(q_nib - 8);
                     VKQ[i] += phi * v_val;
                 }
+            } else if constexpr (type_V == GGML_TYPE_Q8_0) {
+                const block_q8_0 * V_row = (const block_q8_0 *)(V_chunk_base + v_off_s*nb21);
+                #pragma unroll
+                for (int i = 0; i < V_PER_THREAD; ++i) {
+                    const int d        = lane + i*WARP_SIZE;
+                    const int blk_idx  = d / K_qk;
+                    const int blk_off  = d % K_qk;
+                    const block_q8_0 * blk = V_row + blk_idx;
+                    VKQ[i] += phi * __half2float(blk->d) * (float)blk->qs[blk_off];
+                }
             } else {
                 const half * V_row = (const half *)(V_chunk_base + v_off_s*nb21);
                 #pragma unroll
@@ -347,6 +376,16 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 const int q_nib    = (blk->qs[byte_idx] >> (shift*4)) & 0xF;
                 partial += d_scale * (float)(q_nib - 8) * Q_reg[i];
             }
+        } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+            const block_q8_0 * K_row = (const block_q8_0 *)(K_tail_base + k_tail_off*nb11);
+            #pragma unroll
+            for (int i = 0; i < Q_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const int blk_idx  = d / K_qk;
+                const int blk_off  = d % K_qk;
+                const block_q8_0 * blk = K_row + blk_idx;
+                partial += __half2float(blk->d) * (float)blk->qs[blk_off] * Q_reg[i];
+            }
         } else {
             const half * K_row = (const half *)(K_tail_base + k_tail_off*nb11);
             #pragma unroll
@@ -378,6 +417,16 @@ static __global__ void flash_attn_per_slot_kv_singlewarp_kernel(
                 const int shift    = blk_off / (K_qk/2);
                 const int q_nib    = (blk->qs[byte_idx] >> (shift*4)) & 0xF;
                 VKQ[i] += phi * d_scale * (float)(q_nib - 8);
+            }
+        } else if constexpr (type_V == GGML_TYPE_Q8_0) {
+            const block_q8_0 * V_row = (const block_q8_0 *)(V_tail_base + k_tail_off*nb21);
+            #pragma unroll
+            for (int i = 0; i < V_PER_THREAD; ++i) {
+                const int d        = lane + i*WARP_SIZE;
+                const int blk_idx  = d / K_qk;
+                const int blk_off  = d % K_qk;
+                const block_q8_0 * blk = V_row + blk_idx;
+                VKQ[i] += phi * __half2float(blk->d) * (float)blk->qs[blk_off];
             }
         } else {
             const half * V_row = (const half *)(V_tail_base + k_tail_off*nb21);
@@ -440,8 +489,8 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(mask->type == GGML_TYPE_F16);
     GGML_ASSERT(K->type == V->type && "K and V must have same dtype");
-    GGML_ASSERT((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_F16) &&
-                "FIX-C v5 singlewarp supports Q4_0 (production) or F16 (test) KV cache");
+    GGML_ASSERT((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_F16) &&
+                "FIX-C v5 singlewarp supports Q4_0 (production), Q8_0 or F16 (test) KV cache");
     GGML_ASSERT(!per_row_k_bound || per_row_k_bound->type == GGML_TYPE_I32);
     GGML_ASSERT(!block_table || block_table->type == GGML_TYPE_I32);
 
@@ -499,6 +548,8 @@ extern "C" void ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75(
     };
     if (K->type == GGML_TYPE_Q4_0) {
         launch_kernel(flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>);
+    } else if (K->type == GGML_TYPE_Q8_0) {
+        launch_kernel(flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>);
     } else { // GGML_TYPE_F16
         launch_kernel(flash_attn_per_slot_kv_singlewarp_kernel<256, 256, GGML_TYPE_F16, GGML_TYPE_F16>);
     }
