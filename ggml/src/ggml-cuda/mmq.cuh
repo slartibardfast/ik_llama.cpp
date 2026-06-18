@@ -4959,7 +4959,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // NP-invariance. Disabled by default for determinism. Opt-in via
     // GGML_CUDA_MMQ_ENABLE_STREAM_K=1 if a non-determinism-critical workload
     // needs the perf back.
+#ifdef _WIN32
+    // plan/0133: the fork's batch-invariant split-K MMQ path miscompiles under
+    // MSVC+nvcc (q4_0 decode -> catastrophic garbage). The upstream stream-K
+    // path is correct under MSVC, so default to it on Windows. NP-invariance is
+    // not required for the single-context Windows bring-up. Opt back into the
+    // split-K path with GGML_CUDA_MMQ_DISABLE_STREAM_K=1.
+    static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K") == nullptr;
+#else
     static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
+#endif
     const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
 
     // Split-K MMQ — NPC-by-construction K-dim split with a uniform
@@ -5178,7 +5187,16 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_y = get_mmq_y_host(cc);
     const int block_num_y = (args.ne01 + mmq_y - 1) / mmq_y;
     // See launch_mul_mat_q above — stream_K disabled by default for NP-invariance.
+#ifdef _WIN32
+    // plan/0133: the fork's batch-invariant split-K MMQ path miscompiles under
+    // MSVC+nvcc (q4_0 decode -> catastrophic garbage). The upstream stream-K
+    // path is correct under MSVC, so default to it on Windows. NP-invariance is
+    // not required for the single-context Windows bring-up. Opt back into the
+    // split-K path with GGML_CUDA_MMQ_DISABLE_STREAM_K=1.
+    static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_DISABLE_STREAM_K") == nullptr;
+#else
     static const bool stream_k_enabled = std::getenv("GGML_CUDA_MMQ_ENABLE_STREAM_K") != nullptr;
+#endif
     const bool use_stream_k = stream_k_enabled && (cc >= CC_VOLTA && cc < CC_OFFSET_AMD);
 
     int mmq_x_best  = 0;
