@@ -149,6 +149,19 @@ endif()
 # build the library
 #
 
+# Enable CUDA as a first-class language at top scope, before any subdirectory
+# accumulates C/CXX compile options. Enabling it deep in ggml/src (after that
+# directory's add_compile_options) left CMAKE_CUDA_COMPILE_OBJECT unset at
+# generate on a from-scratch configure (call/0011, call/0012): no CUDA compile
+# rule reached the targets. Hoisting it here establishes the rule in the top
+# scope; ggml/src keeps find_package(CUDAToolkit) + the arch logic, and its own
+# enable_language(CUDA) is a no-op once already enabled. Scoped to a build that
+# passes an explicit CMAKE_CUDA_ARCHITECTURES (production and the Windows port
+# both do) so the GGML_NATIVE "native"-arch default path is untouched.
+if (GGML_CUDA AND DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_COMPILE_OBJECT)
+    enable_language(CUDA)
+endif()
+
 if (NOT TARGET ggml)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
