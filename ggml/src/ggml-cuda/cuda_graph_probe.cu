@@ -14,7 +14,13 @@
 #include <set>
 #include <sys/stat.h>
 #include <thread>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#define gmtime_r(t, tm) gmtime_s((tm), (t))
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -141,7 +147,9 @@ void ensure_initialized() {
             if (v >= 1) g_flush_sec = v;
         }
 
+#ifndef _WIN32
         std::signal(SIGUSR1, &sigusr1_handler);
+#endif
         g_flusher = std::thread(&flusher_loop);
         g_flusher.detach();
 

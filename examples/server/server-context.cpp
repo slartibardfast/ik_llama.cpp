@@ -11,6 +11,16 @@
 #include "speculative.h"
 #include "mtmd.h"
 
+#ifdef _WIN32
+#include <cstdlib>
+// MSVC has no POSIX setenv; map onto _putenv_s (these call sites all use
+// overwrite=1, so an unconditional set matches the POSIX behaviour).
+static inline int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
+#endif
+
 #include <atomic>
 #include <fstream>
 #include <iostream>

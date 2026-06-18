@@ -38,11 +38,13 @@
 #include <random>
 #include <algorithm>
 #include <src/llama-impl.h>
-#include <dlfcn.h>
 
 // Opt-in nsys profile-range bracketing via SIGUSR1/SIGUSR2.
 // Enabled when env var LLAMA_NSYS_PROFILE_RANGE=1 is set at startup.
-// Uses dlsym(cudart) so there is no link-time dependency.
+// Uses dlsym(cudart) so there is no link-time dependency. POSIX-only — the
+// mechanism is SIGUSR-driven, which Windows does not have.
+#ifndef _WIN32
+#include <dlfcn.h>
 static void (*g_nsys_profiler_start)() = nullptr;
 static void (*g_nsys_profiler_stop)()  = nullptr;
 static void nsys_load_profiler() {
@@ -56,6 +58,7 @@ static void nsys_load_profiler() {
 }
 static void nsys_on_sigusr1(int) { if (g_nsys_profiler_start) g_nsys_profiler_start(); }
 static void nsys_on_sigusr2(int) { if (g_nsys_profiler_stop)  g_nsys_profiler_stop();  }
+#endif
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
 #include <sqlite_modern_cpp.h>
 
@@ -478,12 +481,14 @@ int main(int argc, char ** argv) {
     gpt_params_parse_from_env(params);
 
     // Opt-in nsys profile-range bracketing (SIGUSR1=start, SIGUSR2=stop).
+#ifndef _WIN32
     if (const char * v = std::getenv("LLAMA_NSYS_PROFILE_RANGE"); v && v[0] == '1') {
         nsys_load_profiler();
         signal(SIGUSR1, nsys_on_sigusr1);
         signal(SIGUSR2, nsys_on_sigusr2);
         LOG_INFO("LLAMA_NSYS_PROFILE_RANGE=1 — SIGUSR1=cudaProfilerStart, SIGUSR2=cudaProfilerStop", {});
     }
+#endif
 
     // TODO: not great to use extern vars
     server_log_json = params.log_json;

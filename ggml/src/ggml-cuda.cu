@@ -12,6 +12,20 @@
 #include <chrono>
 #include <set>
 
+#ifdef _WIN32
+#include <cstdlib>
+// MSVC has no POSIX setenv/unsetenv; map onto _putenv_s. setenv preserves the
+// overwrite=0 (don't clobber a caller-supplied value) semantics the determinism
+// path relies on; unsetenv removes the variable (empty value).
+static inline int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
+static inline int unsetenv(const char * name) {
+    return _putenv_s(name, "");
+}
+#endif
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/arange.cuh"

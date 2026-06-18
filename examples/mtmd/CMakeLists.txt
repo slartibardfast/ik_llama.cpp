@@ -26,6 +26,14 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(mtmd PUBLIC  LLAMA_SHARED)
 endif()
 
+if (GGML_CUDA AND WIN32)
+    # clip.cpp forward-declares cudart symbols (cudaMallocHost, cudaGetDevice, ...)
+    # and relies on transitive linkage, which resolves against libggml.so on Linux
+    # but not against ggml.dll's import library on Windows. Link cudart explicitly.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(mtmd PRIVATE CUDA::cudart)
+endif()
+
 set(MTMD_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h

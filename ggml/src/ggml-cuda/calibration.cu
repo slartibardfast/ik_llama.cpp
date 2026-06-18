@@ -14,9 +14,18 @@
 #include <ctime>
 #include <algorithm>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#define gmtime_r(t, tm) gmtime_s((tm), (t))
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#else
 #include <sys/types.h>
 #include <unistd.h>
 #include <pwd.h>
+#endif
 #include <fstream>
 #include <sstream>
 
@@ -183,10 +192,16 @@ std::string ggml_cal_resolve_cache_dir() {
         if (ggml_cal_mkdir_p(p)) return p;
     }
     const char * home = std::getenv("HOME");
+#ifndef _WIN32
     if (!home || !*home) {
         struct passwd * pw = getpwuid(getuid());
         if (pw && pw->pw_dir) home = pw->pw_dir;
     }
+#else
+    if (!home || !*home) {
+        home = std::getenv("USERPROFILE");
+    }
+#endif
     if (home && *home) {
         std::string p = std::string(home) + "/.cache/ggml";
         if (ggml_cal_mkdir_p(p)) return p;
