@@ -2214,7 +2214,26 @@ static void ggml_cuda_op_mul_mat(
     }
 
     const int64_t src1_col_stride = ne11;
+    // plan/0133 box 3: the 3D fast-path below calls ggml_cuda_op_mul_mat_vec_q_3D,
+    // whose kernel reads src1 as standard block_q8_1 (mmvq-templates.cuh casts vy to
+    // const block_q8_1 *). It is only valid when the quantizer wrote block_q8_1.
+    // The batched MMQ dispatch (ggml_cuda_mul_mat, use_mul_mat_q branch) passes
+    // quantize_mmq_q8_1_cuda, which writes block_q8_1_mmq (d/s packed front, qs
+    // contiguous — not binary-compatible with 4x block_q8_1). Feeding that to the
+    // MMVQ reader corrupts the dot product (q4_0 bs=[10,1] -> NaN at idx 0).
+    //
+    // This is a cross-platform layout mismatch (latent on Linux: production q4_0
+    // weights are 2D, ne02==1, so the 3D condition never holds). Scoped to Windows
+    // here to match plan/0133's Windows milestone and leave the deployed Linux line
+    // byte-identical; the shared fix is tracked in plan/0133. On Windows, skip the
+    // fast-path for the MMQ quantizer and fall through to the per-batch MMQ loop,
+    // whose kernel reads block_q8_1_mmq correctly.
+#ifdef _WIN32
+    if (quantization_done && ne11 == 1 && ne12 > 1 && ne13 == 1 && ne02 == ne12 && ne02 == dst->ne[2]
+            && quantize_src1 != quantize_mmq_q8_1_cuda) {
+#else
     if (quantization_done && ne11 == 1 && ne12 > 1 && ne13 == 1 && ne02 == ne12 && ne02 == dst->ne[2]) {
+#endif
         //printf("invoking fast path for %s x %s\n", src0->name, src1->name);
         int id = ctx.device;
         char  *  src0_dd_i =  dev[id].src0_dd;
