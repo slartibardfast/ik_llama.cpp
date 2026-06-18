@@ -1220,3 +1220,7 @@ target_include_directories(test-capture-loader-smoke PRIVATE audit)
 target_compile_features(test-capture-loader-smoke PRIVATE cxx_std_17)
 
 
+
+# local diagnostic only (plan/0132 box 2 — Windows CUDA op-correctness localization)
+add_executable(test-backend-ops test-backend-ops.cpp)
+target_link_libraries(test-backend-ops PRIVATE common)
