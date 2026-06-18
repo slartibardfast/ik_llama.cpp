@@ -2508,6 +2508,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         //     capture failure
         // Cross-stream join + fan-in handled by
         // ggml_cuda_outer_capture_begin / _end_and_launch in ggml-cuda.
+        // Declared outside the CUDA guard: the non-CUDA build also reads this
+        // below (the event-record skip), where with no capture it stays false.
+        bool capture_active = false;
 #ifdef GGML_USE_CUDA
         // PHASE_CUDA_NATIVE_DISPATCH C6: hoist leading CPU splits out of
         // outer capture. PD3 confirmed production has no mid-dispatch
@@ -2620,7 +2623,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         //                 forbids it). Record the key as seen.
         //   second+     → capture (allocators already grown; the captured
         //                 region allocates nothing).
-        bool                     capture_active     = false;
         bool                     cache_hit          = false;
         bool                     will_capture       = false;
         ggml_cuda_graph_exec_t   cached_exec        = nullptr;

@@ -36,6 +36,14 @@
 #pragma warning(disable: 4244 4267)
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC (cl.exe) has no __builtin_prefetch (a hint only) and ignores the GCC
+// unroll pragmas; map the builtin to a no-op and silence the unknown-pragma
+// warning so the quant kernels build under cl.exe. clang-cl keeps its own.
+#pragma warning(disable: 4068)
+#define __builtin_prefetch(addr, ...) ((void)0)
+#endif
+
 #define UNUSED GGML_UNUSED
 
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
