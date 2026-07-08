@@ -1,0 +1,20 @@
+# Obligations for cb_eval_residual_capture.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.SchedulerInstance => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.GraphSplit => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ExtractConfig => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.TapNode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ResidualBuffer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DecodeCall => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.CaptureMechanism => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.ResidualDtype => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_extract_layers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_seq_per_decode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ResidualExtract.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SchedulerFastPath.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.GraphTapEmission.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ResidualExtractObservationallyEquivalent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CaptureMechanismIsTapNode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CbEvalResidualCaptureSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateCbEvalResidualCaptureSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

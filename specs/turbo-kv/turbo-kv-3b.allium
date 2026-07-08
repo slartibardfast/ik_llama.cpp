@@ -1,0 +1,330 @@
+-- allium: 3
+-- turbo-kv-3b.allium
+
+-- Scope: TurboQuant 3-bit KV cache quantisation — the paper's
+-- 3-bit variant plus the same Variant F adaptations that
+-- turbo-kv-4b.allium describes for 4-bit.
+--
+-- Citable sources (use throughout this file):
+--
+--   [PAPER]       Zandieh, Daliri, Hadian, Mirrokni. "TurboQuant:
+--                 Online Vector Quantization with Near-optimal
+--                 Distortion Rate." ICLR 2026. arxiv 2504.19874.
+--                 The paper's bit-width parameter b is variable;
+--                 3-bit appears in compression tables. The paper
+--                 validates at d=1536, 3072 (OpenAI3 embeddings);
+--                 not at LLM KV head_dim. Google Research's
+--                 public summary of the paper
+--                 (research.google/blog/turboquant-redefining-ai-
+--                 efficiency-with-extreme-compression) states
+--                 "TurboQuant proved it can quantize the key-value
+--                 cache to just 3 bits without requiring training
+--                 or fine-tuning and causing any compromise in
+--                 model accuracy."
+--
+--   [QUANT.CPP]   quantumaikr/quant.cpp (Apache-2.0). The
+--                 3-bit Variant F layout in include/turboquant/
+--                 tq_types.h is:
+--                   norm(2) + residual_norm(2) + inv_std(2) +
+--                   _pad(2) + mse_3bit(48) = 56 bytes
+--                 with 3-bit (8-level) Lloyd-Max Gaussian codebook
+--                 and max_abs rescaling. No QJL.
+--                 Note: the TQ_TYPE_TURBO_KV_3B enum comment in
+--                 tq_types.h still reads "2-bit codebook + 1-bit
+--                 QJL" — that is pre-Variant-F documentation.
+--                 Current implementation (per the turbo_kv_3b
+--                 struct comment and the ref code at
+--                 src/core/tq_turbo_kv.c:189-231) is 3-bit
+--                 Lloyd-Max codebook only.
+--
+--   [TONBI-V3]    tonbistudio/turboquant-pytorch compressors_v3.py.
+--                 3-bit measured as problematic: "3-bit keys,
+--                 generation is broken" (README, 4K context
+--                 needle-in-haystack test with K3/V4 configuration).
+--                 This is an important caveat — 3-bit KEYS alone
+--                 may not be production-quality for LLM
+--                 attention, independent of the paper's embedding-
+--                 dimension claims.
+--
+-- Goal: SOTA 3-bit quantisation for LLM KV cache. Sibling
+-- improvement specs (turbo_kv_residual_window, turbo_kv_asymmetric,
+-- turbo_kv_layer_adaptive, turbo_kv_outliers) compose on top of
+-- this core. The [TONBI-V3] evidence that 3-bit keys alone are
+-- inadequate is one of the motivations for the asymmetric sibling
+-- spec — a K4+V3 or K3+V2 configuration could be more practical
+-- than symmetric K=V=3.
+--
+-- Includes: head quantise / dequantise, RHT forward / inverse,
+-- L2_norm, normalize, rescale, nearest_centroid, reconstruct_codebook.
+-- Excludes: SIMD / backend (sister specs), 4-bit variant
+-- (turbo-kv-4b.allium), the improvement layers (their own files).
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+entity Tensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+actor TensorSupplier {
+    identified_by: Tensor
+}
+
+-- ============================================================
+-- Value types
+-- ============================================================
+
+entity QuantizedHead {
+    norm: Decimal
+    inv_std: Decimal       -- [QUANT.CPP] Variant F field; paper has none
+    indices: Set<Integer>
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    head_dim: Integer = 128
+
+    bits: Integer = 3
+
+    -- [PAPER] §3 prescribes 2^b centroids. 8 for 3-bit.
+    codebook_size: Integer = 8
+
+    seed: Integer = 305419896
+
+    -- Wider tolerance than 4-bit: the 3-bit codebook has half as
+    -- many levels, so per-element quantisation error is roughly
+    -- 2× higher. [QUANT.CPP] observed ~0.15 rel_err on Qwen3.5 KV
+    -- activations.
+    reconstruction_rel_error: Decimal = 0.15
+
+    -- [QUANT.CPP] Variant F 3-bit codebook maximum centroid value.
+    -- Lloyd-Max Gaussian centroids for 3-bit:
+    --   {-2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560,
+    --    1.3440, 2.1520}
+    -- See quant.cpp/src/core/tq_turbo_kv.c:222
+    -- (CENT_3BIT_MAX = 2.1520f).
+    cent_max: Decimal = 2.1520
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+open question "3-bit key viability for LLM attention: tonbistudio V3 measurements show 3-bit keys produce broken generation even with a residual window at 4K context. Paper's '3 bits with no accuracy compromise' claim is for generic vector quantisation (d=1536+), not LLM KV heads. Spec allows the configuration; deployers should prefer asymmetric K≥4, V≤3 where memory permits (see turbo_kv_asymmetric.allium)."
+
+open question "QJL residual: same status as turbo-kv-4b.allium — paper prescribes it, both quant.cpp Variant F and tonbistudio V3 drop it based on independent ablations. Spec follows community consensus."
+
+open question "Rotation granularity: same as turbo-kv-4b.allium — paper uses full d×d per-head, quant.cpp Variant F uses fixed 128-element sub-blocks. Our port inherits Variant F."
+
+open question "Codebook parameterisation: same as turbo-kv-4b.allium — paper uses [-1,1] centroids; quant.cpp Variant F uses Gaussian(0,1) centroids + max_abs rescale. Different Lloyd-Max parameterisations of the same distribution."
+
+-- ============================================================
+-- Algorithm-level rules
+-- ============================================================
+
+rule L2_norm {
+    when: L2_norm(data)
+
+    let norm_sq = sum_of_squares(data)
+    let result = sqrt(norm_sq)
+
+    ensures: result >= 0.0
+}
+
+rule normalize {
+    when: normalize(data, norm)
+
+    requires: norm > 0.0
+
+    let inv_norm = 1.0 / norm
+    let result = scaled(data, inv_norm)
+
+    ensures: L2_norm(result) = 1.0
+}
+
+rule rescale {
+    when: rescale(data, norm)
+
+    requires: norm >= 0.0
+
+    let result = scaled(data, norm)
+
+    ensures: L2_norm(result) = L2_norm(data) * norm
+}
+
+rule RHT_forward {
+    when: RHT_forward(data, n, seed)
+
+    requires: n > 0
+
+    let n2 = floor_pow2(n)
+    let with_signs = apply_sign_flip(data, n2, seed)
+    let hadamarded = walsh_hadamard_transform(with_signs, n2)
+    let result = scale(hadamarded, 1.0 / sqrt(n2), n2)
+
+    ensures: result.length = n
+}
+
+rule RHT_inverse {
+    when: RHT_inverse(data, n, seed)
+
+    requires: n > 0
+
+    let n2 = floor_pow2(n)
+    let scaled_data = scale(data, 1.0 / sqrt(n2), n2)
+    let hadamarded = walsh_hadamard_transform(scaled_data, n2)
+    let result = apply_sign_flip(hadamarded, n2, seed)
+
+    ensures: result.length = n
+}
+
+rule nearest_centroid {
+    when: nearest_centroid(rotated_data, inv_std, codebook_entries)
+
+    requires: codebook_entries.count > 0
+
+    let scaled_data = scaled_vector(rotated_data, inv_std)
+    let result = find_nearest(scaled_data, codebook_entries)
+
+    ensures: result.count = rotated_data.count
+}
+
+rule reconstruct_codebook {
+    when: reconstruct_codebook(block, codebook_entries)
+
+    requires: codebook_entries.count > 0
+    requires: block.indices.count > 0
+    requires: block.inv_std > 0.0
+
+    let scale = 1.0 / block.inv_std
+    let lut = scaled_codebook(codebook_entries, scale)
+    let result = lookup_indices(block.indices, lut, block.indices.count)
+
+    ensures: result.count = block.indices.count
+}
+
+-- ============================================================
+-- Composite rules
+-- ============================================================
+
+rule QuantizeHead {
+    when: QuantizeHead(tensor, seed)
+
+    requires: tensor.count = config.head_dim
+    requires: L2_norm(tensor.data) > 0.0
+
+    let norm = L2_norm(tensor.data)
+    let normalized = normalize(tensor.data, norm)
+    let rotated = RHT_forward(normalized, config.head_dim, config.seed)
+    let max_val = max_abs(rotated)
+    let inv_std = config.cent_max / max_val
+    let indices = nearest_centroid(rotated, inv_std, turbo_kv_3b_codebook)
+
+    ensures: QuantizedHead.created(
+        norm: norm,
+        inv_std: inv_std,
+        indices: indices
+    )
+}
+
+rule DequantizeHead {
+    when: DequantizeHead(block)
+
+    requires: block.inv_std > 0.0
+    requires: block.indices.count = config.head_dim
+
+    let codebook_values = reconstruct_codebook(block, turbo_kv_3b_codebook)
+    let dequant_rotated = RHT_inverse(codebook_values, config.head_dim, config.seed)
+    let reconstructed = rescale(dequant_rotated, block.norm)
+
+    ensures: Tensor.created(
+        data: reconstructed,
+        count: config.head_dim
+    )
+}
+
+rule VectorDot {
+    when: VectorDot(query, block)
+
+    requires: query.count = config.head_dim
+
+    let q_rotated = RHT_forward(query.data, config.head_dim, config.seed)
+    let k_codebook = reconstruct_codebook(block, turbo_kv_3b_codebook)
+    let dot_result = dot_product(q_rotated, k_codebook) * block.norm
+
+    ensures: result = dot_result
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+invariant ReconstructionPreservesNorm {
+    for block in QuantizedHeads:
+        let reconstructed = DequantizeHead(block)
+        abs(L2_norm(reconstructed.data) - block.norm) <= block.norm * config.reconstruction_rel_error
+}
+
+invariant RHTOrthogonality {
+    for a in Tensors:
+        for b in Tensors:
+            let a_rot = RHT_forward(a.data, a.count, config.seed)
+            let b_rot = RHT_forward(b.data, b.count, config.seed)
+            dot_product(a_rot, b_rot) = dot_product(a.data, b.data)
+}
+
+invariant RHTIsSelfInverse {
+    for v in Tensors:
+        let rotated = RHT_forward(v.data, v.count, config.seed)
+        let restored = RHT_inverse(rotated, v.count, config.seed)
+        restored = v.data
+}
+
+invariant NearestCentroidMinimizesError {
+    for x in ScaledValues:
+        for cb in Codebooks:
+            let best = find_nearest(x, cb.entries)
+            for other in cb.entries:
+                abs(x - best) <= abs(x - other)
+}
+
+invariant DeterministicSeed {
+    config.seed = 305419896
+}
+
+invariant HeadDimIsPowerOfTwo {
+    is_power_of_two(config.head_dim) and config.head_dim > 0
+}
+
+invariant IndicesInBounds {
+    for block in QuantizedHeads:
+        for idx in block.indices:
+            idx >= 0 and idx < config.codebook_size
+}
+
+invariant CodebookSizeMatchesBits {
+    config.codebook_size = 8 and config.bits = 3
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Same black-box helpers as turbo-kv-4b.allium.
+-- C reference: llama.cpp/ggml/src/ggml-turbo-kv.c (the generic
+-- quantize_block_turbo / dequantize_block_turbo paths with
+-- bits=3), inherited from quantumaikr/quant.cpp's Variant F.
+--
+-- Per-type wire layout from [QUANT.CPP]:
+--   block_tq_turbo_kv_3b = 56 bytes (norm 2 + pad 2 + inv_std 2
+--   + pad 2 + mse_3bit 48 for 128 indices at 3 bits each).
+--
+-- The sibling improvement specs (residual window, asymmetric,
+-- layer-adaptive, outliers) compose on top of this core exactly
+-- as they do for the 4-bit variant — see turbo-kv-4b.allium's
+-- pointer list.

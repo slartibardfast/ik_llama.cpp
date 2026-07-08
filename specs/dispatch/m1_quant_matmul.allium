@@ -1,0 +1,589 @@
+-- allium: 3
+-- specs/dispatch/m1_quant_matmul.allium
+
+-- Scope: a FORWARD-LOOKING design contract for an as-yet-unwritten CUDA
+-- SMALL-BATCH (ne11 <= K, decode-family) quantized matrix-multiply
+-- replacement kernel ("the M1 kernel") on sm_75 / TU102, for Q4_0 and
+-- Q4_0_AR16 weights. The kernel does NOT exist yet; this spec states the
+-- obligations the implementation MUST satisfy before it can ship.
+-- Invariants here are obligations, not empirically-established facts —
+-- the same framing as the "Stage 2 design implication" notes in
+-- specs/deltanet/batch-invariance.allium.
+--
+-- STATUS (2026-06-14, PHASE_LM_DECODE_CAPTURE D1). Two np-safe decode
+-- matmul kernels now exist; path B ships, M1 is the fallback:
+--   - PATH B (SHIPPING decode path): GGML_CUDA_DECODE_MMVQ — reuse the
+--     existing MMVQ GEMV at decode (default-off pending deploy). After the
+--     nwarps=4 fix (mmvq-templates.cuh:460) MMVQ is SELF-BATCH-INVARIANT
+--     (byte-identical across ncols 1..8); combined with path B it gives
+--     np <= 4 token-level determinism (batch-invariance.allium
+--     TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity and
+--     MmvqSelfBatchInvariantAfterNwarps4). Path B's correctness contract
+--     is MMVQ self-batch-invariance, which lives in batch-invariance.allium
+--     — NOT restated here.
+--   - PATH A / M1 (RETAINED np-safe FALLBACK): GGML_CUDA_M1_GEMV — the
+--     byte-identical-to-MMQ read-once GEMV this spec certifies (default-off).
+--     M1 was measured SLOWER than path B and is kept as the np-safe
+--     fallback, not the shipping decode path. The M1 obligations below
+--     remain VALID for the fallback and are unchanged; only this status
+--     note is added to record that path B, not M1, is what ships.
+--
+-- "M1" NAMING: "M1" denotes the small-batch carve-out — the read-once
+-- GEMV that handles ne11 in [1, K] (K = config.max_carveout_batch). K = 1
+-- is the original batch-1 case (one decode token, single slot, no
+-- speculation); the name is historical and MUST NOT be misread as
+-- batch-1-only. The kernel is naturally multi-column (the existing mmvq
+-- GEMV already handles up to MMVQ_MAX_BATCH_SIZE columns), so the same
+-- kernel covers the whole ne11 in [1, K] family in one launch.
+--
+-- WHY this is a family, not a point (perf motivation): at single-slot,
+-- non-speculative decode the token count is ne11 == 1. But two roadmap
+-- goals produce decode batches of M = 2..K:
+--   - multi-slot serving (--parallel N > 1, concurrent sessions): the
+--     decode batch = number of active slots, so M scales with concurrency.
+--   - speculative decoding (MTP draft-K): a draft of K tokens verified in
+--     one forward pass makes the decode batch K + 1.
+-- All of these hit the SAME mmq_x = 8 N-tile waste. The dispatcher at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:2801 deliberately forces quantized
+-- matmuls through the MMQ split-K GEMM path and suppresses mul_mat_vec_q
+-- "regardless of batch size" by calling ggml_cuda_should_use_mmq(...,
+-- ne11=16) — a hardcoded 16 that bypasses the small-ne11 size cutoff for
+-- shape-pinned determinism. At ne11 <= 8 the MMQ picker selects mmq_x = 8
+-- (see batch-invariance.allium invariant DispatcherTemplateUniformity_MMQ),
+-- so at ne11 = M < 8 the kernel computes an 8-wide N-tile with (8 - M)/8 of
+-- the int8 tensor-core work spent on padding columns. The M1 kernel
+-- computes ONLY the M real columns (reads each Q4_0 weight once, no N-tile
+-- waste) for a decode speedup — WITHOUT changing numerics.
+--
+-- K IS A PERF-TUNING THRESHOLD, NOT A CORRECTNESS BOUND. K
+-- (config.max_carveout_batch) is the crossover point where MMQ's amortised
+-- per-call overhead catches up with the read-once GEMV; above K, MMQ's full
+-- N-tile is genuinely well-utilised and wins. K is set empirically by a
+-- multi-slot A/B. CORRECTNESS (FaithfulByteIdentity and the obligations
+-- below) holds for ANY K — every value the kernel computes is byte-identical
+-- to MMQ's corresponding column regardless of where the threshold sits.
+-- Initial / conservative value is K = 1 (the original batch-1 carve-out),
+-- raised once the multi-slot A/B locates the crossover.
+--
+-- THE HARD CONSTRAINT is already named in batch-invariance.allium,
+-- invariant MMQ_FaithfulPropagation (CLOSED 2026-05-14): "if MMQ is
+-- replaced for perf reasons (per the SoTA-sm_75 mandate), the
+-- replacement must preserve byte-identity propagation" — byte-identical
+-- slot output given byte-identical input. That is what preserves
+-- batch-invariance.allium invariant TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity
+-- (np1 == np2 == np4 token-level greedy argmax) and its multi-slot extension
+-- (np1 == np2 == ... == npK): MMQ is batch-invariant (MMQ_FaithfulPropagation
+-- ⇒ a token's column-k output is independent of how many other columns
+-- share its batch), so if M1's column-k equals MMQ's column-k for EVERY
+-- column k < ne11 it computes, then a token decoded at M = 1 or inside an
+-- M = 4 batch gets identical bits. This spec discharges
+-- MMQ_FaithfulPropagation for the whole ne11 <= K family via the
+-- per-real-column FaithfulByteIdentity below.
+--
+-- Hardware envelope (inherited from batch-invariance.allium):
+--   - 2x Quadro RTX 6000 (sm_75 / TU102), 24 GiB each, NVLINK
+--   - int8_mma_available = true; new_mma_available = false
+--
+-- Includes:
+--   - The dispatch rule that routes ne11 <= K quantized matmuls to M1.
+--   - ScoreCorrectness — the dequantize-then-dot semantic (per real
+--     column), inheriting q4_0_ar16.allium's accumulator-precision
+--     tolerance config.
+--   - FaithfulByteIdentity — THE key obligation: for every real column
+--     k < ne11, M1's column-k output equals the mmq_x = 8 MMQ kernel's
+--     column-k output, byte-for-byte.
+--   - Determinism — identical inputs produce identical output.
+--
+-- Excludes:
+--   - The global scheduler determinism that substituting M1 at decode
+--     preserves token-level greedy argmax across np. That is the job of
+--     the paired TLA+ observational-equivalence spec, NOT this Allium
+--     spec. This spec is the LOCAL kernel + dispatch contract and the
+--     per-column byte-identity refinement only.
+--   - ne11 > K (large-batch prefill / batches above the perf crossover).
+--     Those are unchanged MMQ; M1 never fires there. The boundary is a
+--     perf threshold (config.max_carveout_batch), not a correctness one —
+--     M1 would be correct above K, just not faster.
+--   - The Q4_0 / Q4_0_AR16 quant + dequant + vec_dot semantics
+--     themselves — those live in q4_0_ar16.allium (VecDot ScoreCorrectness
+--     + tolerance config) and mul_mat_cpu.allium (VecDot dot-product
+--     semantics). M1 inherits them; it does not restate them.
+--   - Non-sm_75 backends, non-Q4_0 weight types.
+
+-- ============================================================
+-- Cross-spec references
+-- ============================================================
+--
+-- Per the project's binding convention (feedback_allium_deferred_usage,
+-- followed by batch-invariance.allium), cross-stack references — to
+-- other .allium specs, to C++ kernels, and to empirical/static-analysis
+-- evidence — are recorded in the binding JSON's `bindings_external`
+-- section (specs/deltanet/allium-tla-binding.json), NOT as `deferred`
+-- declarations. `deferred` is reserved for cross-.allium location hints,
+-- of which this spec has none. The relevant cross-spec invariants are:
+--
+--   specs/deltanet/batch-invariance.allium
+--     - MMQ_FaithfulPropagation  (the obligation FaithfulByteIdentity
+--                                  discharges for the whole ne11 <= K
+--                                  family, per real column)
+--     - DispatcherTemplateUniformity_MMQ  (the mmq_x = 8 selection M1
+--                                  must reproduce each real column k of)
+--     - TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity  (the token-level
+--                                  property the per-column byte-identity
+--                                  preserves, including its multi-slot
+--                                  extension np1 == np2 == ... == npK)
+--   q4_0_ar16.allium
+--     - VecDot.ScoreCorrectness + the FP32 vs FP16-GEMM tolerance config
+--   mul_mat_cpu.allium
+--     - VecDot.DotProductCorrectness (the dequantize-then-dot semantic)
+--
+-- C references to record in bindings_external:
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:2801-2819  — dispatch site
+--     (the ggml_cuda_should_use_mmq(..., ne11=16) force, the
+--      use_mul_mat_vec_q = false suppression, the
+--      src1->ne[2]*src1->ne[3] == 1 dispatch guard)
+--   ik_llama.cpp/ggml/src/ggml-cuda/mmq.cu + mmq.cuh  — the MMQ kernel
+--     being refined (the mmq_x = 8 path, block_q8_1_mmq layout)
+--   ik_llama.cpp/ggml/src/ggml-cuda/mmvq.cu  — the numerically-different
+--     existing GEMV (mul_mat_vec_q), which M1 must NOT be confused with
+--   ik_llama.cpp/ggml/src/ggml-cuda/quantize.cu  — the two distinct src1
+--     quantizers: quantize_q8_1 (block_q8_1, GEMV) vs quantize_mmq_q8_1
+--     (block_q8_1_mmq, MMQ); the divergence point this spec turns on
+
+-- ============================================================
+-- External entities — managed by ggml / the CUDA backend
+-- ============================================================
+
+-- The quantized weight matrix (src0). Either Q4_0 or Q4_0_AR16. Per-block
+-- layout and dequant semantics are owned by q4_0_ar16.allium (for
+-- Q4_0_AR16) and ggml's Q4_0 spec; opaque here.
+entity QuantWeight {
+    weight_type: WeightType
+}
+
+-- The activation operand (src1) at decode. M1 fires only when this is a
+-- small batch of real columns: ne11 in [1, K] (K = config.max_carveout_batch)
+-- AND ne12 * ne13 == 1. ne11 = 1 is the original batch-1 case; ne11 = 2..K
+-- arises from multi-slot serving and speculative decoding.
+entity DecodeActivation {
+    -- src1->ne[1]: the N dimension (token count / real-column count of this
+    -- matmul). M1 handles 1..K; > K stays on MMQ.
+    ne11: Integer
+    -- src1->ne[2] * src1->ne[3]: the batched-matmul fold. Must be 1 for
+    -- the small-batch decode path.
+    ne_batch_fold: Integer
+}
+
+-- The MMQ-format quantized view of src1 that the M1 kernel MUST consume.
+-- Produced by quantize_mmq_q8_1 (the block_q8_1_mmq layout), NOT by
+-- quantize_q8_1 (the block_q8_1 layout the mmvq GEMV path uses). This
+-- distinction is load-bearing for FaithfulByteIdentity — see
+-- M1MustUseMmqSrc1Quant.
+entity MmqQuantizedColumn {
+    -- The ne11 real activation columns (1..K of them), quantized in
+    -- block_q8_1_mmq layout. Opaque payload; its bit-exact equality, per
+    -- real column k, with MMQ's own column-k quantization is what M1
+    -- depends on.
+    block_layout: Q8_1Layout
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+enum WeightType { q4_0 | q4_0_ar16 }
+
+-- The two distinct CUDA src1 quantization layouts. block_q8_1 is what the
+-- GEMV (mul_mat_vec_q) path uses; block_q8_1_mmq is what the MMQ path
+-- uses. They are NOT interchangeable: same activation column quantized
+-- through the two layouts yields different stored bytes, hence different
+-- dot products. M1 must use block_q8_1_mmq to be byte-identical to MMQ.
+enum Q8_1Layout { block_q8_1 | block_q8_1_mmq }
+
+-- Accumulator precision of the matmul. Determines which ScoreCorrectness
+-- tolerance band applies (see q4_0_ar16.allium config). MMQ at decode
+-- accumulates int8 dot-products into int32 then scales in FP32, so M1's
+-- score-correctness band is the FP32-accumulator one.
+enum AccumulatorPrecision { int32_then_fp32 | fp16_gemm }
+
+-- The matmul dispatch route for a quantized src0. M1 is the new route.
+enum MatmulRoute { m1_kernel | mmq_kernel | mmvq_gemv }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The lower bound of the carve-out range. A real-column count is at
+    -- least 1 by definition (a matmul with zero columns does not occur),
+    -- so this is fixed at 1; named so the DispatchRouting range does not
+    -- embed a bare literal.
+    min_carveout_batch: Integer = 1
+
+    -- The dispatch threshold K — the largest ne11 the M1 kernel handles.
+    -- M1 fires for ne11 in [min_carveout_batch, max_carveout_batch]; ne11
+    -- above this stays on MMQ. This is a PERF-TUNING knob: K is the
+    -- crossover where MMQ's amortised per-call overhead catches up with the
+    -- read-once GEMV, located empirically by a multi-slot A/B. CORRECTNESS
+    -- is INDEPENDENT of K — every value M1 computes is byte-identical to
+    -- MMQ's corresponding column regardless of where K sits, so raising K
+    -- only ever changes which shapes take the fast path, never the bits.
+    -- Initial / conservative value 1 (the original batch-1 carve-out);
+    -- raised once the A/B locates the crossover.
+    max_carveout_batch: Integer = 1
+
+    -- The batched-matmul fold (src1->ne[2] * src1->ne[3]) that the
+    -- small-batch decode path requires. Anything else stays on MMQ.
+    decode_ne_batch_fold: Integer = 1
+
+    -- The N-tile width the MMQ picker selects at ne11 <= 8 on sm_75
+    -- (mmq_x = 8). M1 computes only the ne11 real columns of this tile; the
+    -- other (mmq_x_at_decode - ne11) columns are padding the MMQ kernel
+    -- wastes work on. Recorded so the byte-identity obligation can name "the
+    -- mmq_x = 8 kernel's column-k output" without a bare literal.
+    mmq_x_at_decode: Integer = 8
+
+    -- THE byte-identity budget. FaithfulByteIdentity is a HARD property:
+    -- for every real column k, M1's column-k output must equal MMQ's
+    -- column-k output exactly. There is no numerical headroom — any nonzero
+    -- diff on any column is a bug. This mirrors q4_0_ar16.allium's
+    -- bit_exact_codes_rel_tol = 0.0 convention.
+    faithful_byte_identity_max_abs_diff: Decimal = 0.0
+
+    -- ScoreCorrectness tolerance bands are NOT redefined here; they are
+    -- inherited from q4_0_ar16.allium config. M1 on the MMQ
+    -- int32-then-FP32 accumulation path is bound by the FP32-accumulator
+    -- band there:
+    --   q4_0_ar16/config.vec_dot_abs_tol  (0.0001)
+    --   q4_0_ar16/config.vec_dot_rel_tol  (0.001)
+    -- A future FP16-GEMM-accumulator M1 variant (not the initial target)
+    -- would instead bind the FP16 band:
+    --   q4_0_ar16/config.vec_dot_fp16_gemm_abs_tol  (0.01)
+    --   q4_0_ar16/config.vec_dot_fp16_gemm_rel_tol  (0.05)
+    -- Listed here as comments only; the authoritative values live in
+    -- q4_0_ar16.allium and must not be duplicated.
+}
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- The dispatch decision for one quantized MUL_MAT node at runtime. Binds
+-- the routing logic at ggml-cuda.cu:2801-2819. M1 is selected when src0
+-- is quantized (Q4_0 or Q4_0_AR16) AND the activation is a single decode
+-- column; otherwise the existing MMQ route is unchanged. The routing
+-- predicate is a compile-time/shape-determined property, asserted by the
+-- DispatchRouting invariant below — not a state-machine transition (this
+-- spec follows the no-rule, no-surface convention of its sibling dispatch
+-- specs: batch-invariance.allium, unified_stream_dispatch.allium,
+-- graph_reuse_set_rows.allium).
+entity QuantMatmulDispatch {
+    weight: QuantWeight
+    activation: DecodeActivation
+    route: MatmulRoute
+}
+
+-- One invocation of the M1 kernel: a quantized weight matrix against the
+-- ne11 (1..K) MMQ-quantized activation columns, producing one output
+-- element per weight row per real column.
+entity M1Invocation {
+    weight: QuantWeight
+    src1_column: MmqQuantizedColumn
+    accumulator: AccumulatorPrecision
+
+    @invariant ComputesOnlyRealColumns
+        -- M1 reads each Q4_0 / Q4_0_AR16 weight block exactly once and
+        -- accumulates against the ne11 real activation columns. It does
+        -- NOT materialise or compute the (mmq_x_at_decode - ne11) padding
+        -- columns the MMQ kernel pays for. This is the entire perf
+        -- rationale; it is an obligation on the implementation, not a
+        -- numerical claim. At ne11 = K = 1 this is the original
+        -- single-real-column case.
+}
+
+-- Top-level contract that anchors the dispatch decision and the kernel
+-- invocation at the root of the entity reference chain — the same
+-- structural role LayerForwardStep plays for HybridPipeline in
+-- batch-invariance.allium. The contract surface is the routing step:
+-- given a QuantMatmulDispatch whose route resolved to m1_kernel, the M1
+-- carve-out produces one M1Invocation against the MMQ-quantized column.
+-- This is NOT a runtime state-machine transition; it names the
+-- routing-to-invocation relationship the DispatchRouting and
+-- FaithfulByteIdentity invariants below quantify over, and binds both
+-- entities into the reference graph so `allium check` sees them used.
+contract RouteDecodeQuantMatmul {
+    invoke: (dispatch: QuantMatmulDispatch) -> M1Invocation
+
+    @invariant RoutesToM1OnlyAtSmallBatch
+        -- This contract fires exactly for a QuantMatmulDispatch whose
+        -- route = m1_kernel (a supported quant type against a small decode
+        -- batch, ne11 in [1, K], per DispatchRouting). For any dispatch
+        -- with ne11 > K (or an unsupported type / batched fold) the route
+        -- stays mmq_kernel / mmvq_gemv and no M1Invocation is produced. The
+        -- produced M1Invocation carries the same weight as the dispatch and
+        -- the MMQ-quantized activation columns (all ne11 of them) M1
+        -- consumes.
+}
+
+-- Top-level contract that anchors the M1Invocation produced by
+-- RouteDecodeQuantMatmul into the byte-identity obligation chain — the
+-- same parameter-anchoring role UniformShapePerTick plays for
+-- LlamaDecodeCall (produced by UnifiedUbatchInvariant, consumed here) in
+-- unified_stream_dispatch.allium. The contract surface is the
+-- equivalence check: given one M1Invocation, decide whether it satisfies
+-- the byte-identity-to-MMQ-column-0 obligation. It names the property the
+-- FaithfulByteIdentity, ScoreCorrectness, M1MustUseMmqSrc1Quant,
+-- M1MustMatchMmqScaleAccumOrder and Determinism invariants below quantify
+-- over per M1Invocation, and binds M1Invocation into the reference graph.
+contract M1ByteIdentityObligation {
+    invoke: (inv: M1Invocation) -> Boolean
+
+    @invariant InvocationSatisfiesByteIdentity
+        -- The boolean result is true exactly when, for EVERY real column
+        -- k < ne11, inv's column-k output equals the mmq_x = 8 MMQ kernel's
+        -- column-k output byte-for-byte (the FaithfulByteIdentity
+        -- obligation), which requires inv to consume block_q8_1_mmq src1
+        -- (M1MustUseMmqSrc1Quant) and to reduce each column's float scale
+        -- accumulation in MMQ's k-block order (M1MustMatchMmqScaleAccumOrder).
+        -- This per-column byte-identity is what discharges
+        -- MMQ_FaithfulPropagation across the np family. It is the
+        -- per-invocation counterpart of the system-wide invariants below; it
+        -- does not restate them, it names the obligation the contract surface
+        -- carries.
+}
+
+-- ============================================================
+-- Invariants — obligations the M1 implementation MUST satisfy
+-- ============================================================
+
+-- The dispatch obligation. Binds ggml-cuda.cu:2801-2819. For any
+-- quantized src0 (Q4_0 or Q4_0_AR16), the route is M1 IFF the activation
+-- is a small decode batch (min_carveout_batch <= ne11 <= max_carveout_batch
+-- AND ne12*ne13 == 1); every other shape is unchanged MMQ. This REFINES the
+-- current dispatcher: today all ne11 take mmq_kernel (because
+-- should_use_mmq is forced with ne11 = 16); M1 carves the ne11 <= K family
+-- out into a faster route that FaithfulByteIdentity proves equivalent, per
+-- real column. ne11 > K (large prefill / batches above the perf crossover)
+-- is ALWAYS mmq_kernel — M1 must never fire there, because above K the MMQ
+-- N-tile is well-utilised and MMQ's amortised per-call overhead wins. The
+-- boundary K (config.max_carveout_batch) is a PERF threshold tuned by a
+-- multi-slot A/B, NOT a correctness one: M1 would be byte-identical above K
+-- too, just not faster.
+--
+-- Implementation site: the
+--   (use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1
+-- branch at ggml-cuda.cu:2801-2819. The M1 carve-out must sit INSIDE that
+-- branch (the ne_batch_fold == 1 guard is already there) and add the
+-- ne11 <= max_carveout_batch test. It must NOT touch the
+-- should_use_mmq(..., ne11=16) force above it — that force keeps the type
+-- test live so unsupported types still fall through to MMVQ/cuBLAS, and
+-- keeps ne11 > K pinned on MMQ. M1 is a small-batch fast-path layered under
+-- the existing pin, not a replacement for the pin.
+invariant DispatchRouting {
+    -- For a supported quant type, route = m1_kernel exactly when the
+    -- activation is a small decode batch (ne11 in the inclusive range
+    -- [min_carveout_batch, max_carveout_batch]). Expressed as the
+    -- conjunction of the two implication directions of that biconditional,
+    -- each fully parenthesised because `implies` is the lowest-precedence
+    -- boolean operator.
+    for d in QuantMatmulDispatches:
+        (d.weight.weight_type in { q4_0, q4_0_ar16 }
+            and d.activation.ne11 >= config.min_carveout_batch
+            and d.activation.ne11 <= config.max_carveout_batch
+            and d.activation.ne_batch_fold = config.decode_ne_batch_fold
+                implies d.route = m1_kernel)
+        and (d.route = m1_kernel
+                implies d.weight.weight_type in { q4_0, q4_0_ar16 }
+                    and d.activation.ne11 >= config.min_carveout_batch
+                    and d.activation.ne11 <= config.max_carveout_batch
+                    and d.activation.ne_batch_fold = config.decode_ne_batch_fold)
+}
+
+-- M1 computes the dequantize-then-dot product, the same quantity the
+-- VecDot contracts in q4_0_ar16.allium and mul_mat_cpu.allium define —
+-- inner product of the dequantized weight row and the dequantized
+-- activation column. This holds PER REAL COLUMN: for every column k in
+-- [0, ne11) the column-k output is the inner product of the dequantized
+-- weight row and dequantized column-k. The tolerance band is determined by
+-- M1's accumulator precision, inherited from q4_0_ar16.allium config rather
+-- than restated. The initial M1 target accumulates int8 dot-products in
+-- int32 then scales in FP32 (the MMQ accumulation model), so it binds the
+-- FP32-accumulator band.
+--
+-- NOTE this is the WEAKER of the two correctness obligations. It bounds
+-- each column of M1 against an independent scalar reference within
+-- tolerance. FaithfulByteIdentity below is STRICTER (exact equality to MMQ
+-- column-k, every k) and is the one that actually discharges
+-- MMQ_FaithfulPropagation. ScoreCorrectness is the floor; byte-identity
+-- is the bar.
+invariant ScoreCorrectness {
+    for inv in M1Invocations:
+        -- For each real column k in [0, ne11), the column-k result equals
+        -- the inner product of dequantize_row(inv.weight) and
+        -- dequantize_column(inv.src1_column, k), within the band selected
+        -- by inv.accumulator:
+        --
+        --   inv.accumulator = int32_then_fp32 (the MMQ model, the
+        --   initial target):
+        --     abs(m1_score_col(inv, k) - scalar_ref_col(inv, k))
+        --         <= q4_0_ar16/config.vec_dot_abs_tol
+        --     OR rel_diff(m1_score_col(inv, k), scalar_ref_col(inv, k))
+        --         <= q4_0_ar16/config.vec_dot_rel_tol
+        --
+        --   inv.accumulator = fp16_gemm (a future variant, not the
+        --   initial target):
+        --     abs(m1_score_col(inv, k) - scalar_ref_col(inv, k))
+        --         <= q4_0_ar16/config.vec_dot_fp16_gemm_abs_tol
+        --     OR rel_diff(m1_score_col(inv, k), scalar_ref_col(inv, k))
+        --         <= q4_0_ar16/config.vec_dot_fp16_gemm_rel_tol
+        --
+        -- The all-columns quantification (every k in [0, ne11)) and the
+        -- dequantize-then-dot semantic and the SIMD/codepath equivalence
+        -- framing are inherited from q4_0_ar16.allium VecDot.ScoreCorrectness
+        -- and mul_mat_cpu.allium VecDot.DotProductCorrectness; not restated.
+        -- inv.accumulator selects which tolerance band the black box applies
+        -- (the int32_then_fp32 MMQ band for the initial target, the
+        -- fp16_gemm band for the future variant).
+        all_columns_dequant_dot_within_accumulator_tol(inv, inv.accumulator)
+}
+
+-- THE key obligation. For a fixed (weight, small activation batch), and
+-- for EVERY real column k in [0, ne11), the M1 kernel's column-k output
+-- equals the CURRENT mmq_x = 8 MMQ kernel's column-k output, byte-for-byte
+-- (max_abs_diff = 0.0). This per-column byte-identity at every k < ne11 is
+-- what discharges MMQ_FaithfulPropagation (batch-invariance.allium, CLOSED
+-- 2026-05-14) for the whole ne11 <= K family. Because MMQ is batch-invariant
+-- (a column's output is independent of how many columns share its batch),
+-- column-k-equals-MMQ-column-k for every k is exactly what preserves
+-- TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity and its multi-slot extension
+-- (np1 == np2 == ... == npK) once M1 is substituted at decode: a token
+-- decoded at M = 1 or as column k of an M = 4 batch gets identical bits.
+--
+-- WHY this is achievable bit-exactly (the mechanism the implementation
+-- MUST honour): MMQ at decode accumulates int8 dot-products into an int32
+-- per-k-block partial sum, then accumulates float scale * int32 across
+-- k-blocks. Integer int8 dot-products are EXACT — the int32 partial sums
+-- are bit-identical regardless of whether they are computed via the
+-- tensor-core int8 MMA or via dp4a, because both compute the same integer
+-- sum. The ONLY divergence risk is the FLOAT scale-accumulation ORDER
+-- across k-blocks. M1 MUST accumulate the per-k-block float contributions
+-- in the SAME ORDER as the mmq_x = 8 kernel, FOR EACH real column. If it
+-- does, every real column of MMQ and the M1 output are the same float bits.
+invariant FaithfulByteIdentity {
+    for inv in M1Invocations:
+        -- For each real column k in [0, ne11): m1_column_output(inv, k) is
+        -- the M1 result for inv.weight against column k; mmq_column_output(
+        -- inv, k) is the column-k lane of the current mmq_x = 8 MMQ kernel
+        -- run on the same weight with the same columns placed at N-tile
+        -- positions 0..ne11-1 (the other config.mmq_x_at_decode - ne11
+        -- columns being padding). For every such k the diff must be exactly
+        -- config.faithful_byte_identity_max_abs_diff (0.0) — bit-for-bit.
+        -- all_real_columns_byte_identical ranges over k in [0, ne11) and
+        -- asserts the per-column abs_diff equals the budget for each.
+        all_real_columns_byte_identical(inv, config.faithful_byte_identity_max_abs_diff)
+}
+
+-- The implementation constraint that makes FaithfulByteIdentity reachable
+-- on the src1 side. M1 MUST consume src1 — all ne11 real columns — quantized
+-- by quantize_mmq_q8_1 (the block_q8_1_mmq layout), the SAME quantizer the
+-- MMQ path uses — NOT quantize_q8_1 (the block_q8_1 layout the mmvq GEMV
+-- path uses).
+--
+-- This is WHY the existing mul_mat_vec_q (mmvq) cannot simply be reused
+-- for the small-batch fast-path even though it is already a multi-column
+-- GEMV: the dispatcher's GEMV path quantizes src1 with quantize_q8_1 into
+-- block_q8_1, whereas MMQ quantizes src1 with quantize_mmq_q8_1 into
+-- block_q8_1_mmq. The two layouts produce DIFFERENT stored activation
+-- bytes for the same float column (different per-block scale grouping and
+-- sum-of-quants bookkeeping), per column. A dot product against block_q8_1
+-- is therefore NOT byte-identical to a dot product against block_q8_1_mmq,
+-- for any column. Reusing mmvq would satisfy ScoreCorrectness (it is the
+-- right dot product within tolerance) but would FAIL FaithfulByteIdentity.
+-- M1 must be a new kernel over block_q8_1_mmq, not a re-pointing of mmvq.
+invariant M1MustUseMmqSrc1Quant {
+    for inv in M1Invocations:
+        -- Each of inv's ne11 real columns is stored in block_q8_1_mmq
+        -- layout (the MmqQuantizedColumn payload carries all of them in the
+        -- one MMQ layout, matching MMQ's own src1 quantization column-for-
+        -- column).
+        inv.src1_column.block_layout = block_q8_1_mmq
+}
+
+-- The implementation constraint that makes FaithfulByteIdentity reachable
+-- on the accumulation side. For EACH real column k in [0, ne11), M1 MUST
+-- accumulate float scale * int32 across k-blocks in the SAME ORDER as the
+-- mmq_x = 8 kernel does for its column k. The int32 partial sums are exact
+-- and order-independent (integer addition is associative and the int8 MMA
+-- and dp4a compute the same sum); the float scale-accumulation is NOT
+-- order-independent (float addition is not associative), so a different
+-- k-block reduction order on any column would produce a different — though
+-- ScoreCorrectness-passing — float result, breaking byte-identity for that
+-- column. Tensor-core MMA vs dp4a for the int8 dot is a free choice; the
+-- float reduction order, per column, is not.
+invariant M1MustMatchMmqScaleAccumOrder {
+    for inv in M1Invocations:
+        -- For each real column k in [0, ne11): m1_scale_accum_order_col(
+        -- inv, k) is the sequence of k-blocks over which M1 accumulates
+        -- float scale * int32 for column k; mmq_scale_accum_order_col(inv,
+        -- k) is the mmq_x = 8 kernel's for the same column. For every k the
+        -- two must be the identical sequence; all_columns_scale_accum_order_matches
+        -- asserts this over k in [0, ne11).
+        all_columns_scale_accum_order_matches(inv)
+}
+
+-- Identical inputs must produce bit-identical output, for every real
+-- column. No thread-order non-determinism, no opportunistic code-path drift
+-- across reps or across the ne11 real columns of a batch. Mirrors
+-- q4_0_ar16.allium invariant Determinism. This is the per-NP self-
+-- determinism (RepDeterminismAtSameNP in batch-invariance.allium) at the
+-- M1 kernel granularity; FaithfulByteIdentity additionally pins each of M1's
+-- real columns to MMQ's corresponding column across the substitution.
+invariant Determinism {
+    for inv in M1Invocations:
+        -- For each real column k in [0, ne11), re-running M1 on the same
+        -- inputs reproduces the same column-k bits;
+        -- all_columns_self_deterministic asserts this over k in [0, ne11).
+        all_columns_self_deterministic(inv)
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Black-box helpers used inline above (per project convention,
+-- `deferred` is for cross-.allium refs only). All "_col" / "all_columns" /
+-- "all_real_columns" helpers range over the real columns k in [0, ne11) of
+-- the invocation:
+--   m1_score_col, scalar_ref_col, rel_diff,
+--   all_columns_dequant_dot_within_accumulator_tol,
+--   m1_column_output, mmq_column_output, all_real_columns_byte_identical,
+--   m1_scale_accum_order_col, mmq_scale_accum_order_col,
+--   all_columns_scale_accum_order_matches, all_columns_self_deterministic,
+--   dequantize_row, dequantize_column.
+--
+-- This spec is the LOCAL kernel + dispatch contract only. The global
+-- claim — that substituting M1 for ne11 <= K preserves
+-- TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity (and its multi-slot extension
+-- np1 == np2 == ... == npK) across the whole decode — is the paired TLA+
+-- observational-equivalence spec's job, refining the per-column
+-- FaithfulByteIdentity into a scheduler-level equivalence. The
+-- observational-equivalence argument: because MMQ is batch-invariant and
+-- every M1 column is byte-identical to MMQ's corresponding column,
+-- substituting M1 for any ne11 <= K leaves the token stream unchanged
+-- across np. Keep the two separated: this file proves the kernel
+-- substitution is byte-identical per column in the small; the TLA+ proves
+-- the substitution is observationally equivalent in the large.
+--
+-- C reference (the kernel to write + the path it refines):
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:2801-2819     — dispatch site;
+--     RouteDecodeQuantMatmul binds here.
+--   ik_llama.cpp/ggml/src/ggml-cuda/mmq.cu + mmq.cuh — the mmq_x = 8
+--     kernel FaithfulByteIdentity pins M1 to (every real column k); the
+--     block_q8_1_mmq layout M1MustUseMmqSrc1Quant requires.
+--   ik_llama.cpp/ggml/src/ggml-cuda/mmvq.cu          — the
+--     numerically-different existing multi-column GEMV (handles up to
+--     MMVQ_MAX_BATCH_SIZE columns); M1MustUseMmqSrc1Quant records why it
+--     cannot be reused (wrong src1 layout) despite being shape-compatible.
+--   ik_llama.cpp/ggml/src/ggml-cuda/quantize.cu      — quantize_q8_1
+--     (block_q8_1, GEMV) vs quantize_mmq_q8_1 (block_q8_1_mmq, MMQ); the
+--     src1-quantizer divergence M1MustUseMmqSrc1Quant turns on.

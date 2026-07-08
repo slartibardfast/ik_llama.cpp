@@ -1,0 +1,276 @@
+-- allium: 3
+-- specs/kv-cache/paged_kv_pool_sizing.allium
+--
+-- Scope: T5.9 paged BACKING — the physical sizing of the block
+-- pool that the paged ADDRESSING layer (T5.1-T5.8) operates on.
+--
+-- T5.1-T5.8 landed paged ADDRESSING end-to-end (allocator +
+-- WRITE/READ/K-shift/defrag/trace + bake-out). At T5.8 the K/V
+-- buffer was still sized to `n_ctx × n_stream` (nominal max) at
+-- llama_kv_cache_init; the per-stream slab pretence had been
+-- dropped in T5.7b but the BACKING bytes still matched the legacy
+-- contig layout. T5.9 shrinks the buffer to a pool sized for
+-- peak-concurrent blocks, separating BACKING from logical
+-- addressing.
+--
+-- This spec is the contract for the sizing decision + the
+-- exhaustion-handling UX. It does NOT respec the allocator
+-- itself — paged_block_allocator.allium remains the authoritative
+-- source for alloc/free/defrag mechanics. This spec adds:
+--   - PoolBoundsRespected — every allocated block id is within
+--     [0, total_pool_blocks).
+--   - PoolExhaustionReturns503 — server returns HTTP 503 +
+--     Retry-After when pool exhausts; server stays up;
+--     in-flight slots continue.
+--   - SizingDerivedFromCtxAndParallel — at init,
+--     total_pool_blocks = ceil((n_ctx × n_seq_max + headroom)
+--     / BLOCK_SIZE_TOKENS) when CLI override is unset.
+--
+-- Composition:
+--   - paged_block_allocator.allium::HighCtxFeasibility is the
+--     reframe-anchor contract. T5.9 implements the BACKING side
+--     that makes feasibility actually realisable (T5.1-T5.8
+--     landed the addressing side; the buffer was still
+--     contig-sized).
+--   - server-side admission (T4 chunked-prefill admission)
+--     composes with PoolExhaustionReturns503: when a slot's
+--     try_alloc_block fails mid-tick, the slot stays
+--     LOAD_PROMPT and retries next tick; when ALL slots are
+--     blocked AND no IDLE slot exists AND pool is full, new
+--     arrivals get 503.
+--
+-- Excludes:
+--   - Pool-grow / eviction policies (out of T5.9 scope; user
+--     explicitly picked 503 over eviction).
+--   - VRAM-aware auto-cap at init (out of T5.9 scope; deferred
+--     until ergonomic pressure demands it).
+--   - The CLI surface itself (--kv-pool-blocks N is described
+--     in PHASE_NSTREAM_KV_PERF.md T5.9.B.7; this spec covers
+--     the behaviour, not the flag string).
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The block pool sizing at context construction. Derived from
+-- ctx-size, n_seq_max, optional CLI override, and a headroom
+-- count of extra blocks.
+entity PoolSizing {
+    n_ctx: Integer
+    n_seq_max: Integer
+    block_size_tokens: Integer
+    headroom_blocks: Integer
+    cli_override: Integer
+    total_pool_blocks: Integer
+}
+
+-- One allocation attempt result, paired with the pool sizing
+-- in effect at the time.
+entity SizedAllocResult {
+    pool: PoolSizing
+    seq_id: Integer
+    result_block_id: Integer
+}
+
+-- One HTTP request to the server that needed a slot/block.
+-- Captures the response status code and headers used in the
+-- exhaustion-UX invariant.
+entity ServerAdmissionResult {
+    request_id: Integer
+    pool_n_free_at_arrival: Integer
+    n_idle_slots_at_arrival: Integer
+    response_status: Integer
+    retry_after_seconds: Integer
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- TLC bounds. Concrete production: total_pool_blocks varies
+    -- with ctx × n_seq_max. For TLC we keep small bounded
+    -- values to keep state space finite.
+    max_total_pool_blocks: Integer = 8
+    max_seqs: Integer = 3
+
+    -- Block size locked at 64 per paged_block_allocator.allium.
+    block_size_tokens: Integer = 64
+
+    -- Default Retry-After in seconds when emitting 503.
+    -- Matches examples/server/server.cpp:413 default.
+    retry_after_seconds: Integer = 5
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- PoolBoundsRespected — every block_id returned by alloc and
+-- every block_id stored in any block_table is in
+-- [0, total_pool_blocks). The structural correctness of paged
+-- BACKING: the pool is a finite physical resource and the
+-- allocator MUST NOT issue ids outside the pool.
+contract PoolBoundsRespected {
+    invoke: (pool: PoolSizing, results: List<SizedAllocResult>) -> Boolean
+
+    @invariant SuccessfulAllocInBounds
+        -- For every SizedAllocResult r in results:
+        --   r.result_block_id = OUT_OF_BLOCKS (= -1)
+        --   OR r.result_block_id ∈ [0, r.pool.total_pool_blocks).
+        -- Composes with paged_block_allocator.allium's
+        -- AllocBlockBehavior::PopsFromFreeListIfNotFull /
+        -- SignalsOutOfBlocksIfFull: pool sizing fixes the
+        -- free_list initial domain; this invariant binds that
+        -- the domain is respected throughout.
+
+    @invariant BlockTableEntriesInBounds
+        -- For every seq s and every block_table[s][i]:
+        --   block_table[s][i] ∈ [0, total_pool_blocks).
+        -- Defrag is also in scope: defrag mechanics may rewrite
+        -- block ids, but the rewritten ids MUST stay within the
+        -- pool domain.
+
+    @guidance
+        -- Implementation: the allocator's init takes
+        -- total_pool_blocks; its free_list is seeded with
+        -- exactly [0, total_pool_blocks-1]. Subsequent alloc
+        -- pops from free_list; defrag rewrites to ids already
+        -- in (or about to be in) free_list ∪ block_tables.
+        -- The bound is structurally enforced by free_list's
+        -- initial domain. The trace validator's
+        -- PoolBoundsRespected check exists as defence-in-depth
+        -- against future regressions (e.g. an off-by-one in
+        -- the init bound).
+}
+
+-- SizingDerivedFromCtxAndParallel — at llama_kv_cache_init,
+-- when the CLI override `--kv-pool-blocks N` is unset (N = 0),
+-- total_pool_blocks is computed as
+-- ceil((n_ctx × n_seq_max + headroom_blocks × block_size_tokens)
+--      / block_size_tokens).
+-- This is the "zero new flags by default" contract: the user
+-- does not need to think about pool sizing; auto-derivation
+-- preserves byte-identity to the legacy contig layout at
+-- production sizes.
+contract SizingDerivedFromCtxAndParallel {
+    invoke: (pool: PoolSizing) -> Boolean
+
+    @invariant AutoSizingWhenOverrideUnset
+        -- pool.cli_override = 0 (sentinel for "unset")
+        --   => pool.total_pool_blocks =
+        --        ceil((pool.n_ctx × pool.n_seq_max +
+        --              pool.headroom_blocks × pool.block_size_tokens)
+        --             / pool.block_size_tokens).
+
+    @invariant ExplicitSizingWhenOverrideSet
+        -- pool.cli_override > 0
+        --   => pool.total_pool_blocks = pool.cli_override.
+        -- User may explicitly under-allocate (smaller pool than
+        -- nominal max) for high-ctx workloads that cannot fit
+        -- nominal max in VRAM.
+
+    @invariant ByteIdentityAtProductionSizes
+        -- pool.cli_override = 0 AND pool.headroom_blocks = 0
+        --   => pool.total_pool_blocks
+        --      = ceil(pool.n_ctx × pool.n_seq_max / pool.block_size_tokens).
+        -- This is the lever for the GP5.9.NPC byte-identity gate:
+        -- at production NP=2 ctx 524288, auto-sized pool is
+        -- byte-identical to the T5.8 buffer total.
+
+    @guidance
+        -- The production profile (qwen36-27b-x2-dflash.sh) does
+        -- NOT set --kv-pool-blocks. The auto-derivation must
+        -- preserve production behaviour exactly. The CLI flag
+        -- exists strictly as an opt-in for under-allocation
+        -- scenarios (high-ctx feasibility); it is never invoked
+        -- on the production codepath.
+}
+
+-- PoolExhaustionReturns503 — the user-visible UX contract for
+-- pool exhaustion. When a new arrival cannot be admitted
+-- because no slot is IDLE and the block pool has no free
+-- blocks, the server returns HTTP 503 with Retry-After header
+-- (default 5 seconds). The server stays up; in-flight slots
+-- continue to make progress; the rejected client is expected
+-- to retry after the indicated interval.
+contract PoolExhaustionReturns503 {
+    invoke: (admissions: List<ServerAdmissionResult>) -> Boolean
+
+    @invariant ExhaustionEmits503
+        -- For every ServerAdmissionResult r:
+        --   r.n_idle_slots_at_arrival = 0
+        --   AND r.pool_n_free_at_arrival = 0
+        --   => r.response_status = 503
+        --      AND r.retry_after_seconds > 0.
+
+    @invariant HappyPathUnchanged
+        -- For every ServerAdmissionResult r:
+        --   r.n_idle_slots_at_arrival > 0
+        --     => r.response_status = 200 (eventually; the
+        --        response is the completion stream, not an
+        --        admission status).
+        -- This invariant exists to lock that the 503 path is
+        -- gated on actual exhaustion, NOT on any other server
+        -- state. A regression that 503s when a slot IS
+        -- available would breach this.
+
+    @invariant ServerStaysUp
+        -- A 503 admission rejection MUST NOT crash, restart, or
+        -- otherwise destabilise the server. Subsequent /health
+        -- requests MUST return 200. In-flight slots MUST
+        -- continue to make progress on their existing prompts.
+
+    @guidance
+        -- Implementation seam: examples/server/server-
+        -- context.cpp's get_available_slot is extended to
+        -- check `cache.paged.n_free()` when no IDLE slot is
+        -- found. A new sentinel "pool exhausted globally" is
+        -- returned to the HTTP handler, which translates it to
+        -- 503 via the existing res_err() path
+        -- (examples/server/server.cpp:413 already emits
+        -- Retry-After when status = 503). No new error-emission
+        -- mechanism is needed; T5.9 only wires the new
+        -- sentinel to the existing 503 path.
+
+    @invariant InFlightSlotsUnaffected
+        -- For every slot s in SLOT_STATE_PROCESSING at the
+        -- moment a 503 is emitted: s's decode tick on the
+        -- next iteration produces output byte-identical to
+        -- what it would have produced absent the 503. The 503
+        -- is an admission decision on a NEW arrival, not a
+        -- preemption of existing work.
+}
+
+-- ============================================================
+-- Composition with paged_block_allocator.allium
+-- ============================================================
+
+-- This module's contracts compose with the allocator spec.
+-- Cross-references:
+--
+--   PoolBoundsRespected
+--     <- paged_block_allocator.allium::BlockUniquelyOwned
+--        (block id uniqueness implies bounded domain via
+--         finite free_list)
+--     <- paged_block_allocator.allium::AllocBlockBehavior
+--        ::SignalsOutOfBlocksIfFull (the OOB signal at pool
+--        exhaustion is the boundary condition this contract
+--        binds)
+--
+--   SizingDerivedFromCtxAndParallel
+--     <- paged_block_allocator.allium::HighCtxFeasibility
+--        ::ActualFootprintBoundedByWrites (high-ctx feasibility
+--        is the user override goal; SizingDerived is the
+--        production-side knob that preserves legacy behaviour
+--        when no override is set)
+--
+--   PoolExhaustionReturns503
+--     <- paged_block_allocator.allium::HighCtxFeasibility
+--        ::OOMBehaviourIsFirstClass (OOM is named first-class
+--        in the reframe; 503+Retry-After is the chosen
+--        server-side realisation)
+--     <- specs/scheduler/batch_composition.allium
+--        ::TokenBudgetPerUbatch (T4 admission loop is the
+--        per-slot composition point; pool exhaustion is
+--        observed there and propagated up)

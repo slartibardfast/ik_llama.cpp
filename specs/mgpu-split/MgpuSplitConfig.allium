@@ -1,0 +1,263 @@
+-- allium: 3
+-- specs/mgpu-split/MgpuSplitConfig.allium
+--
+-- Scope: the static invariants of the mgpu_split_config struct that
+-- Phase 46 Path B (PHASE46 §12.2 spec #1) extracts from llama_model
+-- into a header-portable shared definition (ggml/include/ggml-mgpu-split.h).
+-- This spec is the data-structure spine of B.0-full — the other four
+-- B.0 specs (BuftSetupLoop.tla, CreateSplitBalance.tla,
+-- ClipCrossDeviceFlow.tla, CrossCodepathConsistency.allium) all lean
+-- on the invariants asserted here as axioms.
+--
+-- Provenance: extracted from llama_model fields:
+--   model.splits        std::vector<float>          src/llama-model.h
+--   model.split_buft    ggml_backend_buffer_type_t  src/llama-model.h:496
+--   model.devices       std::vector<...>            src/llama-model.h
+--   model.buft_layer[]  per-layer pair              src/llama-model.h
+--   model.default_layer_device[]                    src/llama-model.h
+--   model.max_gpu, model.main_gpu                   src/llama-model.h
+-- plus the per-device mem_used and capacity[] tracked inside
+-- create_split's loop body in llama-load-tensors.cpp:351-414.
+--
+-- Composition:
+--   - BuftSetupLoop.tla models the loop at llama.cpp:4168-4198 that
+--     populates a fresh MgpuSplitConfig; its post-condition asserts
+--     every invariant in this spec holds at loop exit.
+--   - CreateSplitBalance.tla models create_split() at
+--     llama-load-tensors.cpp:351-414 operating against an
+--     already-populated config; its action invariants assert
+--     CapacityHonored holds across every step.
+--   - ClipCrossDeviceFlow.tla treats this spec's invariants as
+--     axioms; it does not re-prove them.
+--   - CrossCodepathConsistency.allium refines ConsumerAgnostic into
+--     per-consumer state predicates and proves their equivalence.
+--
+-- Excludes:
+--   - The dynamic walk that creates the residency mapping
+--     (CreateSplitBalance.tla).
+--   - The buft-setup loop semantics (BuftSetupLoop.tla).
+--   - Cross-device compute/transfer scheduling
+--     (ClipCrossDeviceFlow.tla, extends AsyncReduce.tla).
+--   - Quantization-type interactions with split_buft alignment
+--     (handled inside ggml_backend_cuda_split_buffer_type).
+--   - The MTP nextn-layer per-device override path at
+--     llama-load-tensors.cpp:313-318. Phase 46 does not touch MTP.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- A participating compute device. For Phase 46 production, the set
+-- is {CUDA0, CUDA1} on the TU102 NV2-NVLink pair.
+entity CudaDevice {
+    id: Integer
+}
+
+-- A buffer-type kind. Three relevant values:
+--   "split"   — the shared ggml_backend_cuda_split_buffer_type
+--               (constructed via llama_default_buffer_type_split at
+--               llama.cpp:4171)
+--   "offload" — a per-device default buffer type returned by
+--               llama_default_buffer_type_offload(model, device)
+--   "cpu"     — the CPU buffer type returned by
+--               llama_default_buffer_type_cpu(true)
+entity BufferType {
+    kind: String     -- ∈ {"split", "offload", "cpu"}
+    device_id: Integer    -- -1 if kind != "offload"
+}
+
+-- The per-layer buft assignment pair. Both slots may be set (under
+-- GRAPH/ATTN modes), or only the offload slot (under LAYER/NONE).
+entity BuftPair {
+    split: BufferType        -- may be the SENTINEL "nil" buft
+    offload: BufferType
+}
+
+-- A weight tensor at the model-loader level. Identified by name;
+-- carries row count for the row-chunk allocation.
+entity WeightTensor {
+    name: String
+    n_rows: Integer
+    layer_index: Integer    -- which transformer layer this belongs to
+}
+
+-- A per-row residency: which device owns row r of tensor t.
+entity RowResidency {
+    tensor_name: String
+    row_index: Integer
+    device_id: Integer
+}
+
+-- The split mode. Four values matching include/llama.h:279-283.
+enum SplitMode {
+    none | layer | attn | graph
+}
+
+-- The mgpu_split_config struct itself.
+entity MgpuSplitConfig {
+    n_device:               Integer
+    devices:                List<CudaDevice>     -- length = n_device
+    capacity_per_device:    List<Integer>        -- bytes, length = n_device
+    mem_used_per_device:    List<Integer>        -- bytes, length = n_device
+    splits:                 List<Integer>        -- CDF scaled to permille, length = n_device, in [0, 1000]
+    split_buft_kind:        String               -- ∈ {"split", "nil"}
+    split_mode:             SplitMode
+    n_layer:                Integer
+    i_gpu_start:            Integer              -- 0 ≤ i_gpu_start ≤ n_layer
+    buft_layer:             List<BuftPair>       -- length = n_layer
+    default_layer_device:   List<Integer>        -- length = n_layer, ∈ {-1} ∪ [0, n_device)
+    weight_tensors:         List<WeightTensor>
+    tensor_residency:       List<RowResidency>
+}
+
+-- ============================================================
+-- INVARIANTS — must hold for any valid MgpuSplitConfig state
+-- ============================================================
+
+-- Cardinality
+
+invariant DevicesNonEmpty {
+    -- MgpuSplitConfig.n_device >= 1. CPU-only configs use a single
+    -- CPU entry; multi-GPU configs use multiple CUDA entries. Phase
+    -- 46's production target is n_device = 2 (CUDA0+CUDA1).
+}
+
+invariant ListLengthsMatchNDevice {
+    -- MgpuSplitConfig.devices.size = capacity_per_device.size =
+    -- mem_used_per_device.size = splits.size = n_device. Asserted
+    -- at config init time; never violated after.
+}
+
+invariant LayerListLengthsMatchNLayer {
+    -- MgpuSplitConfig.buft_layer.size = default_layer_device.size =
+    -- n_layer. Asserted at config init; never violated after.
+}
+
+-- Split ratio shape
+
+invariant SplitsMonotonic {
+    -- For all i in [0, n_device - 1): splits[i] <= splits[i + 1].
+    -- The splits CDF is non-decreasing.
+}
+
+invariant SplitsNormalized {
+    -- splits is represented as integer permille (0..1000) to keep the
+    -- model first-order; the real-valued CDF is splits[i] / 1000.0.
+    -- splits[n_device - 1] = 1000 (the CDF ends at 1.0 = 1000 permille).
+    -- For all i: 0 <= splits[i] <= 1000.
+    -- splits[0] may equal 0 (a zero-share device is permitted), though
+    -- Phase 46 production always has splits[0] > 0.
+}
+
+-- Buft assignment
+
+invariant SplitBuftPresentIffGraphLikeAndMultiDevice {
+    -- split_buft_kind = "split" iff (n_device > 1 AND
+    -- split_mode in {attn, graph}). Otherwise split_buft_kind = "nil".
+    -- Binds on the ground truth at llama.cpp:4170-4173 read during
+    -- the 2026-05-25 spec-pre-work analysis.
+}
+
+invariant NoOrphanGpuLayers {
+    -- For all i in [i_gpu_start, n_layer):
+    --   buft_layer[i].offload.kind != "nil"
+    --   AND (split_buft_kind = "nil" OR
+    --        buft_layer[i].split.kind = "split").
+    -- CPU layers (i < i_gpu_start) have buft_layer[i].offload.kind =
+    -- "cpu" and buft_layer[i].split.kind = "nil".
+}
+
+invariant LayerDeviceInRange {
+    -- For all i: default_layer_device[i] in {-1} union [0, n_device).
+    -- For i < i_gpu_start: default_layer_device[i] = -1.
+    -- For i >= i_gpu_start: default_layer_device[i] in [0, n_device).
+}
+
+-- Memory bookkeeping
+
+invariant MemUsedNonNegative {
+    -- For all d in [0, n_device): mem_used_per_device[d] >= 0.
+}
+
+invariant CapacityHonored {
+    -- For all d: mem_used_per_device[d] <= capacity_per_device[d].
+    -- The binding fit invariant for Phase 46 — if violated, the
+    -- LM/CLIP allocation will fail with cudaErrorMemoryAllocation.
+    -- CreateSplitBalance.tla models the dynamic walk that establishes
+    -- this; the present spec only asserts the static post-condition.
+}
+
+-- Residency consistency
+
+invariant ResidencyTotal {
+    -- For every WeightTensor t in weight_tensors:
+    --   for every row index r in [0, t.n_rows):
+    --     there exists exactly one RowResidency entry with
+    --     tensor_name = t.name and row_index = r.
+}
+
+invariant ResidencyInDeviceRange {
+    -- For every RowResidency entry: device_id in [0, n_device).
+}
+
+invariant ResidencyConsistentWithBuft {
+    -- Under LAYER mode (split_buft_kind = "nil"): every row of
+    -- tensor t lives on the same device, and that device matches
+    -- the offload buft assigned to t's layer.
+    -- Under GRAPH/ATTN modes: a tensor's rows may span devices,
+    -- but the row ranges assigned to each device agree with the
+    -- create_split post-condition modeled separately in
+    -- CreateSplitBalance.tla.
+}
+
+invariant NoMultiResidency {
+    -- For every (tensor_name, row_index): the set of devices
+    -- containing that row has cardinality exactly 1. Rules out
+    -- the row-double-residency bug class flagged by the K/V family
+    -- orphan audit elsewhere in the codebase.
+}
+
+-- Frozen-after-init
+
+invariant SplitModeImmutable {
+    -- MgpuSplitConfig.split_mode does not change after construction.
+    -- Set once at config init from --split-mode (LM) or
+    -- --mmproj-split-mode (CLIP). CrossCodepathConsistency.allium
+    -- leans on this.
+}
+
+invariant SplitsImmutable {
+    -- MgpuSplitConfig.splits does not change after init. Set once
+    -- from --tensor-split / --mmproj-tensor-split.
+}
+
+invariant CapacityImmutable {
+    -- MgpuSplitConfig.capacity_per_device is frozen at init.
+    -- mem_used_per_device grows over time; capacity does not shrink.
+    -- Rules out the "shrinking budget mid-run" failure mode.
+}
+
+-- Path B-specific: shared-struct guarantee
+
+invariant ConsumerAgnostic {
+    -- Every invariant above is stated entirely in terms of
+    -- MgpuSplitConfig fields. None references llama_model or
+    -- clip_ctx. This is what permits the Path B extraction to be
+    -- safe: both consumers (LM and CLIP) see identical structural
+    -- guarantees. Cross-codepath consistency is asserted separately
+    -- in CrossCodepathConsistency.allium.
+}
+
+-- ============================================================
+-- Contracts — bind the entity formally for the spec checker
+-- ============================================================
+
+contract ValidateConfig {
+    invoke: (cfg: MgpuSplitConfig) -> Boolean
+
+    @invariant AllStaticInvariantsHold
+        -- Returns true iff every invariant above holds against cfg.
+        -- A pure-predicate witness operation; the model loader runs
+        -- this implicitly after BuftSetupLoop.tla's loop exits and
+        -- before CreateSplitBalance.tla begins its walk.
+}

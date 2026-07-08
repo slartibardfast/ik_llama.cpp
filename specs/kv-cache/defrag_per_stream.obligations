@@ -1,0 +1,18 @@
+# Obligations for defrag_per_stream.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.DefragOp => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CellMove => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KSliceLayer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.VSliceLayer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_streams => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_kvps_per_stream => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragNoCrossStream.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragCompactsPerStream.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragPreservesKVBytes.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KCellMeta => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DefragNoCrossStreamLeakage => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DefragKVBytesFollowMetadata => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PerStreamCompactionHolds => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DefragViewIs3DPerStream => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragPerDeviceCpyEmission.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

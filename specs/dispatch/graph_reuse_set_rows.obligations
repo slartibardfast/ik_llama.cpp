@@ -1,0 +1,21 @@
+# Obligations for graph_reuse_set_rows.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.CudaGraphCache => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaGraphEntry => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.MultiSeqBatchShape => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KvIdxsInput => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.ReuseMissReason => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.graph_cache_capacity => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_streams => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_reuse_cycles => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SetRowsInputRefresh.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ReuseShapeStability.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.BugCAbsenceUnderReuse.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CacheLookupResult => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.TopologyHashKeyedByShape => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.InpKvIdxsAlwaysFresh => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ReuseProducesByteIdenticalOutput => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NStreamBailoutNeverFires => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.GraphReuseSetRowsSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateGraphReuseSetRowsSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

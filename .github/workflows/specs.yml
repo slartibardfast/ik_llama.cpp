@@ -1,0 +1,98 @@
+name: Spec gates (allium + TLC)
+
+# The verification lanes for the specs co-located on this branch (host methodology,
+# template ledger entry b6232a5). allium check + analyse are green on every spec;
+# allium plan obligations are dispositioned (waived pending property-test authoring,
+# call/0013 in the host repo); the curated base TLA+ configs are model-checked by TLC.
+# Negative-control and Allium/TLA/C++ binding-integrity checks are a follow-up port.
+
+on:
+  push:
+    branches: [host-specs]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  spec-lanes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + allium-cli + host-lifecycle
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+          source "$HOME/.cargo/env"
+          cargo install allium-cli --version 3.4.2 --locked --quiet
+          cargo install --git https://github.com/connollydavid/host-lifecycle --tag v0.40.1 --quiet
+          allium --version
+          host-lifecycle version .
+
+      - name: Install Java (Temurin 21) + fetch TLC
+        run: |
+          # Temurin 21 (methodology pin) for tla2tools v1.8.0.
+          wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public | sudo tee /etc/apt/keyring/adoptium.asc >/dev/null
+          echo "deb [signed-by=/etc/apt/keyring/adoptium.asc] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/adoptium.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq temurin-21-jdk
+          sudo update-alternatives --set java /usr/lib/jvm/temurin-21-jdk/bin/java
+          java -version
+          mkdir -p .tla-tools
+          curl -fsSL -o .tla-tools/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+
+      - name: Allium check + analyse (every .allium)
+        run: |
+          source "$HOME/.cargo/env"
+          rc=0
+          while IFS= read -r f; do
+            allium check   "$f" || { echo "::error::check failed: $f"; rc=1; }
+            allium analyse "$f" >/dev/null || { echo "::error::analyse failed: $f"; rc=1; }
+          done < <(find specs -name '*.allium' | sort)
+          exit $rc
+
+      - name: Allium obligations (every .allium)
+        run: |
+          source "$HOME/.cargo/env"
+          rc=0
+          while IFS= read -r f; do
+            host-lifecycle obligations "$f" --tests specs || { echo "::error::obligations failed: $f"; rc=1; }
+          done < <(find specs -name '*.allium' | sort)
+          exit $rc
+
+      - name: TLC base configs (must pass)
+        run: |
+          # Curated must-pass base configs (the green subset of the host's prior lane).
+          # Each pair is "<cfg> <module.tla> <topic>".
+          run_tlc() {
+            local cfg="$1" mod="$2" topic="$3"
+            ( cd "specs/$topic" && \
+              java -XX:+UseParallelGC -cp "$GITHUB_WORKSPACE/.tla-tools/tla2tools.jar" \
+                tlc2.TLC -workers 4 -config "$cfg" "$mod" > "/tmp/tlc.$$.log" 2>&1 )
+            if grep -qE "Error:|Invariant .* is violated" "/tmp/tlc.$$.log"; then
+              echo "::error::TLC failed: specs/$topic/$cfg $mod"
+              tail -30 "/tmp/tlc.$$.log"; return 1
+            fi
+            echo "PASS specs/$topic/$cfg"
+          }
+          rc=0
+          run_tlc DFlashCycle.cfg             DFlashCycle.tla             dflash                || rc=1
+          run_tlc DFlashMultiSlot.cfg         DFlashMultiSlot.tla         dflash                || rc=1
+          run_tlc PipelineDeterminism_ModalP3.cfg   PipelineDeterminism.tla  deltanet          || rc=1
+          run_tlc PipelineDeterminism_OutlierP0.cfg PipelineDeterminism.tla  deltanet          || rc=1
+          run_tlc BuftSetupLoopMC_graph.cfg   BuftSetupLoop.tla           mgpu-split            || rc=1
+          run_tlc BuftSetupLoopMC_layer.cfg   BuftSetupLoop.tla           mgpu-split            || rc=1
+          run_tlc BuftSetupLoopMC_attn.cfg    BuftSetupLoop.tla           mgpu-split            || rc=1
+          run_tlc BuftSetupLoopMC_none.cfg    BuftSetupLoop.tla           mgpu-split            || rc=1
+          run_tlc CreateSplitBalanceMC.cfg    CreateSplitBalance.tla      mgpu-split            || rc=1
+          run_tlc ClipCrossDeviceFlowMC.cfg   ClipCrossDeviceFlow.tla     mgpu-split            || rc=1
+          run_tlc AsyncReduceMC.cfg           AsyncReduce.tla             async-reduce          || rc=1
+          run_tlc CUDANativeDispatchMC.cfg    CUDANativeDispatchMC.tla    cuda-native-dispatch  || rc=1
+          run_tlc CUDAGraphCacheConsistencyMC.cfg CUDAGraphCacheConsistencyMC.tla cuda-native-dispatch || rc=1
+          run_tlc CalibrationFrameworkMC.cfg  CalibrationFrameworkMC.tla  cuda-native-dispatch  || rc=1
+          run_tlc CalibratedOpEquivalenceMC.cfg CalibratedOpEquivalenceMC.tla cuda-native-dispatch || rc=1
+          run_tlc M1QuantMatmulMC.cfg         M1QuantMatmul.tla           dispatch              || rc=1
+          exit $rc

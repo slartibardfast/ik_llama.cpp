@@ -1,0 +1,23 @@
+# Obligations for cuda_nccl_allreduce.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Buffer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ReduceOp => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BackendContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.NcclCommunicator => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CaptureRegion => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.ReduceDtype => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.ReduceKind => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.ReducePath => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.parity_nmse_bound => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.fallback_env_var => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.CrossDeviceAllReduce.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.NcclLifecycle.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.GraphCaptureCompatible.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ParityWithinNmseBound => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ArgmaxStableAcrossPaths => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NcclPathOnlyWhenDtypeEligible => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.EnvDisableForcesLegacyPath => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CommReadyBeforeFirstReduce => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaNcclAllreduceSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateCudaNcclAllreduceSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

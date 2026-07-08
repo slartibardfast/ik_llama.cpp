@@ -1,0 +1,21 @@
+# Obligations for turbo_kv_outliers.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Tensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.OutlierEntry => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.QuantizedHeadWithOutliers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.outlier_count => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.min_outlier_magnitude_fraction => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.seed => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.cent_max => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.QuantizeHeadWithOutliers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.QuantizeHeadWithOutliers.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.QuantizeHeadWithOutliers.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.QuantizeHeadWithOutliers.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.DequantizeHeadWithOutliers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.DequantizeHeadWithOutliers.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.DequantizeHeadWithOutliers.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.DequantizeHeadWithOutliers.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.OutlierIndicesInBounds => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.OutlierCountConsistent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.OutliersUnique => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

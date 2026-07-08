@@ -1,0 +1,362 @@
+-- allium: 3
+-- mtp_verify_accept.allium
+--
+-- Scope: the ideal-state contract for the verify-step accept-decision
+-- that sits between the per-ubatch MTP-KV hook
+-- (mtp_ubatch_hook.allium) and the post-accept KV chop
+-- (also in mtp_ubatch_hook.allium). Given a verify ubatch shaped
+-- [seed, D_0, D_1, ..., D_{N-1}] and the per-position logits the
+-- main forward produced, the accept-decision computes:
+--
+--   - n_accepted (count of drafts that match argmax of their
+--                 corresponding verify logits, longest-prefix)
+--   - bonus_token (verify's argmax at position pos_seed + n_accepted)
+--   - bonus_pos   (the position the bonus_token occupies)
+--
+-- These three values drive the post-accept KV chop and the seed for
+-- the next fused draft round.
+--
+-- Why this spec exists: the gen-time speculative loop is
+--
+--     [hook fires per ubatch]
+--          -> verify decision        <-- THIS SPEC
+--          -> seq_rm rejected tail
+--          -> fused draft round
+--          -> next round
+--
+-- The hook spec assumes the accept-decision exists; the fused-draft
+-- spec consumes the bonus_token as the seed for the next round.
+-- Without an explicit contract here, both relying specs paper over
+-- the algorithm's correctness obligations.
+--
+-- Includes:
+--   - External entities for the verify-batch shape, the logits
+--     tensor the main forward produces, and the decision result.
+--   - The AcceptVerify contract — invariants on how n_accepted,
+--     bonus_token, and bonus_pos are computed.
+--   - System-wide invariants on the longest-prefix match property,
+--     determinism under fixed logits, and the post-decision token
+--     commitment count.
+--   - Open questions: probabilistic accept (Leviathan/Chen rejection
+--     sampling) for non-argmax sampling; failure mode when verify
+--     logits are unavailable.
+--
+-- Excludes:
+--   - The per-ubatch hook timing. Owned by mtp_ubatch_hook.allium.
+--   - The fused N-step draft graph. Owned by mtp_fused_draft.allium.
+--   - The actual KV chop. Owned by mtp_ubatch_hook.allium's
+--     KvRangeChop contract. This spec produces the inputs the chop
+--     consumes (n_accepted, pos_seed); the chop's position arithmetic
+--     is its own invariant set.
+--   - The probability-ratio accept variant. Currently out of scope
+--     because mtp_fused_draft.allium binds argmax-only sampling. If
+--     that scope expands, both specs grow together.
+
+-- ============================================================
+-- External entities — gen-loop objects we constrain
+-- ============================================================
+
+-- The verify ubatch as submitted to the main forward. The shape is
+-- exactly one seed token plus n_drafts draft tokens, all in one
+-- sequence at consecutive positions.
+entity VerifyUbatch {
+    seq_id:        Integer
+    pos_seed:      Integer    -- position of the seed token
+    n_drafts:      Integer    -- number of drafts; total ubatch len = n_drafts + 1
+    seed_token:    Integer    -- the last-committed token from the prior round
+    draft_tokens:  List<Integer>   -- length n_drafts, in step order
+}
+
+-- The per-position logits emitted by the main forward over the
+-- verify ubatch. logit[k] is the distribution over the next-token
+-- after the k-th input position. The accept test compares
+-- argmax(logit[k]) against draft_tokens[k] for k in [0, n_drafts).
+entity VerifyLogits {
+    n_positions: Integer       -- equals VerifyUbatch.n_drafts + 1
+    n_vocab:     Integer
+}
+
+-- The output of the accept test. n_accepted is the count of drafts
+-- accepted by longest-prefix match. bonus_token is the argmax of
+-- the logit at position pos_seed + n_accepted (the next "real"
+-- token regardless of whether any drafts were accepted).
+entity AcceptDecision {
+    n_accepted:   Integer
+    bonus_token:  Integer
+    bonus_pos:    Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The accept algorithm. argmax_match is the deterministic mode: a
+-- draft is accepted iff it equals argmax(logit). probabilistic is
+-- the Leviathan/Chen rejection-sampling variant; out of scope for
+-- now (see OQ-1).
+enum AcceptMode { argmax_match | probabilistic }
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The verify-step accept-decision. Consumes one VerifyUbatch + its
+-- VerifyLogits. Produces one AcceptDecision. No side effects on KV
+-- state — that work is owned by mtp_ubatch_hook.allium's
+-- KvRangeChop, which the AcceptDecision feeds.
+contract AcceptVerify {
+    invoke: (ub: VerifyUbatch, logits: VerifyLogits, mode: AcceptMode) -> AcceptDecision
+
+    @invariant LogitsShapeMatchesUbatch
+        -- logits.n_positions = ub.n_drafts + 1. The main forward
+        -- emits one logit row per input position; the verify
+        -- ubatch has n_drafts + 1 input positions (seed + drafts),
+        -- so the logits cover positions pos_seed .. pos_seed +
+        -- n_drafts inclusive.
+
+    @invariant LongestPrefixMatchUnderArgmax
+        -- mode = argmax_match implies n_accepted is the largest k
+        -- in [0, n_drafts] such that for every i in [0, k):
+        -- draft_tokens[i] = argmax(logits at row i). Ties in
+        -- argmax broken by lowest token id (matching the rule in
+        -- mtp_fused_draft.allium ArgmaxWinnerWhenArgmaxOnly).
+        --
+        -- "Longest" matters: even if a later draft would have
+        -- matched argmax at its own row, it does not count once
+        -- an earlier draft was rejected. The downstream draft was
+        -- conditioned on a token that turns out wrong, so its
+        -- match is coincidental and discarded.
+
+    @invariant NAcceptedWithinBound
+        -- 0 <= n_accepted <= n_drafts. n_accepted = 0 means no
+        -- draft matched argmax at row 0; n_accepted = n_drafts
+        -- means every draft matched.
+
+    @invariant BonusIsArgmaxAtFirstUnacceptedRow
+        -- bonus_token = argmax(logits at row n_accepted). Ties
+        -- broken by lowest token id.
+        --
+        -- Two cases:
+        -- (a) n_accepted < n_drafts: row n_accepted is where the
+        --     match failed. Its argmax is what the model "wants"
+        --     instead of the rejected draft.
+        -- (b) n_accepted = n_drafts: every draft matched. Row
+        --     n_drafts is the LAST logit row (predicting the
+        --     next-next-token after the last accepted draft).
+        --     Its argmax is the new prediction.
+        --
+        -- In both cases the bonus is consumed as the seed_token of
+        -- the next fused draft round.
+
+    @invariant BonusPosIsSeedPlusNAcceptedPlusOne
+        -- bonus_pos = ub.pos_seed + n_accepted + 1. The bonus
+        -- token occupies the position immediately after the last
+        -- accepted draft (or after the seed, if zero drafts
+        -- accepted).
+        --
+        -- This is the position that becomes the next round's
+        -- pos_seed + 0; the next-round draft_0 will be tested
+        -- against the logit produced from the bonus.
+
+    @invariant DeterminismUnderFixedLogits
+        -- Two invocations with the same VerifyUbatch and the same
+        -- VerifyLogits and the same AcceptMode produce the same
+        -- AcceptDecision (n_accepted, bonus_token, bonus_pos all
+        -- byte-identical). The accept algorithm is a pure function
+        -- of its inputs.
+
+    @invariant ProbabilisticModeOutOfScope
+        -- mode = probabilistic is currently rejected at the
+        -- contract boundary. The implementation must return an
+        -- error and produce no AcceptDecision when called with
+        -- this mode until the scope of mtp_fused_draft.allium
+        -- expands to cover top_k > 1 sampling. See OQ-1.
+
+    @guidance
+        -- Implementation pattern: accept-decision runs entirely
+        -- on host. Inputs: the draft_tokens vector held by the
+        -- speculative caller, plus the verify logits which the
+        -- caller pulls from the main forward via
+        -- llama_get_logits_ith for each row k in [0, n_drafts].
+        -- For each k, run argmax over the n_vocab values, compare
+        -- to draft_tokens[k]. First mismatch terminates the loop;
+        -- record k as n_accepted, run argmax once more on row k
+        -- for bonus_token (or row n_drafts if all matched).
+        --
+        -- For our hardware, host-side argmax over 152K Qwen vocab
+        -- is dominated by the cudaMemcpy of the logits row from
+        -- device to host, not the argmax itself. The chain may
+        -- benefit from running the argmax on-device and pulling
+        -- only the index + chosen-prob; this is exactly what
+        -- llama_get_draft_argmax does today
+        -- (common/sampling.cpp:715-856). The accept-decision
+        -- consumes its output for the per-row argmax index.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- The total-tokens-committed property. Each successful AcceptVerify
+-- commits exactly n_accepted + 1 tokens to the sequence: the
+-- accepted drafts plus the bonus. The +1 is critical: even at
+-- n_accepted = 0, the bonus advances the position by one.
+invariant TotalCommittedIsNAcceptedPlusOne {
+    for decision in AcceptDecisions:
+        committed_token_count(decision) = decision.n_accepted + 1
+}
+
+-- The tokens-committed-are-correct property. The committed token
+-- sequence consists of the accepted prefix of draft_tokens followed
+-- by the bonus_token. The seed_token was committed in the prior
+-- round and is not re-counted. No other tokens enter the committed
+-- sequence from this verify round.
+invariant CommittedSequenceShape {
+    for decision in AcceptDecisions:
+        committed_tokens_match_accepted_prefix_then_bonus(decision)
+}
+
+-- The hook-chop coordination property. The MTP_KV chop range
+-- mandated by mtp_ubatch_hook.allium ChopRangeIsRejectedSuffix is
+-- exactly [ub.pos_seed + n_accepted + 1, ub.pos_seed + n_drafts].
+-- The bonus position (ub.pos_seed + n_accepted + 1) IS the first
+-- chopped position because the bonus's KV has not yet been written
+-- (it will be written by the NEXT verify forward, where the bonus
+-- serves as that round's seed).
+invariant ChopRangeFollowsAcceptDecision {
+    for decision in AcceptDecisions:
+        let ub = ubatch_of(decision)
+        chop_range_first(decision) = ub.pos_seed + decision.n_accepted + 1
+            and chop_range_last(decision) = ub.pos_seed + ub.n_drafts
+}
+
+-- The bonus-becomes-next-seed property. The bonus_token of round t
+-- is the seed_token of round t+1, at position bonus_pos. This is
+-- the contract that makes the speculative loop progress.
+invariant BonusBecomesNextSeed {
+    for pair in ConsecutiveAcceptedRounds:
+        pair.next_round.ub.seed_token = pair.this_round.decision.bonus_token
+            and pair.next_round.ub.pos_seed = pair.this_round.decision.bonus_pos
+}
+
+-- The progress-monotonicity property. Each verify round advances
+-- the committed position by at least one (the bonus always commits)
+-- and at most n_drafts + 1. Speculative decoding cannot stall.
+invariant VerifyAlwaysMakesProgress {
+    for decision in AcceptDecisions:
+        let advance = decision.n_accepted + 1
+        advance >= 1
+            and advance <= ubatch_of(decision).n_drafts + 1
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Probabilistic acceptance for non-argmax sampling.
+--   Leviathan & Chen (2023) defined a rejection-sampling rule that
+--   accepts a draft with probability min(1, p_target/p_draft),
+--   where p_target is the verify model's probability and p_draft
+--   is the draft model's probability of the same token. This rule
+--   makes spec-decode unbiased under stochastic sampling: the
+--   marginal output distribution exactly matches the target
+--   model's. Required if/when mtp_fused_draft.allium expands to
+--   top_k > 1.
+--
+--   Implementation cost: needs probabilities (already populated
+--   per ProbabilityFieldPopulated in mtp_fused_draft.allium) and
+--   per-step uniform random samples. The bonus token, when a
+--   draft is rejected, must be sampled from the residual
+--   distribution max(0, p_target - p_draft) / norm, not just
+--   argmax. This is non-trivial; defer until argmax-only is
+--   shown insufficient.
+--
+-- OQ-2: Failure mode when verify forward output is unavailable.
+--   If main forward returned GGML_STATUS_ALLOC_FAILED (PHASE 35
+--   Phase E) or any non-success status, VerifyLogits is invalid.
+--   The accept-decision must surface an error and produce no
+--   AcceptDecision in that case; the speculative caller should
+--   then short-circuit the entire round (no chop, no draft, no
+--   commit) and let the existing pool-pressure refusal path emit
+--   HTTP 503. This connects to mtp_ubatch_hook.allium OQ-4 (hook
+--   error propagation) but is logically owned here because the
+--   accept-decision is the consumer of the verify forward's
+--   output.
+--
+-- OQ-3: Top-1 stochastic mode (sampling temperature > 0 with
+--   top_k = 1). Mathematically identical to argmax_match for
+--   this case (a top-1 sample is always the argmax). The
+--   contract should accept this as an alias for argmax_match;
+--   the implementation may either treat it explicitly or rely
+--   on the caller passing AcceptMode.argmax_match. Pin down
+--   when the sampling-mode plumbing in
+--   common_speculative_state_mtp / fused dispatch stabilises.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/common/speculative.cpp:1463-1490
+--     - mtp_update_kv_cache; the existing post-accept code path
+--       that produces the inputs the AcceptDecision contract
+--       names. In the ideal state this becomes the consumer of
+--       AcceptDecision rather than the producer.
+--   ik_llama.cpp/common/speculative.cpp (existing common_speculative_state_mtp)
+--     - ::draft + ::accept methods; ::accept's n_accepted argument
+--       is exactly AcceptDecision.n_accepted.
+--   ik_llama.cpp/common/sampling.cpp:715, 856
+--     - llama_get_draft_argmax; reused for the per-row argmax
+--       index that drives the accept comparison.
+--   ik_llama.cpp/include/llama.h:1091
+--     - llama_get_draft_argmax; the accept-decision consumes its
+--       output once per row.
+--   ik_llama.cpp/examples/server/server-context.cpp:3791, 3966, 4523
+--     - existing accept-time call sites; in the ideal state the
+--       accept-decision is computed first, then KvRangeChop fires.
+--
+-- Black-box helpers used inline in the invariants above:
+--   AcceptDecisions, ConsecutiveAcceptedRounds, ubatch_of,
+--   committed_token_count,
+--   committed_tokens_match_accepted_prefix_then_bonus,
+--   chop_range_first, chop_range_last.
+--
+-- Test infrastructure to drive from this spec via
+-- allium:propagate (these RED tests drive the implementation):
+--   - Property test: build random VerifyLogits, build draft_tokens
+--     with controlled argmax-match prefix length k. Run
+--     AcceptVerify; assert n_accepted == k.
+--   - Bonus correctness test: assert bonus_token == argmax of
+--     the row at index n_accepted, with tie-break by lowest id.
+--   - Progress monotonicity test: assert n_accepted + 1 >= 1 in
+--     every round.
+--   - Determinism test: same inputs twice, byte-identical
+--     AcceptDecision.
+--   - Hook-chop coordination test: cross-spec property test that
+--     wires AcceptVerify -> KvRangeChop and asserts the chop
+--     range matches AcceptDecision.n_accepted + ub.pos_seed.
+--   - Probabilistic-mode-rejected test: invoke with
+--     AcceptMode.probabilistic and assert error rc with no
+--     AcceptDecision produced.
+--   - Lives at the host-side speculative.cpp level (no GPU
+--     required for the algorithm itself; logits are inputs).
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity MtpVerifyAcceptSystem {
+    accept_decisions: List<AcceptDecision>
+}
+
+contract ValidateMtpVerifyAcceptSystem {
+    invoke: (sys: MtpVerifyAcceptSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

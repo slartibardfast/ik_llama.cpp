@@ -1,0 +1,21 @@
+# Obligations for calibrated_dispatch_framework.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+enum-comparable.OpId => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.GpuUuid => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CacheKey => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Threshold => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ProbeResult => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CalibrationTable => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DispatchQuery => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaContextPair => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ProbeRun => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CalibratedDispatchSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ThresholdQuantised => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ProbeIsDeterministic => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CacheLoadIdempotent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DispatchIsPureFunction => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CalibrationCompletesBeforeFirstDispatch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoCrossoverImpliesSizeMax => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateCalibrationSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

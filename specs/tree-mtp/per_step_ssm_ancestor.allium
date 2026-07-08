@@ -1,0 +1,229 @@
+-- allium: 3
+-- per_step_ssm_ancestor.allium
+--
+-- Scope: the DeltaNet ancestor-state lookup contract for tree-MTP
+-- depth=2 (Phase 42). At depth=2, child tokens fork from parent tokens
+-- whose state has already been computed earlier in the same batch.
+-- Each forking child must read state from its ancestor's saved
+-- per_step_ssm checkpoint, not from the immediately-preceding token.
+--
+-- Why this spec exists: ik_llama.cpp's existing per_step_ssm
+-- mechanism (src/llama.cpp:1795, 2013-2402, 9112-9256) saves the
+-- DeltaNet state at every batch position and restores it at rejection. The
+-- machinery is correct for linear rejection rollback. Tree depth=2
+-- needs the same machinery to read at FORK points, not just rejection
+-- points. This spec names the contract the new branch_parent_step
+-- field must satisfy.
+--
+-- Includes:
+--   - External entities for the per-step state buffer and the
+--     branch_parent_step field on each batch token.
+--   - The DeltaNetStateRead contract: per-token state-input lookup.
+--   - Invariants on acyclicity, determinism, and state-equivalence
+--     under ancestor lookup.
+--
+-- Excludes:
+--   - The KV cell side (handled by branch_seq_id.allium and
+--     llama_kv_cache_seq_cp's extension).
+--   - The KQ_mask construction for the tree topology.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The DeltaNet per-step state checkpoint buffer. Sized to the batch
+-- length; populated during forward by saving s_l at each token
+-- position before the layer's update. Indexed by step (0 = first
+-- token in batch).
+entity PerStepSsm {
+    n_steps:    Integer
+    state_dim:  Integer
+}
+
+-- One token in the batch. Carries the new branch_parent_step field
+-- which Phase 42 plumbs through the batch struct. -1 indicates no
+-- ancestor branching (use prev-step state); >= 0 indicates the step
+-- index whose state should be loaded as the input.
+entity BatchToken {
+    step_index:          Integer    -- 0..n_steps-1
+    branch_parent_step:  Integer    -- -1 (root) or [0, step_index)
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The DeltaNet update's state-input lookup. Called once per token
+-- per layer; returns the state row to use as input to the layer's
+-- update equations.
+contract DeltaNetStateRead {
+    invoke: (token: BatchToken, ssm: PerStepSsm, layer_idx: Integer) -> StateRow
+
+    @invariant RootReadsPrevStep
+        -- token.branch_parent_step = -1 implies the read returns
+        -- ssm[token.step_index - 1] for that layer (or the slot's
+        -- pre-batch state for step_index = 0). This is the existing
+        -- linear behavior; the new field defaults to -1 to preserve
+        -- it.
+
+    @invariant AncestorReadsAncestorStep
+        -- token.branch_parent_step >= 0 implies the read returns
+        -- ssm[token.branch_parent_step] for that layer. The
+        -- ancestor's state was saved before the current token entered
+        -- the layer, so the read is well-defined.
+
+    @invariant Acyclicity
+        -- token.branch_parent_step < token.step_index for every
+        -- non-root token. The branch parent must be an earlier step
+        -- in the batch; cycles are forbidden by construction.
+
+    @invariant SaveBeforeLayerUpdate
+        -- ssm[token.step_index] is written BEFORE the layer's
+        -- update for token. Subsequent tokens may read from
+        -- ssm[token.step_index] (as their branch_parent_step); this
+        -- is only valid because the save happens first.
+
+    @invariant DeterministicReadGivenSsm
+        -- Two reads with the same BatchToken and the same PerStepSsm
+        -- contents return the same StateRow. The lookup is a pure
+        -- function of its inputs.
+
+    @invariant LayerIndependence
+        -- The branch_parent_step field applies uniformly across all
+        -- DeltaNet layers. There is one branch_parent_step per token,
+        -- not per (token, layer). All layers see the same ancestor
+        -- step; only the layer-indexed contents of ssm differ.
+}
+
+-- ============================================================
+-- External entity declaration for StateRow
+-- ============================================================
+
+-- One row of DeltaNet state for one layer. Opaque to this spec; the
+-- only operations are read/write via per_step_ssm.
+entity StateRow {
+    layer_idx: Integer
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- Equivalence of ancestor-lookup against direct-from-init. Computing
+-- token T's layer output via ancestor lookup from saved
+-- per_step_ssm[ancestor] is byte-equivalent to computing T from a
+-- fresh batch where T's prior state was loaded from the same
+-- per_step_ssm[ancestor] row. The lookup mechanism does not perturb
+-- the state.
+invariant AncestorLookupIsTransparent {
+    for token in BatchTokens where token.branch_parent_step >= 0:
+        layer_output_via_ancestor_lookup(token)
+            = layer_output_via_direct_init(token, state_at_step(token.branch_parent_step))
+}
+
+-- Backward compatibility. Setting branch_parent_step = -1 for every
+-- token reproduces the pre-Phase-42 linear behavior: each token reads
+-- prev-step state.
+invariant LinearModeReproduction {
+    for batch in Batches where all_tokens_branch_parent_step_negative_one(batch):
+        layer_outputs_with_ancestor_field(batch)
+            = layer_outputs_pre_phase_42(batch)
+}
+
+-- Greedy parity at K=1. Phase 41/42 closure binds: with tree disabled,
+-- all token outputs are byte-identical to the pre-Phase-41 build at
+-- temp=0.
+invariant GreedyParityWhenTreeDisabled {
+    for batch in Batches where tree_disabled(batch)
+        and sampling_mode(batch) = greedy_temp_zero:
+            layer_outputs_with_ancestor_field(batch)
+                = layer_outputs_pre_phase_41(batch)
+}
+
+-- Memory cost. Ancestor lookup adds zero bytes of state buffer beyond
+-- per_step_ssm, which already exists. The branch_parent_step field is
+-- one int32 per token in the batch (n_tokens * 4 bytes total); this
+-- is negligible vs the per_step_ssm itself (n_tokens * state_dim *
+-- n_layers * 4 bytes).
+invariant ZeroExtraStateBuffer {
+    for cfg in TreeConfigs:
+        ancestor_lookup_state_bytes(cfg) = 0
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Tree depth > 2 support. Acyclicity already permits arbitrary
+--   depth as long as branch_parent_step < step_index. The
+--   per_step_ssm buffer must be large enough; with the existing
+--   batch-sized allocation this works for any depth that fits in one
+--   batch. No spec change needed; mark explicit if higher depths
+--   land.
+--
+-- OQ-2: Cross-batch ancestor lookup. branch_parent_step is currently
+--   an in-batch index; ancestors from prior batches are not
+--   addressable. This is fine for tree drafting (tree spans one
+--   batch) but constrains future designs that might want to fork
+--   from a previously-committed token. Defer until needed.
+--
+-- OQ-3: Multi-slot batched ancestor lookup. With multiple slots in
+--   one batch, each slot has its own ancestor topology. The
+--   branch_parent_step field is per-token; slot membership is
+--   already encoded via seq_id. The contract holds as long as
+--   branch_parent_step indexes a token of the same slot. The
+--   implementation must enforce this OR allow cross-slot ancestry
+--   (seemingly unintended; flag in implementation).
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama.cpp:8013-8068
+--     - per_step_ssm save site; the existing checkpoint buffer
+--   ik_llama.cpp/src/llama.cpp:8137-8146
+--     - per_step_restore(k); the existing rejection rollback path
+--   ik_llama.cpp/src/llama-delta-net.cpp
+--     - the layer's update site where the ancestor read is added
+--       (specific line determined by Phase 42 implementation)
+--   ik_llama.cpp/include/llama.h
+--     - llama_batch struct extension for branch_parent_step field
+--
+-- Black-box helpers used in invariants:
+--   BatchTokens, Batches, BatchTokensOf, layer_output_via_ancestor_lookup,
+--   layer_output_via_direct_init, state_at_step,
+--   all_tokens_branch_parent_step_negative_one,
+--   layer_outputs_with_ancestor_field, layer_outputs_pre_phase_42,
+--   layer_outputs_pre_phase_41, tree_disabled, sampling_mode,
+--   ancestor_lookup_state_bytes, TreeConfigs.
+--
+-- Test infrastructure (allium:propagate):
+--   - LinearModeReproduction property: set branch_parent_step = -1
+--     for every token; assert byte-equality vs pre-Phase-42 build.
+--   - AncestorLookupIsTransparent property: at depth=2, set token T's
+--     branch_parent_step to ancestor A; assert byte-equality vs
+--     dispatching T alone with state seeded from per_step_ssm[A].
+--   - Acyclicity property: random batches with random
+--     branch_parent_step assignments; reject any with
+--     branch_parent_step >= step_index at construction.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity PerStepSsmAncestorSystem {
+    state_rows: List<StateRow>
+}
+
+contract ValidatePerStepSsmAncestorSystem {
+    invoke: (sys: PerStepSsmAncestorSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

@@ -1,0 +1,616 @@
+-- allium: 3
+-- specs/deltanet/batch-invariance.allium
+--
+-- Scope: the CURRENT behavioural contract for the vanilla decode pipeline
+-- of the hybrid Qwen 3.5/3.6 architecture (linear_attn + full_attention)
+-- on the production 2026-q2-next branch of ik_llama.cpp, running on dual
+-- Quadro RTX 6000 (sm_75 / TU102) with the production target GGUF
+-- /opt/models/recast-out/qwen3.6-27b-V-F1.T1.qq-tool1lossless-vocab-fix.gguf
+-- (general.architecture=qwen35, n_layer=65 with 64 transformer + 1 MTP).
+--
+-- "DeltaNet" in this spec NAMES the whole vanilla hybrid pipeline (the
+-- recurrent DeltaNet kernel together with the interleaved full-attention
+-- layers, projection GEMMs, RMSNorms, residual stream, FFN) — not solely
+-- the recurrence kernel. The user-named workstream phrase carries over
+-- from PLAN.md.
+--
+-- This spec captures the CURRENT state. The 2026-05-14 baseline (Stage 1 /
+-- S2.1 / S2.2 / S2.3) locked the empirically-established FAILURE of
+-- byte-identity at np > 1 and localised its source. The 2026-06-14
+-- reconciliation (PHASE_LM_DECODE_CAPTURE D1, resolved) records that the
+-- SYSTEMATIC source has since been FIXED: np <= 4 is now token-level
+-- deterministic, and the residual np = 8 divergence is an intermittent
+-- host-timing race, not deterministic drift. The dated invariant
+-- corrections below preserve the 2026-05-14 record rather than rewriting
+-- it — each correction names what reality changed and when.
+--
+-- FRAMING — "batch invariance" (prior art). Determinism here means
+-- BATCH INVARIANCE: a fixed reduction order regardless of batch
+-- size/composition, so a token's output is independent of how many other
+-- tokens share its batch. The canonical strategies (Thinking Machines,
+-- "Defeating Nondeterminism in LLM Inference") are: matmul = no split-K,
+-- fixed tiling, FP32 accumulation; attention = fixed split-SIZE with
+-- varying split-COUNT (NOT fixed split-count); norm = fixed per-row
+-- reduction. Our kernels already implement these: the KV-split FA uses a
+-- fixed split SIZE (compute_pb = ceil(n_kv / 256)), and the shipping
+-- decode matmul path (path B, GGML_CUDA_DECODE_MMVQ) and the path-A M1
+-- fallback both avoid MMQ's split-K. This spec's contract is the
+-- MULTI-GPU extension of upstream llama.cpp's single-GPU deterministic
+-- mode (GGML_DETERMINISTIC, PR ggml-org/llama.cpp#16016), which
+-- implements the same strategies.
+--
+-- SCOPE BOUNDARY (load-bearing for the np = 8 result below). Upstream
+-- GGML_DETERMINISTIC guarantees SINGLE-GPU batch-invariance only;
+-- multi-GPU / tensor-parallel determinism is EXPLICITLY out of scope
+-- upstream. Our np <= 4 result sits inside that solvable envelope. The
+-- residual np = 8 intermittent race is a multi-GPU tensor-parallel
+-- determinism problem — beyond the published single-GPU state of the
+-- art; "Deterministic Inference across Tensor Parallel Sizes"
+-- (arXiv:2511.17826) is the frontier for the TP case. This reframes
+-- np = 8 as a known-hard TP-determinism frontier problem (tracked under
+-- PHASE_NP8_FLAKE), not a local kernel defect.
+--
+-- Evidence base (all under data/deltanet/ on 2026-q2-next unless noted):
+--   s1-1-rep-identity.json                 — Stage 1 NP=2 self-determinism
+--   s2-1-per-prompt-first-div.json         — S2.1 8-prompt first-divergent layer
+--   s2-1-corrected-clean-comparison.json   — S2.1 correction (same-offset comparison)
+--   s2-2-dispatch-trace.json               — S2.2 dispatcher uniformity at NP=2/4/8
+--   s2-3-op-level-localization.json        — S2.3 op-level localization (FA + MMQ)
+--   PHASE_LM_DECODE_CAPTURE D1 (2026-06-14) — verify-production-determinism.sh
+--     runs: np<=4 token-level determinism PASS 3/3 at NP_LIST="1 2 4"
+--     (all slots byte-identical to NP=1, cross-NP slot-0 byte-identical),
+--     after the nwarps=4 MMVQ fix (mmvq-templates.cuh:460) + path B
+--     (GGML_CUDA_DECODE_MMVQ on); np=8 12 PASS / 1 FAIL over 13 reps at
+--     CTX_PER_SLOT=8192 with clocks 1455 + Windows Ultimate Performance
+--     pinned (~8% single-slot argmax flip, varying slot)
+--
+-- Hardware envelope:
+--   - 2× Quadro RTX 6000 (sm_75 / TU102), 24 GiB each, NVLINK
+--   - HBM 624 GB/s per-GPU, 1.25 TB/s aggregate
+--   - FP16 tensor-core peak 130.5 TFLOPs per-GPU, 261 TFLOPs aggregate
+--   - fp16_mma_available=true; new_mma_available=false; int8_mma_available=true
+--
+-- Out of scope: Vulkan backend, Mamba / other recurrent stacks,
+-- quantization changes to the target weights, cross-host parity.
+
+-- ============================================================================
+-- Types
+-- ============================================================================
+
+enum NPMode { np1 | np2 | np4 | np8 }
+enum LayerType { linear_attn | full_attention | mtp_head }
+enum ResidualStoragePrecision { f32_storage | f16_storage }
+enum KernelTemplate {
+    wmma_f16_case_128_128_8_half |
+    mmq_x_8_nwarps_8 |
+    delta_net_recurrent_f32_hd128_b256 |
+    other_kernel
+}
+enum DriftLevel {
+    byte_identical |
+    sub_fp32_epsilon |
+    sub_f16_precision |
+    fp16_visible |
+    fp32_visible
+}
+
+-- ============================================================================
+-- Entities
+-- ============================================================================
+
+entity WmmaFAKernel {
+    -- The full-attention kernel template selected for sm_75 with Q4_0 KV
+    -- cache at decode shapes:
+    --   ggml_cuda_flash_attn_ext_wmma_f16_case<128, 128, 8, half>
+    -- Dispatcher: ggml/src/ggml-cuda/fattn.cu:140 routes here on sm_75
+    -- because (!new_mma_available(cc) || K->ne[0] != V->ne[0]).
+    -- Internal branch on Q->ne[1] picks cols_per_block=8 for n_tokens<=8
+    -- (fattn-wmma-f16.cu:81). Same compile-time template at NP=2/4/8;
+    -- grid geometry varies with n_tokens.
+    template: KernelTemplate
+}
+
+entity MmqKernel {
+    -- The quantized matmul kernel template for projection and FFN GEMMs
+    -- at decode shapes (ggml/src/ggml-cuda/mmq.cu + mmq.cuh). Dispatcher
+    -- mul_mat_q_case at mmq.cuh:4175: for ne11 in {2, 4, 8} the mmq_x_best
+    -- picker converges on mmq_x=8 (ntiles_x=1 → nparts=1 on first iter).
+    template: KernelTemplate
+}
+
+entity DeltaNetRecurrenceKernel {
+    -- The DeltaNet linear-attention recurrence kernel for recurrent
+    -- layers. ggml/src/ggml-cuda/delta-net.cu. Dispatch: n_tokens<=8
+    -- branch picks threads_per_block=256 (delta-net.cu:219).
+    template: KernelTemplate
+}
+
+entity PerLayerResidual {
+    -- The l_out-<il> tensor produced at each transformer layer exit.
+    -- Shape [n_embd=5120, n_tokens=N, 1, 1] at decode. Storage precision
+    -- is F32 when N=1 (np=1 single-token path) and F16 when N>=2
+    -- (np>=2 multi-token path) per the qwen35 build graph's batch-dim
+    -- threshold.
+    layer_type: LayerType
+    storage: ResidualStoragePrecision
+    drift: DriftLevel
+}
+
+entity PerSlotKVCache {
+    -- Per-slot KV state for both attention paths. Logically per-slot
+    -- independent. Q4_0 dtype.
+    np: NPMode
+}
+
+entity HybridPipeline {
+    -- The vanilla decode forward pass of Qwen 3.5/3.6 target on sm_75.
+    -- 64 transformer + 1 MTP layer (MTP not on vanilla path at
+    -- cparams.mtp=false). n_embd=5120, head_dim_q=256, head_dim_v=128,
+    -- n_heads=12, n_kv_heads=2. FA layers at indices {3, 7, 11, 15, 19,
+    -- 23, ..., 63} (full_attn_interval=4). All other indices are
+    -- linear_attn. Weights Q4_0 / Q4_0_AR16 / BF16 / F16 / F32. KV
+    -- cache Q4_0 (K + V). flash_attn enabled.
+    fa_kernel: WmmaFAKernel
+    mmq_kernel: MmqKernel
+    deltanet_kernel: DeltaNetRecurrenceKernel
+    residual: PerLayerResidual
+    kv_cache: PerSlotKVCache
+}
+
+-- Top-level contract that anchors HybridPipeline at the root of the
+-- entity reference chain. The contract surface is the per-layer
+-- forward step at one decode position: given a residual stream and
+-- the pipeline state, compute the next layer's residual.
+contract LayerForwardStep {
+    invoke: (pipeline: HybridPipeline, in_residual: PerLayerResidual) -> PerLayerResidual
+
+    @invariant LayerForwardIsPerSlotDeterministic
+        -- For fixed pipeline state and fixed in_residual at slot K, the
+        -- contract produces a unique out_residual at slot K. This is
+        -- the per-slot determinism that holds across reps at fixed NP
+        -- (per RepDeterminismAtSameNP); it does NOT hold across NP
+        -- (per KernelFPArithmeticBatchShapeSensitivity).
+}
+
+-- ============================================================================
+-- INVARIANTS — empirically established as of 2026-05-14
+-- ============================================================================
+
+invariant StorageBranchInvariant {
+    -- The qwen35 build graph emits the per-layer residual tensor as F32
+    -- if and only if the decode batch has n_tokens = 1 (np = 1 path);
+    -- otherwise F16. Confirmed by DFLASH_DIAG=1 stderr trace showing
+    -- t->type at each cb_eval fire. Bound by:
+    --   data/deltanet/d2-first-divergent-layer.json (notes the storage
+    --   delta as the reason NP=1 vs NP>=2 comparisons mix storage with
+    --   computational delta)
+}
+
+invariant RepDeterminismAtSameNP {
+    -- For any fixed NP > 0, fixed prompt set, fixed offset, fixed initial
+    -- KV state, two independent runs produce byte-identical per-layer
+    -- per-slot residual streams. Bound by:
+    --   data/deltanet/s1-1-rep-identity.json — 128/128 (layer × slot)
+    --   pairs byte-identical at NP=2 across 2 reps
+}
+
+invariant DispatcherTemplateUniformity_FA {
+    -- For NP in {2, 4, 8} at decode (Q->ne[1] in {2, 4, 8}) on sm_75
+    -- with head_dim=128 and Q4_0 KV cache, the FA dispatcher selects
+    -- the same kernel template:
+    --   ggml_cuda_flash_attn_ext_wmma_f16_case<128, 128, 8, half>
+    -- Bound by:
+    --   Static analysis of fattn.cu line 140 + fattn-wmma-f16.cu lines
+    --   81-104; Q->ne[1] <= 8 branch, Q->ne[0]=128 case, default precision.
+    --   Documented in data/deltanet/s2-2-dispatch-trace.json
+}
+
+invariant DispatcherTemplateUniformity_MMQ {
+    -- For NP in {2, 4, 8} at decode (src1->ne[1] in {2, 4, 8}), the MMQ
+    -- dispatcher selects mmq_x = 8 (with MMQ_NWARPS = 8). Bound by:
+    --   Static analysis of mmq.cuh:4175-4220 — mmq_x_picker loop converges
+    --   on mmq_x=8 at ne11 <= 8 because ntiles_x=1 yields nparts=1 on
+    --   first iteration. Documented in data/deltanet/s2-2-dispatch-trace.json
+}
+
+invariant DispatcherTemplateUniformity_DeltaNet {
+    -- For NP in {1, 2, 4, 8} at decode (n_tokens <= 8), the DeltaNet
+    -- kernel dispatch selects threads_per_block = 256. Bound by:
+    --   Static analysis of delta-net.cu:219 n_tokens <= 8 branch
+}
+
+invariant ProjectionGEMMSlotInvariance {
+    -- For any prompt p at slot K, the projection GEMM outputs (Qcur,
+    -- Kcur, Vcur, Qcur_normed, Kcur_normed, gate, q) at any layer L
+    -- are byte-identical across NP values when the slot K of each
+    -- NP captures the same prompt p (same offset). Bound by:
+    --   data/deltanet/s2-3-op-level-localization.json — verified at
+    --   p3 layer 3 (offset=3, NP=2 vs NP=4), p1 layer 3 (offset=1),
+    --   p0 layer 19 (offset=0). All projection inputs IDENTICAL at slot 0.
+}
+
+invariant DeltaNetSlotInvariance {
+    -- For any prompt p at slot K, the DeltaNet recurrence kernel
+    -- outputs (linear_attn_out, delta_net_fused_raw, state_in,
+    -- state_fused, new_state, qkv_mixed, linear_attn_qkv_mixed) at any
+    -- linear_attn layer are byte-identical across NP values when slot
+    -- K of each NP captures the same prompt p (same offset). Bound by:
+    --   data/deltanet/s2-3-op-level-localization.json — initial layer 0
+    --   capture at p3 offset=3 NP=2 vs NP=4: all DeltaNet outputs
+    --   IDENTICAL at slot 0
+}
+
+invariant KernelFPArithmeticBatchShapeSensitivity {
+    -- UNIFIED MECHANISM (S2.3 correction 2026-05-14): the same kernel
+    -- TEMPLATE (wmma_f16_case<128,128,8,half> OR mul_mat_q_case<TYPE,
+    -- mmq_x=8>) running on slot-K's BYTE-IDENTICAL inputs produces
+    -- fp32-epsilon-level numerical variation across different batch
+    -- widths (NP=2 vs NP=4 vs NP=8). This is a property of the kernel's
+    -- internal FP-arithmetic at different grid/work distributions, NOT
+    -- of the template selection (which is uniform — see
+    -- DispatcherTemplateUniformity_*).
+    --
+    -- The fp32-epsilon noise floor is approximately 1e-7 at any FA call
+    -- across NP values for slot-K with identical inputs. Whether this
+    -- noise crosses the F16-precision threshold (~1e-3 to 1e-4 at
+    -- residual magnitudes) and becomes visible in the F16-stored
+    -- residual depends on data:
+    --
+    --   (a) FA output already above F16 at this layer (p1, p3, p4 at
+    --       layer 3 per data/deltanet/s2-3-corrected-unified-mechanism.json)
+    --   (b) FA below F16 but downstream MMQ FFN GEMMs amplify (p0 layer
+    --       19, where MMQ amplifies 4.8e-7 to 0.006 at l_out)
+    --   (c) Noise stays sub-F16 throughout the layer (p0 layer 3,
+    --       p2 layer 3 per same evidence)
+    --
+    -- Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json
+}
+
+invariant WmmaFAShapeSensitiveAtSomeInputs {
+    -- FACET of KernelFPArithmeticBatchShapeSensitivity (a): the FA
+    -- output already differs at F16 level at some prompt × layer
+    -- combinations. Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json — p1, p3,
+    --   p4 layer 3 flash_attn max_abs_diff in {5e-4, 6e-4, 8e-4} range
+}
+
+invariant WmmaFAByteIdenticalAtOtherInputs {
+    -- FACET of KernelFPArithmeticBatchShapeSensitivity (c) and (b)
+    -- pre-amplification: at some inputs the FA kernel's noise stays
+    -- sub-F16 and the F16-stored output is byte-identical (modulo
+    -- ~2e-7 fp32-epsilon noise). Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json — p0 layer 3
+    --   FA max_abs_diff 2.4e-7; p0 layer 19 FA max_abs_diff 4.8e-7;
+    --   both result in byte-identical l_out at first decode position
+    --   IF no downstream amplification (e.g., p0 layer 3 → l_out 0.0).
+}
+
+invariant MmqShapeSensitiveViaAmplification {
+    -- FACET of KernelFPArithmeticBatchShapeSensitivity (b): the MMQ
+    -- FFN kernels amplify sub-F16 upstream noise above F16 at specific
+    -- prompt × layer combinations. Empirically observed only at p0
+    -- layer 19 in the current capture set. Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json — p0 layer 19
+    --   shows FA-1019/2019 below F16 but l_out at 0.006 from MMQ
+    --   amplification chain through kqv_wo → ffn_up_gate → ffn_down
+}
+
+invariant DriftCascadeAfterFirstDivergence {
+    -- Once any per-device intermediate diverges at a layer L, all
+    -- downstream computations within layer L diverge (kqv_wo,
+    -- attn_out_with_input, attn_combined via NCCL allreduce,
+    -- ffn_up_gate, ffn_down, ffn_with_inp, l_out). The drift then
+    -- propagates forward to all subsequent layers' residuals. Bound by:
+    --   data/deltanet/s2-3-op-level-localization.json — p1, p3 layer 3
+    --   cascade pattern visible at all per-device il_cb captures (1003,
+    --   2003) and the layer-final tensors (attn_combined, l_out)
+}
+
+invariant PerPromptDriftSiteVariability {
+    -- The first-divergent layer at NP=2 vs NP=4 is data-dependent.
+    -- CORRECTED with same-offset clean comparison
+    -- (data/deltanet/s2-3-corrected-unified-mechanism.json):
+    --   p0 (offset=0): l_out byte-identical until layer 19, where MMQ
+    --                  amplification produces max_abs_diff 0.006
+    --   p1 (offset=1): l_out diverges at layer 3 (FA above F16)
+    --   p2 (offset=2): l_out byte-identical at layer 3 (FA sub-F16,
+    --                  no MMQ amplification at this layer); class same
+    --                  as the p6/p7 "no drift" finding from S2.1
+    --   p3 (offset=3): l_out diverges at layer 3
+    --   p4 (offset=4): l_out diverges at layer 3
+    --   p5, p6, p7: cannot be tested at same-offset clean (np=4 with
+    --              offset >=5 needs p8.txt which doesn't exist)
+    --
+    -- Modal case among testable prompts: FA above F16 at layer 3
+    -- (3 of 5 testable prompts). Outliers: p0 (FA sub-F16 but MMQ
+    -- amplification at layer 19); p2 (sub-F16 throughout — no drift
+    -- at first decoded token). The original S2.1 finding that named
+    -- p1, p2, p3, p4, p5 as all "FA layer 3" was an artifact of
+    -- cross-slot comparison (slot 0 NP=2 vs slot K NP=4 for matching
+    -- prompt); clean same-offset shows p2 is in the no-drift class.
+}
+
+invariant TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity {
+    -- EXTENDED 2026-06-14 (PHASE_LM_DECODE_CAPTURE D1) from NP1_NP2 to
+    -- NP1_NP2_NP4. Originally TokenLevelGreedyArgmaxNP1_NP2_Identity, which
+    -- asserted only np1 == np2; the nwarps=4 MMVQ fix
+    -- (mmvq-templates.cuh:460) + path B (GGML_CUDA_DECODE_MMVQ) extend the
+    -- identity to np4. At the production model (qwen3.6-27b) on 2x Quadro
+    -- RTX 6000 with split-mode graph, greedy argmax of final logits is
+    -- byte-identical (token-level) across NP in {1, 2, 4} for every
+    -- position and every slot. This is single-GPU-class batch invariance
+    -- realised across the multi-GPU decode for np <= 4. Bound by:
+    --   data/phase_dflash_t8/gate7-token-diff-summary.json (original
+    --     NP=1 vs NP=2 byte-identical at token level), AND
+    --   PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh PASS
+    --     3/3 at NP_LIST="1 2 4" (all slots byte-identical to NP=1,
+    --     cross-NP slot-0 byte-identical), 2026-06-14
+}
+
+invariant NP8TokenDeterminismNotHeld_IntermittentTPRace {
+    -- CORRECTED 2026-06-14 (PHASE_LM_DECODE_CAPTURE D1). Was
+    -- TokenLevelGreedyArgmaxNP4_NP8_DeterministicDrift, which framed the
+    -- np4-vs-np8 difference as DETERMINISTIC drift (reproducible per-rep,
+    -- sourced from FA/MMQ kernel shape-sensitivity). That framing is
+    -- WRONG. With clocks (1455) and power (Windows Ultimate Performance)
+    -- fully pinned, np = 8 token determinism does NOT hold, but the
+    -- failure is INTERMITTENT, not deterministic: over 13 reps at
+    -- CTX_PER_SLOT=8192, 12 PASS / 1 FAIL (~8%), a single-slot argmax
+    -- flip on a varying slot. Pinning clocks + power does NOT eliminate
+    -- it (the "operational pinning fixes it" hypothesis is FALSIFIED), so
+    -- the mechanism is a Class-2 concurrency / host-timing race, not the
+    -- systematic FP-arithmetic batch-shape divergence that
+    -- WmmaFAShapeSensitiveAtSomeInputs / MmqShapeSensitiveViaAmplification
+    -- described (and which the nwarps=4 fix has since closed for the
+    -- systematic part). This is a multi-GPU tensor-parallel determinism
+    -- problem — beyond the single-GPU state of the art (see header SCOPE
+    -- BOUNDARY; arXiv:2511.17826 for the TP frontier) — tracked under
+    -- PHASE_NP8_FLAKE. Bound by:
+    --   PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh np=8
+    --     12 PASS / 1 FAIL over 13 reps at CTX_PER_SLOT=8192, clocks+power
+    --     pinned, 2026-06-14
+}
+
+-- ============================================================================
+-- NON-INVARIANTS — explicitly NOT held at the current state
+-- ============================================================================
+
+invariant NotHeld_FA_BatchInvariance {
+    -- wmma_f16 FA kernel batch-invariance (slot-K output identical
+    -- across NP at any input) does NOT hold. Counterexample:
+    -- WmmaFAShapeSensitiveAtSomeInputs.
+}
+
+invariant NotHeld_MMQ_BatchInvariance {
+    -- MMQ kernel batch-invariance does NOT hold. Counterexample:
+    -- MmqShapeSensitiveViaAmplification.
+}
+
+invariant NotHeld_LayerLevelByteIdentity_NP2_NP4 {
+    -- For production prompt set, byte-identity of per-layer per-slot
+    -- residuals across NP=2 and NP=4 does NOT hold at any layer beyond
+    -- the first-divergent one. Counterexample: per-prompt first-divergent
+    -- layer in PerPromptDriftSiteVariability.
+}
+
+invariant Falsified_NotHeld_TokenLevelDeterminism_NP4 {
+    -- FALSIFIED 2026-06-14 (PHASE_LM_DECODE_CAPTURE D1). Was
+    -- NotHeld_TokenLevelDeterminism_NP4, which asserted that NP=4 greedy
+    -- argmax differs from NP=2 at specific positions. Reality changed:
+    -- after the nwarps=4 MMVQ fix (mmvq-templates.cuh:460) + path B,
+    -- NP=4 token-level determinism HOLDS — np1 == np2 == np4 byte-
+    -- identical at every position and slot. The positive statement is now
+    -- TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity above. Kept here as a
+    -- dated record of the corrected non-invariant rather than deleted, so
+    -- the 2026-05-14 baseline is not silently rewritten. Bound by:
+    --   PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh PASS
+    --     3/3 at NP_LIST="1 2 4", 2026-06-14
+}
+
+-- ============================================================================
+-- RECONCILIATION — systematic-fix localization (2026-06-14)
+-- ============================================================================
+
+invariant SystematicDivergenceWasDeltaNetFastPath {
+    -- ESTABLISHED 2026-06-14 (PHASE_LM_DECODE_CAPTURE D1). The SYSTEMATIC
+    -- (reproducible-per-rep) np > 1 divergence localised at 2026-05-14 has
+    -- a single dominant source: the delta_net all_same_seq FAST PATH vs
+    -- the per-block SLOW PATH (src/llama-delta-net.cpp:704-720). The two
+    -- paths diverge at fp32-ULP from layer 6 onward. The divergence is
+    -- toggled by LLAMA_DELTA_FORCE_SLOW: forcing the slow path removes the
+    -- batch-shape-dependent fast/slow selection and the systematic
+    -- divergence with it. This is the systematic mechanism the nwarps=4
+    -- MMVQ fix + path B addressed for np <= 4 (see
+    -- TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity). It is DISTINCT from the
+    -- residual np = 8 intermittent host-timing race
+    -- (NP8TokenDeterminismNotHeld_IntermittentTPRace), which is a timing
+    -- mechanism, not this path divergence — the two must not be conflated.
+    -- Bound by:
+    --   src/llama-delta-net.cpp:704-720 (all_same_seq fast/slow split),
+    --     LLAMA_DELTA_FORCE_SLOW toggle, 2026-06-14
+}
+
+invariant MmvqSelfBatchInvariantAfterNwarps4 {
+    -- ESTABLISHED 2026-06-14 (PHASE_LM_DECODE_CAPTURE D1). After the
+    -- nwarps=4 fix (mmvq-templates.cuh:460), the shipping decode matmul
+    -- (path B, GGML_CUDA_DECODE_MMVQ) is SELF-BATCH-INVARIANT: its output
+    -- is byte-identical across ncols 1..8, i.e. a column's output is
+    -- independent of how many columns share its batch. This is the
+    -- per-kernel realisation of the batch-invariance framing (fixed
+    -- reduction order regardless of batch composition) and is what the M1
+    -- fallback's per-column FaithfulByteIdentity obligation
+    -- (specs/dispatch/m1_quant_matmul.allium) mirrors for the path-A
+    -- kernel. NOTE this is a property of the path-B MMVQ kernel after the
+    -- fix; it does NOT retroactively falsify the 2026-05-14
+    -- MmqShapeSensitiveViaAmplification finding, which described the
+    -- earlier MMQ split-K path under the old build. Bound by:
+    --   mmvq-templates.cuh:460 (nwarps=4) + PHASE_LM_DECODE_CAPTURE D1
+    --     cross-NP slot-0 byte-identity at NP_LIST="1 2 4", 2026-06-14
+}
+
+-- ============================================================================
+-- OPEN INVARIANTS — to confirm with additional capture
+-- ============================================================================
+
+invariant Open_FA_SourceClass_OtherPrompts {
+    -- PARTIALLY CLOSED 2026-05-14:
+    --   p2 layer 3: NO drift (FA byte-identical, l_out byte-identical)
+    --     — CORRECTION to S2.1's "p2 first-div layer 3" finding.
+    --   p4 layer 3: drift confirmed (l_out max_diff 2.6e-3) — FA-source
+    --     class.
+    --   p5 cannot be tested at same-offset (np=4 offset=5 needs p8.txt
+    --     which doesn't exist).
+    -- Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json
+}
+
+invariant Open_P0_EarlyFALayersByteIdentical {
+    -- PARTIALLY CLOSED 2026-05-14:
+    --   p0 layer 3 verified byte-identical at l_out (FA noise 2.4e-7
+    --   sub-F16; no MMQ amplification at layer 3 for p0).
+    --   Layers 7, 11, 15 not yet captured but pattern strongly implies
+    --   byte-identical too (l_out only differs at layer 19 per D1 data).
+    -- Bound by:
+    --   data/deltanet/s2-3-corrected-unified-mechanism.json (p0 layer
+    --   3 entry); confirmation at layers 7/11/15 still pending if
+    --   stronger bind is desired.
+}
+
+invariant FA_NkvIsDominantBatchShapeEntryPoint {
+    -- CLOSED 2026-05-14 by n_kv-pad confirmation experiment
+    -- (data/deltanet/s2-3-nkvpad-confirmation.json).
+    --
+    -- Experiment design: all slots load the SAME prompt
+    -- (LLAMA_TEST_USE_SAME_PROMPT=1 in test-deltanet-s23-op-capture.cpp)
+    -- → per-slot KV content identical across NP=2 vs NP=4 →
+    -- n_kv held truly identical including the layout of valid vs
+    -- padding K positions.
+    --
+    -- Result: slot-0 chain becomes BYTE-IDENTICAL from kqv_wo onward
+    -- (kqv_wo, attn_combined, ffn_up_gate, ffn_down, ffn_with_inp,
+    -- l_out all = 0.0 max_abs_diff). The FA kernel produces only
+    -- ~fp32-epsilon residual variation at one device's flash_attn
+    -- output (2.4e-7), which is BELOW F16 precision and rounded away
+    -- by the downstream chain.
+    --
+    -- Conclusion: n_kv variation (the K-loop iteration count being
+    -- determined by max-KV-across-slots instead of per-slot-valid-
+    -- range) is the DOMINANT entry point for batch-shape-dependent
+    -- slot-K drift at the F16-storage level. The mask-zero
+    -- attention computation to extra K positions introduces fp32-eps
+    -- roundoff in the online softmax that amplifies through the
+    -- downstream chain. When n_kv is identical, drift is sub-F16
+    -- and invisible.
+    --
+    -- Stage 2 design implication: the FA replacement kernel must fix
+    -- the K-loop iteration count to the per-slot-K valid range, not
+    -- the batch-max n_kv. This is the dominant fix.
+}
+
+invariant MMQ_FaithfulPropagation {
+    -- CLOSED 2026-05-14 by n_kv-pad confirmation experiment.
+    --
+    -- When the FA input to MMQ is byte-identical at slot K, the MMQ
+    -- kernel produces byte-identical slot-K output. The MMQ kernel
+    -- does NOT introduce fresh batch-shape sensitivity; observed
+    -- MMQ-output variation in earlier experiments was faithful
+    -- propagation of upstream FA-introduced noise, amplified by
+    -- the operator norm of the projection / FFN weight matrices.
+    --
+    -- Bound by: data/deltanet/s2-3-nkvpad-confirmation.json — at slot 0
+    -- under n_kv-pad conditions, kqv_wo (both devices), ffn_up_gate,
+    -- and ffn_down are all 0.0 max_abs_diff.
+    --
+    -- Stage 2 design implication: an MMQ replacement is NOT required
+    -- to address batch-invariance — fixing FA suffices. However, if
+    -- MMQ is replaced for perf reasons (per the SoTA-sm_75 mandate),
+    -- the replacement must preserve byte-identity propagation.
+}
+
+invariant Open_FA_InternalMechanism {
+    -- SUPERSEDED 2026-05-14 by FA_NkvIsDominantBatchShapeEntryPoint
+    -- (above) which closes the question with experimental evidence.
+    -- Static analysis identified the dual-entry-point hypothesis;
+    -- experiment showed entry point 1 (n_kv) dominates and entry
+    -- point 2 (Q-column padding) is sub-F16. Kept here as historical
+    -- record:
+    --
+    -- The wmma_f16 FA kernel template <128, 128, 8, half> always selects
+    -- parallel_blocks=4 at NP∈{2,4,8} on TU102 (blocks_num_pb1=12 < 144;
+    -- threshold 4*blocks_num_pb1<2*nsm). Four blocks per Q column
+    -- compute partial KQ sums on stride-1024 K chunks; the separate
+    -- flash_attn_combine_results kernel combines them in fixed
+    -- iteration order l=0..3. Combine + per-block compute are FORMALLY
+    -- batch-shape-invariant given identical partial sums.
+    --
+    -- TWO distinct batch-shape-sensitive entry points identified:
+    --
+    -- (1) **n_kv** (= K->ne[1] = max KV-cache occupancy across slots)
+    --     varies with NP. The K-loop iteration count varies; mask-zero
+    --     attention to slot-K's invalid K positions produces fp32-eps
+    --     roundoff in online-softmax accumulators that propagates to
+    --     slot-0 output. Predicted by static analysis; empirically
+    --     operative at offsets 0, 3, 4 (where max prompt lengths differ
+    --     between NP=2 and NP=4 batches).
+    --
+    -- (2) **Q-column padding / WMMA fragment scheduling** varies with
+    --     NP. At NP=2 only Q columns 0-1 hold real data (6 padding);
+    --     at NP=4 columns 0-3 hold real data (4 padding). WMMA
+    --     fragment loads from shared memory have shape-dependent
+    --     bank-conflict patterns. Per-column FRAGMENT MATH is
+    --     mathematically independent, but fragment-internal warp-
+    --     shuffle reductions experience timing differences that may
+    --     interact with tensor-core scheduling, producing fp32-eps
+    --     variation in valid columns' outputs.
+    --
+    --     Empirically operative at offset=1: both NP=2 batch {p1, p2}
+    --     and NP=4 batch {p1, p2, p3, p4} have p2 as longest prompt
+    --     (74 tokens) → n_kv identical → entry point (1) inactive →
+    --     yet drift IS present at p1 layer 3 (1.3e-3 max_diff).
+    --     This FALSIFIES the hypothesis that n_kv is the sole source.
+    --
+    -- Implication for Stage 2 design: the FA replacement kernel must
+    -- address BOTH entry points. TML batch-invariance recipe inherently
+    -- handles both, since per-row CTA eliminates fragment-level
+    -- cross-column aggregation entirely, and fixed K-loop iteration
+    -- count (per-slot-K valid range, not batch-max) eliminates the
+    -- n_kv-dependent fp-eps source.
+}
+
+invariant Open_MMQ_InternalMechanism {
+    -- SUPERSEDED 2026-05-14 by MMQ_FaithfulPropagation (above).
+    -- Static analysis predicted MMQ would faithfully propagate
+    -- upstream noise; experiment confirmed: at byte-identical FA
+    -- input, MMQ output is byte-identical. Kept here as historical
+    -- record:
+    --
+    -- MMQ at mmq_x=8 uses stream-K work partitioning (Osama et al.
+    -- 2023, arXiv:2301.03598). For NP∈{2,4,8} with mmq_x=8:
+    -- ntx=⌈n/8⌉=1 in all cases; nty depends on ne01 (output dim, same
+    -- across NP). gridDim.x=nsm=72. Per-block work assignment
+    -- (kbc_start/stop) is identical across NP at decode shapes.
+    --
+    -- The fixup kernel mul_mat_q_stream_k_fixup combines stream-K
+    -- partial sums in fixed iteration order; FORMALLY batch-shape-
+    -- invariant.
+    --
+    -- For valid output column j=0 with same per-row inputs, the
+    -- formal MMQ sum is identical across NP. Observed variation in
+    -- valid-position MMQ outputs (e.g., kqv_wo divergence at p3
+    -- layer 3) is most likely PROPAGATION of the upstream FA's
+    -- batch-shape sensitivity through MMQ's faithful matmul,
+    -- amplified by the operator norm of the projection weight matrix
+    -- (typical 10²-10³ for 5120×5120 GEMM at this layer's spectrum).
+    --
+    -- To bind: see s2-3-kernel-internals-reading.md "Amplification
+    -- factor in MMQ" — the observed 5.96e-8 → 0.006 amplification at
+    -- p0 layer 19 across 4 chained GEMMs (Q/K/V/O projection × FFN
+    -- gate × FFN up × FFN down) is consistent with operator-norm
+    -- propagation, not independent MMQ-introduced noise.
+}
+
+-- Cross-stack references (tests + kernels) live in the binding JSON's
+-- `bindings_external` section (specs/deltanet/allium-tla-binding.json), not
+-- as `deferred` declarations here — per feedback_allium_deferred_usage,
+-- `deferred` is for cross-.allium references only.

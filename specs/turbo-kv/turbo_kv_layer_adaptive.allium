@@ -1,0 +1,169 @@
+-- allium: 3
+-- turbo_kv_layer_adaptive.allium
+
+-- Scope: layer-adaptive precision — early and late transformer
+-- layers keep more bits; middle layers take the aggressive
+-- compression. Composes on top of core TurboQuant and
+-- asymmetric specs.
+--
+-- Citable sources:
+--
+--   [PAPER]       Zandieh et al., arxiv 2504.19874. Paper does
+--                 not model per-layer precision. The paper treats
+--                 each quantisation instance as independent.
+--
+--   [TONBI-V3]    tonbistudio/turboquant-pytorch compressors_v3.py.
+--                 TurboQuantV3 constructor:
+--                     def __init__(self, ..., layer_idx: int = 0,
+--                                  n_layers: int = 36,
+--                                  protected_layers: int = 4,
+--                                  protected_bits: int = 8, ...)
+--                 The implementation code:
+--                     is_protected = layer_idx < protected_layers or
+--                                    layer_idx >= (n_layers - protected_layers)
+--                     effective_key_bits   = protected_bits if is_protected else key_bits
+--                     effective_value_bits = protected_bits if is_protected else value_bits
+--                 V3 README 8K attention-score table showing the
+--                 effect:
+--                   V3 K4/V2 (no layer adaptive):       cosine 0.9996
+--                   V3 K4/V2 + protected layers:        cosine 0.9997,
+--                                                       99% top-1,
+--                                                       100% top-5
+--                 The "protected layers" line improves top-1
+--                 agreement from 94% to 99% at similar cosine.
+--                 Community finding V3 cites:
+--                     "TheTom/turboquant_plus: layer-adaptive,
+--                      attention-gated decoding"
+--
+--   [QUANT.CPP]   Does NOT implement per-layer precision. Uniform
+--                 bit-width across layers.
+--
+-- Goal: specify a per-layer bit-width override mechanism where
+-- the first `protected_layers` and the last `protected_layers`
+-- of a model's stack use a higher bit-width (default 8) while
+-- the middle of the stack uses the base K/V bit-widths from
+-- turbo_kv_asymmetric.allium.
+--
+-- Includes: protected-layer boundary computation, per-layer
+-- effective-bits override, composition with asymmetric config.
+-- Excludes: attention-gated adaptive (open question at end),
+-- per-head precision (not layer-level).
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Number of layers at the start of the model whose KV cache
+    -- uses protected_bits instead of the base key_bits /
+    -- value_bits. [TONBI-V3] default is 4.
+    protected_layers: Integer = 4
+
+    -- Protected layers' bit-width. [TONBI-V3] default is 8.
+    -- The expected role: first few layers build up the
+    -- representation, last few layers consume it — both benefit
+    -- from more precision than the middle.
+    protected_bits: Integer = 8
+
+    -- Model depth — used to compute the "last N layers"
+    -- boundary. Default 36 matches [TONBI-V3]'s testing on
+    -- Llama-3.2-3B class models. Must be set per-model.
+    n_layers: Integer = 36
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+open question "Protected layer count tuning: [TONBI-V3] defaults to 4 at both ends. Optimal may depend on total depth; 4/36 is ~11% protected. For deeper models (e.g. Qwen3.5 35B-A3B with ~48 layers) the same ~11% protected ratio would suggest 5-6 layers at each end. Not measured empirically at our target sizes."
+
+open question "Asymmetry in protection: [TONBI-V3] applies the same protected_bits to the first N and last N layers. An alternative is separate protected_front_layers and protected_back_layers — the roles of early vs late attention in transformer stacks are not necessarily symmetric."
+
+open question "Attention-gated adaptive (TheTom/turboquant_plus): cited in [TONBI-V3] but not implemented there. The idea is to use the attention scores themselves at read time to decide which KV entries to dequantise to higher precision on the fly. This is a runtime behaviour rather than a quantisation-time config. Out of scope for this spec; flagged as a future extension."
+
+open question "Protection strategy vs residual window interaction: protected layers protect by bit-width; residual window protects by position. Both address recent/important information quality. Should they be composed (both enabled) or is one redundant given the other? [TONBI-V3] composes them in their default config, suggesting complementary effects."
+
+-- ============================================================
+-- Composite rules
+-- ============================================================
+
+-- A layer falls in the protected band if its index is within
+-- protected_layers of either end of the stack. Protected layers
+-- use protected_bits; unprotected use the base K/V bit-widths.
+
+rule EffectiveBitsForProtectedLayer {
+    when: EffectiveBitsForLayer(layer_idx, base_key_bits, base_value_bits)
+
+    requires: layer_idx >= 0
+    requires: layer_idx < config.n_layers
+    -- "Protected" = close to either end of the stack.
+    requires: layer_idx < config.protected_layers
+              or layer_idx >= (config.n_layers - config.protected_layers)
+
+    ensures: effective_key_bits = config.protected_bits
+    ensures: effective_value_bits = config.protected_bits
+}
+
+rule EffectiveBitsForInnerLayer {
+    when: EffectiveBitsForLayer(layer_idx, base_key_bits, base_value_bits)
+
+    requires: layer_idx >= config.protected_layers
+    requires: layer_idx < (config.n_layers - config.protected_layers)
+
+    ensures: effective_key_bits = base_key_bits
+    ensures: effective_value_bits = base_value_bits
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- Protection must be non-negative and fit within the model.
+invariant ProtectedLayersValid {
+    config.protected_layers >= 0 and
+    config.protected_layers * 2 <= config.n_layers
+}
+
+-- The protected bit-width should be at least as large as the
+-- base bit-widths, otherwise protection is downgrading
+-- precision — which would contradict the name and purpose.
+invariant ProtectedBitsAtLeastBase {
+    for block in QuantizedHeads:
+        config.protected_bits >= 1
+    -- The full ordering (protected >= key >= value) is enforced
+    -- by composition with turbo_kv_asymmetric.allium's
+    -- KeyBitsAtLeastValueBits invariant.
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- [TONBI-V3]'s implementation lives in:
+--   tonbistudio/turboquant-pytorch/turboquant/compressors_v3.py
+--   class TurboQuantV3.__init__
+-- It constructs two MSECompressor instances per layer with the
+-- effective bits from the is_protected branch.
+--
+-- In our llama.cpp port's terms, adopting this requires:
+--   - Per-layer bit-width metadata on the KV cache tensors, OR
+--   - Per-layer choice between different ggml types (TURBO_KV_8B
+--     for protected layers, TURBO_KV_4B for the rest)
+-- The metadata approach is less invasive and composes cleanly
+-- with turbo_kv_asymmetric.allium.
+--
+-- Quality evidence from [TONBI-V3] README 8K attention score
+-- table (Llama 3.2 class model):
+--   Without protected layers at K4/V2: cosine 0.9996, 94% top-1
+--   With protected layers at K4/V2:    cosine 0.9997, 99% top-1,
+--                                      100% top-5
+-- The top-1 improvement (94 → 99) at similar cosine suggests
+-- the protected layers specifically help attention pick the
+-- correct token — i.e. they protect the attention read pattern
+-- rather than the overall magnitude.
+--
+-- Protected layer boundaries are a community heuristic. The
+-- paper has no claim about which layers are more sensitive; the
+-- [TONBI-V3] default is based on community convention that
+-- "early layers build up, late layers read out" in transformer
+-- stacks, both of which benefit from cleaner KV signals.

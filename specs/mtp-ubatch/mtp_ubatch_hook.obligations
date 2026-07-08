@@ -1,0 +1,20 @@
+# Obligations for mtp_ubatch_hook.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Tensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ModelContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Ubatch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KvRange => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.HiddenStateRow => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.UbatchContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_ubatch_size => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.HookInvocation.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KvRangeChop.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.MtpKvLockstepWithMainKv => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.MtpKvHasAcceptedPrefix => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.MtpKvLacksRejectedSuffix => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.HookIsSoleMtpKvPopulator => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CrossUbatchPairingOnContinuation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CrossUbatchResetOnDiscontinuation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.MtpUbatchHookSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateMtpUbatchHookSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

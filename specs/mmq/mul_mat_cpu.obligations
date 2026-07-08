@@ -1,0 +1,8 @@
+# Obligations for mul_mat_cpu.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.FloatTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.QuantizedRow => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.simd_equivalence_rel_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.simd_equivalence_abs_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.VecDot.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

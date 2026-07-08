@@ -1,0 +1,232 @@
+-- allium: 3
+-- specs/cuda-native-dispatch/calibrated_dispatch_framework.allium
+--
+-- Status: LIVE as of PHASE_CUDA_NATIVE_DISPATCH commit C0.
+-- This is the foundational spec of the phase — every other
+-- calibrated-op spec composes with this one.
+--
+-- Scope: the ggml_cuda_calibrate() framework. At context init, the
+-- framework probes each registered op at five payload sizes
+-- {0, 1MB, 10MB, 100MB, 1GB} and records the smallest bucket where
+-- the alt-strategy's p95 latency is less than the default-strategy's
+-- p50 latency (the "conservative crossover"). If no crossover is
+-- found in the probe range, the threshold is SIZE_MAX. The threshold
+-- table is cached to disk at
+--   $XDG_CACHE_HOME/ggml/cuda-calibration-{fnv1a64(cache_key)}.json
+-- (fallback $HOME/.cache, then /tmp/ggml-cache). cache_key is
+--   "v{schema} -cuda{ver} -drv{ver} -gpus:{uuid_hex}..."
+-- Mismatch triggers re-calibration.
+--
+-- Composition:
+--   - calibrated_op_equivalence.allium binds output equivalence
+--     between default and alt strategies for the four registered
+--     ops. The present spec binds DISPATCH determinism; equivalence
+--     is the responsibility of that spec. Together they make
+--     calibration safe to deploy.
+--   - libmgpu_subgraph_capture.allium (C7) composes via
+--     LibmgpuCachedReplayMatchesPhase46Closure once a calibrated
+--     op replaces a stub.
+--
+-- Implementation: ik_llama.cpp/ggml/src/ggml-cuda/calibration.cu (C0).
+-- Public API: ik_llama.cpp/ggml/include/ggml-cuda-calibration.h.
+-- Test: ik_llama.cpp/tests/test-cuda-calibration-framework.cpp.
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- The four registered calibrated ops. C8-C11 register these in
+-- op_calibration_probes.cu; the framework only knows the enum.
+enum OpId {
+    reduce_cross_device | matmul_stream_split | peer_copy | graph_capture
+}
+
+-- A 16-byte UUID returned from cudaGetDeviceProperties().uuid.
+-- Modelled here as a hex-string field for first-order tractability.
+entity GpuUuid {
+    hex: String
+}
+
+-- The cache-key components. Mismatch on any of these triggers
+-- re-calibration even if a matching JSON file exists on disk.
+entity CacheKey {
+    schema_version:        Integer
+    cuda_runtime_version:  Integer
+    cuda_driver_version:   Integer
+    gpu_uuids:             List<GpuUuid>
+}
+
+-- A per-op payload-size threshold in bytes. Quantised — must lie
+-- in {0, 1MB, 10MB, 100MB, 1GB, SIZE_MAX}. SIZE_MAX means "alt
+-- strategy never fires for this op".
+entity Threshold {
+    op:           OpId
+    bytes:        Integer       -- in QUANTIZATION_BUCKETS below
+    crossover_found: Boolean    -- false iff bytes = SIZE_MAX
+}
+
+-- Per-bucket probe latency at calibration time.
+entity ProbeResult {
+    op:           OpId
+    payload_bytes: Integer
+    default_p50_ms: Integer    -- microseconds * 1000 to keep first-order
+    alt_p95_ms:    Integer
+}
+
+-- The calibration table held by a CudaContext. thresholds is the
+-- map from each OpId to its calibrated Threshold; cache_key carries
+-- the hash inputs; loaded_from_cache is true iff the table was
+-- read off disk rather than freshly probed; calibrated becomes true
+-- after ggml_cuda_calibrate() returns.
+entity CalibrationTable {
+    thresholds:        List<Threshold>      -- one per OpId
+    cache_key:         CacheKey
+    loaded_from_cache: Boolean
+    calibrated:        Boolean
+}
+
+-- A CUDA context the framework probes against. Bundles the
+-- calibration table.
+entity CudaContext {
+    context_id:        Integer
+    calibration_table: CalibrationTable
+}
+
+-- A single dispatch decision against a calibrated op at runtime.
+-- use_alt_strategy is the boolean the framework returns; ground
+-- truth is (payload_bytes >= threshold.bytes).
+entity DispatchQuery {
+    context:           CudaContext
+    op:                OpId
+    payload_bytes:     Integer
+    use_alt_strategy:  Boolean
+}
+
+-- A pair of CudaContexts on the same hardware used to state the
+-- determinism property.
+entity CudaContextPair {
+    context_a:           CudaContext
+    context_b:           CudaContext
+    same_hardware:       Boolean
+    env_override_active: Boolean
+    cache_disabled:      Boolean
+}
+
+-- The probe outcomes a context recorded for one OpId. Used to state
+-- the no-crossover property.
+entity ProbeRun {
+    op:      OpId
+    context: CudaContext
+    results: List<ProbeResult>     -- one per bucket in [1MB, 10MB, 100MB, 1GB]
+}
+
+-- Top-level system this spec quantifies over.
+entity CalibratedDispatchSystem {
+    contexts:        List<CudaContext>
+    queries:         List<DispatchQuery>
+    context_pairs:   List<CudaContextPair>
+    probe_runs:      List<ProbeRun>
+}
+
+-- ============================================================
+-- Quantisation buckets (locked)
+-- ============================================================
+--
+-- The framework probes at exactly these five sizes; thresholds are
+-- pinned to one of these six values (the five buckets plus
+-- SIZE_MAX). Listing them as prose because Allium 3 reserves
+-- top-level declarations for entity/enum/invariant/contract.
+--
+--   0
+--   1048576           --   1 MiB
+--   10485760          --  10 MiB
+--   104857600         -- 100 MiB
+--   1073741824        --   1 GiB
+--   18446744073709551615  -- SIZE_MAX on a 64-bit host
+
+-- ============================================================
+-- INVARIANTS
+-- ============================================================
+
+invariant ThresholdQuantised {
+    -- For every CudaContext in the system and every Threshold in
+    -- ctx.calibration_table.thresholds: bytes lies in
+    --   {0, 1048576, 10485760, 104857600, 1073741824, SIZE_MAX}.
+    -- Non-quantised values are forbidden — they indicate the
+    -- framework was reconfigured without re-pinning the bucket
+    -- set, which breaks the cross-host cache_key contract.
+}
+
+invariant ProbeIsDeterministic {
+    -- For every CudaContextPair where same_hardware = true,
+    -- env_override_active = false, and cache_disabled = true:
+    -- for every OpId op, the threshold for op in context_a equals
+    -- the threshold for op in context_b. Two fresh contexts on
+    -- the same hardware produce identical thresholds when no env
+    -- override is active and the cache is disabled.
+}
+
+invariant CacheLoadIdempotent {
+    -- For every CudaContextPair where context_a.calibration_table.
+    -- cache_key equals context_b.calibration_table.cache_key and
+    -- context_b.calibration_table.loaded_from_cache = true: for
+    -- every OpId op, the threshold for op in context_a equals the
+    -- threshold for op in context_b. After calibrate(ctx_a) writes
+    -- the cache, calibrate(ctx_b) on a fresh context with matching
+    -- cache_key reproduces the same thresholds.
+}
+
+invariant DispatchIsPureFunction {
+    -- For every DispatchQuery in the system:
+    --   q.use_alt_strategy =
+    --     (q.payload_bytes >= threshold_for(q.context, q.op).bytes)
+    -- The dispatch decision at a calibrated op site is a pure
+    -- function of (op, payload_bytes, threshold). No hidden state,
+    -- no time-varying inputs.
+}
+
+invariant CalibrationCompletesBeforeFirstDispatch {
+    -- For every DispatchQuery in the system:
+    -- q.context.calibration_table.calibrated = true.
+    -- ggml_cuda_calibrate(ctx) is called during ggml_backend_cuda_
+    -- init before the backend is returned to the caller; therefore
+    -- ctx.calibration_table.calibrated = true at every dispatch
+    -- query for that context.
+}
+
+invariant NoCrossoverImpliesSizeMax {
+    -- For every ProbeRun in the system where every ProbeResult in
+    -- run.results has alt_p95_ms >= default_p50_ms: the threshold
+    -- for run.op in run.context is SIZE_MAX (crossover_found =
+    -- false).
+    --
+    -- If during probing no bucket satisfies alt.p95 < default.p50,
+    -- the threshold is SIZE_MAX — the alt strategy never fires for
+    -- that op. This is the "conservative crossover" rule that
+    -- protects against alt strategies that are sometimes worse.
+}
+
+-- ============================================================
+-- Contract
+-- ============================================================
+
+contract ValidateCalibrationSystem {
+    invoke: (sys: CalibratedDispatchSystem) -> Boolean
+
+    @invariant AllCalibrationInvariantsHold
+        -- Returns true iff sys satisfies ThresholdQuantised,
+        -- ProbeIsDeterministic, CacheLoadIdempotent, DispatchIs
+        -- PureFunction, CalibrationCompletesBeforeFirstDispatch,
+        -- and NoCrossoverImpliesSizeMax.
+        --
+        -- The framework's determinism contracts DO NOT bind output
+        -- equivalence by themselves — they only bind that the
+        -- dispatch decision is stable for a fixed (op, payload,
+        -- threshold). The OUTPUT equivalence (default and alt
+        -- strategies produce numerically equivalent results) is
+        -- the responsibility of calibrated_op_equivalence.allium.
+        -- Together the two specs make calibration safe to deploy.
+        --
+        -- Test binding:
+        --   ik_llama.cpp/tests/test-cuda-calibration-framework.cpp
+}

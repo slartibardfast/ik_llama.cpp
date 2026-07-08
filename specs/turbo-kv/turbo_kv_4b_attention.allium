@@ -1,0 +1,271 @@
+-- allium: 3
+-- turbo_kv_4b_attention.allium
+
+-- Scope: flash-attention equivalence between the CPU scalar
+-- reference and any registered GPU backend (Vulkan today; CUDA /
+-- ROCm / Metal when they arrive) for TurboQuant 4-bit KV caches
+-- (Zandieh et al., ICLR 2026, arxiv 2504.19874).
+--
+-- The backend spec (turbo_kv_4b_backend.allium) covers quantise,
+-- dequantise, get_rows, and set_rows at byte-identity / ULP parity
+-- against the CPU scalar. It does NOT cover the flash-attention
+-- path, which is what production inference actually uses for the
+-- KV cache. This file closes that gap: every backend's
+-- GGML_OP_FLASH_ATTN_EXT output must agree with the CPU scalar's
+-- output within an fp32 reduction-drift tolerance.
+--
+-- Multi-head shapes (head_dim > 128) are a distinct concern from
+-- multi-head cross-backend equivalence. The paper's algorithm
+-- operates on one head_dim-sized row at a time with a single
+-- head_dim × head_dim rotation (paper §3). The 0.8B Qwen3.5 uses
+-- head_dim=128; 9B / 35B-A3B use head_dim=256. Direction-of-travel
+-- PPL data (reference/ppl) shows turbo_kv_4b at head_dim=256 on 9B
+-- IQ3_XXS coming in +0.23 PPL above F16 baseline, attributed (per
+-- turbo-kv-4b.allium open questions) to the port's divergence from
+-- the paper's head-centric algorithm — NOT to a GPU FA bug. This
+-- spec's PBT confirms that: CPU FA vs GPU FA at head_dim=256 pass
+-- within fp32 tolerance.
+--
+-- Includes:
+--   - External entities shared with turbo-kv-4b.allium + the
+--     backend spec (QuantizedHead, FloatTensor).
+--   - Tolerance config calibrated at fp32 dot-product drift over
+--     n = head_dim elements plus softmax-weighted V accumulation
+--     over n_kv positions.
+--   - FlashAttentionEquivalence contract with one signature
+--     (flash_attn_ext) and two @invariant declarations.
+--   - @guidance for /allium:propagate describing the CPU backend
+--     vs non-CPU backend differential-test shape.
+--
+-- Excludes:
+--   - Raw dot-product-per-K-position semantics — owned by
+--     turbo-kv-4b.allium's VectorDot rule. This spec asserts that
+--     the end-to-end FLASH_ATTN_EXT output matches, not each
+--     intermediate dot.
+--   - Softmax numerical correctness at the op level — that's a
+--     generic FA concern, not turbo_kv_4b-specific. A separate
+--     spec would cover it if needed.
+--   - Backend-internal implementation (tile sizes, workgroup
+--     layouts, accumulator precision) — invisible to the
+--     equivalence property.
+--   - Reduced-precision Tensor Core accumulation paths — break
+--     the fp32 drift bound. Any backend using them MUST declare
+--     its own contract.
+
+-- ============================================================
+-- External entities — shared with turbo-kv-4b.allium and
+-- turbo_kv_4b_backend.allium
+-- ============================================================
+
+entity QuantizedHead {
+    norm: Decimal
+    indices: Set<Integer>
+}
+
+entity FloatTensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+-- ============================================================
+-- Config — tolerance bounds
+-- ============================================================
+
+config {
+    -- Head dimension. Real Qwen3.5 / Qwen3.6 configurations use
+    -- head_dim = 128 (0.8B) or head_dim = 256 (9B, 35B-A3B).
+    -- The PBT that propagates from this spec should cover both.
+    head_dim: Integer = 256
+
+    -- Score (pre-softmax) reduction-drift tolerance. The
+    -- per-position attention score is the dot product of the
+    -- rotated query with the codebook-looked-up K, accumulated
+    -- over head_dim elements. Pairwise reduction on GPU vs linear
+    -- accumulation on CPU produces different fp32 drift trees.
+    -- Bound: log2(head_dim) × fp32_epsilon
+    --   = log2(256) × 2^-23 ≈ 8 × 1.19e-7 ≈ 1e-6 relative on the
+    --   score magnitude at head_dim=256.
+    -- Codebook quantisation error is shared bias (same indices
+    -- and codebook on both sides) and does not enter the drift bound.
+    score_rel_tol: Decimal = 0.00001
+
+    -- Post-softmax × V accumulation. The FA output at each query
+    -- position is sum over k_valid of softmax(scores)[k] * V[k].
+    -- Softmax weights sum to 1 so the weighted-sum error is
+    -- bounded by max error in any V element times 1 plus the
+    -- softmax drift itself.
+    --
+    -- Bound: log2(n_kv) x fp32_epsilon for the softmax
+    -- renormalisation, plus log2(head_dim) x fp32_epsilon for
+    -- each V dot product. Combined ~2e-6 rel for n_kv up to 512,
+    -- head_dim up to 256.
+    --
+    -- output_rel_tol = 1e-5 is 5x theoretical - safety margin
+    -- against adversarial score distributions where softmax
+    -- weights concentrate on a small number of positions.
+    --
+    -- output_abs_tol = 1e-5 covers the near-zero regime where
+    -- rel_err explodes even under tiny absolute drift (common at
+    -- attention outputs, which can be small fractions of the V
+    -- magnitude after normalisation).
+    output_abs_tol: Decimal = 0.00001
+    output_rel_tol: Decimal = 0.00001
+}
+
+-- ============================================================
+-- Contract: multi-block flash-attention
+-- ============================================================
+
+contract FlashAttentionEquivalence {
+    -- GGML_OP_FLASH_ATTN_EXT with TURBO_KV_4B-quantised K and V.
+    -- Signature reflects what ggml-vulkan's FA dispatch actually
+    -- implements:
+    --   q: F32 query   [head_dim, n_tokens, n_heads, n_batch]
+    --   k: TURBO_KV_4B [head_dim, n_kv,     n_heads_kv, n_batch]
+    --   v: TURBO_KV_4B [head_dim, n_kv,     n_heads_kv, n_batch]
+    --   mask: F16      [n_kv, n_tokens, 1, n_batch]   (optional)
+    -- out: F32         [head_dim, n_tokens, n_heads, n_batch]
+    flash_attn_ext: (query: FloatTensor, keys: Set<QuantizedHead>,
+                     values: Set<QuantizedHead>, mask: FloatTensor)
+        -> FloatTensor
+
+    @invariant ScoreEquivalence
+        -- The per-position attention scores computed for each
+        -- query-key pair by the CPU scalar reference
+        -- (ggml_compute_forward_flash_attn_ext_f16 with
+        --  turbo_kv_4b_attention_multi inside) and by a GPU
+        -- backend's FLASH_ATTN_EXT dispatch must agree within
+        -- score_rel_tol.
+        --
+        -- The ONLY divergence source is fp32 reduction drift in
+        -- the head_dim-wide dot product — CPU does linear
+        -- accumulation or an AVX2 pairwise tree; GPU does a
+        -- subgroup / warp / wavefront pairwise reduction.
+        --
+        -- Codebook quantisation error is identical bytes on both
+        -- sides (keys are pre-quantised on CPU and uploaded;
+        -- dequantisation within FA uses the same codebook), so
+        -- the score bias from quantisation is shared bias, not
+        -- drift, and doesn't enter the bound.
+        --
+        -- At head_dim = 256 and n_kv up to the context size, the
+        -- bound is ~1e-6 relative.
+
+    @invariant OutputEquivalence
+        -- The final attention output per query position must
+        -- match within (output_abs_tol OR output_rel_tol). This
+        -- is the observable production behaviour — PPL / token
+        -- generation consume only the output, not intermediate
+        -- scores.
+        --
+        -- Drift sources:
+        --   1. Score drift (per ScoreEquivalence) propagates into
+        --      softmax numerators.
+        --   2. Softmax max-reduction on GPU vs sequential max on
+        --      CPU — max is associative so contributes 0.
+        --   3. Softmax denominator pairwise-sum tree — ~log2(n_kv)
+        --      x eps drift.
+        --   4. Output V-weighted-sum pairwise-sum tree — ~log2(n_kv)
+        --      x eps drift per output element.
+        --
+        -- Combined bound ~2e-6 relative; 1e-5 gives a 5x safety
+        -- margin.
+
+    @invariant LargeHeadDimParity
+        -- Equivalence must hold across backends at head_dim = 256
+        -- (Qwen3.5 9B, 35B-A3B configuration) at the same tight
+        -- bounds as at head_dim = 128 — no additional drift may
+        -- creep in from whatever larger-head dispatch the backend
+        -- uses. This is a stronger form of ScoreEquivalence aimed
+        -- specifically at the production shape we care about.
+        --
+        -- If a GPU FA implementation accidentally uses the wrong
+        -- stride for multi-head layouts (cf. the bug in
+        -- project_turbo_kv_rht_status memory that used
+        -- blocks_per_row where it should have used k_stride) the
+        -- drift would be catastrophic, not fp32-ULP-scale. The
+        -- PBT that propagates this invariant falsifies instantly
+        -- on such a bug.
+        --
+        -- The 0.8B Paris test (head_dim=128) does NOT exercise
+        -- this path. The 9B Paris test did exercise head_dim=256
+        -- but only on one prompt. This spec demands equivalence
+        -- over the PBT-generated input distribution.
+
+    @guidance
+        -- Differential-test shape for /allium:propagate:
+        --
+        --   1. Separate test binary from test-turbo-kv-backend-pbt
+        --      because this one requires BOTH a non-CPU backend
+        --      and the CPU backend (the CPU backend is the oracle,
+        --      not an additional target). GPU-less hosts can't
+        --      run it.
+        --
+        --   2. Generate random Q, K, V tensors at the shape that
+        --      production uses for Qwen3.5 9B / 35B-A3B:
+        --        head_dim = 256   (multi-block: 2 blocks/head)
+        --        n_heads  ∈ {1, 4}  for both q and kv
+        --        n_kv     ∈ {16, 64, 256, 1024}  (context length)
+        --        n_tokens ∈ {1, 8, 64}           (batch size)
+        --      Pre-quantise K and V via quantize_row_turbo_kv_4b_ref
+        --      so both sides see byte-identical quantised tensors.
+        --      Ensure L2_norm of each K and V row > 0.
+        --
+        --   3. Build a graph:
+        --        out = ggml_flash_attn_ext(ctx, q, k, v, mask,
+        --                                   scale, max_bias, softcap)
+        --      with scale = 1/sqrt(head_dim), max_bias = 0,
+        --      softcap = 0. Compile once with the CPU backend,
+        --      read back the reference output. Then compile the
+        --      same graph with the non-CPU backend and read back
+        --      the test output.
+        --
+        --   4. Compare per OutputEquivalence's abs-OR-rel. Also
+        --      report max abs and max rel deviation across the
+        --      tensor for every run — helpful when a failure is
+        --      structural (wrong stride) vs drift (shimmering by
+        --      a few ULPs).
+        --
+        --   5. 50 RapidCheck samples per property (half of the
+        --      backend PBT count because each FA run does more
+        --      work; 50 x 8 shapes is still comprehensive).
+        --
+        --   6. GPU lock via coord/ — the test binary takes a
+        --      device via GGML_VK_VISIBLE_DEVICES env; caller
+        --      wraps in flock.
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- CPU FA reference path (ggml-cpu/ops.cpp):
+--   ggml_compute_forward_flash_attn_ext_f16_one_chunk calls
+--   turbo_kv_4b_attention_multi (ggml-turbo-kv.c) for each
+--   query-head slice. attention_multi pre-rotates Q once and
+--   loops per-K-position via ggml_vec_dot_turbo_kv_4b_f32.
+--   Single-threaded scalar; no SIMD dispatch for the actual
+--   FA accumulator.
+--
+-- Backend FA paths:
+--   Vulkan  (llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp):
+--     the per-type turbo_kv_4b dispatch routes through the
+--     generic flash-attention pipeline with turbo_kv_4b as
+--     the KV type. Shaders under vulkan-shaders/.
+--   CUDA:   not yet implemented for turbo_kv_4b on the FA path.
+--   ROCm:   via HIPIFY of the future CUDA implementation.
+--   Metal:  not yet implemented.
+--
+-- Existing coverage of FA for turbo_kv_4b:
+--   tests/test-turbo-kv-4b-attn.cpp — CPU-vs-CPU (scalar per-call
+--   vec_dot vs batched attention_multi). head_dim ∈ {128, 256},
+--   valid_count ∈ {1, 10, 500}. Tolerance 1e-4. Passes.
+--
+--   memory/project_turbo_kv_rht_status — "Paris" on 0.8B
+--   (head_dim=128) and 9B (head_dim=256). Single-prompt sanity,
+--   not distribution coverage.
+--
+-- Cross-backend coverage: tests/test-turbo-kv-attention-pbt.cpp
+-- propagated from this spec. Compares CPU FA (reference) against
+-- every registered non-CPU backend at multi-block head_dim=256
+-- with RapidCheck-generated Q/K/V distributions.

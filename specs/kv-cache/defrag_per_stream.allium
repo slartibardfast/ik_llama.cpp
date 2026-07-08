@@ -1,0 +1,391 @@
+-- allium: 3
+-- specs/kv-cache/defrag_per_stream.allium
+--
+-- Scope: defragmentation under the 4D per-stream KV layout.
+-- Models `llama_kv_cache_defrag_internal`'s hole-fill pass and
+-- the matching `build_defrag` graph builder. Pins the
+-- per-stream isolation property at the defrag site.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF T3.6.A audit found
+-- two HIGH-severity risks at the defrag site.
+--
+--   F3 (HIGH): `llama_kv_cache_defrag_internal` at
+--   ik_llama.cpp/src/llama.cpp:6661+ walks `cells[]` flat and
+--   pulls cells "from the end" without stream awareness. Under
+--   n_stream > 1 this would move a cell from stream s into
+--   another stream s' != s's slice — silent cross-stream
+--   corruption. Resolution: a per-stream outer loop that scopes
+--   each defrag pass to v_cells[s] within [s * stream_size,
+--   (s+1) * stream_size).
+--
+--   F4 (HIGH): `build_defrag` at
+--   ik_llama.cpp/src/llama-build-context.cpp:280-364 builds a
+--   2D `[n_embd_k_gqa, nm]` view at lines 313-321 assuming flat
+--   `[n_embd_k_gqa, n_kv]` K layout. Under 4D
+--   `[head_dim, kvps, n_head_kv, n_stream]`, n_head_kv is NOT
+--   contiguous with head_dim. Resolution: 3D-view-per-layer
+--   rewrite with head_dim contiguous; per-head stride via
+--   parent `nb[2]`; per-position stride via parent `nb[1]`;
+--   per-stream offset via `s * nb[3]`.
+--
+-- Current state: both
+-- `llama_kv_cache_defrag_internal` and `build_defrag` carry
+-- `n_stream == 1` guards. The whole defrag path is locked off
+-- under multi-seq dispatch until T3.6.I.c2 ships.
+--
+-- Includes:
+--   - External entities for defrag-relevant objects (DefragOp,
+--     CellMove, KSliceLayer, VSliceLayer).
+--   - Contracts for the no-cross-stream property
+--     (DefragNoCrossStream), the per-stream compaction property
+--     (DefragCompactsPerStream), and the K/V byte fidelity
+--     property (DefragPreservesKVBytes).
+--   - System-wide invariants binding the cell move set to its
+--     originating stream and the byte semantics of view-based
+--     reshuffling.
+--
+-- Excludes:
+--   - The 4D KV tensor layout itself. Owned by
+--     specs/kv-cache/n_stream_layer.allium.
+--   - The K-shift path. Owned by
+--     specs/kv-cache/k_shift_per_stream.allium.
+--   - The legacy single-stream defrag. n_stream == 1 is the
+--     trivial case where outer loop runs once.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- A single defrag operation scheduled for a given context. May
+-- span multiple ticks if `n_max_nodes` cap forces a partial
+-- pass per ggml_build_graph invocation.
+entity DefragOp {
+    context_id: Integer
+    n_max_nodes: Integer
+}
+
+-- One cell move scheduled during defrag. The "from" cell is
+-- pulled from "the end" of its stream's slice to fill a hole at
+-- "to" earlier in the same stream's slice. Under T3.6.I.c2 the
+-- from/to indices are STREAM-LOCAL (in [0, kvps)) and the move
+-- is constrained to the same stream.
+entity CellMove {
+    stream_id: Integer
+    from_local_pos: Integer
+    to_local_pos: Integer
+    n_cells: Integer
+}
+
+-- One transformer layer's K tensor under the 4D layout, sliced
+-- to one stream. Memory range is [s * nb[3], (s+1) * nb[3]).
+entity KSliceLayer {
+    layer: Integer
+    stream_id: Integer
+    head_dim: Integer
+    n_head_kv: Integer
+    kvps: Integer
+}
+
+-- One transformer layer's V tensor under the 4D layout, sliced
+-- to one stream. Note: `v_trans` non-FA path is incompatible
+-- with 4D layout (asserts at src/llama-build-context.cpp:790
+-- and 3070); production uses --fa on which keeps v_trans = false
+-- and the defrag spec applies cleanly.
+entity VSliceLayer {
+    layer: Integer
+    stream_id: Integer
+    head_dim: Integer
+    n_head_kv: Integer
+    kvps: Integer
+    v_trans: Boolean
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum streams the spec exercises in TLC. Same value as
+    -- the K-shift spec to keep TLC configs symmetric.
+    max_streams: Integer = 8
+
+    -- Per-stream cell capacity bound for TLC.
+    max_kvps_per_stream: Integer = 8
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- DefragNoCrossStream — every CellMove scheduled by defrag has
+-- `from` and `to` cells in the same stream. The outer-loop
+-- rewrite at T3.6.I.c2 enforces this structurally; the hole-
+-- fill scan is scoped to v_cells[s] within
+-- [s * stream_size, (s+1) * stream_size).
+contract DefragNoCrossStream {
+    invoke: (op: DefragOp, moves: List<CellMove>) -> Boolean
+
+    @invariant FromAndToShareStream
+        -- For every move m in moves: m.from_local_pos and
+        -- m.to_local_pos are both indices in stream
+        -- m.stream_id's slice. No move bridges streams.
+
+    @invariant OuterLoopOrdering
+        -- Moves are emitted in stream order (stream 0's moves
+        -- before stream 1's, etc.). This is a determinism aid
+        -- for repro-byte-identity across harness runs: defrag
+        -- output bytes depend on the order of view-based cpy
+        -- ops emitted into the graph.
+
+    @guidance
+        -- The implementation MUST be:
+        --   for s in 0..n_stream:
+        --     for each hole at local pos p in v_cells[s]:
+        --       find latest occupied cell at local pos p' > p
+        --       schedule CellMove(s, from = p', to = p)
+        -- NEVER walk v_cells flat across stream boundaries.
+}
+
+-- DefragCompactsPerStream — after defrag, each stream's
+-- v_cells[s] has its occupied cells in [0, used_per_stream(s))
+-- contiguously, with v_heads[s] = used_per_stream(s).
+contract DefragCompactsPerStream {
+    invoke: (op: DefragOp, cells_pre: List<KCellMeta>, cells_post: List<KCellMeta>) -> Boolean
+
+    @invariant ContiguousAfterDefrag
+        -- For each stream s, for every local pos p in
+        -- [0, v_heads_post[s]): cells_post[s][p] is occupied.
+        -- For every p in [v_heads_post[s], stream_size):
+        -- cells_post[s][p] is empty.
+
+    @invariant SeqIdSetsPreserved
+        -- For every (stream, post-position) pair, the
+        -- seq_id_set matches a corresponding (stream, pre-
+        -- position) pair from before defrag. No seq_id is
+        -- gained or lost; only positions change.
+
+    @invariant UsedCountPreserved
+        -- For each stream s, the count of occupied cells is
+        -- unchanged: |{p : cells_pre[s][p].occupied}| =
+        -- |{p : cells_post[s][p].occupied}|.
+
+    @invariant CrossStreamSeqIdsUntouched
+        -- For every stream s' != defrag_target_stream(s), every
+        -- cell in s' has byte-identical seq_id_set and pos
+        -- pre/post. This composes with DefragNoCrossStream.
+}
+
+-- DefragPreservesKVBytes — the K and V byte data follow the
+-- cell metadata moves byte-for-byte. After defrag, the K bytes
+-- at the new (stream, local_pos) match the pre-defrag K bytes
+-- at the corresponding (stream, old_local_pos).
+contract DefragPreservesKVBytes {
+    invoke: (op: DefragOp,
+             k_pre: List<KSliceLayer>, k_post: List<KSliceLayer>,
+             v_pre: List<VSliceLayer>, v_post: List<VSliceLayer>,
+             moves: List<CellMove>) -> Boolean
+
+    @invariant KBytesFollowMoves
+        -- For every move m: K_post[m.stream_id][..., to_local_pos
+        -- + k] is byte-identical to K_pre[m.stream_id][...,
+        -- from_local_pos + k] for k in [0, m.n_cells), across
+        -- all layers and all heads.
+
+    @invariant VBytesFollowMoves
+        -- Same as KBytesFollowMoves for V. Under --fa on
+        -- (production default), v_trans = false and the V layer
+        -- shape is [head_dim, kvps, n_head_kv, n_stream]. The
+        -- 3D-view-per-stream cpy follows the per-stream offset
+        -- s * nb[3]. Under --fa off (NOT production), v_trans
+        -- = true; that path is gated off by the existing
+        -- asserts at src/llama-build-context.cpp:790,3070 —
+        -- spec does not cover it.
+
+    @invariant UnmovedCellsByteIdentical
+        -- For every (stream s, local pos p) that is NOT the
+        -- destination of any move: K_post[s][..., p] =
+        -- K_pre[s][..., p] byte-for-byte. Same for V. Holes
+        -- that get filled by a move have their bytes overwritten;
+        -- holes that remain holes (because no later occupied cell
+        -- existed) keep their pre-defrag bytes (which are
+        -- semantically meaningless because the cell is empty).
+
+    @invariant ViewShapeIs3DPerStream
+        -- The cpy view emitted by build_defrag is 3D per layer
+        -- per stream:
+        --   ggml_view_3d(K_l[il],
+        --     head_dim,         -- ne[0]
+        --     n_head_kv,        -- ne[1]
+        --     n_moves_in_layer, -- ne[2]
+        --     nb[1],            -- per-head stride
+        --     nb[2],            -- per-position stride
+        --     s * nb[3])        -- per-stream offset
+        -- NEVER the legacy 2D [n_embd_k_gqa, nm] view (F4),
+        -- which assumes head_dim and n_head_kv are contiguous —
+        -- false under the 4D layout.
+}
+
+-- ============================================================
+-- External entities — referenced above
+-- ============================================================
+
+-- Cell metadata snapshot for the compaction property. Mirrors
+-- llama_kv_cell at src/llama-context.h:16-34. The `occupied`
+-- field is derived from seq_id_set.empty().
+entity KCellMeta {
+    stream_id: Integer
+    local_pos: Integer
+    pos: Integer
+    seq_id_set: Set<Integer>
+    occupied: Boolean
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The no-cross-stream-mutation property at the defrag site.
+-- Lifts FromAndToShareStream and CrossStreamSeqIdsUntouched
+-- from the contracts to a system-wide property.
+invariant DefragNoCrossStreamLeakage {
+    for s in Streams:
+        for t in Streams:
+            s != t implies CellsOf(s).preserved_under_defrag_of(t)
+}
+
+-- The byte-fidelity property under multi-stream defrag. Pins
+-- the F4 resolution: 3D-view-per-stream cpy semantics, not
+-- legacy 2D flat view.
+invariant DefragKVBytesFollowMetadata {
+    for s in Streams:
+        for p in OccupiedLocalPositionsPost(s):
+            let m = MoveTargeting(s, p)
+            (m != null) implies KBytesAtPost(s, p) = KBytesAtPre(s, m.from_local_pos)
+}
+
+-- The compaction property at the system level. Every stream
+-- ends with its occupied cells consolidated to the front of
+-- its slice. Lifts ContiguousAfterDefrag to a system-wide
+-- property.
+invariant PerStreamCompactionHolds {
+    for s in Streams:
+        OccupiedPositionsPost(s).is_prefix_range_of(StreamSize())
+}
+
+-- The view-shape property. The cpy view emitted by build_defrag
+-- is 3D-per-stream per layer; the legacy 2D view is forbidden
+-- under n_stream > 1. Pins F4.
+invariant DefragViewIs3DPerStream {
+    for il in Layers:
+        for s in Streams:
+            DefragCpyView(il, s).is_3d_with_head_dim_contiguous()
+}
+
+-- DefragPerDeviceCpyEmission — under graph-split, build_defrag
+-- emits per-device cpy ops on `kl_extra->splits[d]` /
+-- `vl_extra->splits[d]` so each device sees only its own K/V
+-- split. src and dst views both reference the same per-device
+-- split tensor; the cpy op lives on that device naturally with
+-- no cross-device data movement. The legacy single-tensor cpy
+-- path (asserting n_stream == 1) is gated off under
+-- n_stream > 1.
+contract DefragPerDeviceCpyEmission {
+    invoke: (kv_cache: KVCache, ids: List<Integer>) -> List<CellMove>
+
+    @invariant ViewsReferencePerDeviceSplit
+        -- For each emitted cpy(src_view, dst_view) under graph-
+        -- split: src_view->view_src == dst_view->view_src ==
+        -- kl_extra->splits[d] for some device d. Never the
+        -- parent stub tensor (kv_self.k_l[il] with extra set).
+        -- Same for V via vl_extra->splits[d].
+
+    @invariant CpyOpStaysOnSplitDevice
+        -- The cpy op consumes only views of one device's split.
+        -- The scheduler places it on that device's backend
+        -- without any cross-device cpy. No `backend_override`
+        -- is required (unlike build_k_shift's intermediate
+        -- F32 tmp) because defrag is pure tensor-to-tensor
+        -- movement with no intermediate compute tensor.
+
+    @invariant CUDACpySupportsQQSameType
+        -- The CUDA backend supports same-type quantized cpy with
+        -- non-contiguous strides via the generic
+        -- cpy_q_q_same_type kernel (runtime-parameterized by qk +
+        -- block_bytes; covers Q4_0, Q4_0_AR16, Q8_0, Q4_1, Q5_0,
+        -- Q5_1, Q6_0, IQ4_NL). ggml_backend_cuda_supports_op
+        -- advertises this so the scheduler keeps the op on CUDA
+        -- (not falling back to CPU, which can't read CUDA-resident
+        -- KV data).
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: cross-stream defrag policy. Under multi-stream the
+--   natural extension is "if stream s is full but stream s'
+--   has many holes, rebalance cells across streams." This is
+--   NOT in scope for T3.6 — each stream is owned by one slot
+--   and rebalancing across slots violates the slot binding
+--   model. If a future feature requires it, add a new contract
+--   here; do not silently allow cross-stream moves.
+--
+-- OQ-2: n_max_nodes cap interaction. The legacy defrag emits
+--   moves until ggml_n_max_nodes is hit; under per-stream
+--   outer loop the cap is checked per stream. A pathologically
+--   fragmented stream may exhaust the cap before later streams
+--   are visited. Acceptable: the next defrag tick picks up
+--   where this one left off. The contract holds at each
+--   partial pass.
+--
+-- OQ-3: v_trans = true path. Production uses --fa on which
+--   keeps v_trans = false. The v_trans = true path has its own
+--   layout (V transposed to [kvps, head_dim, n_head_kv]) and
+--   is incompatible with the 4D per-stream layout. T3.6 does
+--   NOT lift the v_trans assertion at
+--   src/llama-build-context.cpp:790, 3070 (per PHASE doc).
+--   This spec deliberately excludes that path.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama.cpp:6661+ —
+--     `llama_kv_cache_defrag_internal`. Flat hole-fill walk
+--     today; T3.6.I.c2 wraps in per-stream outer loop.
+--   ik_llama.cpp/src/llama-build-context.cpp:280-364 —
+--     `build_defrag`. 2D view at 313-321 today; T3.6.I.c2
+--     rewrites to 3D-view-per-stream and changes signature to
+--     `(ids, stream_id)`.
+--   ik_llama.cpp/src/llama-build-context.cpp:287 — assert
+--     `GGML_ASSERT(kv_self.n_stream == 1)` at top of
+--     build_defrag. T3.6.I.c2 lifts this.
+--
+-- Test infrastructure (planned T3.6.T2):
+--   tests/spec/test-kv-defrag-per-stream.cpp — n_stream=2 cache;
+--   populate both streams; `llama_kv_cache_seq_rm(seq_id=0,
+--   p0=5, p1=10)` to create stream-0 hole;
+--   `llama_kv_cache_defrag` + `llama_kv_cache_update`. Assert
+--   stream 0 compacted (DefragCompactsPerStream); stream 1
+--   byte-identical pre/post (DefragNoCrossStream). RED on T3.5
+--   HEAD (assert fires); GREEN after T3.6.I.c2.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/kv-cache/n_stream_layer.allium
+--   The cache-layout spec; KSliceLayer / VSliceLayer here are
+--   views derived from KVTensor there. KV byte locations are
+--   defined by the 4D layout (head_dim contiguous as ne[0];
+--   stream as ne[3]).
+--
+-- specs/kv-cache/k_shift_per_stream.allium
+--   Sister spec at the K-shift site. Both share the per-stream
+--   isolation pattern. defrag mutates cell positions; k_shift
+--   mutates K bytes via RoPE.
+--
+-- specs/dispatch/graph_reuse_set_rows.allium
+--   Defrag is rare and typically a cold-path operation; not in
+--   the steady-state hot path that graph reuse targets.

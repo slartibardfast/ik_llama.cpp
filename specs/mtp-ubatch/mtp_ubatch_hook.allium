@@ -1,0 +1,424 @@
+-- allium: 3
+-- mtp_ubatch_hook.allium
+--
+-- Scope: the ideal-state contract for the per-ubatch MTP-KV
+-- update hook. After every main-model forward graph compute,
+-- the hook captures the residual stream tagged t_h_pre_norm,
+-- pairs each row with the next-position token from the same
+-- ubatch, and runs one batched MTP block forward to populate
+-- MTP-layer KV at every candidate position. After the verify
+-- step decides accept/reject, rejected positions are removed
+-- from MTP-layer KV via llama_kv_cache_seq_rm; no second MTP
+-- decode is required.
+--
+-- Why this spec exists: PHASE36-MTP-AUDIT.md established that
+-- our gen-time MTP path runs an extra MTP_OP_UPDATE_ACCEPTED
+-- decode after the verify forward to populate MTP KV with
+-- accepted-token state. Upstream PR-22673 eliminates this by
+-- inlining the MTP-KV update into the verify forward as a
+-- batched side effect, then chopping rejected positions with
+-- seq_rm. This spec describes the destination behaviour: a
+-- single hook mechanism replaces the existing { warmup,
+-- update_accepted } post-hoc paths and runs in lockstep with
+-- the main forward.
+--
+-- This spec describes the destination, not the migration path.
+-- It is the companion to mtp_fused_draft.allium, which governs
+-- the multi-step draft graph. The two specs together define the
+-- gen-time speculative loop:
+--
+--     [hook fires per ubatch] -> verify decision ->
+--     [seq_rm rejected tail] -> [fused draft round] -> next
+--
+-- Includes:
+--   - External entities for the cgraph objects (Tensor,
+--     ModelContext, Ubatch) and the runtime quantities
+--     (HookInvocation, KvRange, HiddenStateRow).
+--   - Enumerations for the ubatch context (verify, prefill).
+--   - The HookInvocation contract — invariants on how, when, and
+--     where the hook fires.
+--   - The KvRangeChop contract — the post-accept seq_rm
+--     contract that replaces the old post-accept decode.
+--   - System-wide invariants on lockstep-with-main-KV, before-
+--     accept-decision firing, and rejected-tail removal.
+--   - Open questions: cross-ubatch boundary semantics during
+--     prompt switch; multi-slot pending-h tracking.
+--
+-- Excludes:
+--   - The fused N-step draft graph compute. Owned by
+--     mtp_fused_draft.allium.
+--   - The PR-22673-style auxiliary llama_context. Out of scope:
+--     the audit established our existing single-context with
+--     MTP-layer KV is sufficient.
+--   - Acceptance-rate behaviour of the speculative-decoding
+--     state machine. The hook contract does not bind on accept
+--     rate; it binds on the post-accept-decision KV state.
+--   - The numerical bound between hook-populated MTP KV state
+--     and the legacy post-hoc populated state. The contract is
+--     on observable behaviour at downstream consumers (the
+--     fused draft graph, future ratio-based accept tests), not
+--     on bit-identity at intermediate tensor values.
+
+-- ============================================================
+-- External entities — cgraph objects we constrain
+-- ============================================================
+
+-- A ggml tensor flowing into or out of the per-ubatch hook. We
+-- reference only the shape descriptors the contract binds.
+entity Tensor {
+    name: String
+    n_rows: Integer
+    n_embd: Integer
+}
+
+-- The llama_context whose state the hook updates. Same
+-- single-context model used in mtp_fused_draft.allium: MTP
+-- layers tagged is_mtp_layer in the same context, no auxiliary.
+entity ModelContext {
+    n_mtp_layers: Integer
+    n_main_layers: Integer
+}
+
+-- One ubatch processed by the main model forward. Carries the
+-- per-row token ids, the per-row positions, and the per-row
+-- seq_ids the hook needs to construct the MTP input batch.
+entity Ubatch {
+    n_tokens: Integer
+    pos_first: Integer
+    pos_last: Integer
+    seq_id: Integer
+    context: UbatchContext
+}
+
+-- One range of MTP-layer KV slots affected by an operation.
+-- Used for both writes (by the hook) and chops (by the
+-- post-accept seq_rm path).
+entity KvRange {
+    seq_id: Integer
+    pos_start: Integer
+    pos_end: Integer
+}
+
+-- One row of the residual stream the hook consumes from the
+-- main forward graph's tagged tensor t_h_pre_norm.
+entity HiddenStateRow {
+    pos: Integer
+    seq_id: Integer
+    n_embd: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The context in which a ubatch is processed. The hook fires
+-- in both prefill and verify contexts but the cross-ubatch
+-- boundary semantics differ: in prefill consecutive ubatches
+-- share a sequence; in verify the ubatch IS the sequence
+-- (post-accept resets state).
+enum UbatchContext { prefill | verify }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The maximum ubatch size the hook supports. Bounded by the
+    -- main context's n_ubatch parameter; the hook's working
+    -- buffers (cross-ubatch pending hidden, MTP input batch)
+    -- are sized to this bound.
+    max_ubatch_size: Integer = 512
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The per-ubatch hook invocation. Triggered immediately after
+-- the main model's ggml_graph_compute completes and before any
+-- host-side use of the main forward's output (logits sampling,
+-- accept decision). The hook reads t_h_pre_norm from the
+-- completed graph, pairs rows with the next-position tokens
+-- from the same ubatch, and runs one MTP block forward over
+-- those pairs. The MTP-layer KV cache is populated at every
+-- candidate position.
+contract HookInvocation {
+    invoke: (ctx: ModelContext, ubatch: Ubatch, h_tensor: Tensor) -> KvRange
+
+    @invariant THPreNormTensorTagged
+        -- The main forward graph exposes a tagged tensor named
+        -- "h_pre_norm" representing the residual stream
+        -- immediately before the final norm, with shape
+        -- (n_embd, ubatch.n_tokens). The hook depends on this
+        -- tag; main graph builders that omit the tag are out of
+        -- contract.
+
+    @invariant FiresOncePerUbatch
+        -- The hook runs exactly once per ubatch processed by
+        -- the main model when MTP is registered on ctx. It does
+        -- not run on ubatches processed by other contexts and
+        -- does not run multiple times for the same ubatch.
+
+    @invariant FiresBeforeAcceptDecision
+        -- For verify-context ubatches, the hook completes
+        -- before any host code reads the verify logits to
+        -- determine accept/reject. The MTP KV is populated for
+        -- every candidate position regardless of which ones
+        -- turn out accepted; rejection is handled by KvRangeChop.
+
+    @invariant SingleMtpDecodePerInvocation
+        -- The hook issues exactly one ggml_graph_compute on the
+        -- MTP block, batched over all rows of the ubatch (plus
+        -- at most one row from cross-ubatch pending). No
+        -- per-token MTP forwards; no separate post-hoc decode.
+
+    @invariant KvWrittenAtAllUbatchPositions
+        -- After the hook returns, KvRange{seq_id: ubatch.seq_id,
+        -- pos_start: ubatch.pos_first, pos_end: ubatch.pos_last}
+        -- is fully populated in MTP-layer KV. Every position in
+        -- this range has a written entry.
+
+    @invariant CrossUbatchPairingIsLossless
+        -- The hook stores the last hidden row of one ubatch
+        -- into pending state and pairs it with the first token
+        -- of the immediately-subsequent ubatch when that
+        -- ubatch's pos_first is exactly pending_pos + 1. If the
+        -- next ubatch's pos_first does not match, the pending
+        -- state is discarded (different prompt or seq_rm gap)
+        -- and no spurious MTP write is emitted.
+
+    @guidance
+        -- Implementation pattern: extend llama_decode_internal
+        -- to call a hook function after ggml_backend_sched_-
+        -- graph_compute_async returns. The hook reads
+        -- t_h_pre_norm via ggml_backend_tensor_get into the
+        -- existing slot.mtp_hidden_state buffer, builds an
+        -- llama_batch with embd-only rows (token, pos, embd)
+        -- pairing each ubatch row's hidden with the row's
+        -- own-position token shifted by +1, and dispatches the
+        -- existing MTP-block builder via mtp_update_kv_cache
+        -- with all rows logits=false (no logits needed; only
+        -- KV update). The cross-ubatch pending row uses the
+        -- stashed pending_h and the new ubatch's first token.
+}
+
+-- The post-accept KV chop. After the verify decision yields
+-- n_accepted in [0, n_drafts], the rejected suffix
+-- [pos_first + n_accepted, pos_last] is removed from MTP-layer
+-- KV with a single seq_rm call. No re-decode is needed because
+-- the hook already populated the accepted-prefix KV correctly
+-- as a side effect of the verify forward.
+contract KvRangeChop {
+    invoke: (ctx: ModelContext, seq_id: Integer, n_accepted: Integer, ubatch: Ubatch) -> KvRange
+
+    @invariant ChopRangeIsRejectedSuffix
+        -- The chop removes exactly the range
+        -- [ubatch.pos_first + n_accepted, ubatch.pos_last]. The
+        -- accepted prefix [ubatch.pos_first, ubatch.pos_first +
+        -- n_accepted - 1] remains intact in MTP-layer KV.
+
+    @invariant NoSecondaryDecode
+        -- The chop is a memory-state operation only. No MTP
+        -- forward is dispatched. This is the property that
+        -- distinguishes the new path from the old
+        -- mtp_update_kv_cache(MTP_OP_UPDATE_ACCEPTED) decode.
+
+    @invariant IdempotentUnderRepeatedChop
+        -- Calling the chop twice with the same arguments
+        -- produces the same KV state as calling it once. This
+        -- guards against duplicated rejection signals.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- The lockstep property. After every ubatch processed by the
+-- main model's forward, the MTP-layer KV is populated for
+-- exactly the same position range as the main-layer KV for
+-- that ubatch's sequence. No drift between the two KVs in the
+-- forward direction.
+invariant MtpKvLockstepWithMainKv {
+    for ubatch in CompletedUbatches:
+        for pos in ubatch_position_range(ubatch):
+            mtp_kv_has(ubatch.seq_id, pos) = main_kv_has(ubatch.seq_id, pos)
+}
+
+-- The post-accept prefix-presence property. After verify
+-- completes and KvRangeChop fires with n_accepted, every
+-- position in the accepted prefix is present in MTP-layer KV
+-- for the verify ubatch's sequence.
+invariant MtpKvHasAcceptedPrefix {
+    for round in CompletedVerifyRounds:
+        for pos in accepted_prefix_positions(round):
+            mtp_kv_has(round.ubatch.seq_id, pos)
+}
+
+-- The post-accept rejected-suffix-absence property. After
+-- KvRangeChop fires with n_accepted, every position in the
+-- rejected suffix is absent from MTP-layer KV.
+invariant MtpKvLacksRejectedSuffix {
+    for round in CompletedVerifyRounds:
+        for pos in rejected_suffix_positions(round):
+            not mtp_kv_has(round.ubatch.seq_id, pos)
+}
+
+-- The single-mechanism property. The hook is the sole
+-- mechanism by which MTP-layer KV is populated during prefill
+-- and verify. No other code path writes MTP KV outside the
+-- fused draft graph (which writes during gen-time draft
+-- rounds, governed by mtp_fused_draft.allium).
+invariant HookIsSoleMtpKvPopulator {
+    for write in MtpKvWrites:
+        write.source = hook or write.source = fused_draft
+}
+
+-- The cross-ubatch continuation property. When ubatch B
+-- follows ubatch A in the same sequence with B.pos_first =
+-- A.pos_last + 1, the MTP block forward for B's first row
+-- consumes A's last hidden row paired with B's first token.
+invariant CrossUbatchPairingOnContinuation {
+    for pair in ConsecutiveUbatchPairs:
+        ubatches_continue(pair.a, pair.b)
+            implies pairing_uses_a_last_hidden_and_b_first_token(pair.a, pair.b)
+}
+
+-- The cross-ubatch reset property. When B does not continue A
+-- (different sequence, or position gap), the pending state
+-- from A is discarded before B is processed; no spurious MTP
+-- write is emitted from the boundary.
+invariant CrossUbatchResetOnDiscontinuation {
+    for pair in ConsecutiveUbatchPairs:
+        not ubatches_continue(pair.a, pair.b)
+            implies pending_state_discarded_before(pair.b)
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Multi-slot pending-h tracking. The cross-ubatch
+--   pending state must be per-slot (not per-context) so that
+--   ubatches from different slots interleaving on the same
+--   context don't pollute each other. Production currently
+--   runs at parallel=1 per PHASE 35 stability findings, so the
+--   spec binds at parallel=1 for now. When parallel > 1 is
+--   re-attempted, the pending-state lifecycle becomes a slot-
+--   indexed map; the spec should be extended at that point.
+--
+-- OQ-2: Hook firing under embed-only batches. If a caller
+--   submits an llama_batch with only embd (no token), the
+--   hook's pairing logic (token at pos+1) does not apply.
+--   Current production never sends embd-only batches; the
+--   spec leaves this case unconstrained. If embeddings input
+--   becomes a production path, define the pairing behaviour
+--   then.
+--
+-- OQ-3: Backend coverage. CUDA only, mirroring
+--   mtp_fused_draft.allium's OQ-3. The hook's tensor_get is
+--   backend-agnostic, but the inline timing relative to the
+--   main forward's stream completion must be re-validated on
+--   Vulkan and HIP/ROCm before the hook is enabled there.
+--
+-- OQ-4: Failure mode under MTP forward errors. If the hook's
+--   batched MTP decode fails (e.g., GGML_STATUS_ALLOC_FAILED
+--   from PHASE 35 Phase E), what happens to the main forward's
+--   output? Options: (a) the hook surfaces the error and the
+--   caller treats the whole decode as failed; (b) the hook
+--   logs and continues, leaving MTP KV partially populated
+--   for the ubatch (spec-violating). Option (a) is the right
+--   answer; the spec should bind this once the surrounding
+--   error-propagation path stabilises.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama.cpp:4604
+--     - llama_decode_internal; the seam where the hook fires
+--       after main forward graph compute returns.
+--   ik_llama.cpp/src/graphs/build_qwen35.cpp:6-89, 91-169
+--     - build_qwen35moe and build_qwen35; must add cb(cur,
+--       "h_pre_norm", -1) and res->t_h_pre_norm assignment
+--       before the final norm.
+--   ik_llama.cpp/include/llama.h:286-291
+--     - llama_mtp_op_type enum; in the ideal state warmup and
+--       update_accepted are removed (their work is absorbed by
+--       the hook), leaving only { none, draft_gen_fused }.
+--   ik_llama.cpp/common/speculative.cpp:1463-1490
+--     - mtp_update_kv_cache; reused by the hook for the
+--       batched MTP forward (with logits=false on all rows).
+--       The is_prompt_warmup branch is dead in the ideal state.
+--   ik_llama.cpp/examples/server/server-context.cpp:3787-3792
+--     - slot.mtp_hidden_state buffer +
+--       llama_set_draft_input_hidden_state; reused as the
+--       working buffer for the hook's tensor_get and as the
+--       cross-ubatch pending storage.
+--   ik_llama.cpp/examples/server/server-context.cpp:3791, 3966
+--     - mtp_accept_tokens call sites; in the ideal state
+--       these become llama_kv_cache_seq_rm calls (the
+--       KvRangeChop contract), no MTP decode.
+--   ik_llama.cpp/examples/server/server-context.cpp:4523
+--     - mtp_update_kv_cache(is_prompt_warmup=true); in the
+--       ideal state this call is removed (the hook handles
+--       prefill MTP-KV population inline).
+--
+-- Black-box helpers used inline in the invariants above:
+--   CompletedUbatches, CompletedVerifyRounds,
+--   ConsecutiveUbatchPairs, MtpKvWrites,
+--   ubatch_position_range, mtp_kv_has, main_kv_has, pos_range,
+--   paired_input_at_step_zero, last_hidden_of,
+--   pending_state_discarded_before.
+--
+-- Test infrastructure to drive from this spec via
+-- allium:propagate (these RED tests drive the implementation):
+--   - Tagged-tensor test: build the main graph and assert
+--     res->t_h_pre_norm is non-null with shape (n_embd,
+--     n_tokens). Drives THPreNormTensorTagged.
+--   - Single-fire test: instrument the hook to count
+--     invocations per llama_decode call; assert exactly one
+--     per ubatch. Drives FiresOncePerUbatch and
+--     SingleMtpDecodePerInvocation.
+--   - Lockstep test: after a multi-ubatch prefill, walk the
+--     position range and assert mtp_kv_has = main_kv_has at
+--     every position. Drives MtpKvLockstepWithMainKv.
+--   - Reject-tail test: simulate a verify with n_accepted <
+--     n_drafts; assert KV positions [pos_first, pos_first +
+--     n_accepted) are present and [pos_first + n_accepted,
+--     pos_last] are absent post-chop. Drives
+--     MtpKvMatchesAcceptedPrefix and ChopRangeIsRejectedSuffix.
+--   - Cross-ubatch continuity test: two consecutive ubatches
+--     in the same sequence; assert pairing logic works. Then
+--     two ubatches with a position gap; assert pending state
+--     discarded. Drives CrossUbatchBoundaryIsCorrect.
+--   - Sole-populator test: enumerate all MtpKvWrites in a full
+--     spec-decode round and assert each has source in {hook,
+--     fused_draft}. Drives HookIsSoleMtpKvPopulator.
+--   - Idempotent-chop test: chop twice; assert KV state
+--     unchanged after second chop. Drives
+--     IdempotentUnderRepeatedChop.
+--   - Lives at the cgraph level (test-backend-ops style) where
+--     possible; the lockstep test may need a server-level
+--     harness because it spans full decode flows.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity MtpUbatchHookSystem {
+    kv_ranges: List<KvRange>
+    hidden_state_rows: List<HiddenStateRow>
+}
+
+contract ValidateMtpUbatchHookSystem {
+    invoke: (sys: MtpUbatchHookSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

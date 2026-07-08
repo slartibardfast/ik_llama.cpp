@@ -1,0 +1,13 @@
+# Obligations for per_step_ssm_ancestor.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.PerStepSsm => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BatchToken => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DeltaNetStateRead.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.StateRow => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.AncestorLookupIsTransparent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LinearModeReproduction => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.GreedyParityWhenTreeDisabled => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ZeroExtraStateBuffer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.PerStepSsmAncestorSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidatePerStepSsmAncestorSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

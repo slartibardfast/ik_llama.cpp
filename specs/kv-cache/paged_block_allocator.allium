@@ -1,0 +1,477 @@
+-- allium: 3
+-- specs/kv-cache/paged_block_allocator.allium
+--
+-- Scope: the paged KV block allocator that replaces the
+-- contiguous per-stream slab layout. Models the block pool
+-- (flat arena), the per-seq block table, the free list, and
+-- the alloc/free/defrag operations.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF Tier 5 introduces
+-- paged KV to enable workloads where the contiguous layout
+-- cannot allocate the per-stream slabs (e.g. ctx 1M NP=8 Q4_0
+-- requires ~1.2 TB allocated under the current layout; paged
+-- fits in ~10 GiB by allocating only actually-written blocks).
+--
+-- The T5.0-probe falsified the perf-uplift mechanism on
+-- current-workload (`data/t5-probe-findings.md`). User selected
+-- Path C override and reframed Tier 5 as forward-looking infra
+-- for upcoming high-ctx workloads. "Complete sincerity"
+-- discipline: the allocator's correctness contracts MUST be
+-- airtight, including OOM behaviour at high ctx (first-class
+-- test, not edge case).
+--
+-- Includes:
+--   - External entities for the pool, table, free list,
+--     alloc/free/defrag operations.
+--   - Five invariants binding ownership, disjointness,
+--     laziness, determinism, and identity-mapping byte
+--     equivalence to the legacy layout at n_stream = 1.
+--   - Contracts for alloc_block, free_seq, defrag.
+--
+-- Excludes:
+--   - The WRITE path that consumes block table indices. Owned
+--     by specs/kv-cache/paged_write_path.allium.
+--   - The READ path that follows block table to fetch K/V
+--     rows. Owned by specs/kv-cache/paged_read_path.allium.
+--   - The K-shift / defrag K/V byte fidelity (post-move byte
+--     equivalence). Owned by
+--     specs/kv-cache/paged_kshift_defrag.allium.
+--   - Drafter KV under DFlash (OpenQ-T5-I default = drafter
+--     stays contiguous; allocator scope = target KV only).
+--   - The kernel signature change (block_table → K_base
+--     arithmetic). Owned by paged_read_path.allium.
+--
+-- Composition:
+--   - At n_stream = 1 single-seq, the allocator's BlockTable[0]
+--     is the identity mapping [0, 1, 2, ...] and the layout
+--     collapses byte-identically to the contiguous layout
+--     (invariant IdentityMappingAtSingleSeq).
+--   - At n_stream > 1, the allocator interleaves blocks across
+--     seqs in the flat pool; the block_table indirection is
+--     what makes this physical layout serve the same logical
+--     per-seq cache as the legacy per-stream slabs.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The flat block pool. A single arena of n_blocks * block_size
+-- KV cells, each cell holding (K_row, V_row) bytes of size
+-- n_embd_k_gqa + n_embd_v_gqa under the current Q4_0 packing.
+-- Allocated once at context construction; never resized.
+entity BlockPool {
+    n_blocks: Integer
+    block_size: Integer
+    n_embd_k_gqa: Integer
+    n_embd_v_gqa: Integer
+}
+
+-- Per-seq block table. block_table[seq] is the ordered list
+-- of physical block IDs owned by seq, in logical token order.
+-- block_table[seq][i] holds tokens in logical range
+-- [i * block_size, (i+1) * block_size).
+entity BlockTable {
+    seq_id: Integer
+    blocks: List<Integer>
+}
+
+-- The LIFO free list. Holds block IDs not currently owned by
+-- any seq. At construction, free_list = [0, 1, ..., n_blocks-1].
+entity FreeList {
+    n_free: Integer
+    free_ids: List<Integer>
+}
+
+-- One alloc_block operation. Returns either a fresh block_id
+-- popped from free_list, or OUT_OF_BLOCKS sentinel if the pool
+-- is exhausted.
+entity AllocOp {
+    seq_id: Integer
+    requested_at_tick: Integer
+    result_block_id: Integer
+}
+
+-- One free_seq operation. Returns all blocks for seq to the
+-- free list. Called at slot release.
+entity FreeOp {
+    seq_id: Integer
+    tick: Integer
+    freed_block_ids: List<Integer>
+}
+
+-- One defrag operation. Coalesces blocks across seqs to reduce
+-- fragmentation; rewrites block_table[seq] for every seq whose
+-- blocks were moved.
+entity DefragOp {
+    tick: Integer
+    moves: List<Integer>
+}
+
+-- One block move within defrag. Tracks (old_block_id ->
+-- new_block_id) for a single physical block.
+entity DefragMove {
+    seq_id: Integer
+    logical_pos_in_seq: Integer
+    old_block_id: Integer
+    new_block_id: Integer
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- TLC bounds. Concrete production: n_blocks varies with
+    -- context size (e.g. ctx=1M block_size=64 -> n_blocks=16384).
+    -- For TLC we keep small bounded values to keep state space
+    -- finite.
+    max_blocks: Integer = 8
+
+    -- TLC: how many seqs the allocator services concurrently.
+    max_seqs: Integer = 3
+
+    -- Block size in tokens. Locked at 64 per PHASE doc
+    -- "Mechanism" section (working-set L1 fit; 576B per ILP
+    -- group). OpenQ-T5-A allows drop to 128 if kernel
+    -- indirection > 5%; OpenQ-T5-F manual unroll if still over.
+    block_size_tokens: Integer = 64
+
+    -- TLC: maximum tokens written per seq in a bounded
+    -- exploration. Forces n_blocks_per_seq = ceil(N / block_size).
+    max_writes_per_seq: Integer = 24
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- BlockUniquelyOwned — at most one seq's BlockTable references
+-- any given block_id at any time. The single most important
+-- safety property: if violated, two seqs corrupt each other's
+-- K/V data.
+contract BlockUniquelyOwned {
+    invoke: (pool: BlockPool, tables: List<BlockTable>) -> Boolean
+
+    @invariant NoDoubleOwnership
+        -- For all distinct seqs s1, s2 and all i, j:
+        --   tables[s1].blocks[i] != tables[s2].blocks[j].
+        -- A block_id appears in at most one BlockTable.
+
+    @invariant FreeOrOwned
+        -- For every block_id in [0, pool.n_blocks):
+        -- exactly one of {free_list contains block_id,
+        --                  some BlockTable contains block_id}
+        -- is true. No block is both free and owned; no block
+        -- is leaked (free in neither set).
+
+    @guidance
+        -- alloc_block MUST pop from free_list AND push to
+        -- block_table[seq] atomically (under the cache mutex).
+        -- free_seq MUST pop from block_table[seq] AND push to
+        -- free_list atomically. defrag rewrites block_table
+        -- entries while preserving NoDoubleOwnership at every
+        -- intermediate state.
+}
+
+-- FreeListDisjoint — the free list and every block table are
+-- pairwise disjoint. Composition of NoDoubleOwnership +
+-- FreeOrOwned with a stronger constructive statement.
+contract FreeListDisjoint {
+    invoke: (free_list: FreeList, tables: List<BlockTable>) -> Boolean
+
+    @invariant FreeAndTablesDisjoint
+        -- free_list.free_ids ∩ ⋃_seq tables[seq].blocks = ∅.
+}
+
+-- AllocLazy — a seq holds zero blocks until its first KV write.
+-- The seq's BlockTable.size() = ceil(written_tokens / block_size).
+-- This is the structural win over contiguous layout: slots
+-- that don't run consume zero KV.
+contract AllocLazy {
+    invoke: (tables: List<BlockTable>, written_tokens: List<Integer>) -> Boolean
+
+    @invariant TableSizeMatchesWrites
+        -- For every seq s:
+        --   tables[s].blocks.size() = ceil(written_tokens[s] / block_size).
+        -- A seq with zero writes has an empty block table.
+
+    @guidance
+        -- The allocator MUST NOT pre-allocate blocks for seqs
+        -- that have not yet written. alloc_block is called
+        -- lazily on the first WRITE that overflows the current
+        -- last block.
+
+    @invariant NoPreallocation
+        -- For every seq s with written_tokens[s] = 0:
+        --   tables[s].blocks.size() = 0.
+}
+
+-- DeterministicAtFixedSequence — alloc_block calls with the
+-- same prior alloc/free history return the same block_id. The
+-- allocator state is fully determined by its operation sequence;
+-- no hash-map iteration order, no random tie-breaking, no
+-- nondeterministic concurrency primitives.
+contract DeterministicAtFixedSequence {
+    invoke: (history: List<AllocOp>, replays: Integer) -> Boolean
+
+    @invariant SameHistorySameOutcome
+        -- For any two runs of the allocator that receive the
+        -- same sequence of (alloc, free, defrag) operations:
+        -- the resulting (block_pool state, block_tables,
+        -- free_list) are byte-identical.
+
+    @guidance
+        -- The free list MUST be a deterministic ordered
+        -- container (e.g. a std::vector used as a stack, LIFO).
+        -- DO NOT use std::unordered_set or std::unordered_map
+        -- for any structure that influences alloc_block return
+        -- value — their iteration order is implementation-
+        -- defined and breaks NPC at the allocator level.
+
+    @invariant LIFOFreeListOrder
+        -- free_seq pushes blocks in reverse-allocation order
+        -- (the block allocated last is the first to be re-used).
+        -- alloc_block pops the top of free_list.
+
+    -- Composes with GP5.NPC: the verify-production-determinism
+    -- gate requires byte-identical outputs across NP={1,2,4,8}
+    -- runs. The allocator's contribution to NPC is captured here:
+    -- if SameHistorySameOutcome holds, the allocator never
+    -- introduces drift.
+}
+
+-- IdentityMappingAtSingleSeq — when n_stream = 1 and only seq 0
+-- has ever allocated, BlockTable[0] = [0, 1, 2, ...]. This is
+-- the byte-identity lever vs the contiguous layout: at single-
+-- seq production load, the paged layout's physical addresses
+-- collapse to the same flat addresses the contiguous layout
+-- produces.
+contract IdentityMappingAtSingleSeq {
+    invoke: (tables: List<BlockTable>) -> Boolean
+
+    @invariant Seq0OwnsContiguousPrefix
+        -- If only seq 0 has performed alloc_block (n_active_seqs = 1):
+        --   tables[0].blocks = [0, 1, 2, ..., tables[0].blocks.size() - 1].
+        -- The block IDs assigned to seq 0 are the contiguous
+        -- prefix of the pool.
+
+    @invariant CollapsesToContiguousAddressing
+        -- Under IdentityMappingAtSingleSeq, the address of
+        -- logical token t in seq 0 is:
+        --   physical = block_pool + (t / block_size) * block_size + (t % block_size)
+        --            = block_pool + t
+        -- exactly matching the contiguous layout.
+
+    @guidance
+        -- This is the load-bearing property for "Bundle A's
+        -- WRITE path collapses byte-identically at n_stream = 1"
+        -- and "Bundle B's READ path only activates on the new
+        -- kernel signature" (PHASE doc §"Bundles"). Production
+        -- runs n_stream = 2 with seq 0 and seq 1; for each
+        -- seq's prefix considered independently, the property
+        -- generalises to: BlockTable[seq] is contiguous when
+        -- and only when no other seq has interleaved alloc
+        -- between seq's allocations. The production NP=2
+        -- byte-identity gate (GP5.a) relies on this.
+}
+
+-- ============================================================
+-- alloc_block contract
+-- ============================================================
+
+-- AllocBlockBehavior — postconditions of one alloc_block call.
+contract AllocBlockBehavior {
+    invoke: (pool: BlockPool, free_list_pre: FreeList,
+             tables_pre: List<BlockTable>,
+             seq: Integer) -> Boolean
+
+    @invariant PopsFromFreeListIfNotFull
+        -- If free_list_pre.n_free > 0:
+        --   result_block_id = free_list_pre.free_ids.top()
+        --   free_list_post.free_ids = free_list_pre.free_ids.pop()
+        --   tables_post[seq].blocks = tables_pre[seq].blocks ++ [result_block_id]
+        -- All other tables and the rest of free_list are byte-
+        -- identical pre/post.
+
+    @invariant SignalsOutOfBlocksIfFull
+        -- If free_list_pre.n_free = 0:
+        --   result_block_id = OUT_OF_BLOCKS sentinel (= -1)
+        --   no state change.
+
+    @invariant DoesNotTouchOtherSeqs
+        -- alloc_block(seq) modifies ONLY tables[seq] and
+        -- free_list. For every seq' != seq, tables_post[seq'] is
+        -- pointer-equal AND byte-identical to tables_pre[seq'].
+
+    @invariant FullnessGate
+        -- After alloc_block returns OUT_OF_BLOCKS, the caller
+        -- (the K/V write path) is responsible for either
+        -- (a) failing the decode tick gracefully with a logged
+        --     "KV cache full" warning, OR
+        -- (b) triggering eviction policy (OpenQ-T5-B; lazy
+        --     defrag is the default; LRU eviction is a future
+        --     workitem).
+        -- The contract is silent on which path the caller
+        -- chooses; it commits only to NEVER silently
+        -- corrupting state.
+}
+
+-- ============================================================
+-- free_seq contract
+-- ============================================================
+
+contract FreeSeqBehavior {
+    invoke: (tables_pre: List<BlockTable>,
+             free_list_pre: FreeList,
+             seq: Integer) -> Boolean
+
+    @invariant ReturnsAllSeqBlocks
+        -- free_list_post.free_ids =
+        --   free_list_pre.free_ids ++ reverse(tables_pre[seq].blocks)
+        -- Returned in reverse-allocation order so the LIFO
+        -- discipline (DeterministicAtFixedSequence::LIFOFreeListOrder)
+        -- is preserved.
+
+    @invariant ClearsSeqTable
+        -- tables_post[seq].blocks = [] (empty).
+
+    @invariant DoesNotTouchOtherSeqs
+        -- For every seq' != seq: tables_post[seq'] is byte-
+        -- identical to tables_pre[seq'].
+
+    @invariant Idempotent
+        -- free_seq(seq) called twice in a row is a no-op the
+        -- second time (tables_pre[seq] is already empty by then).
+        -- The implementation MAY assert on the second call as
+        -- a defensive check; either behaviour is conformant.
+}
+
+-- ============================================================
+-- defrag contract (allocator-level only)
+-- ============================================================
+
+-- DefragMechanics — the allocator-level mechanics of defrag.
+-- K/V byte fidelity is owned by
+-- specs/kv-cache/paged_kshift_defrag.allium::DefragPreservesLogicalContents;
+-- this contract covers ONLY the block-table rewrite and the
+-- pool re-numbering.
+contract DefragMechanics {
+    invoke: (pool: BlockPool, tables_pre: List<BlockTable>,
+             tables_post: List<BlockTable>,
+             moves: List<DefragMove>) -> Boolean
+
+    @invariant LogicalSequencePreserved
+        -- For every seq s and every logical_pos i:
+        -- the physical block_id holding tokens [i * block_size,
+        -- (i+1) * block_size) of seq s pre-defrag is mapped to
+        -- the physical block_id holding the same tokens post-
+        -- defrag via the moves list.
+        -- Concretely: there exists a move m in moves with
+        --   m.seq_id = s
+        --   m.logical_pos_in_seq = i
+        --   m.old_block_id = tables_pre[s].blocks[i]
+        --   m.new_block_id = tables_post[s].blocks[i]
+        -- OR the block was not moved (old == new and no entry
+        -- in moves).
+
+    @invariant CompactionAfterDefrag
+        -- For every seq s: tables_post[s].blocks occupy the
+        -- lowest-numbered free block IDs available, in order.
+        -- Concretely: if seq s's blocks span IDs
+        -- [b0, b1, b2, ...] post-defrag, those IDs form the
+        -- contiguous prefix of the union of (seq s's prior
+        -- blocks) ∪ (free_list pre-defrag) sorted ascending.
+
+    @invariant BlockUniqueOwnershipPreserved
+        -- BlockUniquelyOwned holds at every intermediate state
+        -- DURING defrag, not just at the endpoints. Defrag
+        -- implementations MUST schedule moves such that no
+        -- partial state has two seqs owning the same block_id.
+
+    @guidance
+        -- The implementation MAY use a two-pass algorithm:
+        --   pass 1: scan all seqs, identify the target
+        --     destination block_id for each owned block;
+        --   pass 2: execute moves in an order that avoids
+        --     overwriting not-yet-moved blocks (e.g. by
+        --     using a scratch block as temporary buffer).
+        -- The Q→Q same-type CUDA cpy kernel
+        -- (feedback_cuda_cpy_q_q_same_type_pattern) is the
+        -- intended K/V byte mover; the allocator-level
+        -- contract is silent on the kernel choice.
+}
+
+-- ============================================================
+-- High-ctx feasibility (Tier 5 reframe — Path C)
+-- ============================================================
+
+-- HighCtxFeasibility — the load-bearing contract for the
+-- reframed GP5.b gate. At ctx >= 1M NP=8 Q4_0, the contiguous
+-- layout cannot allocate the per-stream slabs (requires
+-- ~1.2 TB; we have 48 GiB). The paged layout allocates only
+-- actually-written blocks, fitting in VRAM by AllocLazy.
+contract HighCtxFeasibility {
+    invoke: (pool: BlockPool, tables: List<BlockTable>,
+             written_tokens: List<Integer>,
+             vram_budget_bytes: Integer) -> Boolean
+
+    @invariant ActualFootprintBoundedByWrites
+        -- Total VRAM consumed by the K/V pool =
+        --   (sum over seqs of ceil(written_tokens[s] / block_size))
+        --   * block_size * (n_embd_k_gqa + n_embd_v_gqa) * bytes_per_q40_cell.
+        -- NOT (n_stream * ctx_per_stream * ...) as the
+        -- contiguous layout requires.
+
+    @invariant AdmitsHighCtxLowFillWorkloads
+        -- For any ctx >= 1M, NP = 8, Q4_0 K/V:
+        --   sum(written_tokens) < n_blocks * block_size
+        --     => allocator succeeds for every WRITE request.
+        -- Concretely: a session with 8 seqs each holding
+        -- ~10K tokens at ctx-budget 1M fits in
+        -- ~10 GiB VRAM (~1% of the contiguous-layout
+        -- requirement).
+
+    @guidance
+        -- This is the contract the user named "complete
+        -- sincerity" against: the allocator's whole point under
+        -- Tier 5 reframe is to make high-ctx workloads
+        -- ALLOCATABLE that contiguous cannot allocate at all.
+        -- AllocLazy + ActualFootprintBoundedByWrites together
+        -- bind this.
+
+    @invariant OOMBehaviourIsFirstClass
+        -- The OOM path (pool exhaustion at high load) is a
+        -- first-class test target, not an edge case.
+        -- AllocBlockBehavior::SignalsOutOfBlocksIfFull
+        -- specifies the signal; this invariant binds the test
+        -- discipline:
+        -- (a) The OOM path MUST be reachable under the high-
+        --     ctx workload (`test-paged-allocator-determinism`
+        --     pool-exhaustion stress branch).
+        -- (b) The OOM signal MUST propagate to the caller
+        --     without silent data corruption.
+        -- (c) The OOM message MUST log enough state to
+        --     diagnose (current pool occupancy, recent free
+        --     events).
+}
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity PagedBlockAllocatorSystem {
+    free_ops: List<FreeOp>
+    defrag_ops: List<DefragOp>
+}
+
+contract ValidatePagedBlockAllocatorSystem {
+    invoke: (sys: PagedBlockAllocatorSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

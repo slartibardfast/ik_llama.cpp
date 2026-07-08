@@ -1,0 +1,17 @@
+# Obligations for k_shift_per_stream.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.KShiftInput => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KSlice => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KCells => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KCell => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_streams => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_kvps_per_stream => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftAppliesPerCell.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftIsolation.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftPerDeviceInputs.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftRoPEEquivalent.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftIntermediatePinnedToSplitDevice.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoCrossStreamMutationUnderShift => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PerStreamRopeBSize => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.TotalKShiftSize => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

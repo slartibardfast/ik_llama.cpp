@@ -1,0 +1,14 @@
+# Obligations for libmgpu_subgraph_capture.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.LibmgpuGraph => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.LibmgpuDispatchRun => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.LibmgpuRunSequence => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.LibmgpuSourceFile => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ClipEncoderRun => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.LibmgpuCaptureSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LibmgpuNeedsNoSourceChange => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LibmgpuOutputDeterministicAcrossReplays => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LibmgpuOuterCaptureStaysHealthy => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LibmgpuCachedReplayMatchesPhase46Closure => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateLibmgpuCaptureSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

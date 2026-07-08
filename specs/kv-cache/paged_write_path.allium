@@ -1,0 +1,297 @@
+-- allium: 3
+-- specs/kv-cache/paged_write_path.allium
+--
+-- Scope: the KV WRITE path under paged allocation. Models the
+-- SET_ROWS-with-paged-indices operation that replaces the legacy
+-- CPY-with-patched-view-offsets path. Pins the byte-equivalence
+-- to the legacy WRITE at trivial (identity) block-table mapping.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF Tier 5 generalises
+-- the T3.3 inp_kv_idxs + SET_ROWS scaffold to the paged layout.
+-- T3 already wired ggml_set_rows as the multi-seq WRITE path;
+-- T5 changes only the formula for inp_kv_idxs:
+--   T3 multi-seq: inp_kv_idxs[t] = stream(t) * kvs_per_stream + head_local(t)
+--   T5 paged:     inp_kv_idxs[t] = block_table[seq(t)][block_idx(t)] * block_size
+--                                + (token_in_block(t)) * n_head_kv + h
+-- The legacy CPY-with-view-offset fallback (used at n_stream = 1)
+-- is removed in T5.3 once PagedKVWriteEquivToLegacyAtIdentity
+-- is bound.
+--
+-- The load-bearing contract is PagedKVWriteEquivToLegacyAtIdentity:
+-- at the identity mapping (which is what a single-seq n_stream = 1
+-- session produces — see paged_block_allocator.allium
+-- ::IdentityMappingAtSingleSeq), the post-write bytes are
+-- BYTE-EQUAL to what the legacy CPY path produces. This is
+-- what lets us remove the CPY fallback without regressing the
+-- production NP=2 byte-identity gate (GP5.NPC + GP5.a).
+--
+-- Includes:
+--   - External entities for KVWriteOp (paged), KVWriteOpLegacy
+--     (CPY+view), the inp_kv_idxs tensor.
+--   - Contract PagedKVWriteEquivToLegacyAtIdentity (binding for
+--     T5.3 CPY-fallback removal).
+--   - Invariants WriteIndexInBounds + WriteIndexUnique.
+--
+-- Excludes:
+--   - Block allocator state. Owned by paged_block_allocator.
+--   - K/V READ. Owned by paged_read_path.
+--   - K-shift and defrag. Owned by paged_kshift_defrag.
+--
+-- Composition:
+--   - At n_stream = 1, by IdentityMappingAtSingleSeq, the
+--     block_table is [0, 1, 2, ...] and inp_kv_idxs collapses
+--     to T3's flat-index pattern.
+--   - At n_stream > 1, inp_kv_idxs is set per-(token, head)
+--     row index following the block_table indirection.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- One KV WRITE operation in the paged path: a single
+-- ggml_set_rows call writing n_tokens * n_head_kv K/V rows into
+-- the flat block pool, with target rows indexed by inp_kv_idxs.
+entity KVWriteOp {
+    tick: Integer
+    n_tokens: Integer
+    n_head_kv: Integer
+    n_embd_k_gqa: Integer
+    n_embd_v_gqa: Integer
+    block_size_tokens: Integer
+}
+
+-- The legacy CPY+view-offset WRITE. Used by ik_llama HEAD when
+-- n_stream = 1: a single ggml_cpy call into a 2D K-cache view
+-- offset by the current head position. Marked SUPERSEDED — kept
+-- in spec only to anchor the byte-equivalence contract.
+entity KVWriteOpLegacy {
+    tick: Integer
+    n_tokens: Integer
+    n_head_kv: Integer
+    head_position: Integer
+}
+
+-- The inp_kv_idxs tensor. I32 row indices into the flat K/V
+-- pool, length n_tokens * n_head_kv. inp_kv_idxs[t * n_head_kv + h]
+-- = the destination row for token t's head h.
+entity InpKvIdxs {
+    n_tokens: Integer
+    n_head_kv: Integer
+    indices: List<Integer>
+}
+
+-- One token's batch metadata as consumed by the WRITE indexer.
+-- seq(t), block_idx(t) = pos_in_seq(t) / block_size_tokens,
+-- token_in_block(t) = pos_in_seq(t) % block_size_tokens.
+entity BatchTokenMeta {
+    token_idx_in_batch: Integer
+    seq_id: Integer
+    pos_in_seq: Integer
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- TLC: how large a single decode tick's batch can be.
+    max_tokens_per_tick: Integer = 8
+
+    -- TLC: head count per layer. Production Qwen 3.6 27B
+    -- n_head_kv = 8 (sm_75 GQA grouping).
+    max_n_head_kv: Integer = 8
+
+    -- Locked at 64 (paged_block_allocator::block_size_tokens).
+    block_size_tokens: Integer = 64
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- PagedKVWriteEquivToLegacyAtIdentity — the load-bearing
+-- byte-equivalence contract. When the block_table is the
+-- identity mapping (per IdentityMappingAtSingleSeq), the post-
+-- WRITE bytes in the K/V pool are byte-equal to what the
+-- legacy CPY+view-offset path produces.
+--
+-- This is what makes T5.3 — CPY-fallback removal — safe.
+contract PagedKVWriteEquivToLegacyAtIdentity {
+    invoke: (paged_op: KVWriteOp, legacy_op: KVWriteOpLegacy,
+             block_table_is_identity: Boolean) -> Boolean
+
+    @invariant ByteEqualAtIdentityMapping
+        -- If block_table_is_identity = true, and paged_op and
+        -- legacy_op are driven by the same batch (same seq_ids,
+        -- positions, K/V values to write):
+        --   for every byte address in the K and V pools post-
+        --   write: paged_post_byte = legacy_post_byte.
+        -- The two WRITE operations produce byte-identical
+        -- in-memory state.
+
+    @invariant DerivedFromInpKvIdxsFormula
+        -- At identity mapping:
+        --   inp_kv_idxs[t * n_head_kv + h]
+        --     = block_table[seq(t)][block_idx(t)] * block_size_tokens
+        --       + token_in_block(t) * n_head_kv + h
+        --     = (block_idx(t) + offset_to_seq(t)) * block_size_tokens
+        --       + token_in_block(t) * n_head_kv + h
+        -- For n_stream = 1 single-seq: offset_to_seq = 0,
+        -- block_idx + token_in_block * (1/block_size) = pos_in_seq.
+        -- The expression collapses to:
+        --   pos_in_seq(t) * n_head_kv + h
+        -- — exactly the flat-row index the legacy CPY path
+        -- writes to.
+
+    @guidance
+        -- The CPY-fallback removal (T5.3) MUST be gated on
+        -- ByteEqualAtIdentityMapping holding under the
+        -- ik_llama tests/spec/test-paged-write-byte-identity-at-identity
+        -- harness. The test drives one decode with the paged
+        -- WRITE and one with the legacy WRITE (in two separate
+        -- runs over the same input batch), compares post-write
+        -- K/V bytes, asserts byte-identical.
+        --
+        -- If the test fails: investigate whether
+        -- DerivedFromInpKvIdxsFormula holds under the actual
+        -- runtime (the formula may have an off-by-one in
+        -- production code). Do NOT proceed with T5.3 fallback
+        -- removal until the test is GREEN.
+
+    @invariant LegacyPathStillExistsUntilT5_3
+        -- The legacy KVWriteOpLegacy code path MUST remain in
+        -- the codebase as a parallel implementation until the
+        -- T5.3 commit. Removal is gated on:
+        --   (a) ByteEqualAtIdentityMapping test PASS, AND
+        --   (b) production NP=2 byte-identity gate (GP5.NPC)
+        --       GREEN with paged WRITE active, AND
+        --   (c) verify-production-determinism.sh PASS at NP={1,2,4,8}.
+        -- All three conditions land together in T5.3 or T5.3
+        -- does not commit.
+}
+
+-- WriteIndexInBounds — every row index in inp_kv_idxs falls
+-- within the allocated portion of the K/V pool. No write goes
+-- past the end of the pool, and no write targets a block that
+-- has not been allocated to the writing seq.
+contract WriteIndexInBounds {
+    invoke: (idxs: InpKvIdxs, pool_size_rows: Integer,
+             tables: List<BlockTable>,
+             batch: List<BatchTokenMeta>) -> Boolean
+
+    @invariant IndexLessThanPoolRows
+        -- For every i in [0, n_tokens * n_head_kv):
+        --   0 <= indices[i] < pool_size_rows.
+
+    @invariant IndexTargetsAllocatedBlock
+        -- For every batch token t at pos_in_seq(t):
+        --   let blk = block_idx(t) = pos_in_seq(t) / block_size_tokens
+        --   tables[seq(t)].blocks.size() > blk
+        -- i.e. the writing seq has already allocated the block
+        -- this token is being written into. WRITE never targets
+        -- a not-yet-allocated block — the allocator must run
+        -- BEFORE inp_kv_idxs is populated.
+
+    @guidance
+        -- The order at each tick is:
+        --   1. For each token in the batch: if it overflows the
+        --      seq's current last block, alloc_block(seq).
+        --   2. After all allocs, populate inp_kv_idxs from the
+        --      now-up-to-date block_table.
+        --   3. ggml_set_rows fires.
+        -- IndexTargetsAllocatedBlock will fail if step 1 is
+        -- skipped or reordered after step 2.
+}
+
+-- WriteIndexUnique — no two batch tokens scatter to the same
+-- pool row. Required for ggml_set_rows correctness (SET_ROWS
+-- semantics under duplicate target rows is "last-writer-wins"
+-- which is non-deterministic across runs).
+contract WriteIndexUnique {
+    invoke: (idxs: InpKvIdxs) -> Boolean
+
+    @invariant DistinctIndices
+        -- For all i1 != i2 in [0, n_tokens * n_head_kv):
+        --   indices[i1] != indices[i2].
+        -- This holds by construction when:
+        --   (a) every (seq, pos_in_seq) pair in the batch is
+        --       distinct (no duplicate logical writes), AND
+        --   (b) inp_kv_idxs is populated from a one-to-one
+        --       formula (block_table[seq][blk_idx] * block_size
+        --       + token_in_block * n_head_kv + h).
+        -- Both (a) and (b) are structural; this invariant is a
+        -- defensive check, not a substantive new claim.
+
+    @guidance
+        -- A failure of DistinctIndices is almost always a sign
+        -- that two batch tokens have the same (seq, pos_in_seq)
+        -- — usually a bug in the batch builder. Surface as a
+        -- hard assert, not a silent SET_ROWS overwrite.
+}
+
+-- ============================================================
+-- SET_ROWS @ Q4_0 contract
+-- ============================================================
+
+-- SetRowsQ40Coverage — the contract that pinpoints the
+-- ggml_set_rows operation supports Q4_0 K/V cache rows. T3
+-- already exercised this via the production NP-byte-identity
+-- gate; T5.A audit PUNTed binary-smoke confirmation to the
+-- T5.0 build step. This contract restates that binary-smoke
+-- is required.
+contract SetRowsQ40Coverage {
+    invoke: (build_tree: Integer) -> Boolean
+
+    @invariant TestBackendOpsCoversQ40
+        -- ik_llama.cpp/build/bin/test-backend-ops --op SET_ROWS
+        --   --type Q4_0
+        -- exits 0. Built as part of T5.0 build step.
+
+    @invariant Q40CellBoundaryAlignment
+        -- block_size_tokens (64) is divisible by Q4_0's QK=32.
+        -- Each block of 64 tokens = 2 Q4_0 super-blocks per
+        -- head per seq. SET_ROWS row stride is well-defined.
+
+    @guidance
+        -- If TestBackendOpsCoversQ40 fails at T5.0 build:
+        -- escalate to Risk #3 mitigation (paged-aware Q4_0
+        -- packing variant). Cost +20-40k in Bundle A.
+}
+
+-- ============================================================
+-- Production composition
+-- ============================================================
+
+-- ProductionByteIdentityAtNStream2 — composes
+-- PagedKVWriteEquivToLegacyAtIdentity with the production
+-- profile (qwen36-27b-x2-dflash, --parallel 2). At n_stream = 2
+-- the block_table is NOT the trivial single-seq identity, but
+-- the production gate (GP5.NPC) requires byte-identity across
+-- NP={1,2,4,8}. This contract names the composition.
+contract ProductionByteIdentityAtNStream2 {
+    invoke: (np: Integer) -> Boolean
+
+    @invariant NPByteIdentityHolds
+        -- For NP in {1, 2, 4, 8}:
+        --   the verify-production-determinism.sh script
+        --   reports PASS (cross-NP byte-identical token streams
+        --   at slot 0 for the same prompt).
+        -- This is the existing T3 gate; T5 inherits it.
+
+    @invariant PagingDoesNotIntroduceDrift
+        -- The paged WRITE path's contribution to the slot-0
+        -- token stream is fully determined by:
+        --   (a) the allocator's DeterministicAtFixedSequence,
+        --   (b) the WRITE formula's
+        --       DerivedFromInpKvIdxsFormula.
+        -- No additional NPC risk over T3.
+
+    @guidance
+        -- The NPC gate is the binding contract. If it fails,
+        -- either (a) the allocator is nondeterministic (revisit
+        -- LIFOFreeListOrder, check for hash-map iteration order
+        -- in any data structure influencing alloc_block), or
+        -- (b) the inp_kv_idxs formula has a non-deterministic
+        -- term (e.g. depends on a per-launch counter). Both
+        -- are concrete failure modes; neither is acceptable.
+}

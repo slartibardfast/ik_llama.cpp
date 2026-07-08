@@ -1,0 +1,365 @@
+-- allium: 3
+-- specs/cuda-native-dispatch/single_threaded_dispatch.allium
+--
+-- Status: LIVE as of PHASE_CUDA_NATIVE_DISPATCH commit C1.
+--
+-- Scope: the rewritten ggml_backend_sched_compute_splits at
+-- ik_llama.cpp/ggml/src/ggml-backend.cpp:2177. The dispatch walks
+-- the split sequence on ONE host thread per process lifetime. No
+-- openmp parallel region, no std::barrier worker pool. Cross-
+-- backend dependencies are carried by the existing
+-- ggml_backend_event_record / event_wait calls inside
+-- ggml_backend_sched_copy_inputs (CUDA streams are device-parallel
+-- by construction; host-side parallelism buys nothing for device
+-- concurrency).
+--
+-- Why this spec exists: PD1 (PHASE_CUDA_NATIVE_DISPATCH.md §10)
+-- identified four CUDA-context shared fields that race under
+-- multi-thread eval entry (cuda_graphs map, pools[device],
+-- cublas_handles[device], streams[device][n] lazy-creates). The
+-- structural fix is to eliminate concurrent host-side context
+-- access by construction. This spec binds that property:
+-- HostThreadIsExactlyOne forces a contradiction if a future change
+-- reintroduces multi-thread dispatch entry.
+--
+-- The Phase-46 mitigations (per-split full-backend drain, thread-
+-- gated cudaEventRecord, GGML_SCHED_EVAL_SERIALIZE critical
+-- section, GGML_SCHED_NO_DRAIN escape) become structurally
+-- unnecessary under single-threaded dispatch: there is no
+-- concurrent CPU-side state to coordinate.
+--
+-- Composition:
+--   - cross_device_event_chain.allium (C4) treats HostThread
+--     IsExactlyOne and InCaptureGateGuard as axioms.
+--   - multi_device_graph_cache.allium (C5) assumes the cache is
+--     accessed from a single thread (HostThreadIsExactlyOne).
+--   - libmgpu_subgraph_capture.allium (C7) depends on
+--     NoOpenMpParallelInDispatch + NoStdBarrierInDispatch as the
+--     structural source-level guarantee.
+--
+-- Code refs (paths from /home/dconnolly/yarn-agentic):
+--   ik_llama.cpp/ggml/src/ggml-backend.cpp:2177
+--     ggml_backend_sched_compute_splits (entry, C1 rewrite)
+--   ik_llama.cpp/ggml/include/ggml-backend.h:217-225
+--     dispatch-thread observation API
+--   ik_llama.cpp/tests/test-single-threaded-dispatch.cpp
+--     binds HostThreadIsExactlyOne under 100 graph computes
+--
+-- Companion model: specs/cuda-native-dispatch/CUDANativeDispatch.tla
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- Backend kinds the scheduler can route work to. Two relevant for
+-- this spec: CPU (a strict prefix under C6) and CUDA (the dispatch-
+-- loop body under outer capture).
+enum BackendKind {
+    cpu | cuda
+}
+
+-- An opaque host-thread identifier (std::thread::id wrapped).
+entity HostThreadId {
+    bits: Integer
+}
+
+-- One slice of the computation graph routed to a single backend.
+entity Split {
+    backend_id:         Integer
+    backend_kind:       BackendKind
+    n_inputs:           Integer
+    first_op_is_reduce: Boolean
+}
+
+-- A per-backend CUDA stream. Producer/consumer events are recorded
+-- on / waited on these streams.
+entity BackendStream {
+    backend_id:    Integer
+    stream_handle: Integer
+}
+
+-- One slot of sched->events[backend_id][cur_copy]. Records happen
+-- on the producing backend's stream; waits happen on the consuming
+-- backend's stream inside copy_inputs.
+entity CudaEvent {
+    backend_id: Integer
+    copy_idx:   Integer
+}
+
+-- ggml_backend_t produced by ggml_backend_cuda_init. The backing
+-- context owns the four PD1 lazy-create surfaces; C2 pre-allocates
+-- them at init. A backend is "eager-init complete" when none of
+-- the four surfaces is null on any device.
+entity CudaBackend {
+    device_count:               Integer
+    copy_event_initialised:     Boolean
+    cublas_handles_initialised: Boolean
+    pools_initialised:          Boolean
+    streams_initialised:        Boolean
+    eager_init_complete:        Boolean
+}
+
+-- ggml_backend_sched_t. Owns the split sequence and per-backend
+-- needs_sync / events / statuses state.
+entity ScheduleObject {
+    n_backends:           Integer
+    n_splits:             Integer
+    cur_copy:             Integer
+    is_async:             Boolean
+    split_mode_graph:     Boolean
+    has_reduce:           Boolean
+    cpu_is_prefix_only:   Boolean
+    first_cuda_split:     Integer       -- ≤ n_splits; equals n_splits if no CUDA splits
+    outer_capture_active: Boolean
+    splits:               List<Split>
+    streams:              List<BackendStream>
+    events:               List<CudaEvent>
+    cuda_backends:        List<CudaBackend>
+}
+
+-- A snapshot of the dispatch path's static-grep targets: the source
+-- regions whose contents this spec asserts. Used by the static-grep
+-- gates (NoOpenMpParallelInDispatch, NoStdBarrierInDispatch,
+-- LazyCreateBranchesDeleted, OuterCaptureFlagIsThreadLocal).
+entity DispatchSourceSurface {
+    backend_cpp_path:              String   -- "ik_llama.cpp/ggml/src/ggml-backend.cpp"
+    common_cuh_path:               String   -- "ik_llama.cpp/ggml/src/ggml-cuda/common.cuh"
+    ggml_cuda_cu_path:             String   -- "ik_llama.cpp/ggml/src/ggml-cuda.cu"
+    has_omp_parallel_in_dispatch:  Boolean
+    has_std_barrier_in_dispatch:   Boolean
+    has_lazy_create_in_common:     Boolean
+    has_thread_local_capture_flag: Boolean
+}
+
+-- A run of the dispatcher across the process lifetime. Records the
+-- set of host thread ids that ever entered compute_splits, plus the
+-- per-event-slot record counts.
+entity DispatchRun {
+    sched:                  ScheduleObject
+    observed_thread_ids:    List<HostThreadId>
+    event_record_counts:    List<Integer>     -- index-aligned with sched.events; values in {0, 1}
+    outer_capture_count:    Integer           -- atomic counter at end of run
+}
+
+-- The top-level system this spec quantifies over.
+entity SingleThreadedDispatchSystem {
+    runs:    List<DispatchRun>
+    source:  DispatchSourceSurface
+}
+
+-- ============================================================
+-- INVARIANTS — C1 single-thread dispatch
+-- ============================================================
+
+invariant HostThreadIsExactlyOne {
+    -- For every DispatchRun in the system: the cardinality of
+    -- observed_thread_ids is at most 1. Across the process lifetime
+    -- the set of host thread ids that have entered
+    -- ggml_backend_sched_compute_splits is either empty (never
+    -- called) or a singleton. The dispatcher is single-threaded by
+    -- construction.
+    --
+    -- Bound by ggml_backend_sched_dispatch_thread_count() <= 1
+    -- after any sequence of ggml_backend_sched_graph_compute calls.
+}
+
+invariant SplitsExecuteInSequenceOrder {
+    -- For every DispatchRun and every pair of indices i < j with
+    -- j < sched.n_splits: split[i]'s host-side enqueue precedes
+    -- split[j]'s. The dispatcher walks splits[0..n_splits) in array
+    -- order on the single host thread.
+    --
+    -- Binds host-side enqueue order, not GPU-side completion. GPU
+    -- concurrency across devices is preserved by per-backend streams;
+    -- the dispatcher does not block on per-split completion.
+}
+
+invariant CopyInputsThenEvalThenRecord {
+    -- For every DispatchRun and every Split with n_inputs > 0:
+    --   1. ggml_backend_sched_copy_inputs runs first — uploads
+    --      cross-backend inputs and inserts event_wait calls on the
+    --      destination backend's stream.
+    --   2. ggml_backend_sched_eval runs next — enqueues the split's
+    --      kernels on its backend's stream.
+    --   3. cudaEventRecord on sched.events[backend_id][cur_copy]
+    --      runs last — downstream consumers' event_wait calls see
+    --      the produced data.
+    -- This sequence is host-thread-serial; under HostThreadIsExactly
+    -- One it is also process-wide serial.
+}
+
+invariant EventRecordIsThreadSafe {
+    -- For every DispatchRun, for every entry in event_record_counts:
+    -- the value is in {0, 1}. Under single-threaded dispatch, exactly
+    -- one cudaEventRecord happens per (event_slot, sched_iteration).
+    -- The Phase-46 thread-gated guard `if (ith == split_backend_id)`
+    -- is now structural — encoded by the absence of openmp.
+}
+
+invariant ReduceMarksParticipantsSticky {
+    -- For every DispatchRun and every Split with first_op_is_reduce
+    -- = true at index i < sched.n_splits - 1: every backend that
+    -- participates in the reduce node has its sched.needs_sync slot
+    -- set to true after the dispatch of that split.
+    --
+    -- Reason: after a REDUCE split (and unless it is the last split),
+    -- every participating backend has async peer writes outstanding.
+    -- The next consumer read in copy_inputs must force a stream sync
+    -- via event_wait or backend_synchronize.
+}
+
+invariant NoOpenMpParallelInDispatch {
+    -- For the DispatchSourceSurface in the system: has_omp_parallel_
+    -- in_dispatch = false. The compiled function
+    -- ggml_backend_sched_compute_splits contains no `#pragma omp
+    -- parallel` directive. Bound by the spec-tla-gate grep step:
+    -- lines containing "omp parallel" inside the compute_splits body
+    -- are forbidden.
+}
+
+invariant NoStdBarrierInDispatch {
+    -- For the DispatchSourceSurface in the system: has_std_barrier_
+    -- in_dispatch = false. The std::barrier worker-thread variant
+    -- was deleted by C1 together with the openmp block — originally
+    -- planned for C13, absorbed into C1 to avoid carrying ~80 lines
+    -- of dead code through 12 commits.
+    --
+    -- Static-grep gate: ggml_backend_sched_compute_splits must not
+    -- contain "std::barrier", "barrier.arrive_and_wait", or
+    -- "workers.emplace_back".
+}
+
+-- ============================================================
+-- INVARIANTS — C2 eager init (no lazy create in dispatch path)
+-- ============================================================
+
+invariant NoLazyInitInDispatchPath {
+    -- For every CudaBackend in every DispatchRun's
+    -- sched.cuda_backends list: eager_init_complete = true.
+    -- Equivalently: copy_event_initialised, cublas_handles_
+    -- initialised, pools_initialised, streams_initialised are all
+    -- true on every device of every CudaBackend in the system.
+    --
+    -- After ggml_backend_cuda_init returns, the four PD1 lazy-create
+    -- surfaces (copy_event, streams[d][s], cublas_handles[d],
+    -- pools[d]) are populated. The accessors stream(),
+    -- cublas_handle(), pool() in common.cuh are non-lazy after C2:
+    -- they assert non-null instead of creating on demand. The
+    -- dispatch path cannot trigger lazy init by construction.
+    --
+    -- Holds at backend init return and across arbitrarily many
+    -- graph computes — the surfaces never become null again.
+}
+
+invariant LazyCreateBranchesDeleted {
+    -- For the DispatchSourceSurface in the system:
+    -- has_lazy_create_in_common = false. Static-grep gate (spec-
+    -- tla-gate CI):
+    --
+    --   common.cuh — must not contain
+    --     "cudaStreamCreateWithFlags(&streams["
+    --     "cublasCreate(&cublas_handles["
+    --     "pools[device] = new_pool_for_device"
+    --
+    --   ggml-cuda.cu — the cross-device copy site
+    --     (cpy_tensor_async) must not contain
+    --     "if (!cuda_ctx_src->copy_event)"
+    --     "cudaEventCreate(&cuda_ctx_src->copy_event)"
+}
+
+-- ============================================================
+-- INVARIANTS — C3 in-capture gate
+-- ============================================================
+
+invariant InCaptureGateGuard {
+    -- For every DispatchRun where sched.outer_capture_active = true:
+    -- the inner ggml_backend_cuda_graph_compute does NOT issue any
+    -- of cudaStreamBeginCapture, cudaStreamEndCapture,
+    -- cudaGraphInstantiate, cudaGraphLaunch.
+    --
+    -- All four are gated by use_cuda_graph; C3 sets use_cuda_graph
+    -- = false whenever in_outer_capture is true. Kernel launches
+    -- still occur on the backend's stream via the eager-launch
+    -- fallback; the CUDA driver folds them into the outer captured
+    -- cudaGraph_t via cudaStreamCaptureModeRelaxed's cross-stream
+    -- join semantics (PD2 verified, CUDA 13.2).
+    --
+    -- Why C3 alone is inert: ggml_cuda_outer_capture_active()
+    -- returns false until C4 wraps compute_splits. C3 lands the
+    -- gate ahead of C4 so that C4's commit can be narrow.
+}
+
+invariant OuterCaptureFlagIsThreadLocal {
+    -- For the DispatchSourceSurface in the system: has_thread_
+    -- local_capture_flag = true. The outer-capture flag's
+    -- declaration in ggml-cuda.cu uses `static thread_local bool`.
+    --
+    -- The flag lives in static thread_local storage on the
+    -- dispatcher thread. HostThreadIsExactlyOne guarantees there
+    -- is exactly one dispatcher thread, so the thread-local has
+    -- process-wide reach in practice. A future change that
+    -- re-introduces multi-threaded dispatch would also break
+    -- HostThreadIsExactlyOne — this invariant composes with it to
+    -- make the dependency explicit.
+    --
+    -- Static-grep gate: ggml-cuda.cu contains
+    --   "static thread_local bool g_outer_capture_active"
+}
+
+-- ============================================================
+-- INVARIANTS — C6 CPU prefix hoist
+-- ============================================================
+
+invariant CPUSplitsHoistedBeforeCapture {
+    -- For every DispatchRun where sched.outer_capture_active =
+    -- true: every Split at index i < sched.first_cuda_split has
+    -- backend_kind = cpu and is dispatched synchronously on the
+    -- host BEFORE cudaStreamBeginCapture. The dispatch loop under
+    -- capture starts at sched.first_cuda_split.
+    --
+    -- Gating: outer-capture is enabled only when cpu_is_prefix_only
+    -- AND first_cuda_split < n_splits AND not outer_capture_disabled.
+    -- If a graph has CPU splits interleaved or trailing, the wrap
+    -- is skipped and the dispatch loop runs eagerly over every
+    -- split (the C1 path).
+    --
+    -- Cache hits also bypass the capture round-trip but still need
+    -- the CPU prefix to run on every dispatch; the captured graph
+    -- contains no CPU work.
+}
+
+invariant NoMidDispatchCPUSplitsUnderCapture {
+    -- For every DispatchRun where sched.outer_capture_active =
+    -- true: every Split at index i in [sched.first_cuda_split,
+    -- sched.n_splits) has backend_kind = cuda. CPU splits, if
+    -- present, are entirely upstream of first_cuda_split (the
+    -- loop start under capture).
+}
+
+-- ============================================================
+-- Contract
+-- ============================================================
+
+contract ValidateSingleThreadedDispatch {
+    invoke: (sys: SingleThreadedDispatchSystem) -> Boolean
+
+    @invariant AllSingleThreadedDispatchInvariantsHold
+        -- Returns true iff sys honours every invariant above:
+        -- HostThreadIsExactlyOne, SplitsExecuteInSequenceOrder,
+        -- CopyInputsThenEvalThenRecord, EventRecordIsThreadSafe,
+        -- ReduceMarksParticipantsSticky, NoOpenMpParallelInDispatch,
+        -- NoStdBarrierInDispatch, NoLazyInitInDispatchPath,
+        -- LazyCreateBranchesDeleted, InCaptureGateGuard,
+        -- OuterCaptureFlagIsThreadLocal, CPUSplitsHoistedBefore
+        -- Capture, NoMidDispatchCPUSplitsUnderCapture.
+        --
+        -- HostThreadIsExactlyOne is the load-bearing invariant; the
+        -- four PD1 race surfaces (cuda_graphs, pools, cublas_handles,
+        -- streams) are reachable only via ggml_backend_sched_eval ->
+        -- CUDA backend entry points. Under HostThreadIsExactlyOne
+        -- those entry points are called from a single thread, so
+        -- the lazy-create branches still present in C1 are race-free
+        -- by construction. C2 then pre-allocates those surfaces and
+        -- removes the lazy-create branches entirely (Lazy
+        -- CreateBranchesDeleted closes the loop).
+}

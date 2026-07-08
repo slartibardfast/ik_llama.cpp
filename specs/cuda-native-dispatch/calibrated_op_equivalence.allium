@@ -1,0 +1,189 @@
+-- allium: 3
+-- specs/cuda-native-dispatch/calibrated_op_equivalence.allium
+--
+-- Status: LIVE as of PHASE_CUDA_NATIVE_DISPATCH commit C11 (combined
+-- with C8 / C9 / C10).
+--
+-- Scope: for every calibrated op registered with the framework, the
+-- default and alt strategies produce numerically equivalent output
+-- (byte-identical OR fp16/fp32 ULP-bound, per the op's specific
+-- contract). The dispatch decision (which strategy fires at a given
+-- payload size) may vary across hardware via calibration, but the
+-- output bits MUST NOT vary across strategy choice for a fixed input.
+--
+-- C8-C11 implementation strategy on xeon: all four ops register
+-- `default_wins_stub` probes that bias the conservative crossover
+-- to never fire (alt.p95 = 10.5 ms vs default.p50 = 1.0 ms). The
+-- framework records SIZE_MAX for every op; the alt path never fires
+-- in production. The equivalence property is therefore VACUOUS on
+-- xeon: there is no alt-strategy output to compare against.
+--
+-- When a future deployment replaces a stub with a real probe (e.g.
+-- C9 re-enables NCCL via the typo fix at ggml-cuda.cu:4449 and ships
+-- a real ncclAllReduce-vs-memcpy_peer probe), the equivalence test
+-- for that op must be replaced with a real comparison test that
+-- runs both strategies at a calibrated payload size and asserts
+-- output equivalence (numeric tolerance per dtype).
+--
+-- Composition:
+--   - calibrated_dispatch_framework.allium (C0) — DispatchIs
+--     PureFunction, CalibrationCompletesBeforeFirstDispatch,
+--     ProbeIsDeterministic are taken as axioms.
+--   - libmgpu_subgraph_capture.allium (C7) — LibmgpuCachedReplay
+--     MatchesPhase46Closure composes with this spec's equivalence
+--     once a calibrated op replaces a stub on the libmgpu path.
+--
+-- Code refs:
+--   ik_llama.cpp/ggml/src/ggml-cuda/op_calibration_probes.cu (C8-C11)
+--   ik_llama.cpp/ggml/include/ggml-cuda-calibration.h
+--   ik_llama.cpp/tests/test-calibration-ops-registered.cpp
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- The four registered calibrated ops. Re-declared per-file because
+-- Allium 3 specs are independent units.
+enum OpId {
+    reduce_cross_device | matmul_stream_split | peer_copy | graph_capture
+}
+
+-- A canonical-name registration record. After ggml-cuda module load,
+-- ggml_cal_op_name(op) returns a non-null, non-default string for
+-- every enumerated OpId.
+entity OpRegistration {
+    op:               OpId
+    canonical_name:   String      -- the canonical string returned by ggml_cal_op_name(op)
+    name_is_default:  Boolean     -- true if ggml_cal_op_name returned the placeholder
+    is_null:          Boolean     -- true if ggml_cal_op_name returned null
+}
+
+-- One side of a calibrated op (default OR alt).
+entity CalibratedOpStrategy {
+    op:     OpId
+    is_alt: Boolean
+}
+
+-- One invocation of a calibrated op at a given payload size.
+-- output_hash carries a digest of the produced bytes; the
+-- equivalence invariant compares hashes pairwise.
+entity CalibratedOpRun {
+    op:            OpId
+    payload_bytes: Integer
+    strategy:      CalibratedOpStrategy
+    output_hash:   String
+}
+
+-- A pair of runs of the same op at the same payload — one default,
+-- one alt. Used to state the bit-identity property.
+entity StrategyRunPair {
+    run_default: CalibratedOpRun
+    run_alt:     CalibratedOpRun
+    threshold:   Integer       -- ggml_cuda_threshold_for(op) at the time of the runs
+}
+
+-- A dispatch query at runtime. Mirrors framework spec's entity but
+-- restated here for the pure-function invariant on the threshold.
+entity DispatchQuery {
+    op:                OpId
+    payload_bytes:     Integer
+    threshold:         Integer
+    use_alt_strategy:  Boolean
+}
+
+-- A host-specific calibration snapshot. host_name is the hostname
+-- the calibration ran on; thresholds is the per-op SIZE_MAX
+-- determination on that host.
+entity HostCalibration {
+    host_name:           String
+    op_threshold:        OpId
+    threshold_bytes:     Integer
+    is_size_max:         Boolean
+}
+
+-- Top-level system this spec quantifies over.
+entity CalibratedOpEquivalenceSystem {
+    registrations:    List<OpRegistration>
+    run_pairs:        List<StrategyRunPair>
+    dispatch_queries: List<DispatchQuery>
+    host_calibrations: List<HostCalibration>
+}
+
+-- ============================================================
+-- INVARIANTS
+-- ============================================================
+
+invariant AllFourCalibratedOpsRegistered {
+    -- For every OpId op in {reduce_cross_device, matmul_stream_
+    -- split, peer_copy, graph_capture}: there exists an
+    -- OpRegistration in the system with that op, is_null = false,
+    -- and name_is_default = false. After ggml-cuda module load,
+    -- ggml_cal_op_name returns the canonical string for every op
+    -- id. This binds that C8-C11's static-initializer in
+    -- op_calibration_probes.cu ran and the registry has entries
+    -- for all four ops.
+    --
+    -- Test binding:
+    --   ik_llama.cpp/tests/test-calibration-ops-registered.cpp
+}
+
+invariant DefaultAndAltOutputEquivalence {
+    -- For every StrategyRunPair in the system where
+    -- pair.threshold <= pair.run_default.payload_bytes and
+    -- pair.threshold < SIZE_MAX and the two runs share op and
+    -- payload_bytes: pair.run_default.output_hash =
+    -- pair.run_alt.output_hash.
+    --
+    -- For every (op, payload) where both strategies are reachable
+    -- (alt threshold <= payload < SIZE_MAX), the output bits MUST
+    -- be equivalent. Numeric tolerance depends on dtype:
+    --   F32 / FP16 / BF16 — ULP-bound per the op's dtype contract
+    --   Q8_0              — byte-identical
+    --
+    -- VACUOUS on xeon: all four stubs return SIZE_MAX. The
+    -- invariant binds on any future deployment that replaces a
+    -- stub with a real probe.
+}
+
+invariant DispatchIsPureFunctionOfThreshold {
+    -- For every DispatchQuery in the system: q.use_alt_strategy =
+    -- (q.payload_bytes >= q.threshold). The dispatch decision is
+    -- a pure function of (op, payload, threshold). Restated from
+    -- calibrated_dispatch_framework.allium for composition; this
+    -- spec leans on it for the equivalence claim to be meaningful.
+}
+
+invariant StubProbesYieldSizeMaxOnXeon {
+    -- For every HostCalibration in the system where host_name =
+    -- "xeon" and op_threshold in {reduce_cross_device, matmul_
+    -- stream_split, peer_copy, graph_capture}: is_size_max = true
+    -- and threshold_bytes = SIZE_MAX.
+    --
+    -- Concrete production-hardware contract: with the C8-C11
+    -- `default_wins_stub` probes, every threshold on xeon's
+    -- 2× RTX 6000 SKU calibrates to SIZE_MAX. test-calibration-
+    -- ops-registered.cpp binds this on the actual host.
+}
+
+-- ============================================================
+-- Contract
+-- ============================================================
+
+contract ValidateCalibratedOpEquivalence {
+    invoke: (sys: CalibratedOpEquivalenceSystem) -> Boolean
+
+    @invariant AllCalibratedOpEquivalenceInvariantsHold
+        -- Returns true iff sys satisfies AllFourCalibratedOps
+        -- Registered, DefaultAndAltOutputEquivalence, DispatchIs
+        -- PureFunctionOfThreshold, and StubProbesYieldSizeMaxOnXeon.
+        --
+        -- Composition principle: calibrated ops are SAFE to deploy
+        -- because (a) calibration is deterministic (framework
+        -- spec), (b) the dispatch decision is a pure function of
+        -- (op, payload, threshold) (DispatchIsPureFunctionOf
+        -- Threshold above), and (c) the two strategies produce
+        -- equivalent outputs at the calibrated payload size
+        -- (DefaultAndAltOutputEquivalence). Property (c) is
+        -- vacuous on xeon with stub probes; it becomes load-
+        -- bearing when real probes ship.
+}

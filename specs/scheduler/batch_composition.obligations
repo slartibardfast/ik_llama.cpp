@@ -1,0 +1,21 @@
+# Obligations for batch_composition.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Slot => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Tick => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Batch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BatchToken => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.SlotState => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.SlotCommand => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_parallel_slots => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.prefill_chunk_budget => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TokenBudgetPerUbatch.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DecodePriorityAdmission.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ChunkedPrefillAdmission.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PrefillCarryProgressesMonotonically.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SlotLifecycle.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PerTokenFlagExclusivity => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.BatchCompositionInvariant => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DecodeAdmittedWhenPrefillAdmitted => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BatchCompositionSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateBatchCompositionSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

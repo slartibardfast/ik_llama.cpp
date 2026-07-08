@@ -1,0 +1,21 @@
+# Obligations for paged_read_path.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.FAReadOp => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BlockTableTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KRowFetch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.MaskCell => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_n_seqs_in_batch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_ne11_per_seq => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_blocks_per_seq => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.block_size_tokens => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_registers_per_thread => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.min_occupancy_percent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_per_cta_microseconds => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PagedFAReadEquivToContiguousAtIdentity.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KLoopCanonicalOrder.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.MaskAddressingPreserved.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KernelOccupancyAndLatencyBinding.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.HighCtxFAReadFeasibility.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.PagedReadPathSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidatePagedReadPathSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

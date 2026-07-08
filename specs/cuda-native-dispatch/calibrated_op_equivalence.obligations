@@ -1,0 +1,16 @@
+# Obligations for calibrated_op_equivalence.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+enum-comparable.OpId => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.OpRegistration => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CalibratedOpStrategy => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CalibratedOpRun => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.StrategyRunPair => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DispatchQuery => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.HostCalibration => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CalibratedOpEquivalenceSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.AllFourCalibratedOpsRegistered => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DefaultAndAltOutputEquivalence => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DispatchIsPureFunctionOfThreshold => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.StubProbesYieldSizeMaxOnXeon => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateCalibratedOpEquivalence.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

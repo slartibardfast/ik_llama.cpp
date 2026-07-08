@@ -1,0 +1,176 @@
+-- allium: 3
+-- windows_native_parity.allium
+
+-- Scope: the correctness contract for cutting production over from the
+-- WSL2 ik_llama.cpp build to the native Windows (MSVC + CUDA) build of the
+-- SAME source pin (a0506f2). Two obligations:
+--
+--   1. PARITY. For a fixed model + prompt + seed at --parallel 1, the
+--      native-Windows build's output logits must match the WSL2 baseline
+--      within the established NMSE/PPL tolerance (bit-identical where the
+--      determinism harness already guarantees byte-stability at np=1).
+--
+--   2. DEPLOY SAFETY. The Windows deploy (deploy-llama-server.ps1) must
+--      carry the same guarantees as the Linux scripts/deploy-llama-server.sh:
+--      install exe + DLLs atomically, sha256-verify the install against the
+--      build tree, refuse to deploy a libggml carrying the legacy
+--      GGML_SCHED_MAX_SPLITS assert string, and report healthy ONLY when the
+--      installed bytes match the build tree.
+--
+-- Perf is NOT modelled here as an invariant — it is a measured obligation
+-- (native decode t/s >= the WSL2 baseline from the perf A/B run), recorded
+-- in plan/0132 and gating the cutover decision. TLA+ is not needed: the
+-- cutover introduces no new concurrency ordering (the existing dispatch/KV
+-- specs own that).
+--
+-- Includes: logit-parity tolerance, the deploy stale-lib refusal, the
+-- healthy-implies-bytes-match invariant.
+-- Excludes: the WSL2-specific networking workarounds (127.0.0.2 routing,
+-- loopback0/ufw, peer-copy capture) — those are confirmed UNNEEDED on native
+-- Windows in the networking validation, not specified here.
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- One decode of a fixed (model, prompt, seed) at --parallel 1, producing the
+-- next-token logit vector. `platform` is "linux-wsl2" or "windows-native".
+entity InferenceRun {
+    platform: String
+    logits: Set<Decimal>
+    count: Integer
+}
+
+-- A parity comparison of the native-Windows run against the WSL2 baseline,
+-- both for the same fixed (model, prompt, seed).
+entity ParityCheck {
+    baseline: InferenceRun
+    candidate: InferenceRun
+    nmse: Decimal
+}
+
+-- A Windows deploy candidate: the installed binary + libs, the build-tree
+-- hashes they must match, whether libggml still carries the legacy assert
+-- string, and the service health the deploy reports.
+entity DeployCandidate {
+    installed_sha: String
+    buildtree_sha: String
+    has_legacy_assert: Boolean
+    reported_healthy: Boolean
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Normalised mean-squared-error tolerance for logit parity between the
+    -- native-Windows build and the WSL2 baseline. The determinism harness
+    -- already guarantees byte-stable np=1 decode on the deployed build, so
+    -- the target is effectively zero; the small tolerance absorbs only
+    -- last-bit fp reassociation the MSVC/nvcc toolchain may introduce
+    -- relative to gcc/nvcc, which must not change argmax.
+    nmse_tolerance: Decimal = 0.000001
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+open question "Bit-identity vs NMSE: at --parallel 1 the deployed Linux build is byte-stable (production runs --parallel 1). Whether the MSVC+CUDA build reproduces the SAME bytes, or only matches within nmse_tolerance, is a measurement — the compile and AVX-512 stages of plan/0132 decide whether to tighten this to exact equality."
+
+open question "Tolerance scope: nmse_tolerance is applied to the raw logit vector. An alternative binding is on the argmax (sampled token) only, which is what actually affects output. The vector form is stricter; kept until measurement shows it is too strict for the AVX-512 vs AVX2 staging."
+
+-- ============================================================
+-- Rules
+-- ============================================================
+
+-- Parity: comparing the native-Windows candidate against the WSL2 baseline
+-- yields an NMSE that must sit within tolerance. Same token count is a
+-- precondition (same model + prompt + seed).
+rule CheckWindowsParity {
+    when: CheckWindowsParity(baseline, candidate)
+
+    requires: baseline.count > 0
+    requires: candidate.count = baseline.count
+    requires: candidate.platform = "windows-native"
+    requires: baseline.platform = "linux-wsl2"
+
+    let nmse = normalized_mse(baseline.logits, candidate.logits)
+
+    ensures: ParityCheck.created(
+        baseline: baseline,
+        candidate: candidate,
+        nmse: nmse
+    )
+}
+
+-- Deploy gate: a Windows deploy may report healthy only when the installed
+-- bytes match the build tree AND libggml does not carry the legacy assert.
+-- A mismatch or a stale lib must leave the deploy not-healthy (the .ps1
+-- refuses, as deploy-llama-server.sh does).
+rule WindowsDeployGate {
+    when: WindowsDeployGate(installed_sha, buildtree_sha, has_legacy_assert)
+
+    let healthy = (installed_sha = buildtree_sha) and (not has_legacy_assert)
+
+    ensures: DeployCandidate.created(
+        installed_sha: installed_sha,
+        buildtree_sha: buildtree_sha,
+        has_legacy_assert: has_legacy_assert,
+        reported_healthy: healthy
+    )
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- Every parity check must come in within tolerance for the cutover to be
+-- correct. A check above tolerance blocks the cutover.
+invariant ParityWithinTolerance {
+    for check in ParityChecks:
+        check.nmse <= config.nmse_tolerance
+}
+
+-- A parity check must compare the native-Windows candidate against the WSL2
+-- baseline (not two runs of the same platform), over the same token count.
+invariant ParityComparesAcrossPlatforms {
+    for check in ParityChecks:
+        check.candidate.platform = "windows-native" and
+        check.baseline.platform = "linux-wsl2" and
+        check.candidate.count = check.baseline.count
+}
+
+-- A deploy that reports healthy must have installed bytes matching the build
+-- tree (no stale-lib-loaded-via-search-order class, the 2026-05-25 wedge).
+invariant HealthyImpliesBytesMatch {
+    for d in DeployCandidates:
+        d.reported_healthy = false or d.installed_sha = d.buildtree_sha
+}
+
+-- A deploy carrying the legacy GGML_SCHED_MAX_SPLITS assert string must never
+-- report healthy.
+invariant StaleAssertBlocksDeploy {
+    for d in DeployCandidates:
+        d.has_legacy_assert = false or d.reported_healthy = false
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Parity harness: run the same (model, prompt, seed) at --parallel 1 on the
+-- WSL2 build and the native-Windows build, capture the next-token logit
+-- vectors, compute NMSE. This reuses the existing determinism/NMSE harness
+-- (see plan/0038, the NMSE T1 harness) with the candidate pointed at
+-- llama-server.exe instead of the WSL2 binary.
+--
+-- Deploy gate: deploy-llama-server.ps1 mirrors scripts/deploy-llama-server.sh
+-- — install exe + all .dll atomically, sha256 the install against the build
+-- tree, grep libggml.dll for the GGML_SCHED_MAX_SPLITS assert string and
+-- refuse if present, (re)start the Windows service, poll /health, print the
+-- embedded commit= stamp. Windows has no LD_LIBRARY_PATH/RUNPATH: the loader
+-- resolves DLLs from the .exe's own directory first, so co-locating lib\*.dll
+-- with llama-server.exe (or an app manifest) is the equivalent of the Linux
+-- systemd LD_LIBRARY_PATH drop-in.

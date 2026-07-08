@@ -1,0 +1,19 @@
+# Obligations for nearest_centroid.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.NibblePackedIndices => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.codebook_size => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.argmin_index_rel_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.ArgminFirstMatch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.ArgminFirstMatch.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.PackNibbleIndices => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.PackNibbleIndices.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.PackNibbleIndices.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.PackNibbleIndices.3 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.PackNibbleIndices.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.NearestCentroidAssignment => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.NearestCentroidAssignment.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.NearestCentroidAssignment.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.NearestCentroidAssignment.3 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.NearestCentroidAssignment.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PackingBoundsRespected => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

@@ -1,0 +1,405 @@
+-- allium: 3
+-- specs/dispatch/graph_reuse_set_rows.allium
+--
+-- Scope: CUDA graph reuse under multi-seq dispatch with the
+-- `ggml_set_rows`-based K/V WRITE path. Models the topology
+-- hash → cached cuda_graph lookup, the `inp_kv_idxs` input
+-- refresh that lets the reused graph point at the right K/V
+-- destination rows, and the byte-identity property when the
+-- reused graph executes against fresh inputs.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF T3.6.A audit
+-- identified the n_stream > 1 bailout in `can_reuse_graph` at
+-- ik_llama.cpp/src/llama.cpp:615 as the gate to drop in
+-- T3.6.I.b. The bailout was conservative: cgraphs are
+-- topology-hash-keyed (see GGML_CUDA_GRAPH_MAX=128 FIFO cache),
+-- and the original concern was that K/V WRITE under multi-seq
+-- might stale-bind the set_rows destination indices.
+--
+-- Audit findings:
+--   F6 — `inp_kv_idxs` is `ggml_set_input`-marked. Its data is
+--     uploaded fresh every `llama_set_inputs` call. The
+--     topology hash includes input tensor SHAPES (n_tokens,
+--     n_kv) but not VALUES, so the reused graph picks up the
+--     refreshed indices automatically.
+--   F7 (VRAM) — Worst-case +16 multi-seq cache entries × ~5MB
+--     ≈ +80MB. Irrelevant against 24GB GPU.
+--   F8 (MEDIUM) — Prior "~0% from reuse" A/B was single-seq
+--     dispatch. Multi-seq cgraph has different op count;
+--     microprobe required before declaring perf-neutral.
+--   F9 — Dropping the bailout doesn't create false positives.
+--     Other miss reasons (embd, graph_reuse off, n_kv bucket,
+--     n_outputs, mtp_op_type, update_cache_copies) still gate.
+--
+-- The contract here pins the three load-bearing properties:
+-- (1) input refresh; (2) shape-based reuse keying; (3) byte
+-- identity of the reused-graph output vs a fresh build.
+--
+-- Includes:
+--   - External entities for the graph cache, the topology
+--     hash, the inp_kv_idxs input, and the multi-seq batch
+--     shape (CudaGraphCache, TopologyHash, KvIdxsInput,
+--     MultiSeqBatchShape).
+--   - Contracts for SetRowsInputRefresh, ReuseShapeStability,
+--     and BugCAbsenceUnderReuse.
+--   - System-wide invariants binding the cache key, the
+--     refresh contract, and the byte-identity property.
+--
+-- Excludes:
+--   - The set_rows kernel itself (K/V WRITE path). Owned by
+--     specs/dispatch/unified_stream_dispatch.allium.
+--   - The bailout heuristics other than the n_stream > 1 one.
+--     The other miss reasons are heuristics over n_kv buckets
+--     and op type, not load-bearing correctness.
+--   - The K-shift and defrag flows. Both are cold-path; the
+--     reuse window between two ticks does not overlap them in
+--     production traces.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The CUDA graph cache. FIFO with capacity
+-- `GGML_CUDA_GRAPH_MAX = 128`. Keys are topology hashes
+-- (ne, op, src ptrs identity, etc.) — see
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu around the graph-cache
+-- region. The cache is per-`ggml_backend_cuda_context`; each
+-- device has its own.
+entity CudaGraphCache {
+    device_id: Integer
+    capacity: Integer
+    n_entries: Integer
+}
+
+-- One cached cuda graph. Bound to a captured ggml_cgraph and
+-- the topology hash that produced it.
+entity CudaGraphEntry {
+    device_id: Integer
+    topology_hash: Integer
+    captured_at_step: Integer
+    bytes: Integer
+}
+
+-- The shape signature that drives the topology hash. Under
+-- multi-seq dispatch the relevant components are n_tokens,
+-- n_seq_in_batch, n_tok_per_seq (= n_tokens / n_seq_in_batch),
+-- and the n_kv bucket (rounded for hash stability across
+-- adjacent cell counts).
+entity MultiSeqBatchShape {
+    n_tokens: Integer
+    n_seq_in_batch: Integer
+    n_tok_per_seq: Integer
+    n_kv_bucket: Integer
+}
+
+-- The `inp_kv_idxs` input tensor. Per-(token, head) global
+-- destination row indices for the K/V WRITE via set_rows.
+-- dtype I64. Populated at ik_llama.cpp/src/llama.cpp (the
+-- llama_set_inputs site) and consumed by the set_rows kernel
+-- in the FA path. Each call re-uploads the index buffer; the
+-- shape (n_tokens * n_head_kv) is in the topology hash, the
+-- VALUES are not.
+entity KvIdxsInput {
+    n_tokens: Integer
+    n_head_kv: Integer
+    is_set_input_marked: Boolean
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The graph-reuse miss reason. Mirrors
+-- `g_can_reuse_last_miss_reason` in
+-- ik_llama.cpp/src/llama.cpp. The current bailout `n_stream > 1`
+-- emits reason = 6. T3.6.I.b drops that bailout; reason 6 is
+-- retired (but the enum slot remains for back-compat).
+enum ReuseMissReason {
+    no_miss
+    embd_mismatch
+    graph_reuse_disabled
+    n_kv_bucket_mismatch
+    n_outputs_mismatch
+    mtp_op_type_mismatch
+    n_stream_bailout
+    update_cache_copies_mismatch
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The cuda graph cache capacity. Mirrors
+    -- `GGML_CUDA_GRAPH_MAX`. The reuse properties hold for any
+    -- capacity >= 1.
+    graph_cache_capacity: Integer = 128
+
+    -- Maximum streams the spec exercises in TLC. Matches the
+    -- K-shift and defrag specs.
+    max_streams: Integer = 8
+
+    -- Bounded TLC reuse cycles. Each "reuse cycle" is one
+    -- DispatchUnit at the same MultiSeqBatchShape.
+    max_reuse_cycles: Integer = 6
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- SetRowsInputRefresh — the `inp_kv_idxs` input tensor is
+-- refreshed by `llama_set_inputs` between any two graph
+-- executions. The reused graph reads the refreshed indices on
+-- replay; no stale binding survives across reuse cycles.
+contract SetRowsInputRefresh {
+    invoke: (idxs: KvIdxsInput, set_inputs_call_count: Integer) -> Boolean
+
+    @invariant SetInputMarked
+        -- KvIdxsInput.is_set_input_marked = true. Verified by
+        -- the existing ggml_set_input call at the K/V WRITE
+        -- branch in build_kv_store. Without this flag, the
+        -- graph capture would bake the index data; reuse would
+        -- be unsafe.
+
+    @invariant ValuesUploadedEachCall
+        -- For every llama_set_inputs(N): the data buffer
+        -- attached to KvIdxsInput is overwritten with the
+        -- current call's destination indices. Whether the
+        -- graph is a fresh build or a cache hit is invisible
+        -- to the set_inputs flow.
+
+    @invariant ShapeStableAcrossCalls
+        -- For any two consecutive calls at the same
+        -- MultiSeqBatchShape, KvIdxsInput.n_tokens and
+        -- KvIdxsInput.n_head_kv are byte-identical. (Implied
+        -- by ReuseShapeStability — repeated for explicit
+        -- coverage at the input layer.)
+}
+
+-- ReuseShapeStability — cached graphs are keyed by
+-- (n_tokens, n_seq_in_batch, n_tok_per_seq, n_kv_bucket). Any
+-- mismatch in any component triggers a cache miss; only an
+-- exact match returns a HIT.
+contract ReuseShapeStability {
+    invoke: (cache: CudaGraphCache, shape: MultiSeqBatchShape) -> CacheLookupResult
+
+    @invariant ShapeMismatchIsMiss
+        -- If no CudaGraphEntry exists for this shape, the
+        -- result is MISS with reason in {no_miss is excluded,
+        -- the lookup picks a miss reason from the other enum
+        -- values}. The lookup never returns a HIT for a
+        -- shape-mismatched entry.
+
+    @invariant ExactMatchIsHit
+        -- If a CudaGraphEntry exists with the same
+        -- (n_tokens, n_seq_in_batch, n_tok_per_seq,
+        -- n_kv_bucket) signature, the lookup returns HIT and
+        -- reuses that entry's captured graph.
+
+    @invariant NStreamBailoutRetired
+        -- Under post-T3.6.I.b code, the cache lookup never
+        -- returns MISS with reason = n_stream_bailout. The
+        -- bailout in `can_reuse_graph` at
+        -- ik_llama.cpp/src/llama.cpp:615 is removed; n_stream
+        -- > 1 cgraphs are eligible for caching.
+
+    @invariant SetRowsPassThroughInCacheCopies
+        -- update_cache_copies (ik_llama.cpp/src/llama.cpp:629-
+        -- 749) MUST treat SET_ROWS nodes as pass-through (no
+        -- cpy-style rewrite needed; SET_ROWS already binds via
+        -- inp_kv_idxs). The 4 cpy-branches all check
+        -- `c.cpy->op != GGML_OP_CPY` and skip; SET_ROWS lands
+        -- in cache_copies[2*il+0/1] without interfering with
+        -- MTP-aware iteration (per F5).
+}
+
+-- BugCAbsenceUnderReuse — a reused multi-seq graph with
+-- refreshed `inp_kv_idxs` produces byte-identical output to a
+-- fresh build at the same shape. This is the load-bearing
+-- contract for dropping the n_stream > 1 bailout.
+contract BugCAbsenceUnderReuse {
+    invoke: (shape: MultiSeqBatchShape, n_cycles: Integer) -> Boolean
+
+    @invariant FirstCallMiss
+        -- The first call at a given shape is a cache MISS
+        -- (no entry yet). The graph is built fresh, executed,
+        -- and inserted into the cache.
+
+    @invariant SubsequentCallsHit
+        -- Calls 2..n_cycles at the same shape are cache HITs
+        -- (no other miss reason fires). g_can_reuse_last_-
+        -- miss_reason = 0 (no_miss).
+
+    @invariant OutputByteIdentical
+        -- For every cycle k in [1, n_cycles]: the logits and
+        -- the K/V WRITE destination bytes after the k-th call
+        -- match those produced by a hypothetical alternative
+        -- run where every call is a fresh build (no caching).
+        -- The byte-identity is bit-exact, not approximate.
+
+    @invariant DeterminismCompositional
+        -- Combining with verify-production-determinism.sh's
+        -- byte-identity at NP={1,2,4,8}: under reuse, the NPC
+        -- gate still passes byte-identical at every NP. Reuse
+        -- does not introduce non-determinism beyond what the
+        -- fresh-build path already exhibits.
+
+    @guidance
+        -- The synthetic test at tests/spec/test-graph-reuse-
+        -- set-rows.cpp drives this contract: identical multi-
+        -- seq decode run twice, inspect
+        -- g_can_reuse_last_miss_reason (first MISS, second
+        -- HIT), compare token outputs byte-identical.
+}
+
+-- ============================================================
+-- External entities — referenced by ReuseShapeStability
+-- ============================================================
+
+-- The lookup result from CudaGraphCache. Carries the miss
+-- reason on MISS and the captured graph reference on HIT.
+entity CacheLookupResult {
+    is_hit: Boolean
+    miss_reason: ReuseMissReason
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The shape-keying property. Every reused graph has its
+-- topology hash derived from the four shape components.
+-- Lifts ShapeMismatchIsMiss and ExactMatchIsHit to a
+-- system-wide property.
+invariant TopologyHashKeyedByShape {
+    for entry in CacheEntries():
+        entry.topology_hash = HashOf(ShapeOf(entry))
+}
+
+-- The set-input contract for inp_kv_idxs. Across ANY two
+-- consecutive llama_set_inputs calls, the index data is
+-- refreshed; no stale buffer survives.
+invariant InpKvIdxsAlwaysFresh {
+    for call_k in SetInputsCalls():
+        for call_k_plus_1 in SuccessorCallsOf(call_k):
+            InpKvIdxsBufferAt(call_k_plus_1).overwritten_at(call_k_plus_1)
+}
+
+-- The byte-identity property at the system level. Lifts
+-- OutputByteIdentical to a property over the full execution
+-- trace.
+invariant ReuseProducesByteIdenticalOutput {
+    for cycle in ReuseCycles():
+        TokenOutputAt(cycle).byte_equal_to(FreshBuildOutputAt(cycle))
+}
+
+-- The bailout-absence property at the system level. Pins the
+-- T3.6.I.b deletion: no cache lookup may emit miss_reason =
+-- n_stream_bailout under post-T3.6 code.
+invariant NStreamBailoutNeverFires {
+    for lookup in CacheLookups():
+        lookup.miss_reason != n_stream_bailout
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: F8 microprobe result. The prior single-seq A/B showed
+--   ~0% from reuse. Multi-seq cgraph has different op count
+--   (set_rows adds a node per K/V WRITE branch); CPU host
+--   build cost may differ. The T3.6.M reuse-perf probe under
+--   LLAMA_PROBE_REUSE_TIMING is required before declaring
+--   perf-neutral. If the probe shows non-trivial uplift, keep
+--   reuse on. If zero uplift AND non-zero capture cost, the
+--   bailout drop is still correct (frees the FIFO from a
+--   no-op), but capture overhead is wasted.
+--
+-- OQ-2: VRAM probe (F7). Permanent extension of
+--   `~ggml_backend_cuda_context: have %d graphs` to include
+--   total bytes. Lands in T3.6.M as a kept-forever
+--   instrumentation (not env-gated).
+--
+-- OQ-3: cache eviction policy under multi-seq. FIFO eviction
+--   at GGML_CUDA_GRAPH_MAX = 128. With 16 multi-seq shapes
+--   plus the existing single-seq shapes, the cache may churn
+--   under workload mixes. Acceptable for now; if churn
+--   shows in T3.6.M, consider LRU eviction or capacity bump.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama.cpp:615 — `if (transformer_kv.n_stream
+--     > 1) { g_can_reuse_last_miss_reason = 6; return false; }`.
+--     T3.6.I.b deletes this. The bailout is the only one tied
+--     to n_stream; other miss reasons still gate correctly
+--     (per F9).
+--   ik_llama.cpp/src/llama.cpp:629-749 — `update_cache_copies`
+--     with 4 cpy branches, each checking `c.cpy->op !=
+--     GGML_OP_CPY`. SET_ROWS nodes naturally pass through
+--     (per F5).
+--   ik_llama.cpp/src/llama.cpp around `llama_set_inputs` —
+--     the per-call upload site for inp_kv_idxs (and other
+--     ggml_set_input-marked tensors).
+--   ik_llama.cpp/src/llama-build-context.cpp:614-729 —
+--     `llm_build_kv_store` with the set_rows branch
+--     (T3.3-followup landed). Marks inp_kv_idxs via
+--     ggml_set_input.
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu — graph cache
+--     implementation with topology-hash keying. The
+--     `GGML_CUDA_GRAPH_MAX = 128` constant lives here.
+--
+-- Test infrastructure (planned T3.6.T3):
+--   tests/spec/test-graph-reuse-set-rows.cpp — n_stream=4
+--   cache; run identical multi-seq decode twice. Inspect
+--   g_can_reuse_last_miss_reason: first call MISS (no prev
+--   entry), second call HIT (reason = 0 post-T3.6.I.b).
+--   Outputs byte-identical between calls (FirstCallMiss +
+--   SubsequentCallsHit + OutputByteIdentical). RED on T3.5
+--   HEAD (reason = 6 fires); GREEN after T3.6.I.b.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/dispatch/unified_stream_dispatch.allium
+--   The companion spec for the Tier 3 unified-stream dispatch
+--   itself. The graph being reused here IS the unified
+--   dispatch's cgraph; the topology hash captures its shape.
+--
+-- specs/kv-cache/n_stream_layer.allium
+--   The 4D KV layout. set_rows binds destination cells via
+--   inp_kv_idxs, mapping (token, head) → global K/V row
+--   under the 4D layout. The reuse property depends on the
+--   layout being shape-stable across reuse cycles.
+--
+-- specs/kv-cache/k_shift_per_stream.allium and
+-- specs/kv-cache/defrag_per_stream.allium
+--   K-shift and defrag are cold paths; not in the steady-state
+--   reuse window. The reuse spec composes with them trivially:
+--   any tick that invokes k_shift or defrag is a fresh build
+--   (different topology) and exits the reuse window naturally.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity GraphReuseSetRowsSystem {
+    cuda_graph_entries: List<CudaGraphEntry>
+    cache_lookup_results: List<CacheLookupResult>
+}
+
+contract ValidateGraphReuseSetRowsSystem {
+    invoke: (sys: GraphReuseSetRowsSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

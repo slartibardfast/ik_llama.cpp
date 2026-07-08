@@ -1,0 +1,563 @@
+-- allium: 3
+-- specs/kv-cache/n_stream_layer.allium
+--
+-- Scope: the 4D per-stream KV cache layout, the per-stream
+-- allocator, the per-stream KQ_mask construction, and the
+-- per-stream dispatch decision that together make Bug C
+-- impossible by construction. Once an implementation satisfies
+-- this spec, the DecodeHoldGate from
+-- specs/scheduler/batch_composition.allium becomes redundant
+-- and is removed.
+--
+-- Why this spec exists: today's Bug C closure is
+-- scheduler-level — the DecodeHoldGate in add_sampled_tokens
+-- prevents the failing batch geometry from forming. The cost
+-- is that decode tokens for active slots stall during any
+-- prefill. The kernel-level fix is infeasible (mul_mat
+-- GEMV-vs-GEMM accumulation order; see PHASE_NSTREAM_KV.md (g)).
+-- The remaining option is to make mixed batches impossible
+-- at the structural level: per-stream KV slices + per-stream
+-- dispatch (one llama_decode per active stream per tick). That
+-- restores v1's "TG-overlap preserved" intent at the cost of
+-- a 4D tensor layout port (PHASE_NSTREAM_KV_4D.md).
+--
+-- The implementation is staged. The foundation slice
+-- (n_stream and v_heads fields on struct llama_kv_cache,
+-- initialised but not yet consumed) landed in submodule commit
+-- 969d156e and is reflected in src/llama-context.h around
+-- lines 53-63. The full port (N1+N2+N3 in the plan file)
+-- still has to wire those fields through the allocator, the
+-- graph builders, and the server dispatch. Running
+-- `allium weed` against this spec on today's code will flag
+-- the gaps as expected; those gaps become the binding gates
+-- for N1-N3.
+--
+-- Includes:
+--   - External entities for the cache objects
+--     (KVCache, KVTensor, KVCell, Stream, SlotInfo, KQMask).
+--   - Enumerations for tensor dtypes touched by the cache and
+--     the dispatch option in force.
+--   - Contracts for PerStreamAllocator (find_slot),
+--     MaskPerStream (build_inp_KQ_mask), PerStreamDispatch
+--     (the server-side batch split), and an explicit
+--     BugCAbsenceByConstruction surface naming what this
+--     layout supersedes.
+--   - System-wide invariants binding the stream partition, the
+--     mask correctness, the no-cross-stream-leakage property,
+--     and the relationships to DFlash's existing per-slot
+--     invariants in specs/dflash/dflash.allium.
+--   - Open questions for the dispatch option choice and the
+--     --ctx-size semantics.
+--
+-- Excludes:
+--   - The scheduler gates that close Bug C in the shared-pool
+--     world. Owned by specs/scheduler/batch_composition.allium.
+--     This spec describes the layout that makes those gates
+--     redundant.
+--   - The DFlash drafter's own KV (target_kv, draft_kv_self,
+--     draft_kv_injected). Owned by specs/dflash/dflash.allium.
+--     This spec asserts that PerStreamDispatch composes cleanly
+--     with that three-region layout via DFlashCompatibility.
+--   - The mul_mat GEMV-vs-GEMM accumulation-order issue.
+--     Documented in PHASE_NSTREAM_KV.md (g); this spec works
+--     around it structurally, not by patching the kernel.
+--   - The legacy single-pool allocator (cache.head + flat
+--     cells[]). No spec is being written for it; once N1-N3
+--     land it ceases to exist. PHASE_NSTREAM_KV.md (a)-(g)
+--     records the history.
+
+-- ============================================================
+-- External entities — KV cache objects
+-- ============================================================
+
+-- The K or V tensor for one transformer layer. After N1, both
+-- become 4D with the per-stream axis as ne[3]; before N1 they
+-- remain 3D. The invariants below describe the post-N1 target
+-- shape; `allium weed` against pre-N1 source surfaces the gap.
+entity KVTensor {
+    layer: Integer
+    head_dim: Integer
+    kv_size_per_stream: Integer
+    n_head_kv: Integer
+    n_stream: Integer
+    dtype: KvDtype
+}
+
+-- One cell of metadata in v_cells[stream_id]. After N1, the
+-- shared cache.cells[] is replaced by
+-- std::vector<std::vector<llama_kv_cell>> v_cells, indexed by
+-- stream_id and then by cell-local position within that
+-- stream's slice. Fields mirror llama_kv_cell in
+-- ik_llama.cpp/src/llama-context.h:16-34.
+entity KVCell {
+    stream_id: Integer
+    cell_index: Integer
+    pos: Integer
+    seq_id_set: Set<Integer>
+}
+
+-- One stream's slice of the cache. n_stream = max(1, n_seq_max).
+-- stream_size = kv_size / n_stream cells in each slice. The
+-- v_heads[stream_id] field tracks the per-stream next-free
+-- pointer; both land in struct llama_kv_cache in
+-- ik_llama.cpp/src/llama-context.h:53-63 (foundation already
+-- present from submodule commit 969d156e).
+entity Stream {
+    stream_id: Integer
+    stream_size: Integer
+    v_head: Integer
+}
+
+-- The find_slot return value. The upstream llama.cpp pattern
+-- is a struct named slot_info; ik_llama.cpp keeps the existing
+-- free-function shape but the contract returned here matches.
+entity SlotInfo {
+    stream_id: Integer
+    cell_indices: List<Integer>
+}
+
+-- The whole KV cache for one llama_context. Owns n_layer pairs
+-- of KVTensor (K_l, V_l), the per-stream v_cells, and
+-- v_heads.
+entity KVCache {
+    n_layer: Integer
+    n_stream: Integer
+    kv_size: Integer
+}
+
+-- The KQ_mask input tensor populated each tick. Implementation
+-- writes the f16 mask in
+-- ik_llama.cpp/src/llama.cpp around lines 4290-4470. Per-token
+-- per-cell visibility is computed from cells[i].has_seq_id(seq)
+-- AND cells[i].pos <= pos.
+entity KQMask {
+    n_kv: Integer
+    n_tokens: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The data types this cache supports. Production runs Q4_0 K/V
+-- with Hadamard rotation; F16 is the test/path used by smaller
+-- profiles and by the test-deltanet-shape-invariance harness.
+enum KvDtype { f16 | bf16 | q4_0 | q4_0_ar16 }
+
+-- The dispatch option in force. Per PHASE_NSTREAM_KV_4D.md §N2,
+-- Option A (server-side split, one llama_decode per active
+-- stream per tick) is the default; Option B (one graph per
+-- llama_decode with per-stream sub-graphs) is the pivot if
+-- Option A's CPU overhead bites.
+enum DispatchOption { server_side_split | per_stream_subgraphs }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum streams supported. Mirrors --parallel N at start
+    -- time, cparams.n_seq_max. The contracts hold for any
+    -- value in [1, max_streams]. Production runs at 2; the
+    -- bench harness exercises up to 8.
+    max_streams: Integer = 8
+
+    -- The dispatch option the implementation commits to. The
+    -- contracts in this spec hold under either option; the
+    -- choice is a perf/complexity trade-off. Default reflects
+    -- the plan file's recommendation.
+    dispatch_option: DispatchOption = server_side_split
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The PerStreamAllocator — find_slot, scoped to one stream.
+-- Lives at ik_llama.cpp/src/llama.cpp:1156-1254 today (legacy
+-- shared-pool form); after N1 the body re-scopes to
+-- v_cells[seq_id] and v_heads[seq_id]. The contract here
+-- describes the post-N1 form.
+contract PerStreamAllocator {
+    invoke: (cache: KVCache, seq_id: Integer, n_tokens: Integer) -> SlotInfo
+
+    @invariant CellsLocalToStream
+        -- The returned SlotInfo.cell_indices are local indices
+        -- in [0, stream_size). When materialised to global cell
+        -- offsets by the kernel reading nb13, they fall within
+        -- [seq_id * stream_size, (seq_id + 1) * stream_size).
+
+    @invariant ContiguousAllocationWithinStream
+        -- The cell_indices are a contiguous run. The find_slot
+        -- search scans only v_cells[seq_id], starting at
+        -- v_heads[seq_id], wrapping at the stream's end. No
+        -- allocation crosses into another stream's slice.
+
+    @invariant AdvancesPerStreamHeadOnly
+        -- On success, v_heads[seq_id] advances by n_tokens (or
+        -- wraps to 0 if the stream's slice fills). No other
+        -- stream's v_head changes. The legacy global cache.head
+        -- is no longer authoritative once N1 lands; callers
+        -- that read it become candidates for cleanup in N2.
+
+    @invariant FailureIsContainedToStream
+        -- If the stream's slice cannot accommodate n_tokens
+        -- (because all stream_size cells are occupied), find_slot
+        -- returns failure for THIS seq_id only. Other streams
+        -- remain available; the caller may choose to defrag this
+        -- stream or release positions before retrying.
+}
+
+-- The MaskPerStream — the per-token visibility computation in
+-- build_inp_KQ_mask, lives at
+-- ik_llama.cpp/src/llama.cpp around 4290-4470. Once N1 lands
+-- the mask is per-stream rather than over a flat cell array.
+contract MaskPerStream {
+    invoke: (cache: KVCache, batch_seq_ids: List<Integer>, batch_positions: List<Integer>) -> KQMask
+
+    @invariant SeqIdAndPositionFilter
+        -- For each (token_index j, cell_index i) pair, the mask
+        -- bit is set to 0 (visible) iff cells[i].has_seq_id(
+        -- batch_seq_ids[j]) AND cells[i].pos <= batch_positions[j].
+        -- Otherwise the bit is -infinity (masked out).
+
+    @invariant NoCrossStreamReads
+        -- Under PerStreamDispatch, the mask construction for
+        -- stream s reads only v_cells[s]; cells in other
+        -- streams are not consulted. With server_side_split
+        -- dispatch, each llama_decode invocation sees only one
+        -- stream's cells in its KV view, and the mask shape
+        -- collapses to that stream's slice.
+
+    @invariant MaskTypeIsF16WhenFlashAttn
+        -- When flash_attn is enabled (the production default),
+        -- the mask buffer dtype is f16 to match the FA kernel's
+        -- expected input. Otherwise f32. This mirrors the
+        -- existing branch in llama.cpp set_inputs.
+}
+
+-- The PerStreamDispatch — the server-side batch split that
+-- ensures each mul_mat invocation sees a uniform-seq batch.
+-- Lives in ik_llama.cpp/examples/server/server-context.cpp
+-- (Option A: at the dispatch site that today calls
+-- llama_decode(ctx, batch_view) at ~line 4602; after N2 the
+-- server iterates over distinct seq_ids and calls
+-- llama_decode once per stream). This is what makes mixed
+-- batches structurally impossible.
+contract PerStreamDispatch {
+    invoke: (server_batch: List<BatchToken>, cache: KVCache) -> List<DispatchUnit>
+
+    @invariant OneDispatchUnitPerActiveStream
+        -- The server_batch is partitioned by seq_id. Each
+        -- distinct seq_id present in the batch becomes one
+        -- DispatchUnit, carrying only that stream's tokens.
+        -- The total token count across DispatchUnits equals
+        -- server_batch.count.
+
+    @invariant DispatchUnitTokensShareSeqId
+        -- Within one DispatchUnit, all tokens have the same
+        -- seq_id. No token from a different seq_id leaks in.
+        -- This is the structural guarantee that the mul_mat
+        -- inputs are uniform-seq.
+
+    @invariant DispatchOrderPreservesArrival
+        -- DispatchUnits are dispatched in a stable order
+        -- derived from the server's per-tick scheduling (FIFO
+        -- across streams, or by slot.id). Determinism of the
+        -- dispatch order matters for repro-bit-identity across
+        -- harness runs.
+
+    @invariant NoMixedPrefillDecodeDispatchUnit
+        -- A DispatchUnit may contain prefill tokens OR decode
+        -- tokens, never both. Prefill and decode for the SAME
+        -- stream within one tick is also forbidden: prefill
+        -- completes (over potentially multiple ticks) before
+        -- the stream transitions to decode contribution. This
+        -- is the lifted form of
+        -- MixedBatchProhibition from
+        -- specs/scheduler/batch_composition.allium.
+
+    @guidance
+        -- Under Option A (server_side_split) this is enforced
+        -- by the server's dispatch loop. Under Option B
+        -- (per_stream_subgraphs) it is enforced inside one
+        -- llama_decode by per-stream sub-graphs; both options
+        -- satisfy the contract.
+}
+
+-- The connection between this spec and the legacy gates from
+-- specs/scheduler/batch_composition.allium. Once an
+-- implementation satisfies PerStreamDispatch above, the
+-- DecodeHoldGate becomes redundant: it cannot detect any
+-- mixed batch because none can form. The PrefillSerialisation-
+-- Gate remains optional (it is a perf policy, not a Bug C
+-- fix; see batch_composition.allium PrefillSerialisationGate
+-- guidance).
+contract BugCAbsenceByConstruction {
+    invoke: (cache: KVCache) -> Boolean
+
+    @invariant MixedBatchProhibitionHoldsTrivially
+        -- Under PerStreamDispatch, MixedBatchProhibition from
+        -- specs/scheduler/batch_composition.allium holds by
+        -- construction. The DispatchUnit boundary is finer than
+        -- the Batch boundary in that spec; one Batch becomes
+        -- multiple single-seq DispatchUnits and the prohibition
+        -- is met automatically.
+
+    @invariant DecodeHoldGateMayBeRemoved
+        -- An implementation that satisfies PerStreamDispatch
+        -- MAY remove the DecodeHoldGate from
+        -- add_sampled_tokens. The early-return at
+        -- server-context.cpp:3205-3209 becomes dead code; N3
+        -- of PHASE_NSTREAM_KV_4D.md mandates its removal.
+
+    @invariant PrefillSerialisationGateStays
+        -- The v1 PrefillSerialisationGate at
+        -- server-context.cpp:3644-3681 is NOT made redundant
+        -- by this layout. It remains in force as a perf choice
+        -- (parallel multi-slot prefill on this geometry is
+        -- ~4.8x slower per-sequence than serial). Removing
+        -- it is independent work — possible if a future kernel
+        -- suite makes parallel prefill cheap, but out of scope
+        -- here.
+}
+
+-- ============================================================
+-- External entities — referenced by PerStreamDispatch contract
+-- ============================================================
+
+-- One unit the server dispatches via a single llama_decode (or
+-- equivalent sub-graph under Option B). Carries the tokens of
+-- one stream for one tick.
+entity DispatchUnit {
+    stream_id: Integer
+    n_tokens: Integer
+}
+
+-- A reference to the BatchToken entity from
+-- specs/scheduler/batch_composition.allium. Listed here so the
+-- PerStreamDispatch contract signature is self-contained; the
+-- entity's full definition lives in that spec.
+entity BatchToken {
+    seq_id: Integer
+    is_prefill: Boolean
+    is_decode: Boolean
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The partition property. Each stream's cells live in a
+-- well-defined slice of the cache's underlying memory.
+-- Equivalent statement: cell index i belongs to stream
+-- floor(i / stream_size) where stream_size = kv_size / n_stream.
+invariant StreamPartition {
+    for c in KVCells:
+        c.stream_id = (c.cell_index / (KVCacheSize() / NStream()))
+            and c.cell_index < ((c.stream_id + 1) * (KVCacheSize() / NStream()))
+            and c.cell_index >= (c.stream_id * (KVCacheSize() / NStream()))
+}
+
+-- The no-leakage property. Writes destined for stream s never
+-- mutate any cell in stream s' /= s. This is the load-bearing
+-- structural guarantee that makes Bug C impossible.
+invariant NoCrossStreamLeakage {
+    for s in Streams:
+        for t in Streams:
+            s != t implies WriteRegionOf(s).disjoint(WriteRegionOf(t))
+}
+
+-- The mask correctness property. For any tick under
+-- PerStreamDispatch, the KQ_mask used by stream s's
+-- llama_decode references only v_cells[s]; cells from other
+-- streams are not in the mask's row dimension.
+invariant MaskCorrectness {
+    for unit in DispatchUnits:
+        let mask = MaskForUnit(unit)
+        let visible_cells = CellsVisibleViaMask(mask)
+        visible_cells.all(c => c.stream_id = unit.stream_id)
+}
+
+-- The per-tick uniformity property. Every DispatchUnit
+-- contains tokens of exactly one seq_id. Lifts
+-- DispatchUnitTokensShareSeqId from the PerStreamDispatch
+-- contract to a system-wide property.
+invariant DispatchUnitUniformity {
+    for unit in DispatchUnits:
+        TokensOf(unit).map(t => t.seq_id).distinct.count = 1
+}
+
+-- The DFlash composition property. The drafter's three-region
+-- per-slot layout (target_kv, draft_kv_self, draft_kv_injected)
+-- composes with the n_stream KV layout: each region is itself
+-- partitioned by stream, mirroring this spec's
+-- StreamPartition. References the existing dflash spec rather
+-- than re-stating its contracts.
+invariant DFlashCompatibility {
+    -- For each draft region r in
+    -- { target_kv, draft_kv_self, draft_kv_injected }:
+    --   r is partitioned by stream_id consistent with this
+    --   spec's StreamPartition.
+    --
+    -- The NoCrossSlotRegionOverlap invariant in
+    -- specs/dflash/dflash.allium holds under this layout, and
+    -- the HybridTargetRecurrentStateTracking invariant remains
+    -- compatible because DeltaNet's recurrent state has had a
+    -- per-seq axis since 969d156e's predecessor work (see
+    -- src/llama-delta-net.cpp:78-98).
+    for unit in DispatchUnits:
+        for region in DraftRegions:
+            CellsOfDispatchInRegion(unit, region)
+                .all(c => c.stream_id = unit.stream_id)
+}
+
+-- The relationship to specs/scheduler/batch_composition.allium.
+-- Under PerStreamDispatch, MixedBatchProhibition from that
+-- spec is automatic: a DispatchUnit is the per-stream subset
+-- of one Batch, and since each DispatchUnit is single-seq,
+-- there are no mixed prefill+decode tokens within any
+-- llama_decode call.
+invariant MixedBatchProhibitionByConstruction {
+    for unit in DispatchUnits:
+        let tokens = TokensOf(unit)
+        tokens.all(t => t.is_prefill) or tokens.all(t => t.is_decode)
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Option A (server-side split) vs Option B (per-stream
+--   sub-graphs)? Option A is simpler and the plan's default.
+--   It pays a per-llama_decode CPU overhead proportional to
+--   the number of active streams (one call per stream per
+--   tick). At NP=8 with paired decodes (one decode token per
+--   stream), that's 8 calls per tick vs 1 today. If the CPU
+--   overhead measurably bites the TG-overlap recovery
+--   target (test-pp-serialization.sh wall <= 10s) at N3's
+--   bench gate, pivot to Option B. The contracts above hold
+--   under either option.
+--
+-- OQ-2: --ctx-size semantics. Today --ctx-size N --parallel K
+--   means total N cells across all slots. With the per-stream
+--   layout the natural reading shifts to "N cells per stream",
+--   giving total N*K cells. This is a memory-budget change
+--   visible to users. Document in examples/server/README.md
+--   when N1 lands. At production geometry (Q4_0 KV, 64 layers,
+--   head_dim=128) the budget for N=8192 K=8 is ~2.3 GiB total
+--   — fits dual-24-GiB easily.
+--
+-- OQ-3: graph cache invalidation. ggml caches graphs by tensor
+--   shape. The K/V tensor shape changes from 3D to 4D in N1,
+--   which invalidates every cached graph at startup. Trivial
+--   flush, but verify no stale graph survives a
+--   llama_kv_cache_clear. Resolve by inspecting the graph
+--   cache key derivation when N1 lands.
+--
+-- OQ-4: cross-stream _seq_cp semantics. Speculative draft
+--   acceptance copies content across slots in some flows. With
+--   per-stream KV slices, _seq_cp becomes a cross-slice
+--   memcpy. Confirm correctness via bin/test-dflash-closure
+--   after N1 lands; the test exercises the draft-accept path
+--   that uses _seq_cp.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama-context.h:37-100 (struct
+--     llama_kv_cache; foundation slice n_stream + v_heads
+--     already at ~lines 53-63 from submodule commit
+--     969d156e).
+--   ik_llama.cpp/src/llama.cpp:790-1155 (llama_kv_cache_init;
+--     N1 reshapes K/V allocation to ggml_new_tensor_4d here).
+--   ik_llama.cpp/src/llama.cpp:1156-1254 (llama_kv_cache_find_slot;
+--     N1 rewrites this to per-stream scoping).
+--   ik_llama.cpp/src/llama.cpp:1942-2204 (llama_kv_cache_clear,
+--     _seq_rm, _seq_cp, _seq_keep, _seq_add, _seq_pos_min/max,
+--     _defrag; N1 rewrites these per-stream).
+--   ik_llama.cpp/src/llama-build-context.cpp (graph builders;
+--     N2 threads per-stream strides through ~30-40 view/cpy
+--     sites on kv_self.k_l[il] / kv_self.v_l[il]).
+--   ik_llama.cpp/examples/server/server-context.cpp around line
+--     4602 (the llama_decode call site; N2 splits the batch
+--     per-stream and calls llama_decode once per active
+--     stream under Option A).
+--
+-- Black-box helpers used inline in the invariants above (not in
+-- `deferred` per project convention — they have no separate
+-- .allium spec):
+--   KVCells, Streams, DispatchUnits, DraftRegions, KVCacheSize,
+--   NStream, TokensOf, MaskForUnit, CellsVisibleViaMask,
+--   WriteRegionOf, CellsOfDispatchInRegion.
+--
+-- Test infrastructure to drive from this spec via allium:propagate
+-- (planned as S4 in /home/llm/.claude/plans/cached-crunching-tiger.md):
+--   - Property test that exercises find_slot for distinct
+--     seq_ids and asserts allocated cells fall within the
+--     expected per-stream range. EXPECTED TO FAIL on current
+--     HEAD (legacy shared-pool find_slot); becomes PASS when
+--     N1 lands.
+--   - Stream-isolation property test (mirrors
+--     scripts/r5-probe-c4.sh's behavioural intent but at the
+--     cache layer): writes to stream s do not mutate stream
+--     s' /= s. Already conceptually covered by
+--     test-dflash-np-multislot; the propagated version is
+--     unit-scale and runs against the cache directly.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/scheduler/batch_composition.allium
+--   The companion spec at the scheduler layer. Describes the
+--   gates that close Bug C today; this spec describes the
+--   layout that makes those gates redundant. Cross-references
+--   MixedBatchProhibition, DecodeHoldGate,
+--   PrefillSerialisationGate.
+--
+-- specs/dflash/dflash.allium
+--   The DFlash drafter behavioural contract. Its
+--   NoCrossSlotRegionOverlap and PerSlotDraftKVCache
+--   invariants are upheld by this layout (per
+--   DFlashCompatibility above).
+--
+-- specs/multislot/Decode.tla, specs/multislot/Fix.tla
+--   The TLA+ model of the scheduler/dispatch state machine.
+--   S2.b in the plan file (specs/multislot/StreamIsolation.tla)
+--   ports this spec's invariants into TLC for exhaustive
+--   model checking.
+--
+-- qnext_multislot_dispatch.allium
+--   The engine-level per-block linear-attention dispatch
+--   contract. Composes with PerStreamDispatch: when a
+--   DispatchUnit reaches the engine, the qnext analyser sees
+--   a single-seq batch (DispatchUnitTokensShareSeqId) and the
+--   SINGLE-pattern fast path applies; the CONTIGUOUS_BLOCKS
+--   path is no longer exercised in production.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity NStreamLayerSystem {
+    kv_tensors: List<KVTensor>
+    kv_cells: List<KVCell>
+    streams: List<Stream>
+    slot_infos: List<SlotInfo>
+    kq_masks: List<KQMask>
+}
+
+contract ValidateNStreamLayerSystem {
+    invoke: (sys: NStreamLayerSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

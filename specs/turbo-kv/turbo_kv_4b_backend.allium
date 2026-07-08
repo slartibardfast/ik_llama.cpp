@@ -1,0 +1,348 @@
+-- allium: 3
+-- turbo_kv_4b_backend.allium
+
+-- Scope: backend-agnostic contract for TurboQuant 4-bit KV-cache
+-- non-scalar implementations (Zandieh et al., ICLR 2026, arxiv
+-- 2504.19874). Any ggml backend (Vulkan today; CUDA, ROCm, Metal
+-- when they arrive) that registers quantise / dequantise / get_rows
+-- / set_rows for this type must implement the CPU scalar reference's
+-- behaviour to within the ULP bounds below.
+--
+-- Per the paper (§3) each quantised unit is ONE attention-head row:
+-- a QuantizedHead carries (norm, indices) where indices has one
+-- codebook index per head_dim-sized input element. There is no
+-- additional per-sub-block scale in the wire format.
+--
+-- Why backend-agnostic: the drift sources are properties of IEEE-754
+-- fp32 and reduction tree depth, not of any vendor's silicon. A
+-- subgroupAdd on Vulkan, a warp shuffle reduction on CUDA, and a
+-- wavefront DPP-reduce on ROCm all hit the same log2(n) × fp32_epsilon
+-- bound for a pairwise fp32 sum. Tolerances calibrated at that floor
+-- carry to any backend that uses fp32 arithmetic with a reasonable
+-- reduction pattern.
+--
+-- Includes:
+--   - External entities for the data shapes shared with
+--     turbo-kv-4b.allium (QuantizedHead, FloatTensor, IndexTensor).
+--   - ULP / byte-identity tolerance config — theoretical-floor bounds.
+--   - TurboKv4bBackendOps contract with a signature per op and four
+--     @invariant declarations pinning the CPU-equivalence property.
+--   - @guidance documenting the backend-enumerating differential-test
+--     shape that propagates from this spec via /allium:propagate.
+--
+-- Excludes:
+--   - CPU-side quantise / dequantise semantics — owned by
+--     turbo-kv-4b.allium. This spec only asserts that each registered
+--     backend's output matches the CPU reference.
+--   - Flash-attention path — covered by turbo_kv_4b_attention.allium.
+--   - Backend-internal implementation details (workgroup / warp / wave
+--     layout, reduction tree shape, push-constant / uniform encoding) —
+--     invisible to the spec-level equivalence property.
+--   - Reduced-precision accumulation paths (Tensor Cores with TF32 /
+--     fp16 accum, MFMA, etc.) — would break the fp32 drift bound.
+--     A backend that needs those MUST declare a separate contract
+--     with its own tolerances.
+--
+-- Note: the llama.cpp port's current wire format
+-- (block_turbo_kv_4b = { float norm; float inv_std; uint8
+-- mse_indices[64]; }) carries an additional inv_std field that is a
+-- divergence from the paper — see turbo-kv-4b.allium's open
+-- questions. This spec describes the paper-aligned wire format
+-- { norm, indices }; /allium:weed on this spec against the port will
+-- flag the inv_std field as the divergence.
+
+-- ============================================================
+-- External entities — shared with turbo-kv-4b.allium
+-- ============================================================
+
+-- One quantised attention-head row. Same shape as QuantizedHead in
+-- turbo-kv-4b.allium; re-declared external here because .allium
+-- files don't share entity declarations. The CPU spec owns the
+-- field semantics (norm = L2_norm(pre-normalisation row),
+-- indices ∈ [0, codebook_size)); this file only references the
+-- fields to express the equivalence contract.
+entity QuantizedHead {
+    norm: Decimal
+    indices: Set<Integer>
+}
+
+entity FloatTensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+-- A row-index tensor used by GET_ROWS and SET_ROWS. In ggml this is
+-- a 1-D int tensor; elements index into the row dimension of a
+-- higher-rank tensor.
+entity IndexTensor {
+    indices: Set<Integer>
+    count: Integer
+}
+
+-- ============================================================
+-- Config — tolerance bounds
+-- ============================================================
+
+config {
+    -- Indices byte-identity: the paper's nearest-centroid argmin is
+    -- deterministic given the rotated values (paper §3 eq. for
+    -- indices[i]). With `norm` matching between CPU and backend to
+    -- within scale_rel_tol (below), the rotated inputs to argmin
+    -- also agree to the same order, and the argmin tie-breaking rule
+    -- (first-match, per nearest_centroid.allium) yields bit-identical
+    -- indices on both sides. Zero tolerance — any index-byte drift
+    -- means a real bug.
+    indices_byte_tolerance: Integer = 0
+
+    -- norm scale tolerance. CPU computes sum_of_squares via a fp64
+    -- accumulator with a single final fp32 round (PHASE25), so its
+    -- output is effectively exact at fp32 precision. Non-scalar
+    -- backends compute it via a pairwise fp32 reduction tree
+    -- (subgroupAdd on Vulkan, warp-shuffle reduce on CUDA, wavefront
+    -- DPP-reduce on ROCm, simdgroup reduce on Metal). Relative error
+    -- is bounded by log2(head_dim) × fp32_epsilon; at head_dim=128:
+    --   log2(128) × 2^-23 ≈ 7 × 1.19e-7 ≈ 8e-7 on sum_sq
+    -- After the subsequent sqrt, the bound on `norm` is ~4e-7 relative.
+    -- Observed worst case on a single Zen 2 + RX 6800 XT Vulkan test:
+    -- 1 ULP on the scale ≈ 1e-7 relative, an order of magnitude below
+    -- the theoretical bound.
+    --
+    -- Bound set to 1e-6 — ~2× the theoretical pairwise-sum bound. A
+    -- tighter 1e-7 bound would match observed single-input deltas
+    -- but risk flaking on adversarial inputs where the sum tree hits
+    -- its worst case. A looser 1e-5 would be 25× the theoretical
+    -- drift — enough to hide real backend bugs that introduce
+    -- several ULPs of per-op drift.
+    scale_rel_tol: Decimal = 0.000001
+
+    -- Per-element reconstruction tolerance, abs-OR-rel semantics
+    -- (following mul_mat_cpu.allium's SIMDEquivalence pattern).
+    --
+    -- Paper §3 decompress: reconstructed = codebook[indices] @ Pi * norm.
+    -- The three fp32 stages add drift:
+    --   (a) codebook lookup — no drift, same bytes on both sides.
+    --   (b) Inverse RHT (Pi^T multiply) — pairwise reduction tree at
+    --       log2(head_dim) depth → ~log2(head_dim) × ε relative drift
+    --       on each output coordinate.
+    --   (c) Scalar multiply by `norm` — inherits the ~4e-7 drift from
+    --       the norm computation itself plus one fp32 round.
+    --
+    -- element_rel_tol = 1e-5 is 10× the combined theoretical bound —
+    -- safety margin for pathological input distributions. Observed
+    -- worst case on test-turbo-kv-gpu-roundtrip (Vulkan): max 1e-6
+    -- absolute, RMSE 0.
+    --
+    -- element_abs_tol = 1e-5 covers the near-zero regime where rel_err
+    -- explodes even under tiny absolute drift. Reconstructed values
+    -- span roughly ±3·norm after the inverse rotation, so "near zero"
+    -- here means values below ~0.1; the abs check handles those.
+    element_abs_tol: Decimal = 0.00001
+    element_rel_tol: Decimal = 0.00001
+
+    -- Head dimension. Matches turbo-kv-4b.allium's config.head_dim —
+    -- one QuantizedHead holds indices for exactly this many input
+    -- elements. Not cross-referenced (files are standalone contracts).
+    head_dim: Integer = 128
+}
+
+-- ============================================================
+-- Contract: the four backend-registered ops
+-- ============================================================
+
+-- Each op below is called through the ggml backend's op dispatch and
+-- must produce output that matches the CPU scalar reference within
+-- the tolerances above. The @invariant declarations are prose-only
+-- because the equivalence claim is about cross-backend output
+-- comparison, not an expression over one backend's entities.
+
+contract TurboKv4bBackendOps {
+    -- F32 input tensor → QuantizedHead stream. Called through
+    -- ggml_compute_forward_cpy on the backend when the destination
+    -- type is TURBO_KV_4B and both tensors live on the backend.
+    quantize_head: (input: FloatTensor) -> QuantizedHead
+
+    -- QuantizedHead stream → F32 tensor. Called through
+    -- ggml_compute_forward_cpy / _get_rows when the source type is
+    -- TURBO_KV_4B and the destination is F32 or F16.
+    dequantize_head: (block: QuantizedHead) -> FloatTensor
+
+    -- Slice selected rows from a QuantizedHead-quantised source +
+    -- dequantise to F32. Called through ggml_compute_forward_get_rows
+    -- for backend-resident tensors.
+    get_rows: (heads: Set<QuantizedHead>, indices: IndexTensor) -> FloatTensor
+
+    -- Quantise F32 source rows and scatter them into a
+    -- QuantizedHead-backed destination at positions given by an index
+    -- tensor. Used by the multi-GPU KV scatter path and by
+    -- ggml_compute_forward_set_rows.
+    set_rows: (input: FloatTensor, indices: IndexTensor) -> Set<QuantizedHead>
+
+    @invariant QuantizeEquivalence
+        -- For any FloatTensor x satisfying turbo-kv-4b.allium's
+        -- QuantizeHead precondition (L2_norm(x.data) > 0), any
+        -- registered backend's quantize_head output and the CPU
+        -- scalar reference output agree on:
+        --
+        --   (a) All codebook indices — byte-identical, tolerance 0.
+        --       The paper's nearest-centroid argmin (paper §3
+        --       eq. for indices[i]) is deterministic given identical
+        --       rotated input. When (b) holds at its ~1 ULP bound
+        --       the rotated coordinates agree to within 1-2 ULP, not
+        --       enough to flip the argmin except at codebook-midpoint
+        --       ties — and ArgminFirstMatch's first-match tie-break
+        --       (nearest_centroid.allium) resolves those identically
+        --       on both sides.
+        --
+        --   (b) block.norm — agree within scale_rel_tol. Divergence
+        --       source: CPU accumulates sum_of_squares in fp64 then
+        --       rounds once to fp32; the backend does a fp32 pairwise
+        --       tree reduction (subgroup / warp / wavefront / simdgroup
+        --       depending on vendor). Bounded by log2(head_dim) ×
+        --       fp32_epsilon ≈ 8e-7 relative at head_dim=128.
+
+    @invariant DequantizeEquivalence
+        -- For any QuantizedHead b, any registered backend's
+        -- dequantize_head output and the CPU scalar reference output
+        -- agree element-wise within:
+        --   abs_err <= config.element_abs_tol
+        --   OR rel_err <= config.element_rel_tol
+        --
+        -- Divergence source: the butterfly order inside the backend's
+        -- inverse rotation differs from the CPU implementation's
+        -- (subgroup-cooperative stride pattern vs stride-doubling
+        -- loop), producing sum-tree drift of a few fp32 ULPs. Codebook
+        -- lookup and the final scalar multiply by norm are per-element
+        -- and contribute no drift.
+
+    @invariant GetRowsEquivalence
+        -- get_rows is a sliced dequantise: the backend's output at
+        -- row r and column c equals the CPU dequantise of the head
+        -- at position indices[r] evaluated at column c, within
+        -- element_abs_tol / element_rel_tol. Equivalently,
+        -- get_rows(heads, indices) = dequantise(heads)[indices, :].
+        -- The slice is by reference (no per-row copy into a temp),
+        -- so the tolerance budget is identical to
+        -- DequantizeEquivalence.
+
+    @invariant SetRowsEquivalence
+        -- set_rows(input, indices) produces a QuantizedHead stream
+        -- where the head at destination position indices[r] equals
+        -- the backend's quantise of input row r, within the same
+        -- tolerances as QuantizeEquivalence. Positions not named by
+        -- `indices` are untouched by this op and are outside the
+        -- contract (the backend's dispatch handles them).
+
+    @guidance
+        -- Differential-test shape for /allium:propagate:
+        --
+        --   1. Host test binary requires at least one non-CPU backend
+        --      at build time. Place it in a separate file from
+        --      test-turbo-kv-pbt.cpp (which is CPU-only) so a
+        --      backend-less CI host can still run scalar PBT.
+        --
+        --   2. Enumerate backends at runtime via the ggml backend
+        --      registry, not by compile-time ifdefs:
+        --
+        --        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        --            dev = ggml_backend_dev_get(i);
+        --            if (dev_type == CPU) continue;
+        --            backend = ggml_backend_dev_init(dev, nullptr);
+        --            run_properties(backend);
+        --            ggml_backend_free(backend);
+        --        }
+        --
+        --      This follows test-backend-ops.cpp:9341. Adding CUDA /
+        --      ROCm / Metal support at the ggml level surfaces those
+        --      devices through the enumeration; the test picks them up
+        --      automatically without a file edit.
+        --
+        --   3. For each op × backend, skip gracefully via
+        --      ggml_backend_supports_op() if the backend hasn't
+        --      registered that op for TURBO_KV_4B yet. Coverage grows
+        --      per backend as ops land.
+        --
+        --   4. For each property, generate a random FloatTensor
+        --      (or a quantised head for DequantizeEquivalence) of
+        --      size N * head_dim for N in {1, 2, 4, 8} to exercise
+        --      single-head and multi-head dispatch paths.
+        --      Ensure L2_norm(x.data) > 0 (spec precondition).
+        --
+        --   5. Compute the CPU reference via quantize_row_turbo_kv_4b_ref
+        --      or dequantize_row_turbo_kv_4b from ggml-turbo-kv.c.
+        --      These are the scalar ggml-base entry points; they must
+        --      NOT be routed through any SIMD dispatch.
+        --
+        --   6. Drive the backend dispatch via the ggml backend's op
+        --      interface — construct a graph with the appropriate op
+        --      (CPY / GET_ROWS / SET_ROWS), compile with the target
+        --      backend, read back. Do NOT call shader / kernel entry
+        --      points directly; route through ggml so the uniform /
+        --      push-constant / descriptor-set dispatch matches
+        --      production.
+        --
+        --   7. Compare per the tolerances above. The
+        --      QuantizeEquivalence indices check is byte-for-byte
+        --      memcmp on the packed-index array; the norm and
+        --      element checks use abs-OR-rel tolerance mirroring
+        --      mul_mat_cpu.allium's SIMDEquivalence.
+        --
+        --   8. GPU allocation follows the repo's coord/ protocol:
+        --      the caller wraps the test-binary invocation in the
+        --      flock + state-file claim for gpu-0 (6800 XT) or gpu-1
+        --      (Vega). The test binary itself does not lock — it
+        --      takes whichever backends are visible (controlled via
+        --      GGML_VK_VISIBLE_DEVICES or backend-specific env vars).
+        --
+        -- Minimum per-run sample count: 100 per RapidCheck standard.
+        -- Expected runtime per property on a 6800 XT with ~1 ms per
+        -- Vulkan dispatch: <1 s for 100 samples × a handful of sizes,
+        -- well within CI budget. CUDA / ROCm dispatch costs should
+        -- be similar.
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Per-backend implementation status:
+--
+--   Vulkan (llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/):
+--     cpy_f32_turbo_kv_4b.comp       — quantize_head
+--     dequant_turbo_kv_4b.comp       — dequantize_head
+--     get_rows_turbo_kv_4b.comp      — get_rows
+--     set_rows_turbo_kv_4b.comp      — set_rows
+--     turbo_kv_4b_rht.glsl           — shared RHT + codebook helpers
+--
+--   The current Vulkan shader output carries an inv_std field in the
+--   wire format that this spec does not model. /allium:weed against
+--   the port surfaces this as a divergence — the paper has no per-
+--   head inv_std; only (norm, indices).
+--
+--   CUDA (llama.cpp/ggml/src/ggml-cuda/): not yet implemented. Would
+--     live in cpy.cu + convert.cu + cpy-utils.cuh alongside other
+--     quant-type kernels. The HIPIFY build path automatically yields
+--     the ROCm variant from the same source.
+--
+--   ROCm / HIP: derived from CUDA source via HIPIFY; no separate
+--     implementation today.
+--
+--   Metal: not yet implemented. Would live in ggml-metal.metal
+--     alongside existing quant-type kernels.
+--
+-- Existing integration tests (one input each; this spec generalises
+-- every one of them via PBT sweep):
+--   tests/test-turbo-kv-gpu-quantize.cpp    — QuantizeEquivalence
+--   tests/test-turbo-kv-gpu-roundtrip.cpp   — DequantizeEquivalence
+--   tests/test-turbo-kv-set-rows.cpp        — SetRowsEquivalence
+--                                             (via SR-vs-CPY parity)
+--   tests/test-turbo-kv-vulkan.cpp          — misc single-input checks
+--
+-- There is NO integration test today that exercises GetRowsEquivalence
+-- directly. The propagated PBT property would be that op's first
+-- dedicated coverage on any backend.
+--
+-- MUL_MAT for TURBO_KV_4B is intentionally NOT covered by this spec:
+-- `test-backend-ops -b Vulkan -o MUL_MAT -p turbo_kv` reports "not
+-- supported" because the KV-cache type routes through flash-attention,
+-- not mul_mat. A separate contract spec would be needed for the FA
+-- path once a second backend implements it.

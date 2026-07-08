@@ -1,0 +1,261 @@
+-- allium: 3
+-- turbo_kv_outliers.allium
+
+-- Scope: outlier-aware quantisation — store the K highest-
+-- magnitude coordinates of each rotated vector verbatim as
+-- fp16 alongside their channel indices, and OVERWRITE the
+-- codebook reconstruction at those channels on dequantise.
+-- Addresses the heavy-tail problem in attention activations
+-- that a single global codebook fits poorly. Composes on top
+-- of core TurboQuant.
+--
+-- Citable sources:
+--
+--   [PAPER]       Zandieh et al., arxiv 2504.19874. Paper's §4
+--                 "application to attention" discusses per-
+--                 channel bit allocation as the paper-prescribed
+--                 handling of heavy-tail attention activations.
+--                 [QUANT.CPP]'s outlier variant is described
+--                 there as "a simpler local form" of this idea.
+--
+--   [QUANT.CPP]   Ships the outlier handling as two concrete
+--                 variants in include/turboquant/tq_types.h:
+--
+--                 block_tq_turbo_kv_4bo (Variant G) layout:
+--                   norm(2) + residual_norm(2) + inv_std(2)
+--                   + _pad(2) + mse_4bit(64)
+--                   + out_indices[8] + out_values_fp16[16]
+--                   = 96 bytes per 128-element block
+--
+--                 block_tq_turbo_kv_3bo (same idea, 3-bit base):
+--                   norm(2) + residual_norm(2) + inv_std(2)
+--                   + _pad(2) + mse_3bit(48)
+--                   + out_indices[8] + out_values_fp16[16]
+--                   = 80 bytes per 128-element block
+--
+--                 The per-block outlier count is fixed at
+--                 #define TQ_KV_4BO_OUTLIERS 8
+--                 tq_types.h comment:
+--                     "the K=8 largest |rotated[i]| values are
+--                      stored verbatim as FP16 with their
+--                      channel index, and OVERWRITE the codebook
+--                      reconstruction at dequantize time."
+--                 Comparing block sizes against non-outlier
+--                 variants at same head_dim:
+--                     4b   = 72 B    4bo  = 96 B   (+24 B)
+--                     3b   = 56 B    3bo  = 80 B   (+24 B)
+--                     5b   = 88 B
+--
+--   [TONBI-V3]    Does not ship block-local outlier handling.
+--                 V3 mentions "outlier-aware channel allocation"
+--                 as part of community V3 framing but its
+--                 compressors_v3.py implementation uses MSE-only
+--                 without per-block outliers.
+--
+-- Goal: specify the outlier-augmented wire format and the
+-- overwrite-at-dequantise semantics. This is a wire format
+-- extension to the core QuantizedHead entity, adding an
+-- optional outlier list.
+--
+-- Includes: outlier selection (top-K by |rotated[i]|), outlier
+-- storage (index + fp16 value), dequantise overwrite.
+-- Excludes: base codebook (core spec), residual window, layer-
+-- adaptive, asymmetric bits. Composes with all of those.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+entity Tensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+-- ============================================================
+-- Value types
+-- ============================================================
+
+-- Per-block outlier record: channel index + fp16 verbatim value.
+entity OutlierEntry {
+    channel_index: Integer
+    value: Decimal          -- fp16-encoded verbatim rotated value
+}
+
+-- Extended quantised head carrying both the codebook indices
+-- and an outlier list. Base QuantizedHead remains the same;
+-- this entity adds the outlier slot.
+entity QuantizedHeadWithOutliers {
+    norm: Decimal
+    inv_std: Decimal
+    indices: Set<Integer>   -- base codebook indices (head_dim entries)
+    outliers: Set<OutlierEntry>  -- K largest-magnitude channels
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Number of outlier channels per block. [QUANT.CPP] uses a
+    -- compile-time constant of 8 (TQ_KV_4BO_OUTLIERS). 8 is
+    -- large enough to capture typical heavy-tail behaviour in
+    -- transformer KV without ballooning per-block overhead:
+    -- 8 channels × (1 byte index + 2 bytes fp16) = 24 bytes
+    -- per 128-element block, i.e. +1.5 bytes per element.
+    outlier_count: Integer = 8
+
+    -- Fraction of a block's total magnitude captured by the
+    -- outliers, used for diagnostic invariants. Empirical
+    -- guidance: 8 outliers typically capture >40% of total
+    -- rotated-vector magnitude on attention activations at
+    -- head_dim ≥ 128.
+    min_outlier_magnitude_fraction: Decimal = 0.1
+
+    -- Seed for the deterministic Hadamard rotation used by RHT_
+    -- forward / RHT_inverse. Inherited from the core TurboQuant
+    -- contract; fixed at allocation time so quantise / dequantise
+    -- agree on the rotation matrix.
+    seed: Integer = 0
+
+    -- Codebook centroid magnitude bound. Used in the scale
+    -- normalisation: inv_std = cent_max / max_abs(rotated). Set
+    -- to 1.0 because the 4-bit codebook is parameterised on the
+    -- unit interval [-1, 1].
+    cent_max: Decimal = 1.0
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+open question "Outlier count tuning: [QUANT.CPP] uses 8 per 128-element block. Optimal value likely scales with head_dim and depends on the activation distribution's tail heaviness. At head_dim=256 the proportional choice would be 16, not 8 — but measurements at 9B have not been done."
+
+open question "Outlier selection metric: [QUANT.CPP] selects the K largest by |rotated[i]|. Alternatives: K largest by reconstruction error vs the codebook, K largest by contribution to attention score estimation. The magnitude heuristic is computationally cheapest; attention-aware selection could improve quality at the cost of a pre-pass through the selected queries."
+
+open question "Paper's per-channel bit allocation vs quant.cpp's local outliers: [PAPER] §4 describes a global per-channel bit budget (channels with heavier tails get more bits). [QUANT.CPP]'s 4bo/3bo approximates this locally with a fixed-count outlier list per block. The paper-global approach has better distortion-rate in theory; the local approach has simpler wire format and streaming compatibility. Spec models the local variant; a global-budget sibling spec could be added if measurement justifies it."
+
+open question "Composition with asymmetric K/V: a deployer could enable outliers on K only (preserving attention-score quality where heavy tails matter most) and skip outliers on V (which the softmax already smooths out). Not currently modelled — this spec applies outliers uniformly to whichever tensor it attaches to."
+
+-- ============================================================
+-- Composite rules
+-- ============================================================
+
+-- Quantise with outlier extraction:
+--   1. Compute L2 norm, normalize, rotate (same as core).
+--   2. Identify the outlier_count channels with largest |rotated[i]|.
+--   3. Store those channels' values verbatim as fp16 with
+--      their channel indices.
+--   4. Run the base codebook argmin over ALL channels (including
+--      the outliers) — the codebook indices for outlier channels
+--      will be overwritten at dequantise time, so their codebook
+--      approximation is never used. Quant.cpp pragmatically
+--      leaves them in the index stream for layout simplicity.
+rule QuantizeHeadWithOutliers {
+    when: QuantizeHeadWithOutliers(tensor, seed)
+
+    requires: tensor.count > 0
+    requires: L2_norm(tensor.data) > 0.0
+
+    let norm = L2_norm(tensor.data)
+    let normalized = normalize(tensor.data, norm)
+    let rotated = RHT_forward(normalized, tensor.count, config.seed)
+    let max_val = max_abs(rotated)
+    let inv_std = config.cent_max / max_val
+    let indices = nearest_centroid(rotated, inv_std, turbo_kv_4b_codebook)
+    let outliers = select_top_k_by_magnitude(rotated, config.outlier_count)
+
+    ensures: QuantizedHeadWithOutliers.created(
+        norm: norm,
+        inv_std: inv_std,
+        indices: indices,
+        outliers: outliers
+    )
+}
+
+-- Dequantise with outlier overwrite:
+--   1. Reconstruct the base codebook values for ALL channels.
+--   2. Overwrite the outlier_count outlier channels with their
+--      stored fp16 values (pre-rotation, unit-sphere coords).
+--   3. Apply inverse RHT.
+--   4. Rescale by norm.
+rule DequantizeHeadWithOutliers {
+    when: DequantizeHeadWithOutliers(block)
+
+    requires: block.inv_std > 0.0
+    requires: block.indices.count > 0
+
+    let codebook_values = reconstruct_codebook(block, turbo_kv_4b_codebook)
+    let with_outliers = overwrite_at_channels(codebook_values, block.outliers)
+    let dequant_rotated = RHT_inverse(with_outliers, block.indices.count, config.seed)
+    let reconstructed = rescale(dequant_rotated, block.norm)
+
+    ensures: Tensor.created(
+        data: reconstructed,
+        count: block.indices.count
+    )
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- Outlier channels must be valid indices into the head vector.
+invariant OutlierIndicesInBounds {
+    for block in QuantizedHeadsWithOutliers:
+        for outlier in block.outliers:
+            outlier.channel_index >= 0 and
+            outlier.channel_index < block.indices.count
+}
+
+-- Outlier list size matches config.
+invariant OutlierCountConsistent {
+    for block in QuantizedHeadsWithOutliers:
+        block.outliers.count = config.outlier_count
+}
+
+-- No duplicate outlier channels — each channel appears at most
+-- once in the outlier list.
+invariant OutliersUnique {
+    for block in QuantizedHeadsWithOutliers:
+        for o1 in block.outliers:
+            for o2 in block.outliers:
+                o1 = o2 or o1.channel_index != o2.channel_index
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- [QUANT.CPP] reference: block_tq_turbo_kv_4bo in
+-- include/turboquant/tq_types.h, struct layout quoted at the
+-- top of this file. The 96-byte layout encodes:
+--   8 bytes header (norm + residual_norm + inv_std + pad)
+--   64 bytes mse_indices (128 × 4-bit packed)
+--   8 bytes out_indices (8 × uint8 channel indices)
+--   16 bytes out_values (8 × fp16 verbatim)
+--
+-- Selection implementation in [QUANT.CPP]
+-- (src/core/tq_turbo_kv.c, quantize path): scan the rotated
+-- array, maintain a min-heap of top-K by absolute value. For
+-- K=8 and n=128 the heap-vs-sort tradeoff is marginal;
+-- [QUANT.CPP] uses an in-place partial sort.
+--
+-- Our llama.cpp port does NOT implement outlier handling. The
+-- only turbo_kv_* type registered is TURBO_KV_4B (no-outliers
+-- variant). Adopting 4bo/3bo requires:
+--   - New ggml type TURBO_KV_4BO (96 bytes per 128 elements)
+--   - New quantise / dequantise / vec_dot implementations that
+--     handle the outlier overwrite at the right pipeline stage
+--   - Vulkan / CUDA / ROCm shader variants for the same
+--
+-- Approximate implementation cost: high. Each kernel (quantise,
+-- dequantise, get_rows, set_rows, FA) needs an outlier-aware
+-- variant. This is a sibling-spec at about the same effort
+-- level as adding a whole new precision tier.
+--
+-- Quality evidence: [QUANT.CPP] has not published a direct
+-- 4b-vs-4bo PPL comparison. Paper §4's theoretical argument is
+-- that outlier handling reduces distortion-rate at fixed
+-- average bit budget, matching empirical findings in related
+-- LLM-quantisation literature (SmoothQuant, AWQ, GPTQ all
+-- address activation outliers in various ways).

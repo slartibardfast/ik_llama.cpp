@@ -1,0 +1,748 @@
+-- allium: 3
+-- specs/graphs/cuda_graph_reuse.allium
+--
+-- Scope: the CUDA backend's multi-entry cudaGraphExec cache and the
+-- per-call reuse / patch / instantiate decision the backend takes on
+-- every ggml_backend_cuda_graph_compute. The contracts here describe
+-- the CACHE MECHANISM that the upstream (libllama) `can_reuse_graph`
+-- bailout currently bypasses for `transformer_kv.n_stream > 1`.
+-- This spec is INDEPENDENT of that bailout: it describes what the
+-- backend offers when reuse IS attempted. Tier 2 work in
+-- PHASE_NSTREAM_KV_PERF.md drops the libllama bailout; the cache
+-- behaviour described here must continue to hold.
+--
+-- Why this spec exists: the topology-hash-keyed cache + the
+-- cudaGraphExecUpdate patch path is load-bearing for two future
+-- phases:
+--   1. Tier 2 extends per-stream view patching to the K/V *read*
+--      views in llm_build_kqv. The patch surface relies on the
+--      backend tolerating src_address changes for GGML_OP_VIEW /
+--      GGML_OP_CPY nodes between calls. If the backend later
+--      tightens that tolerance (e.g. to require src_address
+--      equality), Tier 2 silently breaks.
+--   2. Tier 3 unifies dispatch into one llama_decode per tick with
+--      n_stream baked into ne[3]. The topology hash collapses the
+--      per-stream variants into one cache entry; the dtype-strict
+--      invariant prevents cross-dtype reuse that would otherwise
+--      submit mismatched bytes to a kernel templated on the
+--      captured dtype (the suspected mechanism behind the
+--      multi-slot concat.cu:202 GGML_ASSERT crash).
+--
+-- The mechanism has been in tree since PHASE 36-38 and is stable;
+-- this spec pins the load-bearing properties so subsequent
+-- refactors do not silently regress them.
+--
+-- Includes:
+--   - External entities for the runtime objects involved
+--     (CudaContext, CgraphInput, CapturedGraph, ExecutableGraph,
+--     GraphCacheEntry, NodeProperties).
+--   - Enumerations for the cache-action a tick takes and the ggml
+--     op kinds whose src_address mismatch is tolerated.
+--   - Contracts for the load-bearing properties:
+--     CUDAGraphCache (capacity + FIFO eviction),
+--     TopologyHashLookup (key derivation + miss handling),
+--     CudaGraphExecUpdate (patch-vs-reinstantiate semantics),
+--     DtypeStrictness (no reuse across dtype change),
+--     ViewCpyAddressTolerance (src_address ignored for VIEW/CPY).
+--   - System-wide invariants binding the cache size bound, the
+--     dtype invariant, the tolerance scope, and an
+--     EventualEviction liveness property.
+--   - Open questions for points the implementation leaves ambiguous
+--     (FIFO vs LRU; what `cudaGraphExecUpdateFailure` means for the
+--     next call).
+--
+-- Excludes:
+--   - The libllama `can_reuse_graph` bailout itself
+--     (src/llama.cpp:580-628). That decision lives one layer up and
+--     concerns whether to submit the captured cgraph at all; this
+--     spec governs the backend's behaviour given that the cgraph
+--     IS submitted. The interaction is one-way: lifting the
+--     bailout (Tier 2 work) does not change any contract here.
+--   - The cuda_graph_probe instrumentation
+--     (ggml-cuda.cu:4796-4824, 4878-4946). The probe records
+--     telemetry that is zero-cost when GGML_CUDA_GRAPH_PROBE is
+--     unset; no contract depends on its values.
+--   - The disable_due_to_* fallbacks (gpu_arch < CC_TURING,
+--     too_many_updates >= 4, failed_graph_capture). These are
+--     escape hatches that bypass the cache entirely; they are
+--     observable via ctx->cur_graph = nullptr but are not part
+--     of the reuse-path invariants this spec asserts.
+--   - The kv_size bucketing to multiples of 64
+--     (src/llama.cpp:621). That is a libllama-side reuse policy
+--     and lives in the same layer as `can_reuse_graph`.
+--   - The K/V read-view stream patching gap that Tier 2 will close.
+--     Owned by specs/kv-cache/per_stream_read_view_patching.allium
+--     (forthcoming, P0.B.S1.b). THIS spec asserts only what the
+--     backend already does; the patching mechanism that Tier 2
+--     will exercise lives there.
+
+-- ============================================================
+-- External entities — CUDA backend cache objects
+-- ============================================================
+
+-- One ggml_backend_cuda_context. Owns the cuda_graphs map keyed by
+-- topology hash (std::unordered_map<uint64_t,
+-- std::unique_ptr<ggml_cuda_graph>>). Field declared in
+-- ik_llama.cpp/ggml/src/ggml-cuda/common.cuh:888.
+entity CudaContext {
+    device: Integer
+    use_cuda_graph: Boolean
+    cache_size: Integer                    -- mirrors ctx.cuda_graphs.size()
+}
+
+-- One ggml_cgraph submitted to ggml_backend_cuda_graph_compute. The
+-- per-call shape and node sequence the backend must either
+-- capture-fresh, patch, or reuse-as-is.
+entity CgraphInput {
+    n_nodes: Integer
+    topology_hash: Integer                 -- ggml_cuda_graph_get_topology_key(cgraph)
+    shape_hash: Integer                    -- ggml_cuda_graph_get_shape_key(cgraph)
+}
+
+-- One captured cudaGraph_t paired with its instantiated
+-- cudaGraphExec_t and the per-node properties used to decide
+-- whether the next call requires update. Mirrors struct
+-- ggml_cuda_graph in ik_llama.cpp/ggml/src/ggml-cuda/graph.cuh:20-49.
+entity GraphCacheEntry {
+    topology_key: Integer                  -- cache map key
+    shape_key: Integer                     -- last instantiated shape
+    has_captured_graph: Boolean            -- ggml_cuda_graph.graph != nullptr
+    has_executable: Boolean                -- ggml_cuda_graph.instance != nullptr
+    number_consecutive_updates: Integer    -- self-disable counter
+    hits_total: Integer                    -- probe-only telemetry
+}
+
+-- One per-node fingerprint stored on a GraphCacheEntry. Used by
+-- ggml_graph_node_has_matching_properties to decide whether the
+-- next call's matching node differs in a way that requires the
+-- whole executable to be patched (cudaGraphExecUpdate) or fully
+-- reinstantiated. Mirrors struct ggml_graph_node_properties in
+-- ik_llama.cpp/ggml/src/ggml-cuda/graph.cuh:9-18.
+entity NodeProperties {
+    entry: GraphCacheEntry
+    node_index: Integer
+    node_op: GgmlOp
+    node_type: GgmlType                    -- dst tensor dtype
+    node_address: Integer                  -- dst data pointer
+    src_address_0: Integer                 -- per-src dst data pointer (GGML_MAX_SRC)
+    src_type_0: GgmlType                   -- per-src dtype
+}
+
+-- One node in a submitted CgraphInput. Carries the current values
+-- the backend compares against NodeProperties on the matching
+-- GraphCacheEntry. Modelled as an external entity so the
+-- invariants can quantify over both sides of the comparison.
+entity CgraphNode {
+    cgraph: CgraphInput
+    node_index: Integer
+    op: GgmlOp
+    dst_type: GgmlType
+    dst_address: Integer
+    src_address_0: Integer
+    src_type_0: GgmlType
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The action the backend takes for one call against a cached
+-- topology key. Determined by ggml_cuda_get_graph (lookup or
+-- insert-with-eviction) and is_cuda_graph_update_required (decides
+-- between reuse-as-is and patch/reinstantiate). The
+-- `instantiate_then_reuse` action covers a miss: a fresh capture
+-- followed by cudaGraphInstantiate then a normal launch.
+enum CacheAction {
+    reuse_unchanged                        -- topology + per-node fingerprints match; cudaGraphLaunch only
+    exec_update                            -- topology matches; node fingerprints differ; cudaGraphExecUpdate patches
+    reinstantiate                          -- exec_update returned cudaErrorGraphExecUpdateFailure; destroy + cudaGraphInstantiate
+    instantiate_then_reuse                 -- topology key missed in cache; fresh capture + instantiate + launch
+}
+
+-- The ggml op kinds this spec quantifies over. Only the two
+-- src_address-tolerant ops (VIEW, CPY) and a sentinel `other`
+-- are needed; the contract makes no further per-op distinction.
+enum GgmlOp {
+    op_view                                -- GGML_OP_VIEW
+    op_cpy                                 -- GGML_OP_CPY
+    op_scale                               -- GGML_OP_SCALE (op_params comparison required)
+    op_other                               -- every other ggml op kind
+}
+
+-- Distinct ggml tensor dtypes for the DtypeStrictness invariant.
+-- The spec asserts properties of dtype CHANGE, so only the kinds
+-- that appear in the production graph need named values. Production
+-- runs Q4_0 K/V; F16/F32 are dominant on activations.
+enum GgmlType {
+    type_f32 | type_f16 | type_bf16 | type_q4_0 | type_q4_0_ar16 | type_other
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The maximum number of cache entries the backend retains
+    -- before FIFO eviction. Mirrors the default in
+    -- ik_llama.cpp/ggml/src/ggml-cuda.cu:4539 (size_t 128) and the
+    -- override env GGML_CUDA_GRAPH_MAX checked at line 4534.
+    -- Implementations may set any value >= 1.
+    max_cache_entries: Integer = 128
+
+    -- The threshold at which the backend self-disables CUDA-graph
+    -- use for a given topology entry. Mirrors the >= 4 check in
+    -- ik_llama.cpp/ggml/src/ggml-cuda.cu:5069. After this many
+    -- consecutive `cuda_graph_update_required` decisions on the
+    -- same entry, the backend falls back to direct node-by-node
+    -- evaluation for that topology key. This is an escape hatch,
+    -- not a contract surface; named here only so invariants can
+    -- distinguish "live" entries from disabled ones.
+    consecutive_update_disable_threshold: Integer = 4
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The CUDAGraphCache — the multi-entry cache itself. Lives in
+-- ggml_backend_cuda_context.cuda_graphs
+-- (ik_llama.cpp/ggml/src/ggml-cuda/common.cuh:888) with lookup +
+-- insertion + eviction in ggml_cuda_get_graph at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4549-4576. Capacity is set by
+-- ggml_cuda_get_graph_cache_max at line 4532-4542.
+contract CUDAGraphCache {
+    invoke: (ctx: CudaContext) -> Set<GraphCacheEntry>
+
+    @invariant CapacityBoundedByConfig
+        -- The cache size never exceeds max_cache_entries. The
+        -- bound is enforced at insertion in ggml_cuda_get_graph
+        -- (ggml-cuda.cu:4557-4566): a while-loop evicts entries
+        -- until size < cap before the new entry is inserted. The
+        -- bound holds across the lifetime of the CudaContext;
+        -- ctx.cache_size <= max_cache_entries at every observable
+        -- point.
+
+    @invariant FIFOEvictionUnderPressure
+        -- When the cache is full and a new topology key misses,
+        -- entries are dropped via ctx.cuda_graphs.erase(begin())
+        -- (ggml-cuda.cu:4565). std::unordered_map iteration order
+        -- is implementation-defined but stable enough that the
+        -- first-inserted entry tends to be evicted first; the
+        -- contract is "evict ONE entry" rather than a strict LRU
+        -- ordering. Implementations MUST evict at least one entry
+        -- when at capacity AND a new topology must be inserted.
+
+    @invariant EntryFreesUnderlyingCudaResources
+        -- Erasing a cache entry destroys the std::unique_ptr<
+        -- ggml_cuda_graph>, which runs ~ggml_cuda_graph() and
+        -- frees cudaGraphExec_t + cudaGraph_t. No leaked device
+        -- memory or executable graph survives eviction. (The
+        -- destructor is declared at ggml-cuda/graph.cuh:22 and
+        -- defined in ggml-cuda.cu near the cuda_graphs anchor;
+        -- the contract names the property the destructor must
+        -- uphold.)
+
+    @guidance
+        -- The default cap of 128 is large enough that production
+        -- workloads (single-layer reuse + MTP draft + n_kv
+        -- bucketing) typically miss the bound. Eviction is
+        -- observable only on workloads with many distinct
+        -- topologies (multi-model, repeated context resizing,
+        -- mixed prefill/decode where the bucketing window is
+        -- under-tuned). The cap exists to make a pathological
+        -- workload fail safely rather than out-of-memory the
+        -- driver.
+}
+
+-- The TopologyHashLookup — the keying scheme. Lives at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4509-4520
+-- (ggml_cuda_graph_get_topology_key) with the lookup at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4549-4576
+-- (ggml_cuda_get_graph). The shape_key (ggml-cuda.cu:4487-4502)
+-- is recorded as telemetry on the entry but is NOT the cache key;
+-- the comment at line 4506-4508 records this design choice
+-- explicitly.
+contract TopologyHashLookup {
+    invoke: (cache: Set<GraphCacheEntry>, cgraph: CgraphInput) -> GraphCacheEntry
+
+    @invariant KeyDerivedFromOpSequenceOnly
+        -- The topology_hash is FNV-1a 64-bit over (cgraph.n_nodes,
+        -- per-node op). It deliberately does NOT mix in node->ne
+        -- or src_address — those changes are absorbed by the
+        -- CudaGraphExecUpdate path. Two CgraphInputs with the
+        -- same op-sequence collide on topology_hash regardless
+        -- of element-count or pointer-value differences.
+
+    @invariant LookupHitReturnsExistingEntry
+        -- If the cache contains an entry with topology_key =
+        -- cgraph.topology_hash, the lookup returns that entry.
+        -- No new entry is allocated; the entry's hits_total and
+        -- last_use_us are updated in-place.
+
+    @invariant LookupMissAllocatesNewEntry
+        -- If no entry matches the topology_hash, the lookup
+        -- allocates a fresh ggml_cuda_graph, inserts it under
+        -- the topology_hash key, and returns it with
+        -- has_captured_graph = false and has_executable = false.
+        -- Eviction (per CUDAGraphCache.FIFOEvictionUnderPressure)
+        -- happens before the insertion if at capacity.
+
+    @invariant NoCrossTopologyAliasing
+        -- A cache entry under topology_key K is consulted ONLY
+        -- when the submitted cgraph's topology_hash = K. Reuse
+        -- of an entry against a cgraph with a different
+        -- topology_hash is not possible by construction: the
+        -- map lookup either hits the right key or misses
+        -- entirely.
+}
+
+-- The CudaGraphExecUpdate — the patch path for a topology hit
+-- whose per-node fingerprints have drifted. Lives at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4740-4781
+-- (is_cuda_graph_update_required) and
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4783-4825
+-- (update_cuda_graph_executable). The per-node comparison
+-- mechanism is ggml_graph_node_has_matching_properties at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4687-4738.
+contract CudaGraphExecUpdate {
+    invoke: (entry: GraphCacheEntry, cgraph: CgraphInput) -> CacheAction
+
+    @invariant UpdateOnFingerprintDrift
+        -- If the submitted cgraph has the same topology_hash as
+        -- entry.topology_key BUT one or more nodes' properties
+        -- (ne, nb, dst_address for non-VIEW/CPY ops, src_address
+        -- for non-VIEW/CPY ops, dtypes, op_params for SCALE)
+        -- differ from the entry's stored fingerprint, the
+        -- backend calls cudaGraphExecUpdate(entry.instance,
+        -- entry.graph) to patch the executable. The captured
+        -- cgraph (entry.graph) is replaced by the new one
+        -- BEFORE the update call (see capture-end at
+        -- ggml-cuda.cu:4871-4886). The fingerprint vector
+        -- entry.ggml_graph_properties is rewritten in place by
+        -- set_ggml_graph_node_properties at
+        -- ik_llama.cpp/ggml/src/ggml-cuda.cu:4672-4685.
+
+    @invariant ReuseUnchangedWhenAllFingerprintsMatch
+        -- If is_cuda_graph_update_required returns false
+        -- (every node's properties match), no update or
+        -- capture happens; cudaGraphLaunch on the existing
+        -- entry.instance is the only device-side work. The
+        -- entry.number_consecutive_updates counter is reset to
+        -- 0 (ggml-cuda.cu:5065). This is the fast path Tier 2's
+        -- per-stream view-patching enables for read-view
+        -- changes (which today force a fingerprint mismatch
+        -- because src_address differs).
+
+    @invariant UpdateFailureFallsBackToReinstantiate
+        -- If cudaGraphExecUpdate returns
+        -- cudaErrorGraphExecUpdateFailure, the backend
+        -- destroys entry.instance and calls cudaGraphInstantiate
+        -- with the freshly captured graph (ggml-cuda.cu:
+        -- 4812-4816). The cache entry persists; only the
+        -- executable is replaced. This is the safety valve when
+        -- the new fingerprint is structurally incompatible
+        -- (e.g. nb stride change beyond what CUDA's update path
+        -- accepts).
+
+    @invariant ConsecutiveUpdatesSelfDisable
+        -- If entry.number_consecutive_updates reaches
+        -- consecutive_update_disable_threshold, the backend
+        -- sets entry.disable_due_to_too_many_updates and
+        -- bypasses the cache entirely for that topology on
+        -- subsequent calls (ggml-cuda.cu:5069-5079). The entry
+        -- remains in the map for hits_total accounting; new
+        -- calls fall through to direct node-by-node compute.
+        -- This is an escape hatch, not a contract surface; the
+        -- spec names it so callers can reason about why a
+        -- nominally-reusable topology stops reusing.
+
+    @guidance
+        -- The patch path is the load-bearing mechanism for
+        -- Tier 2: extending per-stream patching to read views
+        -- in llm_build_kqv produces a per-stream src_address
+        -- change EVERY decode. Without exec_update, those
+        -- changes would force a full reinstantiate per tick;
+        -- the captured cudaGraph + cudaGraphExecUpdate avoids
+        -- that. Tier 2 must verify that the read-view
+        -- src_address change does not force
+        -- cudaErrorGraphExecUpdateFailure (it should not,
+        -- because the ne/nb shapes are unchanged); if it does,
+        -- the consecutive-update self-disable will trigger
+        -- after 4 ticks and the cache will silently fall back
+        -- to direct evaluation.
+}
+
+-- The DtypeStrictness invariant as a contract surface. Lives at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4698-4711 (the node->type
+-- and src->type checks in ggml_graph_node_has_matching_properties).
+-- The comment at line 4698-4702 records the load-bearing intent.
+contract DtypeStrictness {
+    invoke: (entry: GraphCacheEntry, node: CgraphNode) -> Boolean
+
+    @invariant DstDtypeMismatchInvalidatesNode
+        -- For any node, if node.dst_type differs from the
+        -- corresponding NodeProperties.node_type stored on the
+        -- matching entry, the node fails the matching check.
+        -- This forces cuda_graph_update_required = true and the
+        -- backend takes the exec_update path. cudaGraphExecUpdate
+        -- WILL fail in this case (the captured graph's kernel was
+        -- templated on the original dtype), and the
+        -- reinstantiate path runs — submitting a fresh capture
+        -- with the new dtype.
+
+    @invariant SrcDtypeMismatchInvalidatesNode
+        -- For any node, if any src[i].type differs from the
+        -- corresponding NodeProperties.src_type[i] stored on the
+        -- matching entry, the node fails the matching check.
+        -- Same fallback path as DstDtypeMismatchInvalidatesNode.
+
+    @invariant DtypeChangeIsNeverSilentlyReused
+        -- The two clauses above together guarantee that no
+        -- captured cudaGraphExec is reused with a node whose
+        -- dtype changed between capture and re-submission. This
+        -- is the property the spec exists to assert: a graph
+        -- captured at F16 must not be reused with F32 inputs,
+        -- because the kernel template selection bakes the
+        -- dtype into the launch parameters. Violating this is
+        -- the suspected mechanism behind the multi-slot
+        -- concat.cu:202 GGML_ASSERT crash (see the comment at
+        -- ggml-cuda.cu:4698-4702).
+
+    @guidance
+        -- DtypeStrictness is the structural reason the n_stream
+        -- 4D port could land without re-exposing the
+        -- concat.cu:202 crash: the layout change altered some
+        -- tensor types in unrelated graph paths, and the
+        -- dtype-strict node-match invalidates ALL prior cache
+        -- entries on the first decode after the change. The
+        -- cache rebuilds from scratch with the new dtypes; no
+        -- stale entry survives.
+}
+
+-- The ViewCpyAddressTolerance — the asymmetric tolerance for
+-- src_address (and dst_address) mismatch on GGML_OP_VIEW and
+-- GGML_OP_CPY nodes only. Lives at
+-- ik_llama.cpp/ggml/src/ggml-cuda.cu:4687-4731 (the two
+-- early-return clauses in ggml_graph_node_has_matching_properties:
+-- the dst-address check at lines 4688-4692 and the per-src loop
+-- at lines 4722-4730).
+contract ViewCpyAddressTolerance {
+    invoke: (entry: GraphCacheEntry, node: CgraphNode) -> Boolean
+
+    @invariant ViewCpySrcAddressMismatchToleratedOnVcpy
+        -- For nodes where op = op_view OR op = op_cpy, a
+        -- per-src src_address mismatch between node.src_address
+        -- and NodeProperties.src_address on the matching entry
+        -- does NOT invalidate the match. The per-call src
+        -- pointer is updated via the cpy_dest_ptrs indirection
+        -- (ggml-cuda.cu:4647 + 4665-4666) rather than baked into
+        -- the captured kernel parameters.
+
+    @invariant ViewCpyDstAddressMismatchToleratedOnVcpy
+        -- For nodes where op = op_view OR op = op_cpy, a
+        -- node.dst_address mismatch with
+        -- NodeProperties.node_address does NOT invalidate the
+        -- match (the dst-address early-return at
+        -- ggml-cuda.cu:4688-4691 carves out exactly these two
+        -- ops). The dst pointer follows the same indirection
+        -- mechanism as src.
+
+    @invariant AddressMismatchInvalidatesEveryOtherOp
+        -- For any node with op = op_other (every ggml op kind
+        -- other than VIEW and CPY), a src_address or dst_address
+        -- mismatch DOES invalidate the match. The captured
+        -- kernel for those ops has the pointer baked into its
+        -- launch parameters; reusing it against a different
+        -- pointer would write to the wrong device address.
+
+    @invariant OpScaleParamsMustMatch
+        -- For op = op_scale, the op_params (32 bytes,
+        -- GGML_MAX_OP_PARAMS) must match between the entry
+        -- fingerprint and the current cgraph node. SCALE bakes
+        -- its scalar into op_params; a change there changes the
+        -- computed result and must invalidate the match. Lives
+        -- at ggml-cuda.cu:4732-4735. SCALE is named explicitly
+        -- because its op_params carry a value the kernel reads;
+        -- other ops' op_params are either compile-time fixed or
+        -- absorbed into ne/nb (which the match check already
+        -- compares).
+
+    @guidance
+        -- The asymmetric tolerance is what makes the per-stream
+        -- view patching tractable: K/V write CPY operations
+        -- (update_cache_copies in src/llama.cpp:630-720) update
+        -- node->src[1]->data every decode without invalidating
+        -- the cached executable. Tier 2 extends the same pattern
+        -- to the K/V read views in llm_build_kqv, which are
+        -- GGML_OP_VIEW nodes — already inside the tolerance
+        -- carve-out. The mechanism is pre-supported; what Tier 2
+        -- adds is the libllama-side patching code.
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The capacity invariant lifted to the system level. For any
+-- CudaContext at any observable moment, the cache holds at most
+-- max_cache_entries entries. Eviction (per the
+-- FIFOEvictionUnderPressure contract clause) maintains this
+-- bound under workload pressure.
+invariant CacheBounded {
+    for ctx in CudaContexts:
+        ctx.cache_size <= max_cache_entries
+}
+
+-- The dtype-strictness invariant lifted to the system level.
+-- For any CgraphNode submitted in a tick that reuses a cached
+-- entry without forcing reinstantiate, the dtype of every src
+-- and the dst MUST match the captured fingerprint. Implementation
+-- enforces this via the early-returns in
+-- ggml_graph_node_has_matching_properties at
+-- ggml-cuda.cu:4703-4711 (dst.type and src.type checks).
+invariant NoReuseAcrossDtypeChange {
+    for node in CgraphNodes:
+        let entry = MatchingCacheEntryFor(node)
+        let action = CacheActionFor(node)
+        exists entry and action = reuse_unchanged
+            implies (node.dst_type = NodePropertiesAt(entry, node.node_index).node_type
+                     and node.src_type_0 = NodePropertiesAt(entry, node.node_index).src_type_0)
+}
+
+-- The tolerance scope lifted to the system level. For any
+-- CgraphNode whose op is NOT VIEW or CPY (and not SCALE, which
+-- has its own op_params constraint), src_address and dst_address
+-- equality is a necessary condition for reuse_unchanged. The
+-- invariant phrases the carve-out negatively: address mismatch
+-- on a non-VIEW/CPY op DOES invalidate the match.
+invariant AddressToleranceScopedToViewCpy {
+    for node in CgraphNodes:
+        let entry = MatchingCacheEntryFor(node)
+        let props = NodePropertiesAt(entry, node.node_index)
+        let action = CacheActionFor(node)
+        (exists entry
+         and action = reuse_unchanged
+         and node.op != op_view
+         and node.op != op_cpy)
+            implies (node.dst_address = props.node_address
+                     and node.src_address_0 = props.src_address_0)
+}
+
+-- The liveness companion to CacheBounded: under sustained
+-- pressure from new topology keys, entries DO get evicted (the
+-- cache does not deadlock at the cap). Formally: if the cache
+-- is at capacity and a topology key is submitted that does not
+-- match any existing entry, at least one entry will be removed
+-- before the new entry is inserted. The implementation upholds
+-- this via the while-loop at ggml-cuda.cu:4557-4566.
+invariant EventualEviction {
+    for ctx in CudaContexts:
+        for cgraph in CgraphInputsAt(ctx):
+            (ctx.cache_size = max_cache_entries
+             and not TopologyKeyInCache(ctx, cgraph.topology_hash))
+                implies SomeEntryEvictedBeforeInsert(ctx, cgraph)
+}
+
+-- The reuse-correctness composition: if the backend takes the
+-- reuse_unchanged action on a node, every property the captured
+-- kernel depends on matches. This is the implication of
+-- ReuseUnchangedWhenAllFingerprintsMatch from the
+-- CudaGraphExecUpdate contract, lifted to a system property over
+-- every reused node.
+invariant ReuseImpliesPropertyMatch {
+    for node in CgraphNodes:
+        let entry = MatchingCacheEntryFor(node)
+        let props = NodePropertiesAt(entry, node.node_index)
+        let action = CacheActionFor(node)
+        action = reuse_unchanged
+            implies (node.op = props.node_op
+                     and node.dst_type = props.node_type
+                     and node.src_type_0 = props.src_type_0)
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: FIFO vs LRU. The comment at ggml-cuda.cu:4528-4531 records
+--   that eviction is FIFO-by-insertion-order "for simplicity" and
+--   that std::unordered_map iteration order is
+--   implementation-defined. If a workload emerges where the
+--   evicted entry happens to be the hottest one (the bound-but-
+--   stale entries survive while the next-tick re-use is dropped),
+--   the choice may need to revisit. Today no such workload is on
+--   record. The hits_total + last_use_us telemetry on each entry
+--   (ggml-cuda.cu:4553-4554) supports a switch to LRU if needed;
+--   no contract here precludes it.
+--
+-- OQ-2: cudaGraphExecUpdateFailure → reinstantiate-then-retry vs
+--   reinstantiate-then-drop. The current code (ggml-cuda.cu:4812-
+--   4821) destroys the entry.instance, calls cudaGraphInstantiate
+--   with the new captured graph, and assumes success. There is no
+--   retry on the update path itself. If a future workload sees
+--   cudaErrorGraphExecUpdateFailure at a high rate (e.g. due to
+--   structural drift the topology hash doesn't catch), the
+--   cost of reinstantiate per tick may be material. The
+--   consecutive-update self-disable at threshold=4 is the current
+--   release valve; revisit if the threshold trips frequently in
+--   production telemetry.
+--
+-- OQ-3: scope of the SCALE op_params clause. Other ops also carry
+--   op_params (ROPE, NORM, ALIBI, etc.) but the matching check
+--   only compares op_params for op = SCALE (ggml-cuda.cu:4732-
+--   4735). If an op_params-bearing op other than SCALE starts
+--   carrying values that the captured kernel reads at launch time
+--   (rather than baking at JIT time), the check needs extending.
+--   No such case is known today; the spec records the gap so a
+--   future op landing with that property prompts a contract
+--   update.
+--
+-- OQ-4: multi-context interaction. The cache is per
+--   ggml_backend_cuda_context (one per CUDA device). Production
+--   runs --device CUDA0,CUDA1 with one context per device; each
+--   context has its own cuda_graphs map and the contracts above
+--   hold independently per context. Cross-context coordination
+--   (e.g. shared eviction policy under combined VRAM pressure) is
+--   not modelled here; today the bound is per-context and the
+--   aggregate worst case is N_devices * max_cache_entries.
+--   Acceptable on the current 2-GPU geometry; revisit if a
+--   future system runs 8+ GPUs per process.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/ggml/src/ggml-cuda/common.cuh:855
+--     — forward declaration of struct ggml_cuda_graph.
+--   ik_llama.cpp/ggml/src/ggml-cuda/common.cuh:888
+--     — std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs.
+--   ik_llama.cpp/ggml/src/ggml-cuda/graph.cuh:9-18
+--     — struct ggml_graph_node_properties.
+--   ik_llama.cpp/ggml/src/ggml-cuda/graph.cuh:20-49
+--     — struct ggml_cuda_graph (entry layout).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:614-623
+--     — ggml_backend_cuda_graph_cache_size accessor.
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4487-4502
+--     — ggml_cuda_graph_get_shape_key (telemetry, not the cache key).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4509-4520
+--     — ggml_cuda_graph_get_topology_key (the cache key).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4532-4542
+--     — ggml_cuda_get_graph_cache_max (GGML_CUDA_GRAPH_MAX env override, default 128).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4549-4576
+--     — ggml_cuda_get_graph (lookup, miss-insert, FIFO eviction loop).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4672-4685
+--     — set_ggml_graph_node_properties (fingerprint capture).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4687-4738
+--     — ggml_graph_node_has_matching_properties (per-node match, dtype-strict,
+--       VIEW/CPY src_address tolerance, SCALE op_params check).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4740-4781
+--     — is_cuda_graph_update_required (per-call decision; iterates nodes).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4783-4825
+--     — update_cuda_graph_executable (cudaGraphExecUpdate + reinstantiate fallback).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4828-4972
+--     — evaluate_and_capture_cuda_graph (the per-call wrapper that
+--       chooses CacheAction and calls the right function).
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:5007-5094
+--     — ggml_backend_cuda_graph_compute (the per-graph_compute entry
+--       point; consecutive_updates self-disable at line 5069).
+--
+-- The libllama-side bailout that this spec is INDEPENDENT of:
+--   ik_llama.cpp/src/llama.cpp:608-616
+--     — can_reuse_graph; the n_stream > 1 early-return at line 616.
+--       This spec models what the backend offers; the bailout decides
+--       whether to ask. Tier 2 work in PHASE_NSTREAM_KV_PERF.md drops
+--       the bailout; the contracts here remain unchanged.
+--
+-- Black-box helpers used inline in the system-wide invariants
+-- (not in `deferred` per project convention — they have no separate
+-- .allium spec):
+--   CudaContexts, CgraphNodes, CgraphInputsAt,
+--   MatchingCacheEntryFor, NodePropertiesAt, CacheActionFor,
+--   TopologyKeyInCache, SomeEntryEvictedBeforeInsert.
+--
+-- Test infrastructure to drive from this spec via allium:propagate
+-- (planned as P0.B.S4 in PHASE_NSTREAM_KV_PERF.md):
+--   - Property test that submits two cgraphs with the same
+--     op-sequence and different ne dimensions; asserts the second
+--     submission takes the exec_update path (not instantiate_then_
+--     reuse). PASS on HEAD.
+--   - Property test that submits a cgraph with one GGML_OP_VIEW
+--     node whose src->data is permuted between calls; asserts the
+--     second submission still takes the reuse_unchanged path
+--     (the address change is absorbed by the VIEW tolerance).
+--     PASS on HEAD.
+--   - Property test that submits the same op-sequence with one
+--     node's dst dtype changed F16 -> F32 between calls; asserts
+--     the second submission takes the reinstantiate path (the
+--     dtype-strict check forces it). PASS on HEAD.
+--   - Property test that submits >128 distinct topology hashes
+--     and asserts ctx.cache_size never exceeds 128. PASS on HEAD.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/kv-cache/n_stream_layer.allium
+--   The 4D per-stream KV layout. ITS PerStreamDispatch contract is
+--   what Tier 3 will satisfy; THIS spec is the backend mechanism
+--   Tier 2 depends on while still running per-stream dispatch.
+--   The OQ-3 in that spec ("graph cache invalidation under K/V
+--   shape change") is answered by DtypeStrictness +
+--   AddressToleranceScopedToViewCpy here: the K/V tensor shape
+--   change from 3D to 4D invalidates every cached graph on the
+--   first post-change decode (different ne -> exec_update path
+--   -> rewrite of fingerprints), no manual flush needed.
+--
+-- specs/kv-cache/per_stream_read_view_patching.allium (forthcoming,
+-- P0.B.S1.b)
+--   The Tier 2 patching contract. THAT spec extends
+--   update_cache_copies to also patch the read-view src_address
+--   in llm_build_kqv. The mechanism it depends on is
+--   ViewCpyAddressTolerance.ViewCpySrcAddressMismatchToleratedOnVcpy
+--   here: VIEW src_address can change between calls without
+--   invalidating the cached executable, so the per-stream read
+--   view patching does not force a reinstantiate per decode.
+--
+-- specs/dispatch/unified_stream_dispatch.allium (forthcoming,
+-- P0.B.S1.c)
+--   The Tier 3 dispatch contract. Under unified dispatch, all
+--   active streams share one llama_decode per tick and the
+--   topology_hash collapses to one entry per (n_streams, n_kv-
+--   bucket) combination. The CapacityBoundedByConfig bound here
+--   continues to hold; DtypeStrictness continues to prevent
+--   cross-dtype reuse during the transition between dispatch
+--   modes.
+--
+-- specs/scheduler/batch_composition.allium
+--   The scheduler-level Bug C closure. Independent of this spec
+--   (the cache reuses graphs the scheduler submits; whether the
+--   scheduler may submit a mixed batch is governed there). The
+--   only cross-cut is DtypeStrictness: if Tier 3 unifies dispatch
+--   and a future regression reintroduces mixed-dtype batches, the
+--   dtype-strict check will force a reinstantiate every tick —
+--   measurable as cache thrash in the probe, not as a wrong
+--   output. The spec catches the perf signal before it becomes a
+--   correctness signal.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity CudaGraphReuseSystem {
+    node_properties: List<NodeProperties>
+    cache_action: CacheAction
+}
+
+contract ValidateCudaGraphReuseSystem {
+    invoke: (sys: CudaGraphReuseSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

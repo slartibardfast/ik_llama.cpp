@@ -1,0 +1,252 @@
+-- allium: 3
+-- specs/async-reduce/async-reduce.allium
+--
+-- AsyncReduce — async F32 cross-device reduce with stream-overlap.
+-- Bit-deterministic multi-GPU reduction that hides its bandwidth cost
+-- behind compute by riding in the async-reduce of the per-device
+-- compute kernel. Replaces the F32→F16 cast (the precision-losing
+-- perf optimisation that broke batch-shape invariance) with full F32
+-- throughout, scheduled on a dedicated communication CUDA stream.
+-- Consumers wait on explicit events before reading the reduced tensor.
+--
+-- Scope: structural invariants of the AsyncReduce path. The TLA+
+-- companion (specs/async-reduce/AsyncReduce.tla, when authored) will
+-- model the event-ordering machine; this spec asserts the static
+-- properties any implementation must honour.
+--
+-- Composition:
+--   - cross_device_event_chain.allium asserts the cudaEventRecord/
+--     cudaStreamWaitEvent edges exist in the captured graph; this
+--     spec specialises that property to the AsyncReduce code path.
+--   - libmgpu_subgraph_capture.allium's LibmgpuOutputDeterministic
+--     AcrossReplays property assumes the present spec holds for the
+--     libmgpu cross-device reduce node.
+--
+-- Provenance:
+--   ik_llama.cpp/ggml/src/ggml-cuda/reduce.cu       reduce kernel + dispatch
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu              comm-stream setup
+--   ik_llama.cpp/tests/test-ggml-reduce-async-*.cpp witness tests
+--   scripts/test-production-np-determinism.sh       end-to-end determinism
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- A CUDA stream slot in the AsyncReduce path. Two roles:
+--   "compute" — the backend's main kernel stream
+--   "comm"    — dedicated peer-copy stream
+entity ReduceStream {
+    role:          String          -- in {"compute", "comm"}
+    device_id:     Integer
+    stream_handle: Integer         -- cudaStream_t opaque
+}
+
+-- A CUDA event slot. Two roles:
+--   "input_ready" — signals per-device input is ready for peer-copy
+--   "reduce_done" — signals reduce completes on this device
+entity ReduceEvent {
+    role:          String          -- in {"input_ready", "reduce_done"}
+    device_id:     Integer
+    event_handle:  Integer         -- cudaEvent_t opaque
+}
+
+-- The full AsyncReduce path on one process. n_device compute streams,
+-- n_device comm streams, n_device of each event role. Plus the per-
+-- device input tensors and the single shared reduced output.
+entity AsyncReducePath {
+    n_device:           Integer
+    compute_streams:    List<ReduceStream>   -- length = n_device
+    comm_streams:       List<ReduceStream>   -- length = n_device
+    input_ready_events: List<ReduceEvent>    -- length = n_device
+    reduce_done_events: List<ReduceEvent>    -- length = n_device
+
+    -- Per-device F32 input shape [n_embd, n_tokens, ...]. The list
+    -- carries hashes/digests rather than tensor data: the spec talks
+    -- about identity properties on bytes, not the bytes themselves.
+    per_device_input_hash:  List<String>     -- length = n_device
+    reduced_output_hash:    String           -- post-reduce digest
+    accumulation_order:     List<Integer>    -- permutation of [0..n_device); frozen at init
+    fallback_taken:         Boolean          -- sync fallback fired this run
+}
+
+-- A correlated baseline run for byte-identity comparison.
+entity SyncF32Baseline {
+    per_device_input_hash: List<String>      -- same shape as AsyncReducePath
+    accumulation_order:    List<Integer>     -- must match the async path
+    reduced_output_hash:   String            -- sync reduce digest
+}
+
+-- A pair of AsyncReducePath runs over equal inputs — used to state the
+-- determinism property and the sync↔async equivalence property.
+entity AsyncReducePathPair {
+    run_a:     AsyncReducePath
+    run_b:     AsyncReducePath
+    baseline:  SyncF32Baseline
+}
+
+-- ============================================================
+-- INVARIANTS — Correctness
+-- ============================================================
+
+invariant F32Throughout {
+    -- For every AsyncReducePath: no ggml_cast to a non-F32 type
+    -- appears between per_device_input and reduced_output on the
+    -- async path. F32 is preserved end-to-end. The pre-Option-A
+    -- F16 cast is forbidden.
+}
+
+invariant DeterministicAcrossSchedule {
+    -- For every AsyncReducePathPair where run_a.per_device_input_hash
+    -- = run_b.per_device_input_hash and run_a.accumulation_order =
+    -- run_b.accumulation_order: run_a.reduced_output_hash =
+    -- run_b.reduced_output_hash. The output is byte-identical
+    -- regardless of which stream's kernels happen to run first
+    -- under the GPU scheduler. Verified by bit-comparison across
+    -- 10 runs under different load conditions.
+}
+
+invariant BitIdenticalToSyncF32Baseline {
+    -- For every AsyncReducePathPair: run_a.reduced_output_hash =
+    -- baseline.reduced_output_hash when the per-device inputs and
+    -- accumulation orders agree. F32 reduce is associative only
+    -- when the order is fixed; both sync and async must use the
+    -- same accumulation order (frozen at init). The async path
+    -- keeps the same per-element addition sequence — only the
+    -- kernel launch site differs.
+}
+
+-- ============================================================
+-- INVARIANTS — Ordering & synchronisation
+-- ============================================================
+
+invariant EventOrderingHoldsBeforeRead {
+    -- For every AsyncReducePath: every downstream consumer of
+    -- reduced_output calls cudaStreamWaitEvent on the matching
+    -- reduce_done_events entry before reading. No code path may
+    -- read reduced_output without first waiting on the
+    -- corresponding event.
+}
+
+invariant NoDataRaceOnReducedTensor {
+    -- For every AsyncReducePath: the peer-copy writes that populate
+    -- reduced_output complete before reduce_done_events[d] is
+    -- signalled. The cudaEventRecord runs on the same stream as the
+    -- peer-copy + reduce kernel, so the event is signalled only
+    -- AFTER the writes complete. No reader sees partial state.
+}
+
+invariant InputReadyBeforePeerCopy {
+    -- For every AsyncReducePath, for every device d: comm_streams[d]
+    -- waits on input_ready_events[d] before issuing the peer-copy.
+    -- Without this, peer-copy may transfer stale (pre-FFN-output)
+    -- bytes. The wait edge is comm_stream <- compute_stream's
+    -- input_ready event.
+}
+
+-- ============================================================
+-- INVARIANTS — Stream isolation
+-- ============================================================
+
+invariant StreamIsolation {
+    -- For every AsyncReducePath: operations on comm streams do not
+    -- implicitly reorder operations on compute streams. Only
+    -- explicit cudaStreamWaitEvent edges cross stream boundaries.
+    -- No implicit cudaDeviceSynchronize on the hot path.
+}
+
+invariant NoCrossStreamGlobalSync {
+    -- For every AsyncReducePath: no cudaDeviceSynchronize or
+    -- cudaStreamSynchronize is called inside the async-reduce hot
+    -- path. A device-wide sync would serialise compute+comm and
+    -- defeat the overlap. Only fine-grained event waits are
+    -- permitted.
+}
+
+-- ============================================================
+-- INVARIANTS — Liveness
+-- ============================================================
+
+invariant TerminationUnderFairScheduler {
+    -- For every AsyncReducePath: under a fair CUDA scheduler, every
+    -- issued reduce eventually completes and signals its
+    -- reduce_done_events entry. The reduce kernel makes progress
+    -- and its event is signalled in finite time. No starvation,
+    -- no indefinite blocking.
+}
+
+invariant DeadlockFreedom {
+    -- For every AsyncReducePath: the cudaStreamWaitEvent dependency
+    -- graph between compute and comm streams is acyclic. Verified by
+    -- the layered structure:
+    --   compute -> input_ready -> comm -> reduce_done -> compute
+    -- with no back-edges. TLA+ model checking (when authored)
+    -- confirms.
+}
+
+-- ============================================================
+-- INVARIANTS — Performance (non-correctness)
+-- ============================================================
+
+invariant OverlapComputeWithComm {
+    -- For every AsyncReducePath: when downstream waits on
+    -- reduce_done occur AFTER non-dependent compute kernels in the
+    -- consumer stream, the compute and peer-copy execute
+    -- concurrently. Validated by nsys timeline — the peer-copy of
+    -- layer N's reduce overlaps with layer N+1's matmul (which
+    -- doesn't depend on the reduce until its RMSNorm). Witness:
+    -- nsys shows comm-stream activity overlapping compute-stream
+    -- activity in the per-layer window.
+}
+
+invariant NoPerfRegressionVsCastPath {
+    -- For every AsyncReducePath measured at NP=8 prefill: the async
+    -- F32 reduce matches or beats the pre-Option-A F16-cast path
+    -- within 5%. The cast saved cross-device bandwidth by halving
+    -- payload; async overlap recovers the time by hiding the larger
+    -- F32 transfer behind compute. Net: tokens/sec parity or better.
+}
+
+-- ============================================================
+-- INVARIANTS — Fallback
+-- ============================================================
+
+invariant FallbackToSync {
+    -- For every AsyncReducePath where comm_streams allocation fails
+    -- or hardware does not support cross-device peer access:
+    -- fallback_taken = true and the run uses the synchronous F32
+    -- reduce (Option A behaviour). No silent degradation to F16
+    -- cast. Either async or sync, never lossy.
+}
+
+invariant FallbackIsBitIdentical {
+    -- For every AsyncReducePathPair where run_a.fallback_taken =
+    -- false and run_b.fallback_taken = true and inputs agree: the
+    -- two reduced_output_hash values are equal. The sync fallback
+    -- produces bit-identical output to the async path; only
+    -- scheduling differs.
+}
+
+-- ============================================================
+-- Contract
+-- ============================================================
+
+contract ValidateAsyncReducePair {
+    invoke: (pair: AsyncReducePathPair) -> Boolean
+
+    @invariant AllAsyncReduceInvariantsHold
+        -- Returns true iff `pair` satisfies every invariant above.
+        -- Witness tests:
+        --   ik_llama.cpp/tests/test-ggml-reduce-async-correctness.cpp
+        --     — binds F32Throughout, DeterministicAcrossSchedule,
+        --       BitIdenticalToSyncF32Baseline, EventOrderingHoldsBeforeRead.
+        --   ik_llama.cpp/tests/test-ggml-reduce-async-overlap.cpp
+        --     — binds OverlapComputeWithComm, NoPerfRegressionVsCastPath.
+        --   ik_llama.cpp/tests/test-ggml-reduce-async-deadlock.cpp
+        --     — binds DeadlockFreedom, TerminationUnderFairScheduler,
+        --       StreamIsolation, NoCrossStreamGlobalSync.
+        --   ik_llama.cpp/tests/test-ggml-reduce-async-fallback.cpp
+        --     — binds FallbackToSync, FallbackIsBitIdentical.
+        --   scripts/test-production-np-determinism.sh
+        --     — end-to-end determinism (DeterministicAcrossSchedule +
+        --       BitIdenticalToSyncF32Baseline at the production model).
+}

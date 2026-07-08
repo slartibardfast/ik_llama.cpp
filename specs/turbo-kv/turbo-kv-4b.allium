@@ -1,0 +1,463 @@
+-- allium: 3
+-- turbo-kv-4b.allium
+
+-- Scope: TurboQuant 4-bit KV cache quantisation — the core algorithm
+-- plus its practical SOTA adaptations for LLM KV cache use.
+--
+-- Citable sources (use throughout this file):
+--
+--   [PAPER]       Zandieh, Daliri, Hadian, Mirrokni. "TurboQuant:
+--                 Online Vector Quantization with Near-optimal
+--                 Distortion Rate." ICLR 2026. arxiv 2504.19874.
+--                 Prescribes: random orthogonal rotation 𝚷 ∈ ℝ^(d×d)
+--                 applied to the full d-dimensional input, Lloyd-Max
+--                 codebook with centroids c₁..c₂ᵇ ∈ [-1, 1] solved
+--                 ONCE per bit-width (reused across dimensions), and
+--                 for inner-product estimation (attention) a two-
+--                 stage MSE+QJL construction. Paper's experiments
+--                 use d=1536, 3072 (OpenAI3 embedding dimensions);
+--                 the paper does NOT validate on LLM KV cache head
+--                 dimensions.
+--
+--   [QUANT.CPP]   quantumaikr/quant.cpp (Apache-2.0), the C
+--                 reference implementation our llama.cpp port
+--                 inherits from. Implements "Variant F" of the
+--                 paper's algorithm: codebook-only (no QJL),
+--                 per-128-element block rotation (NOT per-head),
+--                 max_abs-based per-block rescale, fixed Lloyd-Max-
+--                 Gaussian codebooks with centroids extending
+--                 beyond [-1, 1]. Variant F's design comment:
+--                 "Karpathy-loop ablation: QJL contributed ~0.
+--                 Reclaimed those 16 bytes to upgrade codebook
+--                 resolution."
+--                 See include/turboquant/tq_types.h,
+--                 src/core/tq_turbo_kv.c.
+--
+--   [TONBI-V3]    tonbistudio/turboquant-pytorch compressors_v3.py.
+--                 Community PyTorch implementation. Declares:
+--                 "We implemented the paper's algorithm, found that
+--                 its key innovation (QJL) actually hurts in
+--                 practice, and built an improved version (V3)
+--                 informed by findings from 8+ independent
+--                 community implementations." Per-head d×d rotation
+--                 (matches paper), MSE-only codebook, no inv_std
+--                 rescale, **residual window** (keep recent N
+--                 tokens in fp16), asymmetric K/V bit-widths, and
+--                 layer-adaptive precision.
+--
+-- This file describes the core paper algorithm (rotation +
+-- codebook) plus the Variant F simplifications we inherit (no QJL,
+-- per-block adaptation). Sibling specs cover the remaining
+-- community improvements:
+--   - turbo_kv_residual_window.allium      (tonbi-v3)
+--   - turbo_kv_asymmetric.allium           (paper §4 + tonbi-v3)
+--   - turbo_kv_layer_adaptive.allium       (tonbi-v3)
+--   - turbo_kv_outliers.allium             (quant.cpp 4bo / 3bo)
+-- Each of those specs adds a composable layer onto this core.
+--
+-- Goal (per project direction): SOTA for PPL and speed on LLM KV
+-- cache, not paper verbatim. Where [PAPER] and community evidence
+-- disagree, we follow the empirical community consensus and cite
+-- the evidence that justifies the departure.
+--
+-- Includes: head quantise / dequantise, RHT forward / inverse,
+-- L2_norm, normalize, rescale, nearest_centroid, reconstruct_codebook.
+-- Excludes:
+--   - SIMD / backend implementations (AVX2, Vulkan, CUDA, ROCm,
+--     ARM) — implementation detail. Sister specs cover per-backend
+--     equivalence.
+--   - 3-bit variant — separate file (turbo-kv-3b.allium).
+--   - Residual window, asymmetric K/V, layer-adaptive, outlier
+--     handling — separate files as listed above. Their application
+--     composes on top of this core.
+
+-- ============================================================
+-- External entities (managed by the model's tensor system)
+-- ============================================================
+
+entity Tensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+actor TensorSupplier {
+    identified_by: Tensor
+}
+
+-- ============================================================
+-- Value types
+-- ============================================================
+
+-- One quantised attention-head row. [PAPER] §3 compress step
+-- produces a (norm, indices) pair. [QUANT.CPP] Variant F's wire
+-- format additionally stores a per-block inv_std field because it
+-- uses a Gaussian(0, 1) codebook rather than paper's [-1, 1]
+-- codebook and needs to rescale rotated values to fit the codebook
+-- range — included below so wire-format equivalence specs can
+-- check it.
+entity QuantizedHead {
+    norm: Decimal          -- L2 norm of the pre-normalisation head row
+    inv_std: Decimal       -- [QUANT.CPP] Variant F rescale factor;
+                           -- paper has no such field (its codebook
+                           -- lives in [-1, 1] matching the unit-sphere
+                           -- rotated input distribution).
+    indices: Set<Integer>  -- head_dim codebook indices, each in [0, codebook_size)
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Head dimension. [PAPER] does not validate at LLM KV head
+    -- sizes (paper tests d=1536, 3072 on OpenAI3 embeddings).
+    -- Production Qwen3.5 values are 128 (0.8B) and 256 (9B, 35B).
+    -- [QUANT.CPP] Variant F hardcodes block size to TQ_BK = 128,
+    -- which agrees with the paper's full-vector rotation when
+    -- head_dim = 128 and splits into 2 independent sub-blocks
+    -- when head_dim = 256. The multi-block split is a [QUANT.CPP]
+    -- departure, not a paper prescription. [TONBI-V3] uses per-head
+    -- d×d rotation consistent with the paper.
+    head_dim: Integer = 128
+
+    -- Bits per quantised coordinate. Fixed to 4 for this spec file.
+    bits: Integer = 4
+
+    -- Codebook size = 2^bits. [PAPER] §3: "Construct codebook by
+    -- finding centroids c₁, c₂, … c_{2^b} ∈ [-1, 1] that minimize
+    -- MSE cost… store the results for future uses." ONE codebook
+    -- per bit-width, reused across dimensions.
+    codebook_size: Integer = 16
+
+    -- Seed for the random orthogonal rotation. [PAPER] requires
+    -- random orthogonal — any draw from the uniform Haar measure
+    -- on O(d) works. A Hadamard matrix composed with random ±1
+    -- sign flips (Fast Hadamard Transform plus sign randomisation)
+    -- is a fast approximation at O(d log d) cost; [QUANT.CPP] and
+    -- our llama.cpp port use this. [TONBI-V3] uses a dense Gaussian-
+    -- orthogonal matrix at O(d²) from QR decomposition.
+    seed: Integer = 305419896  -- 0x12345678
+
+    -- Empirical tolerance for norm-preservation in reconstruction.
+    -- [QUANT.CPP] ablations on unit Gaussian at head_dim=128 give
+    -- rel_err ≈ 0.083; 0.1 is a ~20% safety margin.
+    reconstruction_rel_error: Decimal = 0.1
+
+    -- [QUANT.CPP] Variant F codebook range. The Lloyd-Max Gaussian
+    -- (not unit-sphere) codebook has centroids in [-cent_max,
+    -- cent_max] with this value as the outermost centroid. Rotated
+    -- values are rescaled by inv_std = cent_max / max_abs to fit.
+    -- [PAPER] has no analogous constant (its centroids live in
+    -- [-1, 1] matching the unit-sphere input range).
+    cent_max: Decimal = 2.7326
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+-- [PAPER] prescribes QJL for inner-product estimation (attention).
+-- Quote from arxiv 2504.19874 §3: "we propose a two-stage approach:
+-- applying an MSE quantizer followed by a 1-bit Quantized JL (QJL)
+-- transform on the residual." Both [QUANT.CPP] Variant F and
+-- [TONBI-V3] drop QJL based on independent empirical ablations.
+-- [QUANT.CPP] commit log: "Karpathy-loop ablation: QJL contributed
+-- ~0. Reclaimed those 16 bytes." [TONBI-V3] README: "QJL actually
+-- hurts in practice… QJL variance is amplified by softmax, hurting
+-- attention." Our llama.cpp port inherits the QJL drop. This is a
+-- community-led improvement over [PAPER] and the spec reflects that.
+open question "QJL residual for attention: paper requires it; two independent community ablations show it hurts quality. Spec currently matches community consensus (no QJL). If future measurement contradicts the community finding, QJL would be added as a sibling improvement spec."
+
+-- [QUANT.CPP] Variant F uses a fixed 128-element block regardless
+-- of head_dim; for head_dim > 128 this splits a head into
+-- blocks_per_head = head_dim / 128 sub-blocks, each with its own
+-- rotation, its own max_abs, and its own inv_std. This is NOT
+-- [PAPER]'s prescription — [PAPER] §3 applies the rotation to the
+-- full d-dimensional vector. [TONBI-V3] implements per-head d×d
+-- rotation. The 9B IQ3_XXS PPL data
+-- (reference/ppl/results/Qwen3.5-9B-UD-IQ3_XXS) shows turbo_kv_4b
+-- +0.23 PPL above F16 baseline — this spec attributes that gap to
+-- the multi-block split at head_dim=256 rather than to any GPU
+-- kernel bug (confirmed by turbo_kv_4b_attention.allium's
+-- propagated PBT: CPU FA vs Vulkan FA pass within fp32 tolerance).
+open question "Rotation granularity: paper and tonbistudio V3 use full d×d (per-head); quant.cpp Variant F uses fixed 128-element sub-blocks. The port inherits Variant F. For head_dim > 128 the sub-block split loses cross-block correlation — the observed cost at 9B head_dim=256 is +0.23 PPL vs F16. Fixing this requires restructuring the port to do one d×d rotation per head."
+
+-- [QUANT.CPP] Variant F's inv_std + Gaussian codebook is
+-- mathematically different from [PAPER]'s direct-argmin +
+-- [-1, 1] codebook. Both are valid Lloyd-Max quantisers on
+-- different parameterisations of the rotated-unit-sphere
+-- distribution. Quality should be similar at d = codebook training
+-- dim; may diverge at other d.
+open question "Codebook parameterisation: paper uses one codebook in [-1,1] per bit-width, trained against the unit-sphere rotated distribution. Quant.cpp uses N(0,1) Lloyd-Max centroids extending past ±1 with per-block max_abs rescaling. These are mathematically different but may perform comparably when the codebook's training distribution matches the input."
+
+-- Asymmetric key/value bit-widths — [PAPER] §4 discusses
+-- asymmetric allocation; [TONBI-V3] measures K6/V4 rw=128 as
+-- "EXACT" (perfect needle-retrieval) while symmetric K4/V4 rw=0
+-- is "MISS" (garbage output). The port is symmetric K=V=4-bit
+-- with no residual window — the worst of the measured configs
+-- in [TONBI-V3]'s table.
+open question "Asymmetric K/V bit allocation: paper §4 discusses and tonbistudio V3 measures K6/V4 as the quality sweet spot. Our port uses symmetric K=V=4-bit. This is a sibling-spec concern (turbo_kv_asymmetric.allium); noted here for visibility."
+
+-- ============================================================
+-- Algorithm-level rules
+-- ============================================================
+
+rule L2_norm {
+    when: L2_norm(data)
+
+    let norm_sq = sum_of_squares(data)
+    let result = sqrt(norm_sq)
+
+    ensures: result >= 0.0
+}
+
+rule normalize {
+    when: normalize(data, norm)
+
+    requires: norm > 0.0
+
+    let inv_norm = 1.0 / norm
+    let result = scaled(data, inv_norm)
+
+    ensures: L2_norm(result) = 1.0
+}
+
+rule rescale {
+    when: rescale(data, norm)
+
+    requires: norm >= 0.0
+
+    let result = scaled(data, norm)
+
+    ensures: L2_norm(result) = L2_norm(data) * norm
+}
+
+-- [PAPER] §3: random rotation 𝚷 ∈ ℝ^(d×d) applied to the full
+-- input vector. Any draw from the Haar measure on O(d) works.
+-- [QUANT.CPP] Variant F and our port approximate this via
+-- FHT + random ±1 signs at O(d log d) cost. [TONBI-V3] uses a
+-- dense Gaussian-orthogonal matrix from QR. Distributional
+-- equivalence is what matters for the Lloyd-Max distortion
+-- bound, not the specific construction.
+rule RHT_forward {
+    when: RHT_forward(data, n, seed)
+
+    requires: n > 0
+
+    let n2 = floor_pow2(n)
+    let with_signs = apply_sign_flip(data, n2, seed)
+    let hadamarded = walsh_hadamard_transform(with_signs, n2)
+    let result = scale(hadamarded, 1.0 / sqrt(n2), n2)
+
+    ensures: result.length = n
+}
+
+rule RHT_inverse {
+    when: RHT_inverse(data, n, seed)
+
+    requires: n > 0
+
+    let n2 = floor_pow2(n)
+    let scaled_data = scale(data, 1.0 / sqrt(n2), n2)
+    let hadamarded = walsh_hadamard_transform(scaled_data, n2)
+    let result = apply_sign_flip(hadamarded, n2, seed)
+
+    ensures: result.length = n
+}
+
+-- Per-element argmin against the codebook. [PAPER] §3
+-- (compress): indices[i] = argmin_c |rotated[i] - centroids[c]|.
+-- [QUANT.CPP] Variant F additionally rescales rotated values by
+-- inv_std before argmin so that the Gaussian(0,1) Lloyd-Max
+-- codebook fits the dynamic range; this is in the port. [TONBI-V3]
+-- omits this step (codebook in [-1, 1] matches the unit-sphere
+-- input range natively). Spec models the [QUANT.CPP] flavour
+-- because that's what our llama.cpp port implements.
+rule nearest_centroid {
+    when: nearest_centroid(rotated_data, inv_std, codebook_entries)
+
+    requires: codebook_entries.count > 0
+
+    let scaled_data = scaled_vector(rotated_data, inv_std)
+    let result = find_nearest(scaled_data, codebook_entries)
+
+    ensures: result.count = rotated_data.count
+}
+
+-- Codebook lookup + inverse of the inv_std rescale so the
+-- reconstructed values land back in the rotated-unit-sphere space.
+rule reconstruct_codebook {
+    when: reconstruct_codebook(block, codebook_entries)
+
+    requires: codebook_entries.count > 0
+    requires: block.indices.count > 0
+    requires: block.inv_std > 0.0
+
+    let scale = 1.0 / block.inv_std
+    let lut = scaled_codebook(codebook_entries, scale)
+    let result = lookup_indices(block.indices, lut, block.indices.count)
+
+    ensures: result.count = block.indices.count
+}
+
+-- ============================================================
+-- Composite rules
+-- ============================================================
+
+-- End-to-end head quantise, matching the [QUANT.CPP] Variant F
+-- pipeline that our llama.cpp port implements:
+--   norm     = L2_norm(x)
+--   rotated  = RHT(x / norm)
+--   inv_std  = cent_max / max_abs(rotated)
+--   indices  = argmin_c |rotated[i] * inv_std - centroids[c]|  per i
+--   store (norm, inv_std, indices)
+rule QuantizeHead {
+    when: QuantizeHead(tensor, seed)
+
+    requires: tensor.count = config.head_dim
+    requires: L2_norm(tensor.data) > 0.0
+
+    let norm = L2_norm(tensor.data)
+    let normalized = normalize(tensor.data, norm)
+    let rotated = RHT_forward(normalized, config.head_dim, config.seed)
+    let max_val = max_abs(rotated)
+    let inv_std = config.cent_max / max_val
+    let indices = nearest_centroid(rotated, inv_std, turbo_kv_4b_codebook)
+
+    ensures: QuantizedHead.created(
+        norm: norm,
+        inv_std: inv_std,
+        indices: indices
+    )
+}
+
+rule DequantizeHead {
+    when: DequantizeHead(block)
+
+    requires: block.inv_std > 0.0
+    requires: block.indices.count = config.head_dim
+
+    let codebook_values = reconstruct_codebook(block, turbo_kv_4b_codebook)
+    let dequant_rotated = RHT_inverse(codebook_values, config.head_dim, config.seed)
+    let reconstructed = rescale(dequant_rotated, block.norm)
+
+    ensures: Tensor.created(
+        data: reconstructed,
+        count: config.head_dim
+    )
+}
+
+-- [PAPER] §3 identity: dot(q, dequant(block)) = dot(RHT(q), lut(indices)) * norm
+-- because RHT is orthogonal. The port uses this to pre-rotate the
+-- query once per attention call and skip the inverse rotation on
+-- the key side.
+rule VectorDot {
+    when: VectorDot(query, block)
+
+    requires: query.count = config.head_dim
+
+    let q_rotated = RHT_forward(query.data, config.head_dim, config.seed)
+    let k_codebook = reconstruct_codebook(block, turbo_kv_4b_codebook)
+    let dot_result = dot_product(q_rotated, k_codebook) * block.norm
+
+    ensures: result = dot_result
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- Distribution caveat: [PAPER] §3 distortion bound assumes the
+-- input follows the distribution the codebook was trained on.
+-- [QUANT.CPP]'s Gaussian(0,1) codebook + max_abs rescale
+-- approximates this across a range of inputs; quality can fall
+-- outside the budget for adversarial one-hot-like inputs. Budget
+-- of 0.1 covers empirical worst-case on Qwen3.5 KV activations
+-- ([QUANT.CPP] PHASE24 measurement; rel_err 0.083 observed).
+invariant ReconstructionPreservesNorm {
+    for block in QuantizedHeads:
+        let reconstructed = DequantizeHead(block)
+        abs(L2_norm(reconstructed.data) - block.norm) <= block.norm * config.reconstruction_rel_error
+}
+
+-- [PAPER] §3 orthogonality: <a, b> = <RHT(a), RHT(b)>. The
+-- paper's entire distortion bound rests on this. The FHT+signs
+-- construction (our port + [QUANT.CPP]) satisfies it exactly in
+-- the math; floating-point accumulation adds ~log2(d) × fp32_eps
+-- drift per the turbo_kv_4b_backend.allium tolerance budget.
+invariant RHTOrthogonality {
+    for a in Tensors:
+        for b in Tensors:
+            let a_rot = RHT_forward(a.data, a.count, config.seed)
+            let b_rot = RHT_forward(b.data, b.count, config.seed)
+            dot_product(a_rot, b_rot) = dot_product(a.data, b.data)
+}
+
+invariant RHTIsSelfInverse {
+    for v in Tensors:
+        let rotated = RHT_forward(v.data, v.count, config.seed)
+        let restored = RHT_inverse(rotated, v.count, config.seed)
+        restored = v.data
+}
+
+-- [PAPER] §3 Lloyd-Max optimality: the chosen centroid minimises
+-- MSE distortion for the post-rotation distribution. Distributional
+-- mismatch between the port's codebook training (Gaussian(0,1))
+-- and input (unit-sphere-rotated, distribution varies with d)
+-- means this invariant holds locally (within a batch of similar
+-- inputs) but not necessarily globally.
+invariant NearestCentroidMinimizesError {
+    for x in ScaledValues:
+        for cb in Codebooks:
+            let best = find_nearest(x, cb.entries)
+            for other in cb.entries:
+                abs(x - best) <= abs(x - other)
+}
+
+invariant DeterministicSeed {
+    config.seed = 305419896
+}
+
+invariant HeadDimIsPowerOfTwo {
+    is_power_of_two(config.head_dim) and config.head_dim > 0
+}
+
+invariant IndicesInBounds {
+    for block in QuantizedHeads:
+        for idx in block.indices:
+            idx >= 0 and idx < config.codebook_size
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Black-box helpers: sum_of_squares, sqrt, scaled, scale,
+-- scaled_vector, scaled_codebook, find_nearest, lookup_indices,
+-- floor_pow2, apply_sign_flip, walsh_hadamard_transform,
+-- dot_product, max_abs, abs, is_power_of_two.
+-- C reference: llama.cpp/ggml/src/ggml-turbo-kv.c.
+-- Original C reference: quant.cpp/src/core/tq_turbo_kv.c (GPL-2.0
+-- Apache-2.0 — attribution in ggml-turbo-kv.h header comment).
+--
+-- This spec describes the CORE algorithm. Sibling improvement
+-- specs layer on the community extensions documented in open
+-- questions:
+--
+--   turbo_kv_residual_window.allium  — [TONBI-V3] fp16 rolling
+--                                      window for recent N tokens,
+--                                      bypasses quantisation
+--   turbo_kv_asymmetric.allium       — [PAPER §4] + [TONBI-V3]
+--                                      K=6/V=4 or K=8/V=4 bit
+--                                      allocation for attention
+--                                      quality
+--   turbo_kv_layer_adaptive.allium   — [TONBI-V3] protected early /
+--                                      late layers at higher bits
+--   turbo_kv_outliers.allium         — [QUANT.CPP] 4bo / 3bo
+--                                      variants: 8 outlier dims
+--                                      stored verbatim as fp16
+--
+-- Each improvement spec cites measurement evidence from its
+-- upstream source. Together they define the SOTA target. Weed
+-- passes against the llama.cpp port will surface which
+-- improvements are not yet implemented.

@@ -1,0 +1,197 @@
+-- allium: 3
+-- mul_mat_cpu.allium
+
+-- Scope: ggml CPU backend's vec_dot contract and the SIMD-equivalence
+-- property that any per-type SIMD variant must honour.
+--
+-- Includes:
+--   - The vec_dot function-pointer contract — what every registered
+--     implementation (scalar, SSE, AVX2, ...) must compute.
+--   - SIMDEquivalence invariant — multiple variants for the same row
+--     type must produce equivalent scores on the same inputs.
+--
+-- Excludes:
+--   - ggml_compute_forward_mul_mat orchestration: tiling, threading,
+--     batching, broadcast, llamafile sgemm early-outs, the nrc-way
+--     batched-row API. None of these change the per-element score
+--     semantics; they are performance implementation detail.
+--   - Pre-conversion of src1 from f32 to vec_dot_type. ggml core does
+--     this before vec_dot is invoked, so the contract starts with an
+--     already-converted query.
+--   - Per-type quantization semantics — what a particular row type
+--     means when dequantized. Those live in per-type specs
+--     (e.g. turbo-kv-4b.allium).
+
+-- ============================================================
+-- External entities — managed by ggml, not by this spec
+-- ============================================================
+
+entity FloatTensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+-- Backend-level view of one weight row of a MUL_MAT. Internal layout
+-- is opaque to this spec — per-type specs define dequantization.
+entity QuantizedRow {
+    row_type: String
+    element_count: Integer
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Error bounds for comparing vec_dot scores across SIMD variants
+    -- of the same row type. Pass criterion is:
+    --     abs_err <= abs_tol  OR  rel_err <= rel_tol
+    -- Mixed metric is necessary because rel_err is unstable when the
+    -- reference score is near zero (random queries and keys can
+    -- produce dot products much smaller than either operand's norm).
+    --
+    -- Budget covers two sources of divergence:
+    --   1. O(n * float_epsilon) accumulation differences from varying
+    --      summation trees across SIMD widths.
+    --   2. Codebook-quantization error when a SIMD variant pre-quantizes
+    --      the per-type codebook into a narrower-integer LUT for fast
+    --      shuffle-based lookup (e.g. the turbo_kv_4b AVX2 / SSE
+    --      kernels store the 16-entry fp32 codebook as int8 so a
+    --      single VPSHUFB dispatches 16 or 32 codebook lookups per
+    --      instruction; reconstruction error is ~1% per element for
+    --      small centroids).
+    --
+    -- These values are per-type-neutral upper bounds. Types that do
+    -- NOT pre-quantize their codebook (pure fp32 path) would pass at
+    -- much tighter values; the loose bounds here cover the int8-LUT
+    -- case without needing per-type overrides.
+    --
+    -- abs_tol = 1.0 is calibrated for worst-case accumulation across
+    -- multi-block head_dim up to 512 and multi-row mul_mat grids
+    -- (m <= 5, n <= 4) — observed absolute error on that regime caps
+    -- around 0.3 for int8-LUT types; 1.0 gives 3x headroom. A tighter
+    -- value broke property_SIMDEquivalence_multi_row in the propagate
+    -- pass that added it: the 0.1 original was calibrated from
+    -- single-block single-row data and didn't scale.
+    simd_equivalence_rel_tol: Decimal = 0.05
+    simd_equivalence_abs_tol: Decimal = 1.0
+}
+
+-- ============================================================
+-- Contract: the vec_dot function-pointer semantics
+-- ============================================================
+
+-- ggml's per-type type_traits_cpu table registers a vec_dot function
+-- per quantized type. That function is called from MUL_MAT's inner
+-- loop with one quantized row and one f32 query row, and must write
+-- the scalar dot product to its output. This contract captures what
+-- any such registered implementation must do.
+--
+-- C-side signature (for reference, not part of the spec):
+--   void (*)(int n, float *s, size_t bs,
+--            const void *vx, size_t bx,
+--            const void *vy, size_t by,
+--            int nrc);
+-- vx = quantized row(s), vy = f32 query row(s), n = row length,
+-- (bs, bx, by, nrc) support batched row-comparisons; nrc = 1 is the
+-- semantic unit of correctness.
+
+contract VecDot {
+    invoke: (row: QuantizedRow, query: FloatTensor) -> Decimal
+
+    @invariant Preconditions
+        -- invoke requires row.element_count = query.count. Callers
+        -- (ggml's MUL_MAT inner loop) never violate this; a vec_dot
+        -- implementation may assume it.
+
+    @invariant DotProductCorrectness
+        -- The returned score equals the inner product of row's
+        -- dequantized view and query.data — i.e. sum over i in
+        -- 0..row.element_count of dequantize(row)[i] * query.data[i]
+        -- — up to two sources of error:
+        --
+        --   (a) Codebook-representation error. A SIMD implementation
+        --       is permitted to pre-quantize the per-type codebook
+        --       into a narrower-integer LUT for fast shuffle-based
+        --       lookup (e.g. the turbo_kv_4b AVX2 / SSE kernels hold
+        --       the 16-entry fp32 codebook as int8). The per-type
+        --       spec owns the bound this introduces; this contract
+        --       only requires that the implementation's dequantize
+        --       semantics match the per-type spec up to that bound.
+        --
+        --   (b) O(n * float_epsilon) floating-point accumulation
+        --       error from varying summation trees across SIMD widths.
+        --
+        -- Both error sources are quantified together by the mixed
+        -- tolerance in SIMDEquivalence below. The scalar reference
+        -- (e.g. ggml_vec_dot_turbo_kv_4b_f32 in ggml-base) uses the
+        -- fp32 codebook directly and achieves only (b), making it the
+        -- appropriate oracle for the SIMD path's combined error.
+        --
+        -- This contract owns only that the implementation computes
+        -- THAT dot product, not some other quantity (e.g. in
+        -- RHT-rotated space, or scaled, or per-block). The per-type
+        -- spec is responsible for any intermediate transformations
+        -- the implementation is allowed to do internally, as long as
+        -- the final score matches the dequantize-then-dot semantic
+        -- within the error budget above.
+
+    @invariant SIMDEquivalence
+        -- If multiple implementations are registered for the same
+        -- row_type (e.g. a scalar reference plus an SSE4.1 kernel
+        -- plus an AVX2 kernel), all must produce the same score on
+        -- the same (row, query) inputs within the mixed tolerance:
+        --
+        --     abs_err <= config.simd_equivalence_abs_tol
+        --     OR
+        --     rel_err <= config.simd_equivalence_rel_tol
+        --
+        -- The disjunction is necessary because rel_err is unstable
+        -- when the reference score is near zero (random queries and
+        -- keys readily produce |dot| much smaller than either
+        -- operand's norm); abs_err covers that regime while rel_err
+        -- covers the typical-magnitude regime.
+        --
+        -- This is the property any new SIMD kernel must be tested
+        -- against before it ships. Without it, a SIMD bug silently
+        -- produces wrong answers that a same-backend test gate
+        -- cannot detect — both sides of a CPU-vs-CPU comparison go
+        -- through the same dispatch and silently agree. Concrete
+        -- incidents found only after this invariant was tested:
+        --
+        --   llama.cpp 70036900a — inverted per_block_scale in the
+        --     SSE and AVX2 per-block wrappers: scores inflated ~2160x.
+        --     Passed 1113/1113 test-backend-ops CPU MUL_MAT cases.
+        --
+        --   llama.cpp 70036900a — AVX2 interleave pulled upper-lane
+        --     VPSHUFB results that were duplicated codebook[0] from a
+        --     zero-padded index vector; elements 16..31 of every
+        --     32-element iter computed against the wrong lookups.
+        --
+        --   llama.cpp 588dd9bd — AVX2 codebook buffer over-read
+        --     (int8[16] loaded as 32 bytes); upper-lane contributions
+        --     silently resolved to zero on the test host's .bss layout.
+
+    @guidance
+        -- The PBT that propagates from this contract must:
+        --   1. Drive the dispatch that production code actually uses
+        --      — i.e. via the CPU backend's MUL_MAT op, not by
+        --      calling the per-type scalar symbol directly (which
+        --      bypasses the registered SIMD path).
+        --   2. Compare the dispatch's score against an independent
+        --      scalar reference. The natural reference is the
+        --      per-type scalar vec_dot exposed from ggml-base
+        --      (e.g. ggml_vec_dot_turbo_kv_4b_f32 in
+        --      ggml-turbo-kv.c), which is written in pure scalar C
+        --      and does not go through the SIMD dispatch.
+        --   3. Generate row data via the per-type quantize helper
+        --      (from_float / quantize_row_*_ref) so the inputs are
+        --      well-formed quantized blocks, not random bytes.
+        --
+        -- At minimum, cover the combinations (row_type × registered
+        -- variant) that the build actually produces — on Zen 2 with
+        -- -march=native, that is TURBO_KV_4B × AVX2, so the Zen 2
+        -- PBT drives the AVX2 kernel through the dispatch and
+        -- compares to the ggml-base scalar. On a host without AVX2
+        -- it would drive the SSE kernel or the scalar fallback.
+}

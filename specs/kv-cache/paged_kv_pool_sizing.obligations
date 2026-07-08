@@ -1,0 +1,13 @@
+# Obligations for paged_kv_pool_sizing.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.PoolSizing => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SizedAllocResult => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ServerAdmissionResult => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_total_pool_blocks => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_seqs => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.block_size_tokens => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.retry_after_seconds => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PoolBoundsRespected.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SizingDerivedFromCtxAndParallel.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PoolExhaustionReturns503.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

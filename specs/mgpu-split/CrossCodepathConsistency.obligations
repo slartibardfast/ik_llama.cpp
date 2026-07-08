@@ -1,0 +1,20 @@
+# Obligations for CrossCodepathConsistency.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+enum-comparable.Consumer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ConfigInstance => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CrossCodepathPair => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ConfigInstanceWellFormed => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.AccessPathsBelongToConsumer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PairOverSameStruct => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.PairConsumersDistinct => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.InvariantSatisfactionEquivalent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.BuftSetupOutputEquivalent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CreateSplitOutputEquivalent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.MutationsByOneConsumerVisibleToOther => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ImmutableFieldsBidirectionallyImmutable => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LmRefactorPreservesAllLmInvariants => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ClipIntroductionPreservesAllLmInvariants => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LmObservableBehaviorUnchanged => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ClipNewObservableBehaviorIsAdditive => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.CheckPair.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

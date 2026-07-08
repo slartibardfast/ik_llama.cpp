@@ -1,0 +1,15 @@
+# Obligations for turbo_kv_4b_backend.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.QuantizedHead => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.FloatTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.IndexTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.indices_byte_tolerance => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.scale_rel_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.element_abs_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.element_rel_tol => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.head_dim => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TurboKv4bBackendOps.quantize_head => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TurboKv4bBackendOps.dequantize_head => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TurboKv4bBackendOps.get_rows => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TurboKv4bBackendOps.set_rows => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

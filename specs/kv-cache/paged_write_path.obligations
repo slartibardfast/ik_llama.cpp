@@ -1,0 +1,15 @@
+# Obligations for paged_write_path.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.KVWriteOp => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KVWriteOpLegacy => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.InpKvIdxs => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BatchTokenMeta => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_tokens_per_tick => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_n_head_kv => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.block_size_tokens => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PagedKVWriteEquivToLegacyAtIdentity.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.WriteIndexInBounds.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.WriteIndexUnique.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SetRowsQ40Coverage.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ProductionByteIdentityAtNStream2.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

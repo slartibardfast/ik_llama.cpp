@@ -1,0 +1,16 @@
+# Obligations for qnext_multislot_dispatch.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Tensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Block => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.Batch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.SeqPattern => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.GgmlType => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_blocks_under_contract => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.LinearAttnLayerBuild.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.EnginePatternRouting.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.GgmlConcatOperands.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DtypeUniformAcrossBlocks => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.InpOutIdsPerBlockSliceOrDeferred => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoAbortOnContractedPatterns => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.SinglePathBlockPathEquivalence => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

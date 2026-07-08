@@ -1,0 +1,429 @@
+-- allium: 3
+-- cuda_nccl_allreduce.allium
+--
+-- Scope: the CUDA backend implementation of GGML_OP_REDUCE on
+-- multi-GPU TP-split graphs. This op sums per-device partial-output
+-- tensors (one tensor per participating device, identical shape and
+-- dtype) and leaves every device holding the all-summed result. The
+-- spec governs the contract independent of which backend mechanism
+-- realises it: NCCL ring-allreduce, or the pre-existing
+-- peer-copy + k_reduce_add_T path. Both paths must satisfy the same
+-- contract.
+--
+-- Why this spec exists: ik_llama.cpp ships a custom path
+-- (ggml/src/ggml-cuda/reduce.cu:74-89 k_reduce_add_T,
+-- :91-118 copy_missing_tensors, dispatch entry
+-- ggml_cuda_op_reduce at :120). The replacement under evaluation
+-- is ncclAllReduce(ncclSum) per device on a NCCL communicator
+-- created at backend init. The two paths reduce in different
+-- floating-point summation orders, so they are not byte-equal;
+-- the spec names the parity envelope inside which the substitution
+-- is permitted, and the lifecycle obligations the NCCL path adds.
+--
+-- Includes:
+--   - External entities for the reduce call site, the per-device
+--     buffer, the backend context that owns the NCCL communicator,
+--     and the CUDA-graph capture region.
+--   - The CrossDeviceAllReduce contract — what callers may assume
+--     of any implementation regardless of mechanism.
+--   - The NcclLifecycle contract — when the communicator is created
+--     and destroyed.
+--   - The GraphCaptureCompatible contract — the capture invariant
+--     the NCCL path must satisfy.
+--   - System-wide invariants on parity envelope, dtype restriction,
+--     in-place semantics and fallback equivalence.
+--
+-- Excludes:
+--   - The TP-split graph construction that produces the per-device
+--     partials. Owned by the build code in src/llama.cpp; this spec
+--     consumes their per-device shape contract, not produces it.
+--   - Quantised-dtype reduction (Q8_0, BF16). The existing path
+--     handles them; NCCL does not. The spec restricts the NCCL
+--     surface to F32/F16 and defers Q*/BF16 to the legacy path. See
+--     OQ-1 for the dispatch rule.
+--   - The numerical bound between the SUM-then-COPY direct kernel
+--     and a ring-allreduce on data of any specific distribution.
+--     The spec binds an NMSE upper bound on the reduced output;
+--     theoretical floating-point error analysis is left to the
+--     measurement/test harness.
+--   - The peer-copy + k_reduce_add_T algorithm internals. The spec
+--     binds it only via FallbackEquivalence; the legacy code path
+--     remains a black box from this spec's perspective.
+
+-- ============================================================
+-- External entities — backend objects we constrain
+-- ============================================================
+
+-- One participating device's tensor in a cross-device reduce. Every
+-- device produces a Buffer of identical shape and dtype before the
+-- reduce; after the reduce, every device's Buffer holds the sum.
+entity Buffer {
+    device:     Integer       -- 0..n_devices-1
+    n_elements: Integer
+    dtype:      ReduceDtype
+}
+
+-- One invocation of the cross-device reduce. Carries the participating
+-- device count and the per-device Buffers. The same shape applies
+-- before and after; the operation is in-place.
+entity ReduceOp {
+    n_devices:  Integer       -- always >= 2; reduce on n=1 is a no-op
+    op_kind:    ReduceKind    -- only sum is in scope
+}
+
+-- The CUDA backend context for one participating device. Owns the
+-- per-device CUDA stream and (in the NCCL path) the NCCL
+-- communicator handle. One BackendContext per device per process.
+entity BackendContext {
+    device:        Integer
+    has_nccl_comm: Boolean    -- true iff NCCL path is active
+}
+
+-- The NCCL communicator. Created once per process when n_devices > 1;
+-- destroyed at backend teardown. Process-wide handle; each device's
+-- BackendContext holds a reference into the same communicator group.
+entity NcclCommunicator {
+    n_ranks:    Integer       -- equals n_devices
+    initialised: Boolean
+}
+
+-- The CUDA-graph capture region inside which a reduce may be invoked.
+-- ggml-cuda.cu:4487-4490 currently disables capture when GGML_OP_REDUCE
+-- is in the graph; the NCCL path is required to lift this gate.
+entity CaptureRegion {
+    contains_reduce: Boolean
+    capture_succeeded: Boolean
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The dtypes the NCCL allreduce path supports. F32 and F16 are
+-- in-scope; quantised dtypes (Q8_0) and BF16 fall back to the legacy
+-- path.
+enum ReduceDtype { f32 | f16 | q8_0 | bf16 }
+
+-- The reduce operation. Only sum is in scope; the GGML_OP_REDUCE
+-- dispatch enforces this at ggml_cuda_op_reduce entry
+-- (reduce.cu:122-123 GGML_ASSERT op == GGML_OP_ADD).
+enum ReduceKind { sum }
+
+-- The implementation path actually taken. Routed by the
+-- GGML_NCCL_DISABLE env var and by the dtype/shape eligibility test.
+enum ReducePath { nccl_allreduce | peer_copy_k_reduce }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Upper bound on normalised mean-squared error between the
+    -- NCCL path's reduced output and the peer-copy + k_reduce_add_T
+    -- path's reduced output, measured on hidden-state tensors
+    -- downstream of a TP layer using this reduce. Beyond this
+    -- envelope the substitution is not permitted.
+    parity_nmse_bound: Decimal = 0.0000001    -- 1e-7
+
+    -- Environment variable name that selects the legacy path. When
+    -- set (any value), the implementation must use the peer-copy +
+    -- k_reduce_add_T path regardless of NCCL availability.
+    fallback_env_var: String = "GGML_NCCL_DISABLE"
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The cross-device allreduce surface. One invocation reduces N
+-- per-device Buffers in place: every Buffer's content after the call
+-- equals the sum of every Buffer's content before the call (within
+-- the parity envelope; see ParityWithinNmseBound). No allocation:
+-- the input buffers ARE the output buffers.
+contract CrossDeviceAllReduce {
+    invoke: (op: ReduceOp, buffers: List<Buffer>) -> List<Buffer>
+
+    @invariant InputBufferUniformShape
+        -- Every Buffer in buffers has the same n_elements and the
+        -- same dtype. Two buffers of differing shape are a contract
+        -- error — the TP-split caller is responsible for producing
+        -- identically shaped partials.
+
+    @invariant DtypeIsF32OrF16OnNcclPath
+        -- Implementations using ReducePath.nccl_allreduce accept
+        -- only buffers whose dtype is f32 or f16. Buffers with
+        -- dtype q8_0 or bf16 must route to ReducePath.peer_copy_k_reduce.
+        -- The NCCL library does not implement quantised reduces;
+        -- the legacy path remains the only supported route for them.
+
+    @invariant InPlaceSemantics
+        -- The output Buffers are the same Buffer instances as the
+        -- input Buffers. No new allocation. The data pointer of
+        -- buffers[i] before invoke equals the data pointer of
+        -- buffers[i] after invoke for every i.
+
+    @invariant SumAcrossDevicesOnEveryDevice
+        -- After invoke, for every device d in 0..n_devices-1 and
+        -- every element index k in 0..n_elements-1:
+        -- buffers[d].element[k] equals the sum over j in 0..n_devices-1
+        -- of (buffers[j].element[k] before invoke), within the
+        -- parity envelope ParityWithinNmseBound.
+
+    @invariant CallerHoldsStreamSynchronization
+        -- The contract does not synchronise the participating CUDA
+        -- streams against the host. The caller is responsible for
+        -- any cudaStreamSynchronize / event recording it needs after
+        -- the reduce. The contract guarantees only that subsequent
+        -- work on each device's stream observes the reduced result.
+
+    @guidance
+        -- The two implementation paths achieve the contract via
+        -- different mechanisms:
+        --
+        --   nccl_allreduce: ncclAllReduce(ncclSum) per device on the
+        --     process-wide NCCL communicator. Ring-allreduce internal
+        --     to NCCL; floating-point sum order is the ring order,
+        --     not the device-index order.
+        --
+        --   peer_copy_k_reduce: cudaMemcpyPeerAsync from each peer
+        --     into device 0's copy_buffer, then k_reduce_add_T<T,
+        --     BLOCK, nptr> across the N pointers (reduce.cu:74-89),
+        --     then cudaMemcpyPeerAsync the result back to every
+        --     peer. Floating-point sum order is the j=1..nptr loop
+        --     order.
+        --
+        -- Both produce the same sum modulo float-add associativity.
+        -- The parity envelope (NMSE < 1e-7) accommodates the order
+        -- difference; argmax over the reduced tensor at temp=0 must
+        -- match across paths.
+}
+
+-- The NCCL communicator lifecycle. The communicator is a heavyweight
+-- handle (kernel modules, peer mappings, ring topology); creating it
+-- per call is prohibitive. The contract binds creation to backend
+-- init and destruction to backend teardown, with no per-call
+-- initialisation.
+contract NcclLifecycle {
+    invoke: (devices: Integer) -> NcclCommunicator
+
+    @invariant InitialisedOnceAtBackendCreate
+        -- ncclCommInitAll is called exactly once per process, at the
+        -- moment the first BackendContext is created with n_devices
+        -- > 1. The resulting NcclCommunicator is shared across every
+        -- BackendContext.
+
+    @invariant DestroyedAtBackendTeardown
+        -- ncclCommDestroy is called for every rank when the last
+        -- BackendContext referencing the communicator is destroyed.
+        -- No leak; no double-destroy.
+
+    @invariant NoPerCallInitialisation
+        -- The CrossDeviceAllReduce.invoke path does not call
+        -- ncclCommInitAll, ncclCommSplit, or any other communicator
+        -- creation function. Per-call init is prohibited.
+
+    @invariant SkippedWhenSingleDevice
+        -- When n_devices = 1 (or 0), no NcclCommunicator is created
+        -- and BackendContext.has_nccl_comm = false. The reduce
+        -- contract does not apply at n_devices < 2; ggml_cuda_op_reduce
+        -- requires n_devices >= 2 (reduce.cu:129).
+}
+
+-- The CUDA-graph capture compatibility surface. The reduce must be
+-- callable inside a captured stream without aborting capture.
+contract GraphCaptureCompatible {
+    invoke: (region: CaptureRegion, op: ReduceOp) -> CaptureRegion
+
+    @invariant CaptureSucceedsWithReduceInsideRegion
+        -- region.contains_reduce = true and ReducePath = nccl_allreduce
+        -- implies region.capture_succeeded = true. The NCCL path is
+        -- required to be capture-safe; the gate at
+        -- ggml-cuda.cu:4487-4490 (which currently sets
+        -- use_cuda_graph = false on GGML_OP_REDUCE) must be lifted
+        -- when the NCCL path is active.
+
+    @invariant ReliesOnNcclLibraryCaptureSupport
+        -- The contract does not specify a NCCL version; it requires
+        -- only that the linked NCCL library supports
+        -- cudaStreamBeginCapture for ncclAllReduce. NCCL >= 2.13
+        -- provides this. Build-time or runtime detection of capture
+        -- support is the implementation's responsibility; if the
+        -- linked NCCL does not support capture, the implementation
+        -- must keep the existing capture-disable gate active.
+
+    @invariant LegacyPathRetainsCaptureGate
+        -- region.contains_reduce = true and ReducePath = peer_copy_k_reduce
+        -- implies the implementation may set capture_succeeded = false
+        -- (the existing behaviour). The legacy path uses
+        -- cudaMemcpyPeerAsync across peer streams which is not
+        -- capturable; only the NCCL path lifts the gate.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- The parity envelope. Both paths produce reduced outputs whose
+-- normalised mean-squared error against each other is bounded by
+-- config.parity_nmse_bound, measured on hidden-state tensors
+-- downstream of a TP layer using this reduce. The bound is observed
+-- at the model-output level: per-token argmax at temp=0 sampling
+-- agrees across paths over an evaluation window.
+invariant ParityWithinNmseBound {
+    for op in ReduceOps:
+        nmse(reduced_output_via_nccl(op), reduced_output_via_legacy(op))
+            <= config.parity_nmse_bound
+}
+
+-- The argmax-stability property. At temperature 0 sampling, the
+-- token chosen by the model under the NCCL path equals the token
+-- chosen under the legacy path for every position in a fixed
+-- evaluation window. This is the user-observable consequence of
+-- ParityWithinNmseBound and the ship-gate for the substitution.
+invariant ArgmaxStableAcrossPaths {
+    for window in EvalWindows:
+        argmax_tokens_under_path(window, nccl_allreduce)
+            = argmax_tokens_under_path(window, peer_copy_k_reduce)
+}
+
+-- The dtype-routing property. Implementations must route Q8_0 and
+-- BF16 reduces to the legacy path even when GGML_NCCL_DISABLE is
+-- unset. The NCCL path is engaged only when both the env var is
+-- unset AND the dtype is f32 or f16.
+invariant NcclPathOnlyWhenDtypeEligible {
+    for op in ReduceOps:
+        path_taken(op) = nccl_allreduce
+            implies (op_dtype(op) = f32 or op_dtype(op) = f16)
+                and not env_disable_set()
+}
+
+-- The fallback-equivalence property. Setting GGML_NCCL_DISABLE forces
+-- ReducePath.peer_copy_k_reduce regardless of dtype eligibility.
+-- This is the operator-controlled escape hatch that turns the
+-- substitution off.
+invariant EnvDisableForcesLegacyPath {
+    for op in ReduceOps:
+        env_disable_set() implies path_taken(op) = peer_copy_k_reduce
+}
+
+-- The lifecycle-progress property. Every process that creates a
+-- BackendContext at n_devices > 1 reaches NcclCommunicator.initialised
+-- = true before the first ReduceOp is dispatched. No lazy init on
+-- first reduce; no race where the first reduce sees an uninitialised
+-- communicator.
+invariant CommReadyBeforeFirstReduce {
+    for op in ReduceOps where path_taken(op) = nccl_allreduce:
+        nccl_comm_of(op).initialised = true
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Q8_0 / BF16 fallback strategy under graph capture. The
+--   legacy peer-copy path is not capturable. If a Q8_0 reduce
+--   appears in a graph that the NCCL path would otherwise capture,
+--   the implementation has three options:
+--     A. Disable capture for the entire graph (current behaviour;
+--        pessimistic — kills capture across the whole forward).
+--     B. Disable capture only for the affected reduce op while
+--        capturing the rest of the graph (requires sub-graph
+--        capture support).
+--     C. Reject Q8_0 on TP-split graphs entirely — change the
+--        build code to emit f16 partials when the consumer is a
+--        cross-device reduce.
+--   The spec accepts any of the three as long as
+--   NcclPathOnlyWhenDtypeEligible and EnvDisableForcesLegacyPath
+--   hold. Resolution depends on whether production TP-split
+--   profiles ever produce Q8_0 reduce inputs (currently unknown).
+--
+-- OQ-2: NCCL initialisation failure surface. If ncclCommInitAll
+--   fails at backend creation time (mismatched topology, missing
+--   NCCL library, GPU peer-access denied), the implementation has
+--   to choose:
+--     A. Abort backend creation; the process never serves traffic.
+--     B. Fall back to peer_copy_k_reduce permanently for the
+--        process lifetime; log a warning.
+--   Option B preserves correctness via the existing path and is
+--   consistent with the GGML_NCCL_DISABLE escape hatch. Option A
+--   makes init failure visible to the operator. Pin down before
+--   landing.
+--
+-- OQ-3: Per-stream vs per-device communicator topology. NCCL
+--   supports multiple communicators per process (e.g., one per
+--   stream). The contract above binds a single process-wide
+--   communicator. If the engine adds parallel TP-split graphs that
+--   would benefit from concurrent reduces on disjoint stream sets,
+--   the lifecycle contract must extend to multiple
+--   NcclCommunicator instances. Out of scope for the current
+--   substitution; revisit if multi-stream TP becomes a workload.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/ggml/src/ggml-cuda/reduce.cu:74-89
+--     - k_reduce_add_T<T, BLOCK, nptr>; the legacy direct-sum
+--       kernel. The reference summation order against which
+--       ParityWithinNmseBound is measured.
+--   ik_llama.cpp/ggml/src/ggml-cuda/reduce.cu:91-118
+--     - copy_missing_tensors; the cudaMemcpyPeerAsync cleanup loop
+--       that fills the partials NCCL would otherwise have produced.
+--       Retained on the legacy path; not used on the NCCL path.
+--   ik_llama.cpp/ggml/src/ggml-cuda/reduce.cu:120
+--     - ggml_cuda_op_reduce; the dispatch entry. The new
+--       implementation routes here based on
+--       env_disable_set() and op_dtype eligibility before falling
+--       through to the existing ring/multi-stage paths.
+--   ik_llama.cpp/ggml/src/ggml-cuda.cu:4487-4490
+--     - the use_cuda_graph = false gate on GGML_OP_REDUCE. Must be
+--       lifted on the NCCL path; retained on the legacy path.
+--   ik_llama.cpp/ggml/src/ggml-cuda/common.cuh
+--     - ggml_backend_cuda_context struct; the NCCL communicator
+--       handle is added here, alongside the existing
+--       cuda_stream / copy_event / compute_event fields.
+--
+-- Black-box helpers used inline in the invariants above:
+--   ReduceOps, EvalWindows, reduced_output_via_nccl,
+--   reduced_output_via_legacy, nmse, argmax_tokens_under_path,
+--   path_taken, op_dtype, env_disable_set, nccl_comm_of.
+--
+-- Test infrastructure to drive from this spec via allium:propagate:
+--   - ParityWithinNmseBound property: build a TP-split test graph
+--     producing a synthetic reduce input on each device, run both
+--     paths, compare reduced outputs by NMSE. Assert <= 1e-7.
+--   - ArgmaxStableAcrossPaths property: run a fixed prompt window
+--     at temp=0 under both paths; assert per-token argmax matches.
+--     Anchor on a real production profile (Qwen 3.6 27B at 2-GPU).
+--   - NcclPathOnlyWhenDtypeEligible property: dispatch reduces with
+--     each ReduceDtype; assert the path taken obeys the routing.
+--   - EnvDisableForcesLegacyPath property: set GGML_NCCL_DISABLE=1,
+--     dispatch f32 reduce, assert path_taken = peer_copy_k_reduce.
+--   - CaptureSucceedsWithReduceInsideRegion property: run a
+--     cudaStreamBeginCapture region containing a reduce; assert
+--     capture_succeeded = true on the NCCL path, retained false
+--     on the legacy path.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity CudaNcclAllreduceSystem {
+    backend_contexts: List<BackendContext>
+    nccl_communicators: List<NcclCommunicator>
+    reduce_path: ReducePath
+}
+
+contract ValidateCudaNcclAllreduceSystem {
+    invoke: (sys: CudaNcclAllreduceSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

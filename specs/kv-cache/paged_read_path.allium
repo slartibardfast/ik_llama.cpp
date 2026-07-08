@@ -1,0 +1,335 @@
+-- allium: 3
+-- specs/kv-cache/paged_read_path.allium
+--
+-- Scope: the KV READ path under paged allocation, as consumed
+-- by the PSKV singlewarp attention kernel
+-- (fattn-per-slot-kv-singlewarp-sm75.cu). Models how the kernel
+-- replaces direct stream-slab pointer arithmetic with a
+-- block_table indirection, and pins the byte-equivalence to
+-- the contiguous (Tier 4) kernel at trivial mapping.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF Tier 5's Bundle B
+-- changes the PSKV kernel's K_base + V_base calculation:
+--   T4 contiguous:
+--     K_base = K_direct + nb13 * seq + nb12 * head_kv
+--             + (k - k_start_block) * nb11
+--   T5 paged:
+--     K_base = block_pool + block_table[seq][k / block_size]
+--                          * block_size * nb11
+--             + (k % block_size) * nb11
+--             + nb12 * head_kv
+-- At trivial block_table (block_table[seq] = [0, 1, 2, ...]
+-- offset by per-seq base), the paged expression collapses to
+-- the contiguous expression. This is the load-bearing
+-- byte-equivalence for T5.5 kernel NPC.
+--
+-- Includes:
+--   - External entities for FAReadOp (kernel invocation), the
+--     block_table input tensor at src[6], and the K/V row
+--     fetch operation.
+--   - Contract PagedFAReadEquivToContiguousAtIdentity (binding
+--     for T5.5 kernel NPC).
+--   - Invariants KLoopCanonicalOrder (Bug C absence by
+--     construction) + MaskAddressingPreserved.
+--   - The ncu kernel binding contract (GP5.kernel: registers
+--     <= 254, occupancy >= 25%, per-CTA us <= 127.26 * 1.05).
+--
+-- Excludes:
+--   - Allocator. Owned by paged_block_allocator.
+--   - WRITE. Owned by paged_write_path.
+--   - K-shift / defrag. Owned by paged_kshift_defrag.
+--   - The 5.84x kernel-level gap to vLLM (kernel rewrites,
+--     fusions, FA2 backport). These are a SEPARATE workstream
+--     per the Path C reframe; Tier 5 does not claim to address
+--     them.
+--
+-- Composition:
+--   - At n_stream = 1, block_table[0] = [0, 1, 2, ...] and the
+--     paged kernel produces byte-identical output to the
+--     contiguous kernel.
+--   - At n_stream > 1, the block_table indirection serves the
+--     correct K/V data per seq via the allocator's
+--     BlockUniquelyOwned guarantee.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- One PSKV singlewarp kernel invocation.
+entity FAReadOp {
+    tick: Integer
+    layer: Integer
+    n_seqs_in_batch: Integer
+    n_tokens_per_seq: Integer
+    n_head: Integer
+    n_head_kv: Integer
+    head_dim: Integer
+    ne11_per_seq: Integer
+    block_size_tokens: Integer
+}
+
+-- The block_table tensor passed as src[6] of the kernel.
+-- Shape I32 [max_blocks_per_seq, n_seqs_in_batch] (per
+-- OpenQ-T5-H Path A; OpenQ-T5-H Path B mirrors
+-- inp_K_shift_per_stream's per-(device, stream) layout if
+-- graph-split needs it).
+entity BlockTableTensor {
+    n_seqs: Integer
+    max_blocks_per_seq: Integer
+    data: List<Integer>
+}
+
+-- One K row fetch within the kernel's K-loop. At each k in
+-- [0, ne11_per_seq) the kernel computes K_base and loads
+-- head_dim half-floats (Q4_0 unpacked).
+entity KRowFetch {
+    seq_id: Integer
+    head_kv_id: Integer
+    k_in_seq: Integer
+    physical_block_id: Integer
+    offset_within_block: Integer
+}
+
+-- The attention mask cell consumed by the kernel.
+-- Addressed at base + nb33 * seq + nb31 * row + k (T3.1
+-- foundation). Paging-neutral.
+entity MaskCell {
+    seq_id: Integer
+    row_in_batch: Integer
+    k_position: Integer
+    is_visible: Boolean
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    max_n_seqs_in_batch: Integer = 8
+    max_ne11_per_seq: Integer = 256
+    max_blocks_per_seq: Integer = 4
+    block_size_tokens: Integer = 64
+
+    -- ncu measurement targets (PHASE doc GP5.kernel).
+    max_registers_per_thread: Integer = 254
+    min_occupancy_percent: Integer = 25
+    max_per_cta_microseconds: Integer = 133  -- 127.26 * 1.05
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- PagedFAReadEquivToContiguousAtIdentity — the load-bearing
+-- byte-equivalence contract for T5.5 kernel NPC. When the
+-- block_table is the trivial mapping (each seq owns a
+-- contiguous block_id range), the paged kernel produces
+-- byte-identical output to the contiguous (Tier 4) kernel.
+contract PagedFAReadEquivToContiguousAtIdentity {
+    invoke: (op: FAReadOp, block_table: BlockTableTensor,
+             is_trivial_mapping: Boolean) -> Boolean
+
+    @invariant ByteEqualAtTrivialMapping
+        -- If for every seq s in [0, n_seqs_in_batch):
+        --   block_table.data[s * max_blocks_per_seq + b]
+        --     = s * max_blocks_per_seq + b  for all b
+        --     (i.e. seq s owns blocks
+        --     [s * max_blocks_per_seq, (s+1) * max_blocks_per_seq))
+        -- then the kernel's output K_q matrix is byte-identical
+        -- to the output of the contiguous (Tier 4) kernel on
+        -- the same K/V/Q/mask inputs.
+
+    @invariant KBaseFormulaAtTrivialMapping
+        -- At trivial mapping, the K_base address computation:
+        --   K_base = block_pool
+        --          + block_table[seq][k / block_size_tokens] * block_size_tokens * nb11
+        --          + (k % block_size_tokens) * nb11
+        --          + nb12 * head_kv
+        -- collapses (for seq s owning blocks
+        -- [s * M, (s+1) * M)) to:
+        --   K_base = block_pool
+        --          + (s * M + k / block_size_tokens) * block_size_tokens * nb11
+        --          + (k % block_size_tokens) * nb11
+        --          + nb12 * head_kv
+        --        = block_pool + (s * M * block_size_tokens + k) * nb11
+        --          + nb12 * head_kv
+        -- For the special case s * M * block_size_tokens
+        -- = stream_id * kvs_per_stream (T4 contiguous layout's
+        -- per-stream offset), this is exactly
+        -- K_direct + nb13 * seq + (k - k_start_block) * nb11
+        -- + nb12 * head_kv as Tier 4 computed.
+
+    @guidance
+        -- The implementation MUST land the block_table indirection
+        -- such that:
+        --   (a) the kernel reads block_table from L1 (one I32
+        --       per inner iteration; fits with negligible
+        --       overhead — vLLM's measurement: ~3% kernel-time
+        --       impact on A100 PA V1);
+        --   (b) the trivial-mapping collapse is achievable by
+        --       compile-time / load-time constant folding when
+        --       the runtime detects the identity case (an
+        --       optimisation, not a correctness requirement).
+        -- T5.5's `test-paged-byte-identity-trivial-mapping`
+        -- gates this contract.
+}
+
+-- KLoopCanonicalOrder — for any block_table mapping, the
+-- K-loop iterates positions in [0, ne11_per_seq) in canonical
+-- order (k = 0, 1, 2, ...). Block-boundary crossings DO NOT
+-- permute k-order within a block; cross-block transitions
+-- occur at k ≡ 0 mod block_size_tokens. This is Bug C absence
+-- by construction at the kernel level: every position is
+-- visited exactly once in order.
+contract KLoopCanonicalOrder {
+    invoke: (op: FAReadOp, block_table: BlockTableTensor) -> Boolean
+
+    @invariant CanonicalKOrder
+        -- For any seq s and any block_table mapping for that
+        -- seq: the kernel visits positions
+        --   k = 0, 1, 2, ..., ne11_per_seq - 1
+        -- in that order. The physical block_id transitions
+        -- (at k % block_size_tokens = 0) DO NOT reorder.
+
+    @invariant EveryPositionVisitedExactlyOnce
+        -- For every (seq, k_position in [0, ne11_per_seq)) pair:
+        --   exactly one K row fetch in the kernel reads the
+        --   physical address corresponding to that logical
+        --   position.
+
+    @invariant BugCAbsenceByConstruction
+        -- Bug C (per-stream cache contamination from interleaved
+        -- writes) is structurally impossible under paging:
+        -- block_table[seq] is owned uniquely by seq
+        -- (paged_block_allocator::BlockUniquelyOwned), so the
+        -- kernel never reads bytes that another seq wrote.
+        -- This composes with the T3 BugCAbsenceByConstruction
+        -- in specs/dispatch/unified_stream_dispatch.allium
+        -- (which addresses the WRITE side via uniform
+        -- mul_mat shape per tick); together they bind the GP5
+        -- correctness gate.
+
+    @guidance
+        -- The Bug C closure mechanism under paging is different
+        -- from T3's:
+        --   T3: shape-uniform mul_mat per tick (one [d, n_total]
+        --     call covers all streams; no per-stream contamination
+        --     possible at WRITE).
+        --   T5: per-seq block ownership in the allocator
+        --     (BlockUniquelyOwned) + canonical k-order in the
+        --     kernel (no cross-seq reads at READ).
+        -- Both layers are load-bearing; if EITHER fails, Bug C
+        -- can resurface. GP5.Bug-C (r5-probe-c4.sh ITERS=20 =
+        -- 0/20) is the binding empirical gate.
+}
+
+-- MaskAddressingPreserved — the T3.1 mask addressing pattern
+-- (mask_base + nb33 * seq + nb31 * row + k_byte_offset) is
+-- paging-neutral. Paging changes only K/V data addressing;
+-- mask addressing is unchanged.
+contract MaskAddressingPreserved {
+    invoke: (op: FAReadOp, mask: List<MaskCell>) -> Boolean
+
+    @invariant NbAddressingUnchanged
+        -- For every K-row fetch at (seq, k_position):
+        --   the mask cell consulted is at
+        --     mask_base + nb33 * seq + nb31 * row + k_position * sizeof(half)
+        --   exactly as T3.1 + T4 specifies. Paging does NOT
+        --   change nb33, nb31, or the mask layout.
+
+    @invariant Nb33MaskIntactUnderPaging
+        -- The T3.1 mask byte stride `nb33 = max_n_kv_per_seq
+        -- * sizeof(half) * pad_to_8` is unchanged. The mask is
+        -- still allocated per (batch, seq) with one row per
+        -- batch token; paging applies to K/V tensor not mask.
+
+    @guidance
+        -- This contract exists primarily as a sanity barrier:
+        -- if a future paging-related kernel rewrite touches
+        -- the mask addressing for any reason, this contract is
+        -- the first thing that should re-evaluate.
+}
+
+-- ============================================================
+-- Kernel ncu binding (GP5.kernel)
+-- ============================================================
+
+contract KernelOccupancyAndLatencyBinding {
+    invoke: (op: FAReadOp, registers_per_thread: Integer,
+             occupancy_percent: Integer, per_cta_us: Integer) -> Boolean
+
+    @invariant RegistersBudgetMet
+        -- For the T5.5 PSKV singlewarp kernel post-rewrite:
+        --   registers_per_thread <= 254
+        -- (T3 baseline; ncu-measured; 0 spills).
+
+    @invariant OccupancyMaintained
+        -- For the T5.5 kernel:
+        --   theoretical occupancy >= 25% (4 warps per SM at
+        --   the chosen __launch_bounds__).
+
+    @invariant PerCTALatencyBoundedByOverhead
+        -- For the T5.5 kernel measured under ncu:
+        --   per_cta_us <= 127.26 (T3 baseline) * 1.05 = 133 us.
+        -- This binds the OpenQ-T5-A block_size choice: if
+        -- the kernel rewrite at block_size_tokens = 64
+        -- produces per_cta_us > 133, the OpenQ-T5-A
+        -- mitigation drops to block_size = 128. If still over,
+        -- OpenQ-T5-F manual unroll.
+
+    @guidance
+        -- The ncu measurement is run as part of T5.5 close
+        -- and recorded in `data/t5-perf-gate-ledger.md`. The
+        -- gate is hard-binding (per PHASE doc binding gates
+        -- section); a regression beyond 5% requires going back
+        -- to OpenQ-T5-A.
+}
+
+-- ============================================================
+-- High-ctx feasibility (composition with allocator)
+-- ============================================================
+
+contract HighCtxFAReadFeasibility {
+    invoke: (op: FAReadOp, ctx_size: Integer, n_stream: Integer) -> Boolean
+
+    @invariant KernelFunctionsAtHighCtx
+        -- For ctx_size >= 1M, n_stream in {2, 4, 8} (i.e. NP in
+        -- {2, 4, 8} at high ctx): the kernel does not assume
+        -- any per-stream slab size; the K-loop bound
+        -- ne11_per_seq scales with actual written tokens, NOT
+        -- with the per-stream slab capacity.
+
+    @invariant Ne11PerSeqIsActualNotSlab
+        -- ne11_per_seq = actual_written_tokens_in_seq, not
+        -- ctx_size / n_stream. This is what makes paged kernel
+        -- compute scale with actual workload rather than
+        -- allocated slab.
+
+    @guidance
+        -- The "complete sincerity" reframe binds: the kernel
+        -- must work correctly under high-ctx workloads that
+        -- the contiguous layout cannot allocate. The test
+        -- harness for T5.5 includes a stress case at
+        -- ctx = 1M (synthetic, since production prompts are
+        -- shorter) to confirm KernelFunctionsAtHighCtx.
+}
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity PagedReadPathSystem {
+    k_row_fetches: List<KRowFetch>
+}
+
+contract ValidatePagedReadPathSystem {
+    invoke: (sys: PagedReadPathSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

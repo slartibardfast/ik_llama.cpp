@@ -1,0 +1,15 @@
+# Obligations for mtp_verify_accept.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.VerifyUbatch => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.VerifyLogits => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.AcceptDecision => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.AcceptMode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.AcceptVerify.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.TotalCommittedIsNAcceptedPlusOne => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CommittedSequenceShape => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ChopRangeFollowsAcceptDecision => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.BonusBecomesNextSeed => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.VerifyAlwaysMakesProgress => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.MtpVerifyAcceptSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateMtpVerifyAcceptSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

@@ -1,0 +1,205 @@
+-- allium: 3
+-- branch_seq_id.allium
+--
+-- Scope: transient seq_id allocation for tree-MTP branches. The
+-- contract names where branch seq_ids live in the seq_id space, how
+-- they map to (slot, branch) pairs, and the lifecycle invariants the
+-- accept-cycle must preserve.
+--
+-- Why this spec exists: Phase 40's first attempt allocated branch
+-- seq_ids at TREE_BRANCH_BASE = 1024, well outside the qnext_state_slots
+-- buffer (sized to n_parallel ≈ 4). DeltaNet's GGML_ASSERT(s <
+-- qnext_state_slots) fired at the moment seq_id 1025 entered the engine.
+-- Phase 41 fixes this by allocating branch seq_ids inside the bumped
+-- slot range.
+--
+-- Includes:
+--   - External entities for slot/branch identity and the seq_id space.
+--   - The BranchSeqIdAllocate contract: deterministic mapping from
+--     (slot, branch_idx) to seq_id.
+--   - Invariants on range, uniqueness, lifecycle, and slot-buffer fit.
+--
+-- Excludes:
+--   - The DeltaNet state-row content at the branch seq_id slot.
+--     Owned by per_step_ssm_ancestor.allium.
+--   - The KV cell-list extension via seq_cp. The kv_cache_seq_cp
+--     contract extends to copy s_l in src/llama.cpp:2033-2045 — see
+--     the implementation notes.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The qnext-state slot buffer. Sized to qnext_state_slots after the
+-- Phase 41 n_seq_max bump. seq_ids in [0, qnext_state_slots) are
+-- legal; seq_ids outside this range trip GGML_ASSERT.
+entity SlotBuffer {
+    qnext_state_slots: Integer
+    n_parallel:        Integer    -- the original max-concurrent slots
+}
+
+-- The runtime configuration influencing branch allocation.
+entity TreeConfig {
+    tree_k:        Integer    -- 1 (linear) or 2 (tree)
+    n_parallel:    Integer
+}
+
+-- A branch-allocation request: which slot is fanning out, which
+-- branch index within that slot's K candidates.
+entity BranchRequest {
+    slot_id:    Integer    -- in [0, n_parallel)
+    branch_idx: Integer    -- 0..tree_k - 1; idx 0 reuses slot.seq_id_main
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The branch seq_id allocator. Pure function: given a slot and branch
+-- index, returns the seq_id used for that branch's verify-batch entry.
+contract BranchSeqIdAllocate {
+    invoke: (req: BranchRequest, cfg: TreeConfig) -> Integer
+
+    @invariant BranchZeroReusesMainSeqId
+        -- req.branch_idx = 0 returns the slot's main seq_id (which
+        -- equals req.slot_id by ik_llama.cpp convention). The first
+        -- branch is the linear-chain path and reuses existing state.
+
+    @invariant NonZeroBranchInExtendedRange
+        -- req.branch_idx > 0 returns a seq_id in
+        -- [cfg.n_parallel, cfg.n_parallel + cfg.n_parallel * (cfg.tree_k - 1)).
+        -- The extended range starts at cfg.n_parallel — past the
+        -- main slot range — and is sized to fit one extra slot per
+        -- main slot per non-zero branch.
+
+    @invariant DeterministicMapping
+        -- The same BranchRequest with the same TreeConfig always
+        -- produces the same Integer seq_id. The allocator is a pure
+        -- function of its inputs.
+
+    @invariant DistinctMainSlots
+        -- For a given branch_idx > 0, distinct slot_id inputs
+        -- produce distinct seq_ids: req_a.slot_id != req_b.slot_id
+        -- and req_a.branch_idx = req_b.branch_idx > 0
+        -- implies allocate(req_a) != allocate(req_b).
+
+    @invariant DistinctBranchIndices
+        -- For a given slot_id, distinct branch_idx inputs produce
+        -- distinct seq_ids.
+
+    @invariant FormulaMatchesSpec
+        -- For req.branch_idx > 0:
+        -- allocate(req, cfg) = cfg.n_parallel
+        --                    + req.slot_id * (cfg.tree_k - 1)
+        --                    + (req.branch_idx - 1).
+        -- This is the canonical mapping the implementation must use.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- All branch seq_ids fit inside the qnext_state_slots buffer. This is
+-- the invariant Phase 41 exists to enforce; violating it trips the
+-- GGML_ASSERT and aborts the server process.
+invariant AllBranchSeqIdsFitInSlotBuffer {
+    for cfg in TreeConfigs:
+        for req in BranchRequestsUnder(cfg):
+            allocate(req, cfg) < SlotBufferOf(cfg).qnext_state_slots
+}
+
+-- The slot buffer is sized to accommodate the extended range. Server
+-- startup must bump cparams.n_seq_max to cfg.n_parallel * cfg.tree_k
+-- before context creation; otherwise the bump silently does nothing
+-- because qnext_state_slots = min(n_seq_max, kv_size).
+invariant SlotBufferSizedToTreeK {
+    for cfg in TreeConfigs:
+        SlotBufferOf(cfg).qnext_state_slots >= cfg.n_parallel * cfg.tree_k
+}
+
+-- Lifecycle: branch seq_ids exist only within one accept cycle. At
+-- cycle entry no branch seq_id is in use; at cycle exit all branch
+-- seq_ids are cleared via seq_rm. Cross-cycle leak would silently
+-- accumulate state and eventually trip CellOverflow.
+invariant BranchSeqIdsClearedPerCycle {
+    for cycle in Cycles where cycle.cfg.tree_k > 1:
+        for req in BranchRequestsOf(cycle) where req.branch_idx > 0:
+            seq_id_in_use_after(allocate(req, cycle.cfg), cycle) = false
+}
+
+-- No collision with main seq_ids. Branch seq_ids for branch_idx > 0
+-- are >= n_parallel; main slot seq_ids are < n_parallel. The two
+-- ranges cannot overlap.
+invariant BranchAndMainSeqIdsDisjoint {
+    for cfg in TreeConfigs:
+        for req in BranchRequestsUnder(cfg) where req.branch_idx > 0:
+            for s in MainSlotIds(cfg):
+                allocate(req, cfg) != s
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Allocation strategy for tree_depth > 1. At depth=2 with
+--   tree_k=2, the spec assumes all 7 candidate positions ride on
+--   slot.seq_id_main with depth distinction handled by KQ_mask, not
+--   by additional branch seq_ids. If the implementation instead
+--   uses one seq_id per tree position, the formula above must
+--   extend to encode depth as well as branch_idx. Phase 42's design
+--   commits to KQ_mask (single seq_id), so this OQ stays closed for
+--   Phase 41.
+--
+-- OQ-2: Multi-process server with shared slot buffer. Currently each
+--   process has its own slot buffer; cross-process collision is not
+--   a concern. If a future shared-process model emerges, the formula
+--   needs a process_id term.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/examples/server/server-context.cpp:29
+--     - server_tree_k(); LLAMA_MTP_TREE_K env reader
+--   ik_llama.cpp/examples/server/server-context.cpp:44
+--     - TREE_BRANCH_BASE = 1024 (Phase 41 replaces with formula above)
+--   ik_llama.cpp/examples/server/server-context.cpp:47
+--     - server_tree_branch_seq() — Phase 41 rewrites body to FormulaMatchesSpec
+--   ik_llama.cpp/src/llama.cpp:745-746
+--     - llama_qwen3next_state_slots; SlotBufferSizedToTreeK enforces
+--       the n_seq_max bump
+--
+-- Black-box helpers used in invariants:
+--   TreeConfigs, BranchRequestsUnder, BranchRequestsOf, MainSlotIds,
+--   SlotBufferOf, Cycles, allocate, seq_id_in_use_after.
+--
+-- Test infrastructure (allium:propagate):
+--   - DistinctBranchIndices / DistinctMainSlots: enumerate
+--     (slot, branch) pairs under tree_k=2, n_parallel=4. Assert all
+--     allocate() outputs are pairwise distinct.
+--   - AllBranchSeqIdsFitInSlotBuffer: with the bumped n_seq_max,
+--     assert allocate(req) < qnext_state_slots for all
+--     (slot, branch) under tree_k=2.
+--   - BranchSeqIdsClearedPerCycle: 1000-cycle stress; final cell
+--     count and state-row content at branch slots match initial.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity BranchSeqIdSystem {
+    slot_buffers: List<SlotBuffer>
+}
+
+contract ValidateBranchSeqIdSystem {
+    invoke: (sys: BranchSeqIdSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

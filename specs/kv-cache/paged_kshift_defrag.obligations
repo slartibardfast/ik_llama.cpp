@@ -1,0 +1,18 @@
+# Obligations for paged_kshift_defrag.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.KShiftPerBlock => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DefragBlockMove => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.InpBlockKShift => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_total_blocks => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_n_head_kv => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_n_layers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.block_size_tokens => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.bytes_per_q40_super_block => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.super_blocks_per_token_per_head => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftPerBlockBehavior.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.KShiftAtTrivialMappingEquivLegacy.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragPreservesLogicalContents.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.DefragLatencyBounded.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.PagedKshiftDefragSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidatePagedKshiftDefragSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

@@ -1,0 +1,473 @@
+-- allium: 3
+-- mtp_fused_draft.allium
+--
+-- Scope: the ideal-state contract for the multi-step fused MTP
+-- draft graph. One ggml_graph_compute produces N argmax-sampled
+-- draft tokens AND populates MTP-layer KV at positions p..p+N-1.
+--
+-- Why this spec exists: PHASE36-MTP-AUDIT.md established that
+-- per-step kernel-launch overhead and per-step host-device
+-- synchronisation dominate the gen-time budget on our hardware
+-- when the main forward is fast. Fusing N MTP block forwards
+-- into a single graph compute eliminates N-1 launches and N-1
+-- syncs per draft round. This spec describes WHAT a fused round
+-- must produce so test-first implementation can drive against
+-- it.
+--
+-- This spec describes the destination, not the migration path.
+-- It assumes the iterative single-token MTP draft loop has been
+-- retired in favour of the fused path. The companion spec
+-- mtp_ubatch_hook.allium governs the inline MTP-KV update during
+-- the verify forward.
+--
+-- Includes:
+--   - External entities for the cgraph objects (Tensor,
+--     ModelContext) and the runtime quantities the contract
+--     constrains (DraftRound, DraftToken, KvSlot).
+--   - Enumerations for the sampling mode and the MTP op type
+--     that selects this graph at build time.
+--   - The FusedDraftStep contract — invariants on a single
+--     ggml_graph_compute that produces N drafts and N KV writes.
+--   - System-wide invariants on the intrinsic correctness of
+--     argmax sampling, KV write idempotence under chop+rewrite,
+--     and determinism under argmax sampling.
+--   - Open questions: probability emission consumer; sampling
+--     beyond argmax; backend coverage beyond CUDA.
+--
+-- Excludes:
+--   - The per-ubatch MTP-KV update during the verify forward.
+--     Owned by mtp_ubatch_hook.allium.
+--   - The PR-22673-style auxiliary llama_context. Out of scope:
+--     the audit established that our existing single-context
+--     with MTP-layer KV is sufficient.
+--   - Acceptance-rate behaviour. The fused graph contract does
+--     not bind on accept rate, only on what it produces given
+--     inputs.
+--   - The numerical bound between fused-graph and reference-
+--     model logits. The contract here is on the argmax winner
+--     (the chosen token id), not on bit-identity of logit
+--     values.
+--   - turbo4 / TBQ4_0 KV quantisation. Explicitly retired in
+--     PHASE36-MTP-AUDIT.md; not connected to this work.
+
+-- ============================================================
+-- External entities — cgraph objects we constrain
+-- ============================================================
+
+-- A ggml tensor flowing into or out of the fused draft graph.
+-- We reference only the shape descriptors the contract binds.
+entity Tensor {
+    name: String
+    n_rows: Integer
+    n_embd: Integer
+}
+
+-- The llama_context whose state participates in the fused
+-- draft. For our fork this is the same context that holds the
+-- main model (MTP layers tagged is_mtp_layer); we do NOT model a
+-- separate auxiliary context.
+entity ModelContext {
+    n_mtp_layers: Integer
+    n_main_layers: Integer
+}
+
+-- One slot in the MTP-layer KV cache. Position p, sequence
+-- seq_id. The fused graph's KV writes name this entity.
+entity KvSlot {
+    seq_id: Integer
+    pos: Integer
+    written: Boolean
+}
+
+-- One draft token produced by the fused graph. The N tokens of
+-- one fused round form a Sequence ordered by step index.
+entity DraftToken {
+    step_index: Integer
+    token_id: Integer
+    prob: Decimal
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The sampling mode the fused graph runs under. argmax_only is
+-- the deterministic mode currently in scope. top_k_n covers
+-- future stochastic sampling (top-k with k > 1, top-p, etc.);
+-- the contract leaves top_k_n behaviour open.
+enum SamplingMode { argmax_only | top_k_n }
+
+-- The MTP op type that selects this graph at build time. Lives
+-- alongside the existing { none, warmup, update_accepted,
+-- draft_gen } in include/llama.h:286-291. In the ideal state
+-- draft_gen_fused is the only MTP draft path; warmup and
+-- update_accepted are absorbed by the per-ubatch hook (see
+-- mtp_ubatch_hook.allium); draft_gen is retired.
+enum MtpOpType {
+    none | draft_gen_fused
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum N (steps per fused round) the contract binds. The
+    -- graph builder must support 1 <= N <= max_fused_steps.
+    max_fused_steps: Integer = 8
+
+    -- Minimum N below which the fused path is not exercised. At
+    -- N=1 the fused graph degenerates to one MTP block; the spec
+    -- still applies but provides no fusion benefit. Callers
+    -- selecting N below this bound are out of contract.
+    min_fused_steps: Integer = 2
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The single fused draft graph compute. Inputs: the seed token
+-- id, the seed hidden state row, and the requested step count N.
+-- Outputs: N DraftToken entities (in step-index order) plus N
+-- KvSlot entities marked written at positions p..p+N-1.
+contract FusedDraftStep {
+    invoke: (ctx: ModelContext,
+             seed_token: Integer,
+             seed_hidden: Tensor,
+             n_steps: Integer,
+             mode: SamplingMode) -> Sequence<DraftToken>
+
+    @invariant SeedHiddenShapeIsOneRow
+        -- seed_hidden has n_rows = 1 and n_embd = ctx hidden
+        -- dimension. The fused graph's first MTP block consumes
+        -- this single row; subsequent blocks consume the
+        -- previous block's output hidden via in-graph wiring.
+
+    @invariant StepCountWithinBound
+        -- config.min_fused_steps <= n_steps <= config.max_fused_steps.
+        -- Outside this range the contract does not apply.
+
+    @invariant SingleGraphCompute
+        -- The implementation issues exactly one
+        -- ggml_graph_compute call per invocation. Multiple
+        -- compute calls within one invocation violate the
+        -- contract — the whole point of fusion is to amortise
+        -- the per-call overhead across N steps.
+
+    @invariant NTokensProducedInOrder
+        -- The returned Sequence has exactly n_steps elements,
+        -- with step_index running 0, 1, ..., n_steps - 1 in
+        -- order. The Sequence type carries the order; consumers
+        -- iterating in declared order observe step 0 first.
+
+    @invariant ArgmaxWinnerWhenArgmaxOnly
+        -- mode = argmax_only implies that for each step k, the
+        -- emitted token_id is the argmax of the step-k logits
+        -- over the model's vocabulary. Ties are broken by lowest
+        -- token id, deterministically.
+
+    @invariant ProbabilityFieldPopulated
+        -- For every emitted DraftToken, the prob field equals
+        -- the softmax probability of the chosen token under the
+        -- step's logits. Required for downstream consumers that
+        -- may use probability ratios in accept tests.
+
+    @invariant KvWrittenAtPositionsPThroughPPlusN
+        -- After the graph compute completes, KvSlot{seq_id,
+        -- pos} entities exist with written = true for every pos
+        -- in the range [p, p + n_steps), where p is the first
+        -- position the round drafts from. This is the
+        -- precondition for verify-step KV reads at the same
+        -- positions.
+
+    @invariant NoSyncBetweenSteps
+        -- Within one fused graph compute, no host-side
+        -- synchronisation occurs between step k and step k+1.
+        -- The intermediate hidden states and sampled tokens flow
+        -- through ggml tensors entirely on-device. Host code may
+        -- only synchronise after the final step.
+
+    @invariant StepInputsFlowOnDevice
+        -- For step k > 0, the token_emb input is derived
+        -- entirely on-device from step k-1's argmax tensor:
+        -- ggml_get_rows(tok_embd, ggml_argmax(logits_k_minus_1)).
+        -- The hidden input is the residual stream output of
+        -- step k-1's MTP block. No host-side intervention
+        -- between steps.
+
+    @guidance
+        -- Implementation pattern: the graph builder emits N
+        -- copies of build_qwen35_mtp (or build_qwen35moe_mtp
+        -- for the MoE variant), wired in series. Between blocks:
+        -- ggml_argmax over the logits tensor produces an index
+        -- tensor; ggml_get_rows on the token-embedding matrix
+        -- using that index produces the next block's token_emb
+        -- input. The hidden carries forward via the residual
+        -- stream the existing block already exposes. KV writes
+        -- are ggml_cpy at offsets kv_head + 0, kv_head + 1, ...,
+        -- kv_head + N - 1.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- The intrinsic argmax-correctness property. For every step k
+-- in every fused round under argmax_only mode, the emitted
+-- token_id is the argmax (lowest-id tie-break) of the step-k
+-- logits over the full vocabulary. No reference to a separate
+-- iterative path is needed: the property is intrinsic to what
+-- argmax means.
+invariant ArgmaxCorrectnessIntrinsic {
+    for round in DraftRoundsViaFusedPath:
+        round.mode = argmax_only
+            implies for_all_steps_emit_argmax(round)
+}
+
+-- The KV idempotence property under chop-and-rewrite. After a
+-- fused round writes KV at p..p+N-1 and the post-verify step
+-- chops the rejected suffix [p+k, p+N-1], a subsequent fused
+-- round writing at p+k..p+k+N-1 produces the same KV state as
+-- if the previous round had only written p..p+k-1 in the first
+-- place. Backend implementations may not introduce stale-data
+-- artefacts in the chopped region.
+invariant KvChopRewriteIsIdempotent {
+    for sequence in TwoRoundSequencesWithRejection:
+        kv_state_after_round_two(sequence) = kv_state_if_first_round_truncated(sequence)
+}
+
+-- The determinism property. Two invocations of FusedDraftStep
+-- with byte-identical inputs and identical model state produce
+-- byte-identical Sequence<DraftToken> outputs (by token_id)
+-- when mode = argmax_only. Binds against non-deterministic
+-- atomic kernel ordering or random-state leakage.
+invariant DeterminismUnderArgmax {
+    for round_a in DraftRounds:
+        for round_b in DraftRounds:
+            round_a.mode = argmax_only
+            and round_b.mode = argmax_only
+            and inputs_byte_identical(round_a, round_b)
+                implies token_ids_match(round_a.seq, round_b.seq)
+}
+
+-- The fused-graph step count obeys the configured bound.
+invariant StepCountConformsToBound {
+    for round in DraftRoundsViaFusedPath:
+        round.n_steps >= config.min_fused_steps
+            and round.n_steps <= config.max_fused_steps
+}
+
+-- The KV-write coverage property. Every fused round writes
+-- exactly n_steps KvSlot entities, no more and no fewer, all
+-- at consecutive positions starting from the round's base
+-- position. No KV writes leak to other ranges.
+invariant KvWritesAreExactlyNSteps {
+    for round in DraftRoundsViaFusedPath:
+        kv_writes_in_round(round).count = round.n_steps
+            and kv_writes_are_contiguous_from(round.p, round.n_steps, kv_writes_in_round(round))
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Does any consumer use the per-step probability the
+--   fused graph emits? llama_get_draft_argmax returns (id, prob)
+--   today and our verify path may use prob in future
+--   ratio-based acceptance tests. The contract requires prob to
+--   be populated; if no consumer ever reads it, we accept the
+--   waste for forward compatibility. Resolve when the verify
+--   path's accept test stabilises.
+--
+-- OQ-2: When does top_k_n sampling enter the fused graph
+--   contract? The current scope is argmax_only because it is
+--   deterministic. Stochastic sampling complicates the
+--   correctness invariants (different RNG seeds produce
+--   different traces) and requires either pre-sampled noise
+--   tensors or a graph-internal RNG primitive. Defer until
+--   benchmark evidence shows argmax-only is leaving acceptance
+--   rate on the table.
+--
+-- OQ-3: Backend coverage. CUDA is the only backend currently in
+--   scope: production runs on 2x RTX 6000 sm_75. Vulkan and
+--   HIP/ROCm coverage for the fused graph is deferred. The
+--   primitives (ggml_argmax, ggml_get_rows, ggml_cpy) exist on
+--   all backends but the kernel launch ordering and stream
+--   semantics differ; bind a separate spec when those backends
+--   become production-relevant.
+
+-- ============================================================
+-- Cross-cutting — scheduler interaction
+-- ============================================================
+
+-- FusedDraftStep is invoked from the verify-decode path; the
+-- verify ubatch carries one decode-contribution token per
+-- active PROCESSING slot. The scheduling of that ubatch is
+-- governed by specs/scheduler/batch_composition.allium, not by
+-- this spec. The two interact as follows.
+
+-- A FusedDraftStep invocation only occurs when its parent
+-- verify ubatch was admitted by the scheduler. Under Tier 4
+-- chunked-prefill admission, the parent ubatch may contain
+-- both decode tokens (from PROCESSING slots) AND prefill chunks
+-- (from LOAD_PROMPT slots). The MTP fused KERNEL still requires
+-- all its consumed tokens to be decode-shaped — the draft round
+-- reads only the is_decode slice of the parent ubatch. The
+-- BatchCompositionInvariant in batch_composition.allium binds
+-- the per-tick admission shape; this local invariant binds the
+-- draft round's per-token-kind constraint.
+invariant FusedDraftRoundsRunOnPureDecodeBatches {
+    for round in DraftRoundsViaFusedPath:
+        round.parent_ubatch.matches(BatchCompositionInvariant)
+            and round.consumed_tokens.all(t => t.is_decode)
+}
+
+-- When the n_stream KV 4D port (specs/kv-cache/n_stream_layer.allium)
+-- lands and the server switches to PerStreamDispatch, the
+-- fused draft graph still composes correctly: one
+-- llama_decode per stream means one fused round writes to
+-- exactly that stream's KV slice (per StreamPartition); no
+-- cross-stream KV writes from draft rounds. The
+-- KvWrittenAtPositionsPThroughPPlusN contract above is
+-- already per-(seq_id, pos) and survives the layout change
+-- unmodified.
+invariant FusedDraftRespectsStreamPartition {
+    for round in DraftRoundsViaFusedPath:
+        let writes = kv_writes_in_round(round)
+        writes.all(w => w.seq_id = round.seq_id)
+            and writes.all(w => stream_id_of_cell(w) = round.seq_id)
+}
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/scheduler/batch_composition.allium
+--   Governs the slot state machine and (under Tier 4) the
+--   chunked-prefill admission contracts: TokenBudgetPerUbatch,
+--   DecodePriorityAdmission, ChunkedPrefillAdmission,
+--   PrefillCarryProgressesMonotonically. The verify ubatch that
+--   triggers a FusedDraftStep is admitted under those contracts;
+--   the MTP fused KERNEL then reads only the is_decode slice of
+--   the parent ubatch (per FusedDraftRoundsRunOnPureDecodeBatches
+--   above). At HEAD the fused draft path is single-stream
+--   per MTPFusedAtN_StreamLessThan2Or1.
+--
+-- specs/kv-cache/n_stream_layer.allium
+--   Models the 4D per-stream KV layout. The structural closure
+--   it provides (per-stream slabs) is what enables Tier 4 to
+--   admit mixed prefill+decode batches safely — the upstream
+--   mul_mat sees a uniform [d, n_total] shape per tick
+--   regardless of admission mode. The fused draft graph's KV
+--   writes continue to satisfy StreamPartition (per
+--   FusedDraftRespectsStreamPartition above).
+--
+-- specs/dispatch/unified_stream_dispatch.allium
+--   Tier 3 unified-stream dispatch. Under unified dispatch, the
+--   UniformShapePerTick contract guarantees every op — including
+--   the fused draft graph — sees one shape per call within a
+--   tick. The fused graph's per-MTP-step internal structure
+--   (N copies of build_qwen35_mtp wired in series) remains
+--   unchanged; what changes is that a single tick may span
+--   multiple streams, and the cross-stream composition of the
+--   fused draft is governed by
+--   specs/composition/mtp_fused_x_n_stream.allium below.
+--
+-- specs/composition/mtp_fused_x_n_stream.allium
+--   The MTP-fused × n_stream composition spec. At HEAD the
+--   MTPFusedAtN_StreamLessThan2Or1 contract makes the
+--   chain-residual path single-stream by construction: when
+--   the fused decoder dispatches under multi-slot batched
+--   conditions, the chain-residual arm is skipped (opt-out),
+--   so FusedDraftStep as specified here only runs in the
+--   single-stream regime. Cross-stream composition is a future
+--   extension and requires the MTPChainResidualPerStream
+--   contract — per-stream chain_residual indexing — before this
+--   spec's invariants extend to the multi-stream case. The
+--   KvWrittenAtPositionsPThroughPPlusN invariant above is
+--   already per-(seq_id, pos) and survives this future
+--   extension unmodified.
+--
+-- mtp_ubatch_hook.allium
+--   The companion spec — the per-ubatch MTP-KV update during
+--   the verify forward. Same per-(seq_id, pos) write semantics
+--   on a different code path.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/include/llama.h:286-291
+--     - llama_mtp_op_type enum; in the ideal state the only
+--       non-none variant is draft_gen_fused.
+--   ik_llama.cpp/include/llama.h:1091
+--     - llama_get_draft_argmax host-side fetch API; consumed
+--       once per step index after the fused round completes,
+--       indexing into the device-cached argmax tensor.
+--   ik_llama.cpp/src/graphs/build_qwen35.cpp:171-246
+--     - build_qwen35_mtp; the single-step block that the fused
+--       builder emits N copies of, wired in series.
+--   ik_llama.cpp/src/graphs/build_qwen35.cpp:6-89
+--     - build_qwen35moe; the MoE variant must mirror the dense
+--       changes.
+--   ik_llama.cpp/src/llama.cpp:569
+--     - graph cache key with mtp_op_type; draft_gen_fused
+--       participates here.
+--   ik_llama.cpp/ggml/include/ggml.h:1239
+--     - ggml_argmax primitive; the in-graph sampling node.
+--   ik_llama.cpp/src/llama-build-context.cpp:544
+--     - llm_build_kv_store; per-step KV write at offset
+--       kv_head + step_index.
+--
+-- Black-box helpers used inline in the invariants above:
+--   DraftRoundsViaFusedPath, DraftRounds,
+--   TwoRoundSequencesWithRejection, for_all_steps_emit_argmax,
+--   token_ids_match, kv_state_after_round_two,
+--   kv_state_if_first_round_truncated, inputs_byte_identical,
+--   kv_writes_in_round, kv_writes_are_contiguous_from.
+--
+-- Test infrastructure to drive from this spec via
+-- allium:propagate (these RED tests drive the implementation):
+--   - Property test: for n_steps in [min_fused_steps,
+--     max_fused_steps], assert ArgmaxCorrectnessIntrinsic by
+--     comparing each step's emitted token_id against the
+--     argmax of a host-side recomputation of the step's
+--     logits.
+--   - Determinism test: same inputs run twice, byte-identical
+--     output sequence by token_id.
+--   - KV chop-rewrite test: round 1 writes p..p+N-1, accept k,
+--     chop p+k..p+N-1, round 2 writes p+k..p+k+N-1. Compare
+--     resulting KV state against the "round 1 truncated to k
+--     drafts then round 2 starting at p+k" reference.
+--   - Single-compute test: instrument the test backend to count
+--     ggml_graph_compute invocations per FusedDraftStep call;
+--     assert exactly 1.
+--   - KV-write coverage test: assert exactly n_steps writes per
+--     round at exactly the contiguous positions [p, p+n_steps).
+--   - Lives at the cgraph level (test-backend-ops style) so it
+--     reproduces deterministically without needing a 27B model
+--     loaded.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity MtpFusedDraftSystem {
+    kv_slots: List<KvSlot>
+    op_type: MtpOpType
+}
+
+contract ValidateMtpFusedDraftSystem {
+    invoke: (sys: MtpFusedDraftSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

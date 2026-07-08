@@ -1,0 +1,488 @@
+-- allium: 3
+-- specs/dflash/cb_eval_residual_capture.allium
+--
+-- Scope: the implementation-level contract for capturing per-layer
+-- residual streams from the target during a llama_decode call, for
+-- consumption by the DFlash drafter's combine_features + inject_kv
+-- path. The abstract behaviour ("extract features at a configured
+-- layer subset") is owned by specs/dflash/dflash.allium's
+-- ExtractFeatures contract. THIS spec narrows the implementation
+-- mechanism, because the choice of mechanism is load-bearing on
+-- target-forward determinism and the obvious choice (scheduler
+-- eval-callback) violates it.
+--
+-- Why this spec exists: P0.A.3 falsification matrix (2026-05-20)
+-- confirmed that the DFlash CLI on production/2026-q2-next emits
+-- garbled output ("user user wants wants quick quick") while
+-- spec-none and `--spec-type ngram-simple` on the same prompt /
+-- seed / batch shape produce clean, byte-identical-to-baseline
+-- output. The single architectural difference DFlash carries over
+-- ngram-simple is the cb_eval hook installed by
+-- llama_set_dflash_extract_layers. The hook returns `true` on
+-- `ask=true` for the configured `l_out-<il>` source-layer nodes
+-- and the scheduler responds by splitting each per-backend split
+-- into N small subgraphs (one per gap between watched nodes),
+-- inserting ggml_backend_synchronize between each, then issuing N
+-- separate ggml_backend_graph_compute_async calls. Each
+-- sub-invocation lets the CUDA backend re-plan fusion / re-issue
+-- cudaGraph capture / re-pick cuBLAS algos on a *different*
+-- contiguous-node range than the fast path would. The argmax flip
+-- cascades through 65 transformer layers and breaks DFlash verify.
+--
+-- The fix is to mirror what MTP already does (and what production
+-- relies on for byte-identity): emit dedicated tap nodes inside
+-- the graph builder, mark them with ggml_set_output, leave the
+-- scheduler on its fast path (no eval-callback). Production MTP
+-- ships with `h_pre_norm` and `result_output` tap nodes
+-- (build_qwen35.cpp:96-99,205-208) and is byte-identical to
+-- spec-none. Residual capture must use the same mechanism.
+--
+-- Includes:
+--   - External entities for the runtime objects involved (the
+--     graph, the scheduler, the per-split sub-graphs, the
+--     extract configuration, the tap nodes, the residual buffers
+--     keyed by layer + seq_id).
+--   - Enumerations for the two candidate mechanisms
+--     (scheduler_callback, graph_tap_node) and the residual
+--     tensor dtype that may legitimately reach the host buffer.
+--   - Contracts for ResidualExtract (the public surface),
+--     SchedulerFastPath (the property the implementation must
+--     not violate), and GraphTapEmission (the required mechanism
+--     in build_qwen35* graph builders).
+--   - System-wide invariants binding the observational
+--     equivalence of decode-with-extract vs decode-without-extract
+--     and naming the forbidden mechanism explicitly.
+--   - Open questions for the design points the
+--     replacement-of-cb_eval refactor must commit to.
+--
+-- Excludes:
+--   - The downstream consumption of the captured residuals
+--     (combine_features GEMM, inject_kv_fused, drafter_forward).
+--     Owned by specs/dflash/dflash.allium contracts ProjectAndFuse
+--     and DraftBlockEmit.
+--   - The cb_eval callback's *type-handling* logic (F16 vs F32
+--     rows, seq_id demux). That logic is correct; the mechanism
+--     itself is wrong. Removing the cb_eval hook removes the
+--     bug.
+--   - The MTP fused draft graph (mtp_fused_draft.allium). MTP
+--     uses tap nodes already and is not affected. This spec
+--     converges DFlash onto the same architectural footing.
+--   - The DFlash drafter's internal layers. Untouched.
+--   - The 4D per-stream KV layout (n_stream_layer.allium). The
+--     post-fold submodule already runs n_stream=2 in production;
+--     P0.A.3's bug is independent of n_stream.
+
+-- ============================================================
+-- External entities — runtime objects we constrain
+-- ============================================================
+
+-- One ggml backend scheduler instance owned by a llama_context.
+-- The scheduler dispatches compute on the per-backend "splits"
+-- of the inference cgraph and invokes the per-tensor eval
+-- callback at fixed points if one is installed. Lives at
+-- ggml-backend.cpp:1173-1174 (callback_eval field) and is wired
+-- via ggml_backend_sched_set_eval_callback at line 2669.
+entity SchedulerInstance {
+    has_eval_callback: Boolean
+}
+
+-- One "split" of the cgraph for a single backend. The scheduler
+-- builds these in ggml_backend_sched_compute_splits and dispatches
+-- each via ggml_backend_sched_eval at ggml-backend.cpp:2126. The
+-- fast path (no callback) executes the whole split in ONE
+-- ggml_backend_graph_compute_async call. The slow path (callback
+-- installed) iterates node-by-node and breaks into sub-graphs at
+-- every node where callback_eval returns true on ask=true.
+entity GraphSplit {
+    n_nodes: Integer
+    n_subgraph_invocations: Integer
+}
+
+-- The runtime configuration that arms (or disarms) residual
+-- capture for the current llama_context. Mirrors
+-- llama_cparams.dflash_extract_count + dflash_extract_layers[80]
+-- (src/llama-cparams.h, set via llama_set_dflash_extract_layers
+-- at src/llama.cpp:10051-10082).
+entity ExtractConfig {
+    layer_count: Integer            -- 0 disables; >0 selects layers
+    layer_ids: List<Integer>        -- which il indices to capture
+    enabled: Boolean                -- derived: layer_count > 0
+}
+
+-- One ggml tensor node in the cgraph that the graph builder
+-- emits specifically as a "tap" for residual extraction. It
+-- carries the value of a per-layer residual stream (`l_out-<il>`
+-- for the qwen35 family) but is NOT consumed by any downstream
+-- compute node — it exists only so its data is reachable from
+-- host code after llama_decode returns. Marked with
+-- ggml_set_output so the allocator places it in the output
+-- buffer pool. Compare build_qwen35.cpp:96-99
+-- (`embd_copy = ggml_dup(...); cb(..., "h_pre_norm", -1);
+-- ggml_set_output(embd_copy)`).
+entity TapNode {
+    layer_index: Integer
+    name: String                    -- e.g. "l_out_tap-<il>"
+    is_output: Boolean              -- ggml_set_output was called
+    feeds_compute_node: Boolean     -- MUST be false for tap nodes
+}
+
+-- The host-side residual buffer keyed by (layer_slot, seq_id).
+-- Populated by the post-decode read path (graph_tap_node
+-- mechanism: ggml_backend_tensor_get on the named TapNode;
+-- legacy scheduler_callback mechanism: rows appended by the
+-- cb_eval callback during graph execution). Owned by
+-- llama_decoder.dflash_extract_buf[layer_slot][seq_id] (see
+-- include/llama-decoder.h:164-174).
+entity ResidualBuffer {
+    layer_slot: Integer
+    seq_id: Integer
+    n_rows: Integer
+    row_dim: Integer
+    dtype: ResidualDtype
+}
+
+-- A specific llama_decode call. The unit at which the
+-- observational-equivalence property is asserted: target forward
+-- output must be the same with or without extract armed,
+-- pointwise on every produced logit row.
+entity DecodeCall {
+    n_tokens: Integer
+    extract_armed: Boolean
+    out_logits_hash: String         -- abstract digest of post-llama_decode logits
+    out_argmax: List<Integer>       -- argmax token per output row
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The two candidate implementation mechanisms for moving
+-- residual-stream rows from device to host. Only `graph_tap_node`
+-- is permitted by this spec; `scheduler_callback` is named so
+-- that ForbiddenMechanism can refer to it.
+enum CaptureMechanism {
+    scheduler_callback              -- FORBIDDEN: cb_eval, perturbs forward
+    graph_tap_node                  -- REQUIRED: ggml_dup + ggml_set_output
+}
+
+-- The dtype the tap node may carry. F32 is the canonical case
+-- (single-token decode collapses to a 1D residual in build_qwen35
+-- as F32). F16 is the multi-token prefill / verify case (the
+-- residual stream is F16 when n_tokens > 1). Both are converted
+-- to F32 on the host side at read time.
+enum ResidualDtype { f32 | f16 }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The maximum number of extract layers the implementation
+    -- must support. Mirrors LLAMA_DFLASH_MAX_EXTRACT_LAYERS in
+    -- src/llama-cparams.h (and the cap enforced in
+    -- llama_set_dflash_extract_layers at src/llama.cpp:10053).
+    -- The DFlash drafter for Qwen3.6-27B uses 5 layers
+    -- (1, 16, 31, 46, 61); the cap is 80.
+    max_extract_layers: Integer = 80
+
+    -- The maximum sequences-per-decode the implementation must
+    -- support, used for per-seq demux of the residual rows.
+    -- Mirrors cparams.n_seq_max; production runs with 2 today.
+    max_seq_per_decode: Integer = 8
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The public surface for residual capture. Whatever mechanism
+-- the implementation picks, the BEHAVIOUR observed by DFlash
+-- drafter code is: "after llama_decode returns, the host buffer
+-- for layer L and seq_id S contains the residual rows produced
+-- during that decode call". This contract is mechanism-agnostic
+-- on its own; the mechanism is constrained by
+-- SchedulerFastPath + ForbiddenMechanism below.
+--
+-- Tied to source:
+--   - public C API:
+--       include/llama.h llama_set_dflash_extract_layers
+--       include/llama.h llama_get_dflash_extract_data_seq
+--   - implementation today:
+--       src/llama.cpp:9961-10049  llama_dflash_extract_cb_eval (TO BE REMOVED)
+--       src/llama.cpp:10051-10082 llama_set_dflash_extract_layers
+--       src/llama.cpp:10088-...   llama_get_dflash_extract_data_seq
+--   - consumer:
+--       src/llama-dflash.cpp:552-... stage_target_hiddens
+contract ResidualExtract {
+    invoke: (target: TargetModel, cfg: ExtractConfig, decode: DecodeCall) -> List<ResidualBuffer>
+
+    @invariant LayerSlotEqualsConfigLayerIndex
+        -- The ResidualBuffer at layer_slot k carries the residual
+        -- for ExtractConfig.layer_ids[k]. The drafter is trained
+        -- against a SPECIFIC tuple of target layer indices (see
+        -- ExtractFeatures.UniformSampleSpacing in dflash.allium);
+        -- swapping slots is silent corruption.
+
+    @invariant RowsAlignWithDecodeOutputs
+        -- For every (layer_slot, seq_id) ResidualBuffer, n_rows
+        -- equals the number of rows that contributed to the
+        -- decode's output for that seq_id. For single-token
+        -- decode this is 1; for multi-token verify of a draft
+        -- block of size B the slot's verify-batch contributes B
+        -- rows.
+
+    @invariant SeqIdDemuxByUbatchRowSeq
+        -- Rows of a multi-seq ubatch are demuxed to the
+        -- per-seq_id ResidualBuffer using the dispatch-time row→seq_id
+        -- map (llama_decoder.dflash_ubatch_row_seq, populated by
+        -- the ubatch builder; see include/llama-decoder.h:164). The
+        -- spec does not constrain the demux site (callback or
+        -- post-decode loop) — only that rows land in the buffer
+        -- whose seq_id matches their batch row.
+
+    @invariant ConfigChangeBetweenDecodesIsAllowed
+        -- llama_set_dflash_extract_layers may be called between
+        -- llama_decode invocations. Once a decode is in flight,
+        -- the configuration may not change. The implementation
+        -- must reject config changes that would race a live
+        -- decode (or document that this is undefined).
+
+    @invariant DisarmReleasesScheduler
+        -- When ExtractConfig.layer_count = 0, the implementation
+        -- must restore the scheduler to its fast path: no
+        -- callback_eval installed, one ggml_backend_graph_compute_async
+        -- per split. Specifically, llama_set_dflash_extract_layers(0)
+        -- must clear cparams.cb_eval IFF the cb_eval pointer is
+        -- the dflash-installed one (don't stomp third-party
+        -- callbacks unrelated to dflash).
+}
+
+-- The property the implementation must not violate: the
+-- scheduler stays on its fast path during a llama_decode call.
+-- This is the mirror image of the forbidden mechanism — phrasing
+-- it positively lets propagate generate a binding test that
+-- inspects scheduler state directly rather than only the
+-- observable output.
+--
+-- Tied to source:
+--   - the slow path: ggml-backend.cpp:2136-2173 (the
+--     callback-armed branch of ggml_backend_sched_eval)
+--   - the fast path: ggml-backend.cpp:2127-2135 (the single
+--     ggml_backend_graph_compute_async call for the whole split)
+contract SchedulerFastPath {
+    invoke: (sched: SchedulerInstance, split: GraphSplit) -> GraphSplit
+
+    @invariant OneSubgraphPerSplit
+        -- For every GraphSplit dispatched during a DecodeCall
+        -- whose ExtractConfig.enabled is true OR false,
+        -- split.n_subgraph_invocations = 1. The scheduler must
+        -- invoke ggml_backend_graph_compute_async exactly once
+        -- per split; the callback-armed slow path at
+        -- ggml-backend.cpp:2136-2173 must not run.
+
+    @invariant NoEvalCallbackInstalled
+        -- During llama_decode, sched.has_eval_callback = false.
+        -- This is the spec-level binding of "no cb_eval, ever,
+        -- during inference". The scheduler may legitimately
+        -- carry a callback for other purposes (graph diffing,
+        -- ggml_backend_compare_graph_backend) but those are not
+        -- on the inference path.
+
+    @guidance
+        -- The forbidden combination is: the scheduler has an
+        -- eval callback that returns true on `ask=true` for ANY
+        -- node in the inference graph. That's what triggers the
+        -- node-by-node iteration in ggml_backend_sched_eval and
+        -- breaks fusion. A callback that always returns false on
+        -- ask=true is technically allowed by ggml-backend.cpp
+        -- (the per-node ask loop still walks node-by-node even
+        -- though no node is "needed"), but the spec's
+        -- OneSubgraphPerSplit forbids that walk too: every extra
+        -- per-node check is a perturbation surface.
+}
+
+-- The required mechanism for getting residual data out of the
+-- graph. The graph builder emits dedicated tap nodes that
+-- duplicate the `l_out-<il>` residual to a buffer owned by the
+-- output pool. The MTP path in the same builder already uses
+-- this mechanism for `h_pre_norm` and `result_output`; this
+-- contract narrows DFlash residual capture to the same
+-- mechanism.
+--
+-- Tied to source:
+--   - the MTP reference pattern:
+--       src/graphs/build_qwen35.cpp:96-99 (build_qwen35moe)
+--       src/graphs/build_qwen35.cpp:205-208 (build_qwen35)
+--   - the residual nodes to be tapped:
+--       src/graphs/build_qwen35.cpp:75 (cb(cur, "l_out", il) in moe)
+--       src/graphs/build_qwen35.cpp:193 (cb(cur, "l_out", il) in dense)
+--   - the existing extract-config the new tap emission consumes:
+--       src/llama-cparams.h dflash_extract_layers[80]
+contract GraphTapEmission {
+    invoke: (target: TargetModel, cfg: ExtractConfig) -> List<TapNode>
+
+    @invariant OneTapPerConfiguredLayer
+        -- For every il in cfg.layer_ids, the graph builder emits
+        -- exactly one TapNode whose layer_index = il. No tap
+        -- nodes are emitted for layers not in cfg.layer_ids.
+        -- When cfg.enabled is false, no tap nodes are emitted.
+
+    @invariant TapNameMatchesLayerIndex
+        -- TapNode.name follows a stable convention. The current
+        -- choice is "l_out_tap-<il>". The name is used only for
+        -- post-decode lookup via ggml_get_tensor + may also be
+        -- used in diag prints. Cross-referencing the existing
+        -- "h_pre_norm" / "result_output" pattern in
+        -- build_qwen35.cpp:97,103 confirms the name-as-handle
+        -- convention is load-bearing for the MTP path too.
+
+    @invariant TapIsLeafInGraph
+        -- TapNode.feeds_compute_node = false. The tap is a
+        -- terminal in the cgraph: ggml_build_forward_expand
+        -- enrols it as a graph output, no downstream op consumes
+        -- it. This is what keeps the tap from forming a fusion
+        -- partner with the next layer's first compute node. The
+        -- MTP `h_pre_norm` example at build_qwen35.cpp:96-99
+        -- is a leaf in exactly this sense.
+
+    @invariant TapIsCheapDuplicate
+        -- The tap node is a single ggml_dup of the residual
+        -- (`l_out-<il>`). It performs one tensor copy of the
+        -- residual into the output buffer. No quantisation, no
+        -- norm, no projection — those happen on the host side
+        -- (or in the drafter's combine_features) where the
+        -- forward path is no longer running.
+
+    @invariant TapPlacementAfterCvecApply
+        -- Source tap point is the residual AFTER lctx.cvec.apply_to
+        -- (build_qwen35.cpp:74 and :192 in moe/dense), which is
+        -- the same point cb names "l_out-<il>". Placing the tap
+        -- before cvec.apply_to would change which residual
+        -- stream the drafter sees and is a different feature
+        -- definition.
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The load-bearing observational property. For a fixed
+-- (target, prompt, seed, cparams\\{extract}) tuple, the post-decode
+-- logits — and therefore the argmax token stream — must be the
+-- same whether ExtractConfig.enabled is true or false. This is
+-- the property whose VIOLATION is the P0.A.3 bug today: the
+-- spec-none baseline ("\\n\\n<think>\\nHere's a thinking
+-- process...") differs from the cb_eval-armed DFlash output
+-- ("user user wants wants...") with everything else fixed.
+invariant ResidualExtractObservationallyEquivalent {
+    for da in DecodeCalls:
+        for db in DecodeCalls:
+            (da.n_tokens = db.n_tokens
+             and da.extract_armed = false
+             and db.extract_armed = true)
+            implies da.out_argmax = db.out_argmax
+}
+
+-- The forbidden mechanism, stated as an invariant on the
+-- system-wide implementation. Every captured ResidualBuffer
+-- must trace its origin to a TapNode in the cgraph, not to a
+-- scheduler callback. Property-test generation off this
+-- invariant should emit a test that inspects sched.has_eval_callback
+-- inside a wrapped llama_decode call.
+invariant CaptureMechanismIsTapNode {
+    for buf in ResidualBuffers:
+        ProvenanceOf(buf) = graph_tap_node
+}
+
+-- The two invariants above compose: they REQUIRE
+-- observational equivalence AND name the only implementation
+-- mechanism that achieves it. Together they let propagate
+-- generate a test that (a) compares argmax sequences across
+-- extract on/off, (b) asserts no scheduler callback is
+-- installed during the extract-on decode. (a) without (b)
+-- catches the bug but not the mechanism; (b) without (a) lets
+-- a different perturbation slip through.
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+-- OQ-CB-EVAL-DEPRECATION
+-- The cb_eval surface is still public on llama_context_params
+-- (include/llama.h:481-482). Third-party consumers may install
+-- their own callbacks for unrelated reasons. The spec's
+-- NoEvalCallbackInstalled invariant binds only on the DFlash
+-- extract path; it does not deprecate the field. Should the
+-- field be deprecated entirely now that DFlash no longer uses
+-- it, or left as a public hatch with a documented "do not use
+-- during inference" warning? Decide before P0.A.3 closure
+-- ships.
+
+-- OQ-LEGACY-INTEGRATION-TESTS
+-- libllama has multi-slot DFlash test harnesses (tests/
+-- test-dflash-np-multislot, test-dflash-closure) that
+-- currently pass byte-identity using the cb_eval mechanism.
+-- They MUST also pass with the new tap-node mechanism — but
+-- since the tap-node mechanism produces byte-identical
+-- target-forward output by construction (spec-none baseline
+-- = tap-armed output), and the per-row content of the
+-- residual buffers is unchanged (same tensor, same elements,
+-- same demux), the libllama tests should continue to pass
+-- without modification. Confirm under test-first design.
+
+-- OQ-TAP-NODE-ALLOCATOR-COST
+-- ggml_set_output places the tap in the output buffer pool.
+-- For 5 source layers x [D_emb x n_tokens] residuals at F32,
+-- this is 5 * 5120 * 1 * 4 = 100 KB per single-token decode
+-- and 5 * 5120 * 16 * 4 = 1.6 MB per 16-token verify. The
+-- allocator already handles `result_output` which is
+-- vocab_size * n_tokens * 4 = 248320 * 16 * 4 ≈ 15 MB, so
+-- the tap nodes are an order of magnitude smaller. Confirm
+-- in N1 that the output buffer pool sizing accommodates
+-- without recompute.
+
+-- OQ-MULTI-TOKEN-DTYPE
+-- The current cb_eval code branches on t->type to handle F32
+-- vs F16 (src/llama.cpp:10011-10047). With tap nodes, the
+-- builder controls the dtype of the duplicated tensor. The
+-- simplest choice is to ggml_dup the residual at its native
+-- dtype (F16 for multi-token, F32 for single-token), then
+-- convert F16→F32 on the host side post-decode using the
+-- existing ggml_fp16_to_fp32_row helper. Alternative: insert
+-- a ggml_cast to F32 in the graph so the tap is uniformly
+-- F32. Decide based on a single allium check + test pass.
+
+-- @guidance
+--     This spec is INTENTIONALLY narrow on mechanism. The
+--     dflash.allium ExtractFeatures contract is abstract on
+--     mechanism — it says "extract residuals at the configured
+--     layers, deterministically". This refinement says "and
+--     don't do it with a scheduler eval-callback because that
+--     specific mechanism perturbs the forward path on our
+--     CUDA backend". A different backend (CPU, Metal) might
+--     not exhibit the perturbation. The spec is still correct
+--     on those backends; the forbidden-mechanism invariant
+--     defaults to redundant rather than wrong. The
+--     justification for the narrowness is empirical — see
+--     PHASE_NSTREAM_KV_PERF.md P0.A.3 falsification matrix.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity CbEvalResidualCaptureSystem {
+    capture_mechanism: CaptureMechanism
+}
+
+contract ValidateCbEvalResidualCaptureSystem {
+    invoke: (sys: CbEvalResidualCaptureSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

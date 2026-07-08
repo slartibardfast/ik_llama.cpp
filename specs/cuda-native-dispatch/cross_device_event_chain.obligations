@@ -1,0 +1,18 @@
+# Obligations for cross_device_event_chain.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+enum-comparable.CapturedNodeKind => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaStream => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CudaEvent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CapturedGraphNode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CrossBackendTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CapturedGraph => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CapturedGraphSequence => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CrossDeviceEventChainSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.JoinBeforeFirstSecondaryKernel => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FanInBeforeEndCapture => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ConsumerWaitsForProducer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoMissingEdges => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CapturedGraphIsNonEmpty => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.OuterCaptureCounterAdvancesMonotonically => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateCrossDeviceEventChain.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

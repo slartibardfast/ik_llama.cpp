@@ -1,0 +1,647 @@
+-- allium: 3
+-- specs/dflash/dflash_server_cli.allium
+--
+-- Scope: the implementation contract for the llama-server CLI path
+-- that turns `--spec-type dflash -md <drafter.gguf> --parallel N`
+-- into a working multi-slot DFlash deployment. The abstract DFlash
+-- pipeline (combine_features, inject_kv_fused × L_d, drafter_forward,
+-- drafter_lm_head, sample-and-accept) is owned by specs/dflash/dflash.allium.
+-- THIS spec narrows the SERVER-SIDE wiring: how the sidecar is loaded,
+-- how the per-slot bindings are constructed, how the orchestrator's
+-- batched fan-out is reached from process_batch_tokens, and how the
+-- sample/accept loop addresses per-stream logits without faulting at
+-- np >= 2.
+--
+-- Status: every contract below is HONOURED ON HEAD as of 2026-05-21
+-- (post-P0.A.4 closure, submodule commit cad6b591). The spec exists as
+-- a regression guard against future server-CLI refactors silently
+-- breaking the multi-slot DFlash path — not as a backlog of pending
+-- work.
+--
+-- Why this spec exists: P0.A had four sub-issues to close before Tier 2
+-- prerequisite work could land. P0.A.4 specifically was a SEGV in
+-- llama_sampling_prepare at --parallel 2: the per-stream dispatch
+-- introduced by PHASE_NSTREAM_KV_4D N2.d (Bug C structural fix) split
+-- the combined `batch` into one llama_decode per slot per tick. The
+-- engine resets output_ids on every llama_decode and indexes it in the
+-- LOCAL frame [0..n_tokens) of the dispatched batch_view. The
+-- pre-existing speculative_decoding_accept() walked all slots and
+-- read their verify logits via slot.i_batch_dft[k] — a GLOBAL-frame
+-- index recorded at common_batch_add time. At np=2 with --draft-max 4,
+-- slot 1's i_batch_dft[0]=5 falls outside slot 0's just-decoded
+-- output_ids window; llama_get_logits_ith hit
+-- `batch.logits[5] != true` and the server SIGSEGV'd. The fix:
+-- scope speculative_decoding_accept to a single run_seq_id and
+-- translate i_batch_dft from global to local frame before any
+-- llama_get_logits_ith / get_embeddings_ith call. THIS spec binds
+-- that fix so the index frame and the per-stream scoping cannot drift
+-- silently in future server-CLI work.
+--
+-- Includes:
+--   - External entities for the runtime objects the wiring touches
+--     (the target llama_context, the sidecar drafter, the per-slot
+--     common_speculative wrapper, the combined batch and its
+--     per-run batch_view, the per-slot i_batch_dft index list).
+--   - Contracts for the five load-bearing properties:
+--       SidecarSharesTargetTokenizer
+--       OrchestratorInvokedFromServerCLI
+--       PerSlotSeqIdBinding
+--       BatchedFanOutContract
+--       MultiSlotSamplingContract
+--   - A derived system-wide invariant MultiSlotSEGVAbsence that
+--     composes the per-stream split with MultiSlotSamplingContract
+--     to bind absence of the regressed
+--     `batch.logits[N] != true` runtime failure.
+--   - Cross-references to specs/dflash/dflash.allium (abstract DFlash
+--     contracts) and specs/dflash/cb_eval_residual_capture.allium
+--     (the residual-capture surface the orchestrator depends on).
+--
+-- Excludes:
+--   - The drafter's internal kernel pipeline. Owned by
+--     specs/dflash/dflash.allium contracts ProjectAndFuse and
+--     DraftBlockEmit.
+--   - The cb_eval residual extract surface (mechanism + scheduler
+--     fast-path constraints). Owned by
+--     specs/dflash/cb_eval_residual_capture.allium.
+--   - Per-stream KV layout invariants. Owned by
+--     specs/kv-cache/n_stream_layer.allium.
+--   - The single-slot DFlash CLI driver
+--     (examples/dflash-speculative-simple/dflash-speculative-simple.cpp).
+--     That binary does not exercise the server's per-stream split;
+--     it has its own decode loop.
+
+-- ============================================================
+-- External entities — runtime objects we constrain
+-- ============================================================
+
+-- The target llama_context the server boots. Carries vocab/embedding
+-- (token_embd.weight / output.weight) which the DFlash sidecar
+-- REUSES rather than carrying its own. Lives in src/llama-context.h
+-- and is constructed by llama_init_from_gpt_params via
+-- examples/server/server-context.cpp:121-124.
+entity TargetContext {
+    vocab_size: Integer
+    lm_head_dtype: TensorDtype
+    n_seq_max: Integer              -- mirrors cparams.n_seq_max; production = 2
+    has_dflash_binding: Boolean     -- true after llama_set_dflash succeeds
+}
+
+-- The DFlash sidecar drafter, loaded from the path supplied via
+-- `-md <path>` and routed to llama_dflash_drafter_load via
+-- params_base.speculative.mparams_dft.path. The sidecar is NOT a
+-- standalone llama_model: it has no tokenizer and no embedding;
+-- token_embd / output are borrowed from the target. Lives at
+-- src/llama-dflash.cpp:225-310 (llama_dflash_drafter_load).
+entity DflashSidecar {
+    path: String
+    n_layers: Integer
+    block_size: Integer             -- BS; constrains draft length per cycle
+    sliding_window: Integer         -- SWA bound; constrains drafter K/V depth
+    target_layer_ids: List<Integer> -- source layers for residual extract
+    -- The sidecar carries NO vocab of its own. The drafter operates
+    -- in the target's embedding/logit space; the drafter_lm_head
+    -- kernel multiplies drafter hiddens against ctx.target_lm_head
+    -- (src/llama-dflash.cpp:836-838).
+    has_own_vocab: Boolean          -- always false; structurally enforced
+}
+
+-- The per-slot common_speculative wrapper. One per server slot
+-- (server-context.cpp:333), each binds a DFlash impl to ctx_tgt
+-- with the slot's seq_id. Owns a common_speculative_state_dflash
+-- (common/speculative.cpp:969-1096) that holds the drafter pointer
+-- and the seq_id. The drafter pointer is SHARED across slots via
+-- the share-the-bind path at common/speculative.cpp:992-999
+-- (llama_get_dflash_drafter returns the existing binding so the
+-- second and subsequent slots reuse it rather than reloading the
+-- GGUF).
+entity SlotSpec {
+    slot_id: Integer                -- 0..n_seq_max-1
+    seq_id: Integer                 -- = slot_id; passed at init
+    impl_type: SpecImplType         -- = dflash for this spec
+    owns_drafter: Boolean           -- only slot 0 typically owns
+}
+
+-- A per-stream slice of the combined batch dispatched by
+-- process_batch_tokens. The combined batch is assembled by
+-- add_sampled_tokens + batch_pending_prompt in update_slots
+-- (server-context.cpp:4982, 4985, 4997) and indexed in the GLOBAL
+-- frame [0..batch.n_tokens). Each slot's i_batch_dft[k] is a
+-- GLOBAL-frame index recorded by common_batch_add at append time
+-- (server-context.cpp:3305, 3322, etc.). Construction of the view
+-- is at server-context.cpp:4647-4674: the loop walks the combined
+-- batch from i=0, identifies the contiguous run with the same
+-- primary seq_id (run_seq_id), and builds a batch_view starting at
+-- offset `i` with `n_tokens` rows. The view's index frame is
+-- LOCAL [0..n_tokens). Each such view is handed to llama_decode,
+-- which resets output_ids and addresses logits in the view's local
+-- frame.
+entity BatchView {
+    batch_offset: Integer           -- start index in the combined batch
+    n_tokens: Integer
+    run_seq_id: Integer             -- uniform across all rows
+}
+
+-- The per-slot deferred logits index list. Pushed in the GLOBAL
+-- frame by common_batch_add at each verify-batch row append (see
+-- server-context.cpp:3305 etc.). Consumed by speculative_decoding_accept
+-- after the per-stream llama_decode of that slot's BatchView
+-- returns. Stored on server_slot.i_batch_dft.
+entity SlotVerifyIndexList {
+    slot_id: Integer
+    global_indices: List<Integer>   -- recorded global-frame indices
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The dtype the target's lm_head must carry for DFlash to bind.
+-- llama_set_dflash explicitly rejects non-F16 lm_head at
+-- src/llama-dflash.cpp:444-452: "target token_embd / output.weight
+-- must both be F16". The lm_head-f16 recast target variant
+-- (V-F1.T1.lm_head-f16.gguf) is the production input.
+enum TensorDtype { f32 | f16 | bf16 | q4_0 | other }
+
+-- The speculative implementation a SlotSpec wraps. Mirrors
+-- enum common_speculative_type in common/speculative.h.
+enum SpecImplType {
+    none | draft | mtp | eagle3
+  | ngram_simple | ngram_map_k | ngram_map_k4v | ngram_mod | ngram_cache
+  | suffix | dflash
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The maximum --parallel value the multi-slot wiring must
+    -- support. Mirrors cparams.n_seq_max at llama_set_dflash time
+    -- (src/llama-dflash.cpp:487). Production runs with 2;
+    -- alloc_ctx_scratch is sized for the full n_slots_cap regardless
+    -- of how many slots are active.
+    max_parallel_slots: Integer = 8
+
+    -- The default draft block length: --draft-max. Production
+    -- profile sets this to 4 (qwen36-27b-x2-dflash.sh:35).
+    -- The drafter's internal BS is fixed at 4 in
+    -- src/llama-dflash.cpp:690.
+    default_draft_max: Integer = 4
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- Contract 1: The DFlash sidecar drafter does NOT carry its own
+-- tokenizer or vocabulary; it operates in the TARGET's embedding /
+-- logit space. Token IDs the drafter emits are valid target token
+-- IDs by construction because the drafter_lm_head kernel projects
+-- drafter hiddens against the target's output.weight tensor.
+--
+-- Tied to source:
+--   - sidecar GGUF schema:
+--       src/llama-dflash.cpp:225-310 (llama_dflash_drafter_load)
+--       reads only `dflash.*` keys — no tokenizer.ggml.tokens, no
+--       tokenizer.ggml.model. The "drafter loaded:" log at line 306
+--       explicitly prints "vocab(target)=?" to flag that vocab
+--       belongs to the target.
+--   - shared tensors:
+--       src/llama-dflash.cpp:441-468 — llama_set_dflash resolves
+--       token_embd.weight + output.weight FROM THE TARGET and stores
+--       pointers in ctx_tgt->dflash_state. target_vocab_size is read
+--       from target's token_embd.weight->ne[1] (line 467), never
+--       from the sidecar.
+--   - drafter lm_head dispatch:
+--       src/llama-dflash.cpp:836-838 — drafter_lm_head_launch
+--       multiplies st.d_drafter_hidden against st.target_lm_head;
+--       output rows have V = ctx.target_vocab_size columns.
+--   - server wiring:
+--       examples/server/server-context.cpp:150-156, 188-196 — the
+--       `is_dflash_spec` branch routes the `-md` path into
+--       mparams_dft.path and SKIPS the standalone draft-model load
+--       (no llama_model_load_from_file for the sidecar; the sidecar
+--       is not a standalone llama_model).
+contract SidecarSharesTargetTokenizer {
+    invoke: (target: TargetContext, sidecar: DflashSidecar) -> TargetContext
+
+    @invariant DrafterCarriesNoVocab
+        -- The sidecar GGUF contains only `dflash.*` keys and per-layer
+        -- weight tensors. No tokenizer.ggml.* keys, no token_embd
+        -- tensor, no output tensor of its own. sidecar.has_own_vocab
+        -- is false by construction.
+
+    @invariant TargetSuppliesEmbedAndLMHead
+        -- After llama_set_dflash succeeds, ctx_tgt->dflash_state
+        -- holds two device pointers borrowed from the target:
+        -- target_token_embd and target_lm_head, each addressing
+        -- the target's [vocab_size, D_emb] tensor. The kernel
+        -- pipeline reads these pointers; there is no second
+        -- embedding table in flight.
+
+    @invariant TargetLMHeadMustBeF16
+        -- llama_set_dflash rejects (returns LLAMA_DFLASH_INVALID_DRAFTER)
+        -- unless target_token_embd and target_lm_head are both F16.
+        -- BF16 lm_head requires the lm_head-f16 recast variant of the
+        -- target GGUF (the production profile uses
+        -- V-F1.T1.lm_head-f16.gguf). target.lm_head_dtype = f16 is
+        -- the prerequisite for has_dflash_binding becoming true.
+
+    @invariant TokenSpaceEquivalence
+        -- Every llama_token the drafter emits is a valid token in the
+        -- TARGET vocabulary, because the per-row argmax at
+        -- src/llama-dflash.cpp:847-850 ranges over [0, V) where
+        -- V = target.vocab_size. The drafter cannot emit out-of-vocab
+        -- IDs for the target verifier.
+}
+
+-- Contract 2: When the server is started with `--spec-type dflash`
+-- and a non-empty `-md <path>`, every active slot receives a
+-- common_speculative initialised with a DFlash impl. The orchestrator
+-- multi-slot fan-out (common_speculative_draft_batched) is the
+-- entry point at np >= 2; the per-slot fallback path
+-- (common_speculative_draft) is the np = 1 path. Both paths
+-- ultimately dispatch into llama_dflash_draft_batch.
+--
+-- Tied to source:
+--   - CLI flag parsing:
+--       common/common.cpp:1082 — `-md` / `--model-draft` populates
+--       params.speculative.model.
+--       common/common.cpp:1087 — `--spec-type` parses the enum
+--       (none | ngram-cache | ngram-simple | ngram-map-k | ngram-map-k4v
+--       | ngram-mod | suffix | mtp | dflash).
+--   - server load-model branch:
+--       examples/server/server-context.cpp:156 — is_dflash_spec gate
+--       on params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH.
+--       Lines 188-196 route the GGUF path to mparams_dft.path.
+--   - per-slot init:
+--       examples/server/server-context.cpp:333 — every slot in
+--       [0, n_parallel) calls
+--       common_speculative_init(params_base.speculative, ctx, slot.id).
+--   - DFlash impl construction:
+--       common/speculative.cpp:1224-1234 — has_dflash gate.
+--       common/speculative.cpp:1320-1332 — case COMMON_SPECULATIVE_TYPE_DFLASH
+--       constructs common_speculative_state_dflash; first slot loads
+--       the GGUF and binds via llama_set_dflash; subsequent slots
+--       reuse via llama_get_dflash_drafter (common/speculative.cpp:992-999).
+--   - orchestrator entry (multi-slot):
+--       common/speculative.cpp:1481-1641 — common_speculative_draft_batched
+--       checks all_dflash + shared ctx_tgt at lines 1554-1559, then
+--       performs a single llama_dflash_draft_batch call for all
+--       slots (line 1592-1596). Falls back to per-slot serial if
+--       the shape is mixed or N <= 1.
+--   - orchestrator entry (single-slot):
+--       common/speculative.cpp:1429-1471 — common_speculative_draft
+--       loops over spec->impls and calls impl->draft(); the DFlash
+--       impl's draft() dispatches through
+--       llama_dflash_draft_batch(n_slots=1, ...) at
+--       common/speculative.cpp:1071-1074 — preserving regression
+--       coverage between np=1 and np>=2 (the trampoline at
+--       src/llama-dflash.cpp:634-649 enforces byte-identical behaviour).
+contract OrchestratorInvokedFromServerCLI {
+    invoke: (target: TargetContext, sidecar: DflashSidecar, n_slots: Integer) -> TargetContext
+
+    @invariant SidecarPathRoutedThroughCLI
+        -- When params_base.speculative.type =
+        -- COMMON_SPECULATIVE_TYPE_DFLASH and
+        -- params_base.speculative.model is non-empty, the path is
+        -- assigned to params_base.speculative.mparams_dft.path and
+        -- the standalone draft-model loader at
+        -- server-context.cpp:197-240 is bypassed.
+
+    @invariant EveryActiveSlotInitsDFlash
+        -- For every slot in [0, params_base.n_parallel), the loop
+        -- at server-context.cpp:253-353 calls common_speculative_init
+        -- with the slot's seq_id. When type = DFLASH, this produces a
+        -- common_speculative_state_dflash whose drafter pointer is
+        -- either the first-slot-loaded drafter (owns_drafter=true)
+        -- or a shared reference via llama_get_dflash_drafter
+        -- (owns_drafter=false).
+
+    @invariant MultiSlotEntryIsBatched
+        -- At n_slots >= 2 with all-DFlash + shared ctx_tgt, the
+        -- caller (e.g. update_slots → common_speculative_draft_batched)
+        -- dispatches through llama_dflash_draft_batch in a single
+        -- call. The per-slot serial fallback is reachable only when
+        -- one or more slots are non-DFlash or carry a different
+        -- ctx_tgt (common/speculative.cpp:1541-1559).
+
+    @invariant SingleSlotIsBatchedTrampoline
+        -- At n_slots = 1, common_speculative_draft calls
+        -- common_speculative_state_dflash::draft, which dispatches
+        -- into llama_dflash_draft_batch with n_slots=1. The
+        -- single-slot trampoline at src/llama-dflash.cpp:634-649 is
+        -- byte-identical to the legacy llama_dflash_draft. There is
+        -- no separate np=1 kernel path that np>=2 could diverge from.
+}
+
+-- Contract 3: Each slot's common_speculative_state_dflash wraps the
+-- same shared llama_context (ctx_tgt) but is tagged with a unique
+-- seq_id ∈ [0, n_slots). The drafter pointer is shared across
+-- slots; the per-slot CONTEXT MAPPING is the seq_id, not a separate
+-- llama_context copy. This is the post-D9.5 collapsed-context
+-- invariant that common_speculative_draft_batched assumes at lines
+-- 1522-1532 (MTP) and lines 1554-1559 (DFlash).
+--
+-- Tied to source:
+--   - per-slot seq_id binding:
+--       common/speculative.cpp:1324-1325 — common_speculative_state_dflash
+--       is constructed with seq_id passed through from
+--       common_speculative_init's `llama_seq_id seq_id` parameter.
+--   - shared ctx, shared drafter:
+--       common/speculative.cpp:983-987 — the constructor captures
+--       ctx_tgt_ + seq_id_ into the state.
+--       common/speculative.cpp:992-999 — share-the-bind path:
+--       llama_get_dflash_drafter returns the existing binding so
+--       the second slot reuses it (owns_drafter=false).
+--   - server slot.id → seq_id propagation:
+--       examples/server/server-context.cpp:256, 333 — slot.id = i in
+--       [0, n_parallel); common_speculative_init is called with
+--       slot.id as the seq_id argument. Therefore SlotSpec.seq_id =
+--       SlotSpec.slot_id by construction at server level.
+--   - cross-slot ctx invariance:
+--       common/speculative.cpp:1554-1559 — the batched path asserts
+--       df_states[i]->ctx_tgt = df_states[0]->ctx_tgt for every i.
+--       The fan-out is rejected (all_dflash = false → serial
+--       fallback) if any slot wraps a different ctx_tgt.
+contract PerSlotSeqIdBinding {
+    invoke: (target: TargetContext, slots: List<SlotSpec>) -> List<SlotSpec>
+
+    @invariant AllSlotsShareCtxTarget
+        -- For every pair of SlotSpecs in the same server instance,
+        -- their underlying common_speculative_state_dflash captures
+        -- the same ctx_tgt pointer. There is exactly one
+        -- llama_context per server; per-slot speculative state is a
+        -- wrapper, not a context copy.
+
+    @invariant SeqIdMatchesSlotId
+        -- For every SlotSpec, seq_id = slot_id. The server passes
+        -- slot.id straight through to common_speculative_init's
+        -- seq_id parameter; the DFlash state stores it for use as
+        -- the seq_id field on llama_dflash_draft_batch's seq_ids[]
+        -- argument (common/speculative.cpp:1589).
+
+    @invariant SeqIdsAreUniqueAcrossSlots
+        -- Within a single server instance, slots have distinct ids
+        -- (server-context.cpp:256 assigns slot.id = i in the slot
+        -- creation loop). Therefore distinct slots dispatch with
+        -- distinct seq_ids, and the kernel's per-slot K/V cache
+        -- offsets (src/llama-dflash.cpp:768-769) are non-overlapping.
+
+    @invariant DrafterPointerIsShared
+        -- Exactly one of the slots holds owns_drafter=true (the slot
+        -- whose init triggered llama_dflash_drafter_load); the
+        -- remainder hold owns_drafter=false and share the same
+        -- drafter pointer via llama_get_dflash_drafter. The
+        -- destructor at common/speculative.cpp:1020-1026 frees the
+        -- drafter exactly once, gated on owns_drafter. The GGUF is
+        -- loaded once per server, not once per slot.
+}
+
+-- Contract 4: llama_dflash_draft_batch is the kernel-level API the
+-- orchestrator dispatches into. Its signature and per-slot stride
+-- semantics are load-bearing on the multi-slot fan-out.
+--
+-- Tied to source:
+--   - declaration:
+--       include/llama.h:1848 — LLAMA_API int32_t
+--       llama_dflash_draft_batch(ctx, n_slots, anchor_token_ids,
+--       anchor_positions, seq_ids, out_candidates, max_total_candidates).
+--   - definition:
+--       src/llama-dflash.cpp:671-871 — implementation.
+--   - per-slot stride + capacity check:
+--       src/llama-dflash.cpp:690-695 — BS = 4; max_total_candidates
+--       must be at least BS * n_slots.
+--   - per-slot pipeline dispatch:
+--       src/llama-dflash.cpp:734-773 — stage_target_hiddens +
+--       combine_features + inject_kv_fused × L_d run with N_slots=1
+--       per slot at the slot's pointer offset.
+--   - shape-uniform multi-slot fan-out:
+--       src/llama-dflash.cpp:822-833 — drafter_forward_launch is
+--       called once with N_slots=n_slots; the kernel's storage
+--       stride uses n_slots_cap (bind-time capacity), not the
+--       dispatch count. This is the feedback_drafter_forward_n_slots_cap
+--       lesson from Phase 4 multi-slot landing.
+--   - per-slot argmax write-back:
+--       src/llama-dflash.cpp:847-850 — out_candidates is written
+--       slot-major: slot s occupies BS contiguous rows starting at
+--       index s * BS. The caller's per_slot = rc / N decode at
+--       common/speculative.cpp:1599 reverses this layout.
+--   - n_max_block ceiling at orchestrator level:
+--       common/speculative.cpp:1600 — n_max_block = min(params.n_max,
+--       per_slot). The caller truncates the per-slot draft list to
+--       the requested n_max even if the kernel wrote BS rows.
+contract BatchedFanOutContract {
+    invoke: (target: TargetContext, sidecar: DflashSidecar, n_slots: Integer) -> Integer
+
+    @invariant CapacityIsNSlotsTimesBlockSize
+        -- max_total_candidates >= n_slots * BS, where BS =
+        -- sidecar.block_size (=4 in src/llama-dflash.cpp:690 for the
+        -- production Qwen3.6-27B DFlash drafter). Smaller capacity
+        -- returns LLAMA_DFLASH_INVALID_DRAFTER (line 691-695).
+
+    @invariant SlotMajorOutputStride
+        -- out_candidates is laid out [n_slots, per_slot] with per_slot
+        -- = rc / n_slots. Slot s's draft list occupies indices
+        -- [s * per_slot, (s + 1) * per_slot). The caller MUST decode
+        -- with this stride or slots will be confused with each
+        -- other's drafts.
+
+    @invariant SeqIdsPassedThroughToKernel
+        -- The seq_ids[N] argument is passed through to the
+        -- per-layer inject_kv_fused dispatch as the slot indexing
+        -- key into the [L_d, n_slots_cap, SeqLen, ...] K/V cache
+        -- (src/llama-dflash.cpp:768). Distinct seq_ids therefore
+        -- write/read non-overlapping slot regions, preserving
+        -- cross-slot isolation.
+
+    @invariant NSlotsCapIsKernelStorageStride
+        -- The kernel addresses per-layer K/V via
+        -- l * n_slots_cap * SeqLen * H_kv * D_h + s * SeqLen * H_kv * D_h.
+        -- n_slots_cap is the BIND-TIME capacity (captured at
+        -- llama_set_dflash from ctx_tgt->cparams.n_seq_max,
+        -- src/llama-dflash.cpp:487); n_slots is the per-dispatch
+        -- count. They are decoupled; the kernel must not collapse
+        -- them.
+
+    @invariant NMaxBlockBoundsPerSlot
+        -- The orchestrator's effective per-slot draft length is
+        -- min(params.n_max, per_slot). Even when the kernel produces
+        -- BS candidates per slot, the caller truncates to n_max
+        -- (default 4 in production; matches BS exactly for this
+        -- drafter, so no truncation is observed in the production
+        -- profile).
+}
+
+-- Contract 5: At n_slots >= 2, the server's per-stream split in
+-- process_batch_tokens dispatches ONE llama_decode per slot per
+-- tick (Bug C structural fix from PHASE_NSTREAM_KV_4D N2.d). Inside
+-- the loop, speculative_decoding_accept(batch_offset, run_seq_id)
+-- is called once per dispatched batch_view. It processes only the
+-- slot whose slot.id = run_seq_id and translates i_batch_dft from
+-- the GLOBAL combined-batch frame to the LOCAL batch_view frame
+-- by subtracting batch_offset, before any llama_get_logits_ith or
+-- llama_decoder_get_embeddings_ith call.
+--
+-- This is the P0.A.4 closure invariant. It is load-bearing: the
+-- prior implementation walked all slots per call and faulted with
+-- `batch.logits[N] != true` at np>=2.
+--
+-- Tied to source:
+--   - per-stream loop:
+--       examples/server/server-context.cpp:4647-4674 — the loop
+--       walks batch from i=0, identifies the contiguous primary
+--       seq_id run (run_seq_id), constructs batch_view starting at
+--       offset i with run length capped by n_batch.
+--   - in-loop call site:
+--       examples/server/server-context.cpp:4945-4947 — after the
+--       per-stream llama_decode, calls
+--       speculative_decoding_accept(i, run_seq_id). i is the run's
+--       start in the combined batch frame; run_seq_id is the
+--       single slot whose tokens were just submitted.
+--   - signature change:
+--       examples/server/server-context.h:412 —
+--       void speculative_decoding_accept(int32_t batch_offset, int run_seq_id);
+--   - Phase A run scoping:
+--       examples/server/server-context.cpp:4194-4206 — slot iteration
+--       skips slots where slot.id != run_seq_id with a comment
+--       documenting why: "Another slot's verify tokens belong to a
+--       different run; its decode either hasn't happened yet
+--       (output_ids will be -1 in this run's frame) or already
+--       happened earlier (its output_ids has since been overwritten
+--       by THIS run's decode)."
+--   - i_batch_dft global → local translation:
+--       examples/server/server-context.cpp:4214-4221 — builds
+--       idx_local from slot.i_batch_dft by subtracting
+--       batch_offset. Subsequent llama_get_logits_ith /
+--       llama_decoder_get_embeddings_ith calls (lines 4224, 4234,
+--       4240) consume idx_local.
+--   - i_batch_dft is recorded in the GLOBAL frame:
+--       examples/server/server-context.cpp:3305, 3322, 3391, 3403,
+--       3459, 3471 — every common_batch_add accompanying push_back
+--       records batch.n_tokens at the moment of append, which is
+--       the global combined-batch frame index.
+contract MultiSlotSamplingContract {
+    invoke: (view: BatchView, slot: SlotSpec, idx: SlotVerifyIndexList) -> SlotVerifyIndexList
+
+    @invariant CalledOncePerStreamDispatch
+        -- For every BatchView dispatched by process_batch_tokens,
+        -- speculative_decoding_accept is invoked exactly once at
+        -- server-context.cpp:4947, receiving the view's
+        -- (batch_offset, run_seq_id).
+
+    @invariant OnlyRunSeqIdSlotIsRead
+        -- Inside speculative_decoding_accept Phase A, slots are
+        -- skipped unless slot.id = run_seq_id. No
+        -- llama_get_logits_ith or llama_decoder_get_embeddings_ith
+        -- call is issued for any other slot in this invocation.
+        -- The skipped slots' verify reads happen in their own
+        -- per-stream invocation later in the loop.
+
+    @invariant GlobalToLocalFrameTranslation
+        -- For the run_seq_id slot, every entry g in
+        -- slot.i_batch_dft is translated to local frame as
+        -- (g - batch_offset) before being passed to
+        -- llama_get_logits_ith. The translated index lies in
+        -- [0, view.n_tokens) by construction (the per-stream split
+        -- guarantees the slot's verify rows are contiguous within
+        -- the current view).
+
+    @invariant TwoPhaseSplitPreserved
+        -- Phase A (the read-only block at server-context.cpp:4193-4249)
+        -- collects logits/embeddings + accepted-token IDs into
+        -- per-slot `accepted_slot` records BEFORE any state mutation.
+        -- Phase B (lines 4252-) applies the mutation
+        -- (restore_speculative_checkpoint, mtp_accept_tokens, etc.)
+        -- which may internally re-issue llama_decode and clobber
+        -- output_ids. Phase A's reads must finish before Phase B
+        -- begins; the in-function ordering enforces this.
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The composition invariant. The per-stream split in
+-- process_batch_tokens (PHASE_NSTREAM_KV_4D N2.d) plus the
+-- per-stream-scoped speculative_decoding_accept (this spec's
+-- MultiSlotSamplingContract) together guarantee that
+-- llama_get_logits_ith never reads a logit index that was not
+-- enabled by the most recent llama_decode. The runtime fault
+-- `batch.logits[N] != true` does not arise.
+--
+-- Property-test generation off this invariant should produce a
+-- regression test that boots the server at --parallel >= 2 with
+-- --spec-type dflash + a non-empty -md path, sends concurrent
+-- /v1/completions requests, and asserts no `batch.logits[*] != true`
+-- log line surfaces. The existing
+-- scripts/test-server-multi-slot-dflash.sh script (parent commit
+-- a12609a) is the binding test referenced by the P0.A.4 closure.
+invariant MultiSlotSEGVAbsence {
+    for slot in SlotSpecs:
+        for view in BatchViews:
+            (slot.slot_id = view.run_seq_id)
+            implies
+            (view.n_tokens > 0)
+}
+
+-- The structural property that gives the above invariant teeth.
+-- Every entry in a slot's i_batch_dft for the currently-dispatched
+-- view, after global-to-local translation, lies in the engine's
+-- enabled output_ids window for that view.
+invariant TranslatedIndicesAreInWindow {
+    for view in BatchViews:
+        for slot in SlotSpecs:
+            for g in slot_global_indices(slot, view):
+                (slot.slot_id = view.run_seq_id)
+                implies
+                (g - view.batch_offset >= 0
+                 and g - view.batch_offset < view.n_tokens)
+}
+
+-- Helper black box function: returns the GLOBAL-frame index list
+-- recorded for `slot` that belongs to the current dispatch's run.
+-- Concrete implementation reads SlotVerifyIndexList.global_indices
+-- and filters to indices in [view.batch_offset,
+-- view.batch_offset + view.n_tokens).
+-- slot_global_indices(slot, view) — see comment above.
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+-- OQ-PARALLEL-CAP-SOURCE
+-- max_parallel_slots above is the spec's upper bound on the wiring
+-- (config default 8). The runtime cap on a given binding is
+-- ctx_tgt->cparams.n_seq_max, captured by llama_set_dflash into
+-- n_slots_cap (src/llama-dflash.cpp:487) and used as the kernel's
+-- per-layer K/V stride. Production runs with n_seq_max=2 today;
+-- larger values would require revisiting alloc_ctx_scratch's
+-- VRAM budget. This spec binds the WIRING property
+-- (every active slot is initialised, every active slot dispatches
+-- through the orchestrator); the VRAM ceiling is a separate
+-- concern owned by the production profile.
+
+-- OQ-DRAFTER-VOCAB-DRIFT-DETECTION
+-- The current implementation does NOT compare a sidecar-side
+-- vocab record against the target's vocab — the sidecar simply
+-- has no vocab. If a future drafter format gains tokenizer
+-- metadata (e.g. for cross-tokenizer DFlash variants), the
+-- SidecarSharesTargetTokenizer contract becomes a runtime check
+-- rather than a structural fact. Decide before that variant ships
+-- whether the check belongs in llama_dflash_drafter_load or in
+-- llama_set_dflash (the latter has access to ctx_tgt and can
+-- compare against target vocab_size directly).
+
+-- @guidance
+--     This spec intentionally binds the SERVER-CLI surface only.
+--     The single-slot dflash-speculative-simple CLI driver has its
+--     own decode loop (no per-stream split, no
+--     speculative_decoding_accept) and is governed by
+--     specs/dflash/dflash.allium plus the per-cycle math therein.
+--     Server-side regressions surface against this spec via the
+--     scripts/test-server-multi-slot-dflash.sh harness; the
+--     libllama-level DFlash tests in tests/dflash-speculative/
+--     (test-dflash-np-multislot, test-dflash-closure) cover the
+--     contracts the orchestrator depends on at the C API layer
+--     and run unmodified after server-CLI refactors.

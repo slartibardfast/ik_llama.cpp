@@ -1,0 +1,936 @@
+-- allium: 3
+-- specs/dispatch/unified_stream_dispatch.allium
+--
+-- Scope: the Tier-3 post-implementation contract for the server's
+-- per-tick dispatch model. Today (Tier-2) the server runs Option A
+-- per-stream dispatch — one llama_decode per active stream per tick,
+-- as described by PerStreamDispatch in
+-- specs/kv-cache/n_stream_layer.allium. Tier 3 of
+-- PHASE_NSTREAM_KV_PERF.md REPLACES that loop with one llama_decode
+-- per tick whose batch's ne[3] axis indexes the active streams; each
+-- stream contributes a uniform number of tokens per the
+-- UniformShapePerTick invariant below.
+--
+-- Why this spec exists: the per-stream dispatch model recovers Bug C
+-- absence (each call sees a single-seq batch) but pays a per-stream
+-- llama_decode overhead — at NP=8 that's 8 graph submissions, 8
+-- update_cache_copies invocations, 8 cudaGraphExecUpdate patches per
+-- tick. The TG-NP=8 regression carried over from PHASE_NSTREAM_KV
+-- (-6.2 %) traces to this dispatch overhead, not to any kernel cost.
+-- Tier 3 collapses the loop to one llama_decode whose batch spans
+-- all N active streams; the existing PSKV per-slot kernel already
+-- grids over Q->ne[3] as n_seqs
+-- (ik_llama.cpp/ggml/src/ggml-cuda/fattn-per-slot-kv-singlewarp-sm75.cu:
+-- 363), so the kernel-side change is "pass n_active_streams in
+-- ne[3]" rather than "port a new kernel".
+--
+-- The contracts below describe the POST-TIER-3 state. No
+-- implementation in tree satisfies them yet; the RED test at
+-- tests/spec/test-unified-stream-dispatch.cpp (P0.B.S4) FAILS on
+-- HEAD and PASSES when T3.b + T3.c land.
+--
+-- Includes:
+--   - External entities for the unified-tick objects (UnifiedBatch,
+--     StreamSlot, the active-stream set, the tick the dispatch fires
+--     against).
+--   - Enumerations for the stream's per-tick eligibility state and
+--     the per-stream phase the admission logic gates on.
+--   - Contracts: UnifiedUbatchInvariant (one llama_decode per tick),
+--     UniformShapePerTick (one shape per op per call),
+--     AdmissionToUnifiedBatch (which streams enter the unified
+--     batch), DispatchSemantics (the replacement of the per-stream
+--     loop with one call), RaggedFAComposition (the FA kernel sees
+--     ne[3] = n_active_streams), PreservesBugCAbsence (composition
+--     argument).
+--   - System-wide invariants binding the dispatch-call-count
+--     property, the per-tick uniformity property, and the
+--     composition with the predecessor specs.
+--   - Open questions for the admission policy in mixed-phase ticks
+--     and the future ragged-FA relaxation.
+--
+-- Excludes:
+--   - Per-stream KV layout (head_dim/kv_size_per_stream/n_head_kv/
+--     n_stream axis order). Owned by
+--     specs/kv-cache/n_stream_layer.allium. Tier 3 consumes that
+--     layout unchanged; the contracts here describe the dispatch
+--     above it.
+--   - K/V write CPY view patching. Owned by
+--     specs/kv-cache/n_stream_layer.allium (the existing
+--     update_cache_copies write-side block at
+--     ik_llama.cpp/src/llama.cpp:630-749). Tier 3 inherits the
+--     write-side patching unchanged; the K-and-V tensors are shared
+--     across all streams and the per-stream stride is the same as
+--     today.
+--   - K/V read-view per-stream patching at NP > 1 with per-stream
+--     dispatch. Owned by
+--     specs/kv-cache/per_stream_read_view_patching.allium. Tier 3
+--     SUBSUMES that spec's load-bearing claim: under unified
+--     dispatch, the read views naturally span ne[3] = n_streams
+--     instead of being patched per-decode. The Tier-2 patching code
+--     becomes redundant (PHASE_NSTREAM_KV_PERF.md T3.f calls this
+--     out for the n_stream==1 guards on build_k_shift / build_defrag
+--     / v_trans).
+--   - Scheduler-level batch composition rules (prefill vs decode).
+--     Owned by specs/scheduler/batch_composition.allium. Tier 3
+--     dispatched pure-decode or pure-prefill ticks; Tier 4
+--     (chunked-prefill admission) supersedes that mode and allows
+--     mixed admission under a per-tick token budget K. The Tier 3
+--     unified-stream dispatch (ne[3] = n_active_streams, uniform
+--     mul_mat shape) is INDEPENDENT of admission mode — Bug C
+--     absence holds structurally regardless of which tokens are
+--     in the ubatch.
+--   - CUDA-graph cache mechanism. Owned by
+--     specs/graphs/cuda_graph_reuse.allium. Tier 3's stable
+--     topology (one shape per tick) is strictly better for that
+--     spec's TopologyHashLookup; cross-referenced below in
+--     RaggedFAComposition's guidance but no contract surface
+--     duplicated here.
+--   - Ragged FA (per-stream ne[1] mismatch). Tier 3's initial form
+--     pins per-stream ne[1] to a single value via
+--     UniformShapePerTick. The ragged variant is a future
+--     relaxation, called out as OQ-3 below but explicitly NOT a
+--     load-bearing contract clause in the initial Tier 3 surface.
+
+-- ============================================================
+-- External entities — unified dispatch objects
+-- ============================================================
+
+-- The set of streams managed by one llama_context. Sized at
+-- start-time from --parallel N (cparams.n_seq_max). Streams that
+-- have never been bound to a slot are present in the set but
+-- inactive; the Tier-3 unified batch indexes only the active
+-- subset. Mirrors the Stream entity in
+-- specs/kv-cache/n_stream_layer.allium; redeclared here as external
+-- so this spec's contracts are self-contained.
+entity StreamSlot {
+    stream_id: Integer
+    phase: StreamPhase
+    has_pending_decode_token: Boolean
+    pending_token_count: Integer
+}
+
+-- One server tick — the update_slots() iteration that today calls
+-- process_batch_tokens once. Mirrors the Tick entity in
+-- specs/scheduler/batch_composition.allium; redeclared external for
+-- self-containment.
+entity Tick {
+    index: Integer
+}
+
+-- One unified batch assembled for one tick. Replaces the per-stream
+-- batch_view at
+-- ik_llama.cpp/examples/server/server-context.cpp:4665-4674 (Tier-3
+-- T3.b in PHASE_NSTREAM_KV_PERF.md). Carries N active streams' tokens
+-- packed into a single ne[3]-axis dimension; the per-stream ne[1]
+-- (token count) is uniform across active streams within this batch
+-- per UniformShapePerTick.
+entity UnifiedBatch {
+    tick: Tick
+    n_active_streams: Integer
+    per_stream_token_count: Integer
+    total_token_count: Integer
+}
+
+-- One per-stream contribution to the UnifiedBatch. The token list
+-- the stream contributed; in the Tier-3 initial form this list has
+-- length per_stream_token_count for every active stream. The
+-- batch back-reference plus the slice's stream_id together identify
+-- the ne[3] index assigned to this slice (per
+-- AdmissionOrderPreservesStreamId).
+entity UnifiedBatchSlice {
+    batch: UnifiedBatch
+    stream_id: Integer
+    token_count: Integer
+    is_prefill: Boolean
+    is_decode: Boolean
+}
+
+-- One llama_decode invocation observed by the libllama API. The
+-- Tier-3 contract is that exactly one of these fires per Tick when
+-- any stream contributes, regardless of n_active_streams. Mirrors the
+-- existing per-call llama_decode at
+-- ik_llama.cpp/examples/server/server-context.cpp:4723; Tier 3 fans
+-- out one call instead of looping over runs.
+entity LlamaDecodeCall {
+    tick: Tick
+    batch: UnifiedBatch
+}
+
+-- The flash-attention kernel input as seen by the PSKV kernel. The
+-- kernel grids over (Q->ne[1], Q->ne[2], Q->ne[3]) per
+-- ik_llama.cpp/ggml/src/ggml-cuda/fattn-per-slot-kv-singlewarp-sm75.cu:
+-- 361-363. Tier 3 binds Q->ne[3] = batch.n_active_streams; Q->ne[1] =
+-- batch.per_stream_token_count.
+entity FAKernelInput {
+    batch: UnifiedBatch
+    q_ne_1: Integer
+    q_ne_2: Integer
+    q_ne_3: Integer
+}
+
+-- One mul_mat / norm / projection op observed within a single
+-- llama_decode call. The shape it sees is determined by the unified
+-- batch; the UniformShapePerTick contract clauses constrain its
+-- input geometry. Modelled as external because the engine does not
+-- have a single concrete struct for this; it is the abstract notion
+-- of one ggml op invocation.
+entity OpInvocation {
+    decode_call: LlamaDecodeCall
+    op_kind: OpKind
+    input_ne_1: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The per-stream phase at the start of a tick. Mirrors the
+-- (state, command) pair from
+-- specs/scheduler/batch_composition.allium (idle+load_prompt =
+-- load_prompt; processing+none = decode_ready; idle+none =
+-- inactive). Collapsed to one enum so the admission contract's
+-- predicate is single-axis.
+enum StreamPhase {
+    inactive                                -- (idle, none): no work pending
+    load_prompt                             -- (idle, load_prompt): prefill pending
+    decode_ready                            -- (processing, none): has sampled token to decode
+    decode_no_token                         -- (processing, none): processing but no pending token this tick
+}
+
+-- The kinds of ggml ops the spec quantifies over. Only the
+-- shape-bearing ones matter for UniformShapePerTick; op_other is
+-- the catch-all for everything else.
+enum OpKind {
+    op_mul_mat                              -- projection matmuls, logits proj
+    op_flash_attn_ext_per_slot_kv           -- PSKV; the production FA path
+    op_norm                                 -- RMSNorm
+    op_other                                -- everything else (rope, scale, etc.)
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum streams. Mirrors max_streams in
+    -- specs/kv-cache/n_stream_layer.allium and
+    -- specs/kv-cache/per_stream_read_view_patching.allium. Pinned
+    -- here so the invariants can reference a numeric bound without
+    -- cross-spec navigation.
+    max_streams: Integer = 8
+
+    -- The minimum per-stream token count the Tier-3 initial form
+    -- requires. Decode ticks always run at 1 token per active
+    -- stream; the contract pins this value so a future verify-side
+    -- multi-token unification (DFlash multi-slot, MTP draft depth)
+    -- can override it explicitly rather than implicitly.
+    min_per_stream_token_count: Integer = 1
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The UnifiedUbatchInvariant — when n_stream > 1 and multiple
+-- streams are active, exactly one llama_decode per tick covers all
+-- of them. The previous per-stream loop at
+-- ik_llama.cpp/examples/server/server-context.cpp:4647-4823 is
+-- replaced by a single dispatch; the contract binds the call-count
+-- property of the post-Tier-3 implementation.
+contract UnifiedUbatchInvariant {
+    invoke: (tick: Tick, streams: Set<StreamSlot>) -> LlamaDecodeCall
+
+    @invariant ExactlyOneDecodeCallPerActiveTick
+        -- For any tick T where any stream has phase = decode_ready
+        -- (i.e. at least one stream has a sampled token ready to
+        -- decode), exactly one llama_decode is invoked. The
+        -- previous loop's `for (i = 0; i < batch.n_tokens; ...)`
+        -- structure dissolves: the assembled batch spans the
+        -- active streams along ne[3] and one decode call submits
+        -- the whole shape.
+
+    @invariant DecodeCallBatchIndexesActiveStreamsViaNe3
+        -- The submitted UnifiedBatch carries
+        -- batch.n_active_streams = count of streams with
+        -- phase = decode_ready in this tick. That count becomes
+        -- the ne[3] dimension of Q, K, V tensors in the FA path
+        -- and of the mul_mat inputs in the projection path.
+
+    @invariant NoCallsAtIdleTick
+        -- If no stream has phase = decode_ready and no stream has
+        -- phase = load_prompt in this tick, no llama_decode fires.
+        -- The previous per-stream loop's "if batch.n_tokens == 0
+        -- skip" condition is preserved at the unified level.
+
+    @invariant PrefillTickIsSeparate
+        -- A stream with phase = load_prompt takes a SEPARATE
+        -- llama_decode invocation in its own tick. Decode-ready
+        -- streams stall for that tick under
+        -- batch_composition.allium's DecodeHoldGate (still in
+        -- force; see PreservesBugCAbsence below). The unified
+        -- batch contract applies to decode ticks only; prefill
+        -- ticks still run one-stream-per-call.
+
+    @guidance
+        -- Pending Tier 3: unified-stream dispatch + ragged FA.
+        -- RED test in
+        -- tests/spec/test-unified-stream-dispatch.cpp will fail on
+        -- HEAD. The current dispatch loop at
+        -- ik_llama.cpp/examples/server/server-context.cpp:4647-4823
+        -- emits one llama_decode per primary-seq_id run; this
+        -- contract requires exactly one call regardless of how
+        -- many streams contribute.
+}
+
+-- The UniformShapePerTick — within one llama_decode, every
+-- mul_mat / FA / norm sees one shape per call. The per-stream ne[1]
+-- (token count) is the SAME for every active stream in this batch.
+-- This is the Q1 composition argument from
+-- PHASE_NSTREAM_KV_PERF.md (lines 1911-1915), formalised as a
+-- contract: the within-tick GEMM/GEMV decision is consistent because
+-- every op sees one shape per call, just as it did under per-stream
+-- dispatch — only now the single-call shape includes the n_streams
+-- axis at ne[3] rather than being one of N per-stream calls.
+contract UniformShapePerTick {
+    invoke: (call: LlamaDecodeCall) -> Boolean
+
+    @invariant PerStreamTokenCountIsUniform
+        -- For UnifiedBatch b dispatched by call c, every
+        -- UnifiedBatchSlice s with s.batch = b has the same
+        -- s.token_count. The shared value is
+        -- b.per_stream_token_count. Mixed per-stream token counts
+        -- within one unified batch are forbidden in the Tier-3
+        -- initial form; the ragged variant (OQ-3) would relax this
+        -- but is not part of the load-bearing contract surface.
+
+    @invariant EveryOpSeesOneShapePerCall
+        -- For OpInvocation o with o.decode_call = c, the op sees a
+        -- single shape value for its input_ne_1: there is no
+        -- branch within the call that produces o.input_ne_1
+        -- differing across active streams. Specifically:
+        -- mul_mat for Q/K/V projections, output projection, MLP
+        -- FC1/FC2 all see one (head_dim, n_tokens_per_call,
+        -- n_streams) shape per call; the GEMM-vs-GEMV dispatcher
+        -- branch picks once per op-invocation, not per-stream.
+
+    @invariant FAInputShapeIsBatchScoped
+        -- For FAKernelInput fa with fa.batch = b: fa.q_ne_1 =
+        -- b.per_stream_token_count; fa.q_ne_3 = b.n_active_streams.
+        -- The kernel grids over (ne[1], ne[2], ne[3]) per
+        -- fattn-per-slot-kv-singlewarp-sm75.cu:363 and the per-CTA
+        -- bind is one (token, head, stream) tuple.
+
+    @invariant NoCrossShapeDispatcherBranchWithinCall
+        -- The mmvq / MMQ / MMV dispatcher (the historical Bug C
+        -- root cause) selects a kernel template based on the
+        -- input's (ne[0], ne[1], dtype) tuple. Under
+        -- UnifiedShape, the input has one such tuple per op per
+        -- call, so the dispatcher's selection is single-valued.
+        -- The contract names this property explicitly because the
+        -- Tier-3 transition risks reintroducing cross-shape
+        -- dispatch if a future refactor were to per-stream-loop
+        -- INSIDE one llama_decode (e.g. for ragged FA). Any such
+        -- per-stream looping MUST preserve EveryOpSeesOneShapePerCall.
+
+    @guidance
+        -- Pending Tier 3: this contract becomes load-bearing for
+        -- Bug C absence under unified dispatch. The previous
+        -- per-stream-dispatch model achieved "one shape per call"
+        -- by running N calls; Tier 3 achieves the same property
+        -- by running one call with one shape spanning N streams.
+        -- The composition argument in PreservesBugCAbsence below
+        -- closes the loop.
+}
+
+-- The AdmissionToUnifiedBatch — which streams enter the decode-tick
+-- unified batch. A stream is admitted iff it has at least one
+-- decode token ready (phase = decode_ready). Streams in
+-- load_prompt take their own prefill tick (preserving
+-- batch_composition.allium's BatchCompositionInvariant); streams
+-- in decode_no_token wait for their next sampled token.
+contract AdmissionToUnifiedBatch {
+    invoke: (tick: Tick, streams: Set<StreamSlot>) -> UnifiedBatch
+
+    @invariant AdmissionRequiresDecodeReady
+        -- A stream s contributes a UnifiedBatchSlice to this tick's
+        -- UnifiedBatch iff s.phase = decode_ready AND
+        -- s.has_pending_decode_token. The two clauses are
+        -- equivalent at the implementation level (decode_ready
+        -- implies has_pending_decode_token) but stated separately
+        -- to bind both the lifecycle state AND the readiness
+        -- predicate the admission code checks.
+
+    @invariant LoadPromptStreamsNotAdmittedToDecodeTick
+        -- A stream s with s.phase = load_prompt is NOT admitted to
+        -- a decode-tick unified batch. It runs its own prefill
+        -- llama_decode in this tick (one-stream-per-call,
+        -- inheriting the existing per-stream dispatch path for
+        -- prefill); other decode-ready streams stall this tick
+        -- under DecodeHoldGate from batch_composition.allium.
+
+    @invariant InactiveStreamsNeverAdmitted
+        -- A stream s with s.phase = inactive is never admitted.
+        -- The unified batch's n_active_streams counts only streams
+        -- in decode_ready (for decode ticks) or load_prompt (for
+        -- prefill ticks).
+
+    @invariant AdmissionOrderPreservesStreamId
+        -- The order of UnifiedBatchSlice instances within an
+        -- UnifiedBatch is stable: slice for stream s appears at
+        -- ne[3] index s.stream_id, regardless of arrival order.
+        -- Determinism of the ne[3] index assignment matters for
+        -- byte-identity across harness runs (GP3.d, GP3.g in
+        -- PHASE_NSTREAM_KV_PERF.md).
+
+    @guidance
+        -- Pending Tier 3: the admission predicate lives at
+        -- ik_llama.cpp/examples/server/server-context.cpp:4637
+        -- onwards (process_batch_tokens). Today the function
+        -- iterates by primary seq_id run; Tier 3 replaces the
+        -- iteration with a single unified-batch assembly. The RED
+        -- test at tests/spec/test-unified-stream-dispatch.cpp
+        -- exercises a 2-stream decode-ready tick and asserts
+        -- exactly one llama_decode fires (FAIL on HEAD; PASS after
+        -- T3.b).
+}
+
+-- The DispatchSemantics — the operational replacement of the
+-- per-stream loop. Lives at
+-- ik_llama.cpp/examples/server/server-context.cpp:4647-4823 (the
+-- current per-stream loop with its run detection at 4647-4660 and
+-- single llama_decode at 4723). Tier 3 T3.b replaces this with one
+-- assembly + one call.
+contract DispatchSemantics {
+    invoke: (tick: Tick, batch: UnifiedBatch) -> LlamaDecodeCall
+
+    @invariant PerStreamLoopReplacedBySingleCall
+        -- The for-loop at server-context.cpp:4647 that iterates
+        -- contiguous primary-seq_id runs and emits one
+        -- llama_decode per run is REMOVED. In its place: one
+        -- assembly step that walks all active streams and emits
+        -- one UnifiedBatch, then one llama_decode(ctx,
+        -- unified_batch). The runs-by-seq_id splitting logic is no
+        -- longer needed because the unified batch is by
+        -- construction one-seq-id-per-ne[3]-slot.
+
+    @invariant BatchViewConstructionElidedAtUnifiedSite
+        -- The per-stream llama_batch batch_view = { ... } block at
+        -- server-context.cpp:4665-4674 (which slices into the
+        -- assembled `batch` per run) is replaced by the unified
+        -- batch assembly. The unified llama_batch carries the
+        -- token / pos / n_seq_id / seq_id / logits arrays directly,
+        -- with ne[3]-axis indexing the per-stream segments by
+        -- offset within those arrays.
+
+    @invariant ContinueOnFailurePathPreserved
+        -- The error-recovery semantics (KV-full retry with halved
+        -- n_batch at server-context.cpp:4789-4802; slot release on
+        -- ret < 0 at 4744-4787) are preserved at the unified
+        -- level. A single llama_decode failure releases all
+        -- contributing slots (not just one stream's), because the
+        -- failure mode under unified dispatch is whole-batch.
+
+    @invariant TraceEmissionAdaptedToUnifiedShape
+        -- The NDJSON TickDispatch event emitted at
+        -- server-context.cpp:4687-4712 still fires per dispatch,
+        -- but with prefill_slots / decode_slots /
+        -- loading_prompt_set computed from the unified batch's
+        -- slice list rather than from one run's seq_ids. The
+        -- BatchComposition.tla / StreamIsolation.tla validators
+        -- continue to receive one record per llama_decode.
+
+    @guidance
+        -- The Tier-3 implementation may want to keep the inner
+        -- loop body's pre-existing per-slot work (mtp_warmup,
+        -- checkpoint save, the per-slot post-decode bookkeeping at
+        -- server-context.cpp:4831 onwards). That work fans out
+        -- naturally over the unified batch's slice list; it does
+        -- NOT re-introduce a per-stream llama_decode. The contract
+        -- binds the llama_decode call count to 1 per decode tick,
+        -- not the per-slot bookkeeping count.
+}
+
+-- The RaggedFAComposition — the FA kernel's per-tick input shape.
+-- The kernel sees a batch with ne[3] = n_active_streams; ne[1] =
+-- per_stream_token_count. In the Tier-3 initial form, per-stream
+-- ne[1] is uniform (UniformShapePerTick). If ragged FA lands later,
+-- the contract relaxes to allow per-stream ne[1] mismatch under an
+-- explicit ragged-mode dispatcher; document the ragged variant as a
+-- future relaxation (OQ-3), not as the initial contract.
+contract RaggedFAComposition {
+    invoke: (input: FAKernelInput) -> Boolean
+
+    @invariant Ne3EqualsNActiveStreams
+        -- For the unified-tick FA invocation,
+        -- input.q_ne_3 = input.batch.n_active_streams. The PSKV
+        -- kernel grids over (ne[1], ne[2], ne[3]) per
+        -- fattn-per-slot-kv-singlewarp-sm75.cu:363; the per-CTA
+        -- bind of (token, head, stream) means each CTA reads
+        -- exactly one stream's K/V slab via the ne[3]-axis
+        -- stride. No cross-stream data crosses any CTA boundary.
+
+    @invariant Ne1EqualsPerStreamTokenCount
+        -- For the unified-tick FA invocation,
+        -- input.q_ne_1 = input.batch.per_stream_token_count. Under
+        -- UniformShapePerTick this is one value across the batch;
+        -- the FA kernel sees a uniform per-stream token axis.
+
+    @invariant KVStreamStrideIsParentNb3
+        -- The K and V tensors' ne[3] equals the cache's n_stream;
+        -- the per-stream stride is parent.nb[3] (the existing
+        -- 4D layout from specs/kv-cache/n_stream_layer.allium).
+        -- The kernel reads K, V via the ne[3]-axis stride; under
+        -- unified dispatch the read paths span n_active_streams
+        -- slabs in one launch, rather than one slab per launch.
+
+    @invariant PerRowKBoundConsumedPerStream
+        -- The per_row_k_bound tensor (dst->src[5] per
+        -- fattn-per-slot-kv-singlewarp-sm75.cu:334) is sized
+        -- [n_tokens] with one entry per token-in-batch. Under
+        -- unified dispatch it carries n_active_streams *
+        -- per_stream_token_count entries; the kernel indexes it
+        -- via the linear token position computed from
+        -- (ne[1], ne[3]) coordinates. Plumbed today but a no-op
+        -- for correctness (the mask handles bound enforcement per
+        -- the PSKV P2 closure); the contract names the shape for
+        -- the ragged variant's future use.
+
+    @guidance
+        -- Pending Tier 3: the FA kernel input today has ne[3] = 1
+        -- under per-stream dispatch (one stream per call). The
+        -- Tier-3 implementation passes n_active_streams in ne[3];
+        -- no kernel changes are needed for this transition because
+        -- the kernel already grids over ne[3]. The
+        -- RaggedFAComposition contract names what the kernel
+        -- consumes; it does not assert any kernel-side
+        -- modification. Cross-references the PSKV per-slot kernel
+        -- closure in
+        -- ~/.claude/projects/-home-llm-yarn-agentic/memory/project_fattn_per_slot_kv_p2_landed_kernel_only.md.
+        -- RED test in tests/spec/test-unified-stream-dispatch.cpp
+        -- will fail on HEAD because no current call site produces
+        -- ne[3] > 1 for FA input (per-stream dispatch keeps it
+        -- at 1).
+}
+
+-- The PreservesBugCAbsence — the composition argument: under
+-- Tier-3 unified dispatch, the historical Bug C closure mechanism
+-- is preserved by construction. Bug C was "mixed shape WITHIN a
+-- tick"; unified dispatch achieves single-shape-per-tick differently
+-- from per-stream dispatch (one call with one shape including the
+-- n_streams axis at ne[3]) but achieves the same load-bearing
+-- property. Cross-references n_stream_layer.allium's StreamPartition
+-- and per_stream_read_view_patching.allium's PerStreamReadIsolation
+-- (under unified dispatch the read views span ne[3]=n_streams
+-- naturally, so the Tier-2 patching becomes redundant).
+contract PreservesBugCAbsence {
+    invoke: (call: LlamaDecodeCall) -> Boolean
+
+    @invariant UniformShapeArgumentClosesBugC
+        -- Bug C's root cause was the mul_mat GEMV-vs-GEMM
+        -- dispatcher selecting different reductions for
+        -- different shapes within one tick. Under
+        -- UniformShapePerTick.EveryOpSeesOneShapePerCall, each
+        -- mul_mat invocation sees ONE shape per call, so the
+        -- dispatcher branch is single-valued. The Bug C failure
+        -- geometry cannot form because there is no within-tick
+        -- shape transition for the dispatcher to branch across.
+
+    @invariant StreamPartitionComposesWithUnifiedDispatch
+        -- StreamPartition from
+        -- specs/kv-cache/n_stream_layer.allium states that each
+        -- stream's KV cells live in a well-defined slice of the
+        -- underlying tensor. Under unified dispatch, the per-call
+        -- K/V tensor is the SAME shared tensor (ne[3]=n_stream);
+        -- each ne[3]-axis CTA reads exactly one stream's slice.
+        -- The partition is preserved because the kernel's per-CTA
+        -- bind selects exactly stream s when CTA z-coordinate = s.
+
+    @invariant PerStreamReadIsolationLiftedToNe3Axis
+        -- PerStreamReadIsolation from
+        -- specs/kv-cache/per_stream_read_view_patching.allium
+        -- states reads bound for stream s only access cells in
+        -- stream s's slice. Under unified dispatch, the read view
+        -- spans ALL streams (ne[3] = n_stream) and the per-stream
+        -- isolation moves from "per-call data pointer offset" to
+        -- "per-CTA ne[3]-axis stride". The kernel reads N
+        -- disjoint slabs in one launch; cross-stream data crosses
+        -- no CTA boundary. The Tier-2 per-call read-view patching
+        -- becomes redundant; the underlying isolation property is
+        -- stronger under Tier 3 (compile-time stride vs runtime
+        -- pointer patch).
+
+    @invariant DispatchOrderAndDeterminismPreserved
+        -- Under per-stream dispatch, byte-identity across harness
+        -- runs required a stable per-tick dispatch order. Under
+        -- unified dispatch, byte-identity requires
+        -- AdmissionOrderPreservesStreamId (above): the ne[3]
+        -- index for stream s is fixed at s.stream_id, so the
+        -- kernel's per-CTA assignment is deterministic across
+        -- runs. GP3.d / GP3.g in PHASE_NSTREAM_KV_PERF.md bind
+        -- this empirically.
+
+    @invariant BatchCompositionInvariantHoldsAtUnifiedTick
+        -- BatchCompositionInvariant from
+        -- specs/scheduler/batch_composition.allium (redefined at
+        -- Tier 4) states every llama_decode batch satisfies the
+        -- chunked-prefill admission shape: tokens.count <= K
+        -- AND per-token flag exclusivity. Tier 3 unified
+        -- dispatch preserves this regardless of which tokens
+        -- are admitted — the ne[3] = n_active_streams structure
+        -- and per-stream slab kernel inputs do not depend on
+        -- whether each stream contributes prefill or decode
+        -- tokens this tick.
+
+    @guidance
+        -- Pending Tier 3: this contract is the load-bearing
+        -- argument that dropping per-stream dispatch is safe.
+        -- Verification: GP3.f (r5-probe-c4.sh ITERS=20 = 0/20)
+        -- continues PASS after T3.b lands. The structural Bug C
+        -- absence under Tier-2 was scheduler+layout-level; under
+        -- Tier-3 it is kernel-input-shape-level — both achieve
+        -- the same observable property.
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The decode-call-count property lifted to a system-wide claim.
+-- For any tick, the number of llama_decode invocations equals 1 if
+-- any decode-ready stream is admitted, else 0 (or 1 if a prefill
+-- stream takes its own tick — covered by PrefillTickIsSeparate).
+-- Lifts UnifiedUbatchInvariant.ExactlyOneDecodeCallPerActiveTick.
+invariant DecodeCallCountPerTickBounded {
+    for tick in Ticks:
+        DecodeCallsAt(tick).count <= 1
+}
+
+-- The per-tick uniformity property lifted to a system-wide claim.
+-- For any tick's UnifiedBatch, every UnifiedBatchSlice has the same
+-- token_count. Lifts UniformShapePerTick.PerStreamTokenCountIsUniform.
+invariant PerTickUniformShape {
+    for batch in UnifiedBatches:
+        let slices = SlicesOf(batch)
+        slices.all(s => s.token_count = batch.per_stream_token_count)
+}
+
+-- The unified-batch admission-mode property. Under Tier 3 this was
+-- a pure/pure disjunction (pure-decode or pure-prefill); Tier 4
+-- supersedes it with the chunked-prefill admission shape from
+-- batch_composition.allium's redefined BatchCompositionInvariant.
+-- The per-slice flag exclusivity stays: any individual slice is
+-- either decode or prefill, never both. The whole-batch
+-- pure/pure constraint does NOT hold under Tier 4 — a single
+-- unified batch may contain decode slices and prefill slices.
+invariant UnifiedBatchSliceFlagExclusivity {
+    for batch in UnifiedBatches:
+        let slices = SlicesOf(batch)
+        slices.all(s => not (s.is_decode and s.is_prefill))
+}
+
+-- The ne[3]-axis identity property. For any unified-tick FA
+-- invocation, the kernel's ne[3] equals the batch's
+-- n_active_streams. Lifts RaggedFAComposition.Ne3EqualsNActiveStreams.
+invariant FANe3EqualsActiveStreamsSystemWide {
+    for input in FAKernelInputs:
+        input.q_ne_3 = input.batch.n_active_streams
+}
+
+-- The admission-determinism property. For any UnifiedBatch, the
+-- ne[3] index assigned to each contributing stream equals the
+-- stream's stream_id. Lifts
+-- AdmissionToUnifiedBatch.AdmissionOrderPreservesStreamId; binding
+-- for byte-identity across harness runs.
+invariant Ne3IndexEqualsStreamId {
+    for slice in UnifiedBatchSlices:
+        Ne3IndexFor(slice) = slice.stream_id
+}
+
+-- The Bug-C-absence composition lifted to a system-wide claim. For
+-- every decode-tick LlamaDecodeCall, the within-call op shapes are
+-- single-valued per op (no cross-shape branching) AND the per-CTA
+-- KV access is stream-local (StreamPartition holds at the kernel
+-- input layer). The conjunction is the Tier-3 structural Bug C
+-- absence.
+invariant BugCAbsenceUnderUnifiedDispatch {
+    for call in LlamaDecodeCalls:
+        for op in OpsInvokedDuring(call):
+            SingleInputShape(op)
+                and KernelInputIsStreamLocal(op, call.batch)
+}
+
+-- The graph-cache-friendliness property. Under unified dispatch the
+-- per-tick topology is stable (one shape per tick across active
+-- streams), so cuda_graph_reuse.allium's TopologyHashLookup hits
+-- the same cache entry across consecutive decode ticks at the same
+-- n_active_streams. Cross-references that spec's
+-- LookupHitReturnsExistingEntry.
+invariant StableTopologyAcrossDecodeTicks {
+    for t1 in DecodeTicks:
+        for t2 in DecodeTicks:
+            (t1 != t2
+             and NActiveStreams(t1) = NActiveStreams(t2)
+             and PerStreamTokenCount(t1) = PerStreamTokenCount(t2))
+                implies TopologyHashAt(t1) = TopologyHashAt(t2)
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: mixed-phase ticks. A tick where some streams are
+--   decode_ready and others are load_prompt forces a choice:
+--   (a) prefill-priority — run the prefill tick alone, decode-ready
+--       streams stall under DecodeHoldGate (today's behaviour);
+--   (b) decode-priority — run the unified decode tick, prefill
+--       streams stall;
+--   (c) split — run two ticks back-to-back within one update_slots
+--       iteration. The contracts above describe (a) as the
+--       Tier-3 initial form (PreservesBugCAbsence relies on it).
+--       Resolve at T3.b: the implementation MAY choose differently
+--       once benchmark gates GP3.i / GP3.j land.
+--
+-- OQ-2: per_stream_token_count > 1 for decode ticks. The Tier-3
+--   initial form uses min_per_stream_token_count = 1; each stream
+--   contributes one sampled token per tick. DFlash multi-slot
+--   verify and MTP draft depth produce N tokens per stream per
+--   tick; the existing dispatch model already handles these by
+--   running one llama_decode per stream per tick at ne[1]>1.
+--   Tier 3's unified form must compose with these — per the Q3
+--   composition argument in PHASE_NSTREAM_KV_PERF.md, the DFlash
+--   draft-side is already batched (Phase 5); Tier 3 unifies the
+--   verify side. Token counts across streams at ne[1]>1 may differ
+--   per stream in principle (mixed-depth speculation), but the
+--   initial contract pins per_stream_token_count to be uniform.
+--   The asymmetric case is OQ-3.
+--
+-- OQ-3: ragged FA — per-stream ne[1] mismatch. The PSKV kernel
+--   today grids over (ne[1], ne[2], ne[3]) and binds one CTA per
+--   (token, head, stream); per-stream ne[1] mismatch would require
+--   either padding the shorter streams (waste) or a ragged-mode
+--   dispatcher (per-stream effective n_tokens via per_row_k_bound
+--   and a per-stream mask). Tier 3's initial form pins
+--   PerStreamTokenCountIsUniform; the ragged variant is a future
+--   relaxation, not part of the initial contract surface.
+--   Resolve when DFlash mixed-depth speculation or asymmetric MTP
+--   draft chains land (no current workload demands it).
+--
+-- OQ-4: prefill tick under unified dispatch — does Tier 3 also
+--   unify prefill batches across streams (when multiple streams
+--   are in load_prompt simultaneously)? The contracts above pin
+--   prefill-as-separate-tick AND one-prefill-stream-per-tick (via
+--   PrefillSerialisationGate inherited from
+--   batch_composition.allium). If a future platform's mul_mat
+--   handles cross-shape prefill cheaply, Tier 3 could also unify
+--   prefill across streams; today the gate stays in force as a
+--   perf choice. Resolve at GP3.c benchmark.
+--
+-- OQ-5: cuda_graph cache capacity under Tier 3. With the bailout
+--   dropped at Tier 2 and dispatch unified at Tier 3, the cache
+--   holds one entry per (n_active_streams, per_stream_token_count,
+--   n_kv_bucket) tuple. At n_active_streams ∈ [1, 8],
+--   per_stream_token_count ∈ {1, 5} (decode + DFlash verify), and
+--   n_kv buckets bucketed to multiples of 64 by
+--   ik_llama.cpp/src/llama.cpp:621, the cache holds well below
+--   GGML_CUDA_GRAPH_MAX = 128 entries. Verify at GP3.j: instrument
+--   ggml_cuda_get_graph_cache to count evictions over a 1000-decode
+--   steady-state run.
+--
+-- OQ-6: MTP fused × Tier 3 chain-residual D2D fast-path. Composition
+--   of this spec with [[mtp_fused_x_n_stream]]. At HEAD, MTP's
+--   chain_residual buffer (one tensor per fused step, allocated as
+--   ggml_tensor_2d [n_embd, 1] in src/llama.cpp:6088-6095) is
+--   structurally single-stream — multi-slot batched dispatch
+--   STRUCTURALLY SKIPS the arm at
+--   examples/server/server-context.cpp:3427-3430, falling back to
+--   the host-bounce path (D→H read of embeddings_ith → H→D
+--   set_draft_input_hidden_state). Closure recorded in
+--   [[mtp_fused_x_n_stream]] as MTPFusedAtN_StreamLessThan2Or1.
+--
+--   Under Tier 3 unified dispatch, MTP rides on top of the unified
+--   batch (UnifiedUbatchInvariant). The chain_residual tensor would
+--   then need an ne[3] axis — [n_embd, 1, 1, n_stream] — for the
+--   D2D fast-path to compose with unified dispatch. Without that,
+--   MTP at Tier 3 multi-slot falls through to host-bounce on every
+--   draft cycle. Direct copy cost is ~10-25 µs per cycle for n_embd
+--   = 5120; the larger cost is the implicit llama_synchronize
+--   barrier the host-bounce introduces (tens to low-hundreds of µs
+--   of GPU idle per cycle, depending on pipeline depth).
+--
+--   At np=8, ~24 cycles/sec → ~600 µs/sec direct + ~5 ms/sec
+--   pipeline → up to ~0.5 % of wall time recoverable.
+--
+--   Resolution: not part of the Tier 3 initial-form contract. The
+--   asymmetric case (MTPChainResidualPerStream extension) is
+--   tracked in [[mtp_fused_x_n_stream]] and lands separately, IF
+--   AND ONLY IF (a) MTP becomes the production multi-slot decode
+--   path AND (b) the ~0.5 % recoverable matters relative to the
+--   prevailing perf target. Bind at GP3.k: profile MTP fused-cycle
+--   wall time at np=8 once Tier 3 lands; if MTP draft-cycle host
+--   bounce shows up above the noise floor in nsys traces, open the
+--   per-stream chain extension as its own workstream.
+--
+--   The Tier-3 dispatch contracts above do NOT depend on this OQ
+--   resolving either way — UnifiedUbatchInvariant and
+--   UniformShapePerTick are independent of MTP arming. This OQ
+--   exists to ensure the perf interaction is not lost when MTP
+--   composition under Tier 3 is implemented.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root, line numbers
+-- verified 2026-05-21 against current HEAD):
+--   ik_llama.cpp/examples/server/server-context.cpp:4637
+--     — process_batch_tokens entry. Tier 3 T3.b replaces the loop
+--       body at lines 4647-4823 with a unified-batch assembly +
+--       one llama_decode call.
+--   ik_llama.cpp/examples/server/server-context.cpp:4647-4660
+--     — current per-stream run detection (the while loop that
+--       advances run_end across same-seq_id tokens). Tier 3
+--       removes this; the unified batch is one-seq-id-per-ne[3].
+--   ik_llama.cpp/examples/server/server-context.cpp:4665-4674
+--     — batch_view construction (the per-run llama_batch slice).
+--       Tier 3 replaces with one unified llama_batch covering all
+--       active streams.
+--   ik_llama.cpp/examples/server/server-context.cpp:4687-4712
+--     — NDJSON TickDispatch emission. Tier 3 adapts to emit one
+--       record per unified call (DispatchSemantics.
+--       TraceEmissionAdaptedToUnifiedShape).
+--   ik_llama.cpp/examples/server/server-context.cpp:4723
+--     — the llama_decode call site. Tier 3 keeps exactly one
+--       invocation here; the prior per-stream loop's repeated
+--       calls collapse into this one site.
+--   ik_llama.cpp/examples/server/server-context.cpp:4744-4802
+--     — error-recovery (KV-full retry, slot release on ret < 0).
+--       Tier 3 preserves DispatchSemantics.
+--       ContinueOnFailurePathPreserved.
+--   ik_llama.cpp/examples/server/server-context.cpp:4831
+--     — per-slot post-decode bookkeeping (the for-each-slot loop
+--       inside the current per-stream loop). Tier 3 hoists this
+--       out of the per-stream loop (now removed) and runs it once
+--       per llama_decode against the unified batch's slice list.
+--   ik_llama.cpp/ggml/src/ggml-cuda/fattn-per-slot-kv-singlewarp-sm75.cu:326-395
+--     — ggml_cuda_flash_attn_ext_per_slot_kv_singlewarp_sm75
+--       dispatcher. Already grids over Q->ne[3] = n_seqs (line
+--       363); Tier 3 binds n_seqs = n_active_streams without any
+--       kernel change. The contracts in RaggedFAComposition pin
+--       this property.
+--   ik_llama.cpp/src/llama-build-context.cpp:1651
+--     — the comment block referencing per-stream dispatch's slot
+--       id derivation. Tier 3 supersedes this; the read view's
+--       ne[3] axis becomes the n_stream axis natively.
+--   ik_llama.cpp/src/llama-build-context.cpp:138-139, 247-248,
+--     663-664, 2832-2833
+--     — the GGML_ASSERT(kv.n_stream == 1) guards on
+--       build_k_shift, build_defrag, v_trans non-FA paths. Tier 3
+--       T3.f lifts these — multi-slot ctx_shift and defrag work
+--       natively under unified dispatch (one cgraph covers all
+--       streams). Not a contract surface here (the guards live in
+--       the build path, not the dispatch path); cross-referenced
+--       so the implementation cards know what to touch.
+--   ik_llama.cpp/src/llama-context.h:52-67
+--     — struct llama_kv_cache; n_stream + kv_size_per_stream
+--       fields the unified dispatch reads to size ne[3] of the
+--       per-tick FA / mul_mat inputs.
+--
+-- Black-box helpers used inline in the system-wide invariants
+-- (not in `deferred` per project convention — they have no
+-- separate .allium spec):
+--   DecodeCallsAt, UnifiedBatches, SlicesOf, FAKernelInputs,
+--   UnifiedBatchSlices, Ne3IndexFor, LlamaDecodeCalls,
+--   OpsInvokedDuring, SingleInputShape, KernelInputIsStreamLocal,
+--   Ticks, DecodeTicks, NActiveStreams, PerStreamTokenCount,
+--   TopologyHashAt.
+--
+-- Test infrastructure to drive from this spec via allium:propagate
+-- (P0.B.S4 in PHASE_NSTREAM_KV_PERF.md):
+--   - tests/spec/test-unified-stream-dispatch.cpp
+--     * Drives a 2-stream decode-ready tick (and 4-stream, 8-stream
+--       under multi-iteration variants); asserts that
+--       (a) exactly one llama_decode fires regardless of
+--           n_active_streams,
+--       (b) the FA kernel input has ne[3] = n_active_streams,
+--       (c) per-stream token count is uniform across slices,
+--       (d) byte-identity holds against an n_active_streams = 1
+--           reference run for the same per-stream prompts.
+--     * EXPECTED TO FAIL on HEAD (process_batch_tokens still loops
+--       per primary seq_id run at server-context.cpp:4647); PASS
+--       after T3.b + T3.c land. Binding RED test for GP0.B.c.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/scheduler/batch_composition.allium
+--   The scheduler-layer admission contract. Under Tier 4 this spec
+--   was rewritten to express chunked-prefill admission
+--   (TokenBudgetPerUbatch + DecodePriorityAdmission +
+--   ChunkedPrefillAdmission + PrefillCarryProgressesMonotonically).
+--   Bug C absence — formerly defended by that spec's
+--   MixedBatchProhibition + DecodeHoldGate — is now delegated to
+--   THIS spec's BugCAbsenceUnderUnifiedDispatch /
+--   PreservesBugCAbsence (the structural kernel-input-shape
+--   closure). Under Tier 4, mixed prefill+decode admission is
+--   allowed and Bug C absence holds regardless.
+--
+-- specs/kv-cache/n_stream_layer.allium
+--   The 4D per-stream KV layout. Tier 3 builds on this; ne[3] of
+--   the K and V tensors = n_stream; the per-CTA bind under
+--   unified dispatch reads exactly one stream's slab via the
+--   ne[3] stride. StreamPartition and NoCrossStreamLeakage from
+--   that spec are LIFTED TO THE KERNEL-INPUT LAYER under unified
+--   dispatch (per PreservesBugCAbsence.
+--   PerStreamReadIsolationLiftedToNe3Axis).
+--
+-- specs/kv-cache/per_stream_read_view_patching.allium
+--   The Tier-2 read-view per-stream patching contract. Tier 3
+--   SUBSUMES this: under unified dispatch the read views span
+--   ne[3] = n_stream naturally and the per-call data-pointer patch
+--   becomes redundant. The Tier-2 patching code may be removed at
+--   Tier-3 close (or left as a no-op at n_active_streams = 1 for
+--   compatibility with single-stream profiles); the contract
+--   surface in that spec is STRICTLY WEAKER than this spec's
+--   RaggedFAComposition + PreservesBugCAbsence.
+--
+-- specs/graphs/cuda_graph_reuse.allium
+--   The CUDA backend's cache mechanism. Tier 3's stable per-tick
+--   topology (one shape per active-stream count) is strictly
+--   better for its TopologyHashLookup: the cache holds one entry
+--   per (n_active_streams, per_stream_token_count, n_kv_bucket)
+--   tuple, with all decode ticks at the same shape hitting the
+--   same entry. StableTopologyAcrossDecodeTicks above formalises
+--   this property.
+--
+-- specs/dflash/dflash.allium
+--   The DFlash drafter behavioural contract. Tier 3 composes
+--   cleanly: DFlash Phase 5's draft-side batched dispatch is
+--   independent of the verify-side dispatch model (the
+--   common_speculative_draft_batched call fans out to drafter
+--   contexts, not to the target llama_decode). Tier 3 unifies
+--   the verify-side dispatch only; the DFlash kernel-side
+--   invariants (NoCrossSlotRegionOverlap,
+--   PerSlotDraftKVCache) hold under both per-stream and unified
+--   verify-side dispatch.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity UnifiedStreamDispatchSystem {
+    unified_batch_slices: List<UnifiedBatchSlice>
+    op_invocations: List<OpInvocation>
+}
+
+contract ValidateUnifiedStreamDispatchSystem {
+    invoke: (sys: UnifiedStreamDispatchSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

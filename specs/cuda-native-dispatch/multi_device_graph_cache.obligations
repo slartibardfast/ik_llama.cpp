@@ -1,0 +1,19 @@
+# Obligations for multi_device_graph_cache.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.TopologyKey => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CachedExec => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.OuterGraphCache => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ScheduleObject => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DispatchInvocation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.CachedReplay => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SchedFreeInvocation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SchedulePair => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.GraphCacheSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CacheKeyDeterministic => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CacheReplayIsByteIdentical => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CacheHitSkipsCapture => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FifoEvictionWhenFull => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CacheClearedOnSchedFree => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoCacheBypass => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateGraphCache.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

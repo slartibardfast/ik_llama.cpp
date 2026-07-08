@@ -1,0 +1,15 @@
+# Obligations for turbo_kv_layer_adaptive.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+config-default.protected_layers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.protected_bits => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.n_layers => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.EffectiveBitsForProtectedLayer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.EffectiveBitsForProtectedLayer.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.EffectiveBitsForProtectedLayer.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.EffectiveBitsForProtectedLayer.3 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.EffectiveBitsForInnerLayer => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.EffectiveBitsForInnerLayer.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.EffectiveBitsForInnerLayer.2 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ProtectedLayersValid => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ProtectedBitsAtLeastBase => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

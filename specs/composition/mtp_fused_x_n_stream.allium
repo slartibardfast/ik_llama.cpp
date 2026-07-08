@@ -1,0 +1,820 @@
+-- allium: 3
+-- specs/composition/mtp_fused_x_n_stream.allium
+--
+-- Scope: the COMPOSITION contract between MTP fused decoding and the
+-- n_stream > 1 per-stream KV layout. Specifically: how the Phase 37
+-- #5 chain-residual REUSE branch (the "fused decode reads its seed
+-- from a prior cycle's chain residual without a host bounce") behaves
+-- when more than one server slot drafts MTP fused chains under the
+-- per-stream KV layout introduced by
+-- specs/kv-cache/n_stream_layer.allium.
+--
+-- Why this spec exists: the chain-residual reuse path is the
+-- load-bearing perf win of Phase 37/38 — it eliminates a per-cycle
+-- D2H+H2D copy of the residual seed. At n_stream == 1 (current
+-- production geometry) the path is well-tested. At n_stream > 1 the
+-- chain residuals live on a SHARED per-decoder buffer
+-- (lctx.default_decoder.mtp_persist[8], indexed by step) with no
+-- per-slot/per-stream axis. The persist[] copy is performed at the
+-- end of every fused decode; the next fused decode reads from it via
+-- the single shared `pending_chain_residual_step` arming field. If
+-- slot 0's fused decode arms step k and slot 1 then runs a fused
+-- decode before slot 0 reads back, the persist[] buffer holds slot
+-- 1's chain — slot 0's read would alias a wrong stream. This is the
+-- MTP analogue of Bug C at the residual-seed boundary.
+--
+-- The composition is INTENTIONALLY HONOURED ON HEAD by an explicit
+-- opt-out: common_speculative_draft_batched at
+-- ik_llama.cpp/examples/server/server-context.cpp:3427-3430 SKIPS
+-- the chain-residual arm in the multi-slot batched path, with the
+-- inline comment "chain-residual seed is single-slot only (uses one
+-- device buffer + one chain)". The env gate
+-- LLAMA_MTP_CHAIN_RESIDUAL_SEED defaults OFF; the opt-out is a hard
+-- structural decision in the batched dispatch path, not a runtime
+-- flag check. This spec binds that decision so a future server-CLI
+-- refactor cannot silently re-enable the chain-residual arm under
+-- multi-slot dispatch without first making the persist[] buffer
+-- per-stream.
+--
+-- Includes:
+--   - External entities for the MTP fused decoder's per-context
+--     state (FusedDecoderState, ChainResidualPersistBuffer,
+--     ChainResidualArm) and the per-slot scheduler state
+--     (SlotChainResidualState) that arms it.
+--   - Contracts: MTPFusedReuseSurvivesStreamPatching (the
+--     composition-with-Tier-2 argument), MTPChainResidualPerStream
+--     (the post-fix contract — the persist buffer becomes
+--     [n_embd, n_steps, n_stream]), BatchedMTPSharedDecoderInvariant
+--     (the post-D9.5 shared-ctx_tgt model that makes
+--     per-stream indexing necessary), MTPFusedAtN_StreamLessThan2Or1
+--     (the HONOURED-ON-HEAD opt-out contract), NoCrossStreamChain-
+--     Poisoning (the safety property the per-stream fix must
+--     preserve).
+--   - System-wide invariants binding the per-decoder buffer
+--     ownership, the multi-slot opt-out, and the composition
+--     argument with Tier 2 read-view patching and Tier 3 unified
+--     dispatch.
+--   - Open questions for the post-fix per-stream indexing layout
+--     and the timing of the lift.
+--
+-- Excludes:
+--   - The FUSED DRAFT GRAPH itself (one ggml_graph_compute produces
+--     N drafts + N KV writes). Owned by mtp_fused_draft.allium
+--     (FusedDraftStep contract; KvWrittenAtPositionsPThroughPPlusN,
+--     FusedDraftRespectsStreamPartition invariants). THIS spec does
+--     NOT re-state those contracts — it composes on top of them.
+--   - The Tier-2 read-view per-stream patching itself. Owned by
+--     specs/kv-cache/per_stream_read_view_patching.allium. THIS
+--     spec asserts ONLY that Tier 2's update_cache_copies extension
+--     does NOT TOUCH the MTP chain-residual buffer (the buffer is
+--     not a K/V read view).
+--   - The Tier-3 unified-dispatch surface. Owned by
+--     specs/dispatch/unified_stream_dispatch.allium. THIS spec
+--     cross-references the unified dispatch invariants in the
+--     "post-fix" surface but does NOT bind on Tier 3 landing.
+--   - The per-stream KV layout itself (StreamPartition,
+--     PerStreamAllocator). Owned by
+--     specs/kv-cache/n_stream_layer.allium.
+--   - The batch composition (chunked-prefill admission shape under
+--     Tier 4). Owned by specs/scheduler/batch_composition.allium;
+--     THIS spec's contracts MUST NOT VIOLATE the redefined
+--     BatchCompositionInvariant (TokenBudgetPerUbatch +
+--     per-token flag exclusivity). MTP fused decode admits
+--     decode-only tokens, which is one valid shape under the
+--     chunked-prefill admission contract.
+
+-- ============================================================
+-- External entities — per-context fused-decoder state
+-- ============================================================
+
+-- The MTP fused decoder's per-llama_context state. One per
+-- llama_context (lctx.default_decoder). Carries the chain-residual
+-- persist buffer plus the single shared arming field that
+-- prepare_mtp_graph_inputs reads. Mirrors the relevant fields of
+-- lctx.default_decoder declared in
+-- ik_llama.cpp/src/llama-context.h around the default_decoder struct
+-- (the persist buffer + pending_chain_residual_step both live as
+-- direct fields of that struct).
+entity FusedDecoderState {
+    -- The maximum number of chain steps the persist buffer can hold.
+    -- Hard-coded to 8 at the allocation site
+    -- (ik_llama.cpp/src/llama.cpp:6089 — "for (int _k = 0; _k < 8;
+    -- ++_k)" + the parallel ggml_tensor_overhead() * 8 allocation).
+    persist_capacity_steps: Integer
+
+    -- The number of persist slots populated by the most recent fused
+    -- compute. Set at the end of llama_decode_internal's chain-
+    -- residual capture block (ik_llama.cpp/src/llama.cpp:6130:
+    -- "lctx.default_decoder.mtp_persist_n = captured"). Read by
+    -- prepare_mtp_graph_inputs at src/llama.cpp:5224 as the upper
+    -- bound on the readable step.
+    persist_populated_steps: Integer
+
+    -- The single shared arming field. Set per-decode by the SERVER
+    -- (via llama_set_draft_input_chain_residual at server-context.cpp:
+    -- 3376); read AND cleared by prepare_mtp_graph_inputs at
+    -- src/llama.cpp:5222-5223. There is NO per-slot or per-stream
+    -- partition of this field at HEAD; the contract surface here
+    -- names the property explicitly so the per-stream extension
+    -- target is unambiguous.
+    pending_chain_residual_step: Integer
+}
+
+-- The chain-residual persist buffer itself. Stored as 8 separate
+-- ggml_tensor_2d allocations of shape [n_embd, 1] on a
+-- ggml_backend_buffer owned by FusedDecoderState.mtp_persist_ctx.
+-- At HEAD the buffer dimensionality is one-tensor-per-step with NO
+-- stream axis. The post-fix contract MTPChainResidualPerStream below
+-- describes the target shape with the additional n_stream axis.
+entity ChainResidualPersistBuffer {
+    -- Equal to FusedDecoderState.persist_capacity_steps. Modelled as
+    -- a separate entity field so the per-stream extension target can
+    -- reference the buffer's dimensionality independently of the
+    -- decoder's bookkeeping.
+    n_steps: Integer
+
+    -- The n_stream axis. At HEAD this value is 1 by construction
+    -- (one buffer per llama_context, no per-stream slab). The
+    -- post-fix target is n_stream = max_streams.
+    n_stream: Integer
+
+    -- The embedding dimension; the n_embd row of one chain residual.
+    -- Matches lctx.model.hparams.n_embd at allocation time
+    -- (src/llama.cpp:6088).
+    n_embd: Integer
+}
+
+-- One slot's chain-residual arming bookkeeping. Lives at
+-- ik_llama.cpp/examples/server/server-context.cpp:4322 (the post-
+-- accept "slot.mtp_next_chain_residual_step = ..." assignment) and is
+-- consumed at server-context.cpp:3375 (the single-slot dispatch
+-- branch). The per-slot field exists at HEAD; what is MISSING at
+-- HEAD is its propagation to the persist buffer at multi-slot
+-- batched dispatch (the multi-slot branch SKIPS it).
+entity SlotChainResidualState {
+    slot_id: Integer
+    seq_id: Integer
+
+    -- The step index armed for the NEXT fused decode this slot
+    -- issues. -1 when no arm is in effect (the host-bounce path
+    -- supplies the seed instead). Per
+    -- server-context.cpp:4289 ("slot.mtp_next_chain_residual_step =
+    -- -1") and :4322 ("slot.mtp_next_chain_residual_step =
+    -- (int32_t) ids.size() - 1"). The lifecycle is described
+    -- prose-only in the @invariant clauses; transitions are not
+    -- modelled here.
+    next_chain_residual_step: Integer
+
+    -- True iff this slot is currently running an MTP fused chain
+    -- this tick. Used by the multi-slot batched-dispatch invariants
+    -- to scope the opt-out.
+    in_fused_chain_this_tick: Boolean
+}
+
+-- One server tick that contains AT LEAST ONE fused MTP draft.
+-- Mirrors the Tick entity in
+-- specs/scheduler/batch_composition.allium and
+-- specs/dispatch/unified_stream_dispatch.allium; redeclared external
+-- for self-containment.
+entity Tick {
+    index: Integer
+    n_active_mtp_slots: Integer
+}
+
+-- One stream as observed by the n_stream-aware KV layout. Mirrors
+-- Stream in specs/kv-cache/n_stream_layer.allium; redeclared
+-- external so this spec's contracts are self-contained.
+entity Stream {
+    stream_id: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- The chain-residual arming MODE in force for a given dispatch.
+-- Names the structural distinction between the single-slot
+-- fast path (arm is honoured) and the multi-slot batched path
+-- (arm is structurally skipped per server-context.cpp:3427-3430).
+enum ChainResidualArmingMode {
+    armed_single_slot              -- single-slot dispatch + arm in effect
+    skipped_multi_slot             -- multi-slot batched dispatch; arm dropped
+    not_armed                      -- single-slot but no arm pending (-1)
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum streams. Mirrors max_streams in
+    -- specs/kv-cache/n_stream_layer.allium and
+    -- specs/dispatch/unified_stream_dispatch.allium. Pinned here so
+    -- the post-fix per-stream-indexing contract can reference a
+    -- numeric bound without cross-spec navigation.
+    max_streams: Integer = 8
+
+    -- The persist buffer's hard-coded step capacity. Equals the
+    -- literal 8 at the allocation site
+    -- (ik_llama.cpp/src/llama.cpp:6089). Pinned here so the
+    -- per-stream extension's buffer-size invariant has a numeric
+    -- bound to reason about.
+    persist_capacity_steps: Integer = 8
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The MTPFusedReuseSurvivesStreamPatching — the composition claim
+-- between Tier 2's per-stream read-view patching and the MTP fused
+-- decoder's chain-residual reuse. Lives at the intersection of
+-- ik_llama.cpp/src/llama.cpp:5222 (the persist[] read site) and
+-- ik_llama.cpp/src/llama.cpp:630-749 (update_cache_copies, the Tier
+-- 2 extension target). The contract clauses bind that Tier 2's
+-- read-view patching does NOT TOUCH the persist buffer; the two
+-- mechanisms are independent.
+contract MTPFusedReuseSurvivesStreamPatching {
+    invoke: (decoder: FusedDecoderState, persist: ChainResidualPersistBuffer) -> Boolean
+
+    @invariant PersistBufferIsNotAKVReadView
+        -- The chain-residual persist buffer (FusedDecoderState.
+        -- mtp_persist[k]) is allocated on a separate ggml_context
+        -- (mtp_persist_ctx) and a separate ggml_backend_buffer
+        -- (mtp_persist_buf) from the K/V cache tensors. The
+        -- allocation lives at ik_llama.cpp/src/llama.cpp:6077-6109
+        -- and is INDEPENDENT of llama_kv_cache_init at
+        -- src/llama.cpp:790-1155. Tier 2's update_cache_copies
+        -- extension at src/llama.cpp:630-749 iterates K/V tensors
+        -- only; the persist buffer is not in its iteration set.
+
+    @invariant PersistBufferNotInReadViewRegistry
+        -- The Tier-2 ReadViewRegEntry set described in
+        -- specs/kv-cache/per_stream_read_view_patching.allium
+        -- contains ONLY the K read view (layer_id, is_k = true) and
+        -- the V read view (layer_id, is_k = false) per layer. The
+        -- persist buffer is not registered as a ReadViewRegEntry
+        -- and is not visited by the Tier-2 patch loop. Cross-
+        -- references that spec's
+        -- ReadViewPatchedByUpdate.EveryActiveReadViewPatchedPerTick.
+
+    @invariant StreamPatchingObliviousToPersistArming
+        -- Tier 2's per-stream patching changes the K/V read views'
+        -- data_offset and ne[1] per decode. It does NOT touch
+        -- decoder.pending_chain_residual_step or any persist[k]
+        -- tensor. The MTP fused decoder's persist-read at
+        -- src/llama.cpp:5222-5237 reads the buffer obliviously to
+        -- whichever stream's K/V views were just patched; the read
+        -- semantics are determined entirely by the
+        -- pending_chain_residual_step value the caller armed.
+
+    @guidance
+        -- This contract is the load-bearing argument that Tier 2 of
+        -- PHASE_NSTREAM_KV_PERF.md (read-view patching at
+        -- n_stream > 1) does not regress the MTP fused chain-
+        -- residual reuse path at single-slot. The two mechanisms
+        -- live in different allocation pools and different patch
+        -- loops; they neither help nor hinder each other.
+}
+
+-- The MTPChainResidualPerStream — the POST-FIX contract surface.
+-- Describes the persist buffer's shape after the per-stream
+-- indexing extension lands. NOT HONOURED ON HEAD; binding only
+-- after the persist buffer is widened to a per-stream axis and
+-- pending_chain_residual_step is split per slot.
+--
+-- This contract is included so the load-bearing detail of "what the
+-- per-stream extension actually has to do" is named in one place,
+-- but it is NOT a Tier-2 or Tier-3 prerequisite. The simpler closure
+-- is MTPFusedAtN_StreamLessThan2Or1 below — the multi-slot opt-out
+-- is honoured today and the spec binds that decision.
+contract MTPChainResidualPerStream {
+    invoke: (decoder: FusedDecoderState,
+             persist: ChainResidualPersistBuffer,
+             stream: Stream) -> Boolean
+
+    @invariant PersistShapeIsNStepsByNStream
+        -- After the fix, persist.n_stream equals
+        -- config.max_streams (or the live cparams.n_seq_max, with
+        -- max_streams as the hard upper bound). The chain-residual
+        -- read at src/llama.cpp:5225 takes the form
+        -- mtp_persist[stream_id][step] (or equivalently a 2D index
+        -- into a single tensor of shape [n_embd, n_steps,
+        -- n_stream]). Each slot reads from its own stream's slab.
+
+    @invariant ArmFieldIsPerSlotAtDecoderBoundary
+        -- After the fix, FusedDecoderState carries one
+        -- pending_chain_residual_step per active stream
+        -- (vector<int32_t> indexed by stream_id), not a single
+        -- scalar. The single-slot fast path arms
+        -- pending_chain_residual_step[s] for stream s only. The
+        -- multi-slot batched path arms all active streams' entries
+        -- in one shot.
+
+    @invariant ReadIndexFollowsStreamId
+        -- prepare_mtp_graph_inputs at src/llama.cpp:5202 reads
+        -- pending_chain_residual_step[s] for the stream s
+        -- corresponding to the slot whose fused decode is being
+        -- prepared. The read clears the per-stream entry (preserves
+        -- the "auto-clear on consume" semantics of the HEAD code at
+        -- src/llama.cpp:5223). No global state survives the read.
+
+    @invariant CaptureWritesAllActiveStreams
+        -- The end-of-fused-compute capture at src/llama.cpp:6112-
+        -- 6130 D2D-copies each chain residual to its persist slot.
+        -- After the fix, the capture writes the per-stream slab
+        -- for the dispatching stream (or all dispatching streams,
+        -- in the unified-dispatch Tier 3 form). No cross-stream
+        -- writes; the capture is a fan-in equivalent to one
+        -- per-stream copy.
+
+    @guidance
+        -- NOT honoured on HEAD. This contract describes the target
+        -- of a future extension that has NOT been scheduled in
+        -- PHASE_NSTREAM_KV_PERF.md. The simpler closure is the
+        -- structural opt-out documented in
+        -- MTPFusedAtN_StreamLessThan2Or1 below. This contract is
+        -- kept here so the cost of the per-stream extension is
+        -- explicit if a future workload demands chain-residual
+        -- reuse at n_stream > 1.
+}
+
+-- The BatchedMTPSharedDecoderInvariant — the post-D9.5 collapsed-
+-- context invariant that all MTP slots share ctx_tgt (and therefore
+-- share the single FusedDecoderState). Confirmed at HEAD by
+-- common/speculative.cpp:1527-1532 (the all_mtp branch asserts every
+-- mtp_states[i]->ctx_tgt equals mtp_states[0]->ctx_tgt before
+-- entering batched mode). This shared-decoder model is WHAT MAKES
+-- the per-stream indexing necessary: if each slot had its own
+-- ctx_tgt and its own decoder, the persist buffer's lack of per-
+-- stream axis would not be a problem (each slot would own its own
+-- buffer). The shared decoder concentrates the cross-slot aliasing
+-- onto one buffer and one arming field.
+contract BatchedMTPSharedDecoderInvariant {
+    invoke: (decoder: FusedDecoderState, tick: Tick) -> Boolean
+
+    @invariant AllMTPSlotsShareCtxTgt
+        -- For any tick with multiple active MTP slots, every slot's
+        -- common_speculative_state_mtp.ctx_tgt resolves to the same
+        -- llama_context. Confirmed structurally at
+        -- common/speculative.cpp:1527-1532: the all_mtp branch
+        -- short-circuits to per-slot serial fallback when the
+        -- ctx_tgt mismatch is detected. The shared-decoder model
+        -- is therefore an INVARIANT of the batched fan-out, not a
+        -- best-effort property.
+
+    @invariant SharedDecoderImpliesSharedPersistBuffer
+        -- Since the FusedDecoderState lives on
+        -- lctx.default_decoder and all MTP slots share lctx, all
+        -- MTP slots share the persist buffer and the
+        -- pending_chain_residual_step field. The shared decoder is
+        -- the structural reason chain_residual indexing without a
+        -- stream axis aliases across slots.
+
+    @invariant PerSlotIndexingNeededForCrossSlotIsolation
+        -- Per-slot chain-residual READS would, in principle, allow
+        -- multiple slots to issue fused decodes within one tick
+        -- without aliasing — provided the persist buffer carries a
+        -- per-stream axis (per MTPChainResidualPerStream above).
+        -- Without that extension, the only safe option is to
+        -- structurally skip the arm in batched mode
+        -- (MTPFusedAtN_StreamLessThan2Or1).
+
+    @guidance
+        -- The shared-ctx_tgt invariant is recent (post-D9.5).
+        -- Earlier MTP-multislot architectures used per-slot
+        -- ctx_tgt instances; under that model the persist buffer
+        -- was implicitly per-slot. The collapse to one ctx_tgt
+        -- removed the natural per-slot isolation; the chain-
+        -- residual buffer is the leftover global state from before
+        -- the collapse. See MEMORY entry
+        -- project_mtp_multislot_determinism_investigation_failed
+        -- for the broader history.
+}
+
+-- The MTPFusedAtN_StreamLessThan2Or1 — the contract that binds the
+-- HONOURED-ON-HEAD opt-out. The chain-residual arm is HONOURED in
+-- single-slot dispatch and STRUCTURALLY SKIPPED in multi-slot
+-- batched dispatch. The opt-out is enforced by the dispatch path's
+-- structure (server-context.cpp:3357 if-branch vs :3410 else-branch),
+-- not by a runtime flag check.
+contract MTPFusedAtN_StreamLessThan2Or1 {
+    invoke: (slot_states: Set<SlotChainResidualState>, decoder: FusedDecoderState) -> ChainResidualArmingMode
+
+    @invariant SingleSlotPathHonoursArm
+        -- When exactly one slot has SlotChainResidualState.
+        -- in_fused_chain_this_tick = true, the dispatch enters the
+        -- single-slot branch at server-context.cpp:3357. That
+        -- branch reads slot.mtp_next_chain_residual_step at
+        -- :3375 and, if non-negative, calls
+        -- llama_set_draft_input_chain_residual(hs_ctx, step) at
+        -- :3376 — which writes decoder.pending_chain_residual_step.
+        -- prepare_mtp_graph_inputs then reads persist[step] at
+        -- src/llama.cpp:5224. The arming mode is armed_single_slot
+        -- (or not_armed if the slot's step is -1).
+
+    @invariant MultiSlotPathSkipsArmStructurally
+        -- When two or more slots have
+        -- SlotChainResidualState.in_fused_chain_this_tick = true,
+        -- the dispatch enters the multi-slot batched branch at
+        -- server-context.cpp:3410. That branch SKIPS the chain-
+        -- residual arm entirely (no call to
+        -- llama_set_draft_input_chain_residual). The arming mode
+        -- is skipped_multi_slot. The decoder's
+        -- pending_chain_residual_step retains the value from prior
+        -- arms (typically -1 after the previous read auto-cleared
+        -- it); prepare_mtp_graph_inputs's bound check at
+        -- src/llama.cpp:5224 ("step >= 0 && step <
+        -- mtp_persist_n") fails on -1 and the host-bounce path at
+        -- src/llama.cpp:5241-5247 supplies the seed instead.
+
+    @invariant EnvGateCannotReintroduceCrossSlotChain
+        -- The single-slot chain-residual arm IS gated by
+        -- LLAMA_MTP_CHAIN_RESIDUAL_SEED at server-context.cpp:3370-
+        -- 3374 (or by LLAMA_MTP_FULL_2). The env gate ONLY
+        -- enables the single-slot path; it CANNOT add the arm to
+        -- the multi-slot batched path because the call site does
+        -- not exist there. A future refactor that moves the env
+        -- gate higher (above the if/else branch) and threads it
+        -- through both arms would violate this contract.
+
+    @invariant N_StreamOneIsTriviallySafe
+        -- When the runtime cparams.n_seq_max == 1 (single-slot
+        -- deployment, the current production configuration for
+        -- 27B-MTP-IR), only one slot ever exists and the multi-
+        -- slot branch is unreachable. The arming mode is always
+        -- armed_single_slot or not_armed. Cross-references
+        -- PreservesNStream1Production from
+        -- specs/kv-cache/per_stream_read_view_patching.allium.
+
+    @guidance
+        -- This contract is HONOURED ON HEAD. The RED test in
+        -- tests/spec/test-mtp-x-n-stream.cpp (P0.B.S4)
+        -- exercises a 2-slot MTP tick and asserts (a)
+        -- pending_chain_residual_step is -1 at the entry to
+        -- prepare_mtp_graph_inputs, (b) no
+        -- llama_set_draft_input_chain_residual call fires from the
+        -- batched path. The test PASSES on HEAD; it exists as a
+        -- regression guard against a future refactor that moves the
+        -- env gate or unifies the dispatch arms.
+}
+
+-- The NoCrossStreamChainPoisoning — the SAFETY property the
+-- composition guarantees. Equivalent statement: slot S's
+-- chain_residual reads never alias slot S' ≠ S's chain_residual
+-- writes. This is the MTP analogue of NoCrossStreamLeakage from
+-- specs/kv-cache/n_stream_layer.allium, applied to the persist
+-- buffer. The property holds at HEAD by the opt-out
+-- (MTPFusedAtN_StreamLessThan2Or1) and would continue to hold under
+-- the per-stream extension (MTPChainResidualPerStream).
+contract NoCrossStreamChainPoisoning {
+    invoke: (slot_states: Set<SlotChainResidualState>, decoder: FusedDecoderState) -> Boolean
+
+    @invariant NoCrossSlotPersistRead
+        -- For any two slots S and S' with S != S' and both having
+        -- in_fused_chain_this_tick = true, S's fused decode at
+        -- src/llama.cpp:5202 (prepare_mtp_graph_inputs) does NOT
+        -- read a persist[k] tensor that was written by S''s prior
+        -- fused decode. At HEAD this holds because the multi-slot
+        -- path does not arm (the persist read short-circuits on
+        -- step == -1). Under the per-stream extension this would
+        -- hold because the read indexes persist[S][k] and the
+        -- prior write was persist[S'][k].
+
+    @invariant NoCrossSlotArmingFieldRace
+        -- For any two slots S and S' that issue fused decodes within
+        -- one tick, S's arm at server-context.cpp:3376 does NOT
+        -- race with S''s read at src/llama.cpp:5222. At HEAD this
+        -- holds because the multi-slot path does not call the arm
+        -- API at all (the single shared
+        -- pending_chain_residual_step is written by neither slot's
+        -- dispatch). Under the per-stream extension this would
+        -- hold because the arm writes
+        -- pending_chain_residual_step[S] and the read reads
+        -- pending_chain_residual_step[S'].
+
+    @invariant PersistCaptureWritesDoNotCrossStreams
+        -- The end-of-fused-compute capture at
+        -- src/llama.cpp:6112-6130 D2D-copies the just-computed
+        -- chain_residuals into persist[]. At HEAD the capture
+        -- writes the SHARED persist[k] for whichever slot's fused
+        -- decode just completed; this is the structural reason
+        -- the multi-slot opt-out is necessary. Under the per-stream
+        -- extension the capture would write persist[S][k] for the
+        -- dispatching stream S; no cross-stream write would occur.
+
+    @invariant SafetyHoldsUnderEitherClosure
+        -- The NoCrossSlot properties above hold under EITHER of two
+        -- closures: (a) the structural opt-out in batched mode
+        -- (HEAD) — the cross-slot read/write path is unreachable;
+        -- (b) the per-stream extension — the cross-slot read/write
+        -- path is reachable but indexed disjointly. Both closures
+        -- satisfy this contract; the choice between them is a
+        -- perf/complexity trade-off documented in OQ-1 below.
+
+    @guidance
+        -- This contract is the MTP analogue of the Bug C absence
+        -- argument. Under (a) the closure is structural (the path
+        -- doesn't fire); under (b) it is by-construction (the
+        -- indexing partitions the state). Either way the safety
+        -- property holds; future workloads at n_stream > 1 will
+        -- determine whether (a)'s perf cost (lost reuse) demands
+        -- the (b) extension.
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The persist-buffer-is-per-decoder property. For any FusedDecoderState
+-- d, the persist buffer holds at most persist_capacity_steps tensors
+-- and has no per-stream axis at HEAD. Lifts
+-- MTPChainResidualPerStream.PersistShapeIsNStepsByNStream's HEAD
+-- form: at HEAD, n_stream collapses to 1 by construction.
+invariant PersistBufferIsPerDecoderAtHead {
+    for d in FusedDecoderStates:
+        d.persist_capacity_steps = config.persist_capacity_steps
+            and d.persist_populated_steps <= d.persist_capacity_steps
+}
+
+-- The arming-mode-is-structural property. For every tick that
+-- dispatches at least one fused MTP decode, the chain-residual
+-- arming mode is either armed_single_slot, not_armed, or
+-- skipped_multi_slot. There is no fourth mode. Lifts
+-- MTPFusedAtN_StreamLessThan2Or1's structural distinction to a
+-- system-wide property.
+invariant ArmingModeIsStructural {
+    for tick in MTPDispatchTicks:
+        ArmingModeAt(tick) in {armed_single_slot, not_armed, skipped_multi_slot}
+}
+
+-- The multi-slot-skips-arm property. For every tick with two or
+-- more active MTP slots, the arming mode is skipped_multi_slot.
+-- Lifts MultiSlotPathSkipsArmStructurally.
+invariant MultiSlotImpliesSkippedArm {
+    for tick in MTPDispatchTicks:
+        tick.n_active_mtp_slots >= 2
+            implies ArmingModeAt(tick) = skipped_multi_slot
+}
+
+-- The no-cross-slot-poisoning property. For any tick with two or
+-- more active MTP slots, no slot's persist read aliases another
+-- slot's persist write within the same tick. Lifts
+-- NoCrossStreamChainPoisoning.SafetyHoldsUnderEitherClosure.
+invariant NoCrossSlotPoisoningSystemWide {
+    for tick in MTPDispatchTicks:
+        tick.n_active_mtp_slots >= 2
+            implies NoSlotReadAliasesAnotherSlotWriteIn(tick)
+}
+
+-- The Tier-2 obliviousness property. For every tick that runs
+-- update_cache_copies (the Tier-2 patch entry point), the patch
+-- iteration does NOT touch the persist buffer or the arming field.
+-- Lifts MTPFusedReuseSurvivesStreamPatching.
+-- StreamPatchingObliviousToPersistArming.
+invariant Tier2PatchObliviousToPersistArming {
+    for tick in Ticks:
+        Tier2PatchedTensorsAt(tick).disjoint(PersistTensorsOf(DecoderAt(tick)))
+            and Tier2PatchedFieldsAt(tick).disjoint(PersistArmingFieldsOf(DecoderAt(tick)))
+}
+
+-- The composition-with-Tier-3-unified-dispatch property. Under
+-- Tier 3 (specs/dispatch/unified_stream_dispatch.allium), one
+-- llama_decode per tick covers all active streams via ne[3]. The
+-- fused MTP draft path runs INSIDE that single decode for the
+-- streams that have armed fused chains; the chain-residual buffer
+-- must be partitioned per stream (per MTPChainResidualPerStream)
+-- for the unified dispatch to compose cleanly. Until that extension
+-- lands, Tier 3 inherits the HEAD opt-out: multi-stream MTP fused
+-- chains run through the host-bounce path.
+invariant Tier3UnifiedDispatchInheritsHEADOptOut {
+    for tick in UnifiedDispatchTicks:
+        tick.n_active_mtp_slots >= 2
+            implies ArmingModeAt(tick) = skipped_multi_slot
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: When (if ever) does the per-stream extension to the
+--   persist buffer land? The trade-off is concrete:
+--   (a) HEAD opt-out — chain-residual reuse loses across n_stream > 1
+--       multi-slot MTP fused ticks. Perf cost: one D2H+H2D copy of
+--       n_embd floats per fused decode per active slot per tick
+--       (~0.5 ms at n_embd = 5120 on PCIe 4.0). At n_seq_max = 2
+--       and decode tick rate ~30/s, the perf cost is ~30 ms/s of
+--       host bounce overhead. Not zero, but small relative to the
+--       decode budget.
+--   (b) Per-stream extension — persist becomes [n_embd, n_steps,
+--       n_stream], pending_chain_residual_step becomes per-stream.
+--       Implementation cost: persist_buf allocation grows by
+--       n_stream; the capture loop at src/llama.cpp:6112-6130 must
+--       index per stream; prepare_mtp_graph_inputs's read must
+--       resolve the calling stream's id (currently it has no such
+--       parameter). ~200 LOC of disciplined refactor.
+--   Resolve when MTP-IR at n_seq_max >= 2 becomes a production
+--   target. Current production runs at n_seq_max = 1 so the
+--   opt-out cost is zero.
+--
+-- OQ-2: Does the multi-slot batched path EVER want chain-residual
+--   reuse for the FIRST slot in the batch? The single-slot fast
+--   path at server-context.cpp:3357 honours the arm because only
+--   one slot is dispatching. The multi-slot batched path could
+--   honour slot 0's arm and skip slots 1..N-1's. This would recover
+--   ~1/N of the perf benefit at multi-slot cost. The current opt-
+--   out is N=0; the lift would require pending_chain_residual_step
+--   to be aware of WHICH slot's chain its persist[] data represents
+--   (or guarantee that slot 0 captured the last fused chain on this
+--   decoder). The simpler full per-stream extension (OQ-1)
+--   subsumes this; not worth implementing as an intermediate step.
+--
+-- OQ-3: Is there a structural way to PREVENT a future refactor
+--   from accidentally re-enabling chain-residual arming under
+--   multi-slot dispatch without first satisfying
+--   MTPChainResidualPerStream? Today the opt-out is enforced by
+--   the dispatch path's if/else structure. A future unification
+--   of the dispatch arms (e.g., one code path that handles
+--   N >= 1 uniformly) is exactly what Tier 3 does for the OUTER
+--   llama_decode loop. The contracts above bind the property
+--   structurally: a unified dispatch arm that calls
+--   llama_set_draft_input_chain_residual unconditionally would
+--   violate MTPFusedAtN_StreamLessThan2Or1.
+--   MultiSlotPathSkipsArmStructurally. The Allium check + the
+--   RED test in tests/spec/test-mtp-x-n-stream.cpp would
+--   catch the regression at PR time.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root, line numbers
+-- verified 2026-05-21 against current HEAD):
+--   ik_llama.cpp/src/llama.cpp:5202-5267
+--     — prepare_mtp_graph_inputs; the chain-residual reuse read
+--       at 5222-5238. The READ site for the persist buffer.
+--   ik_llama.cpp/src/llama.cpp:5222-5223
+--     — "const int step = lctx.default_decoder.
+--        pending_chain_residual_step;
+--        lctx.default_decoder.pending_chain_residual_step = -1;"
+--       — the auto-clear semantics. The arming field is read AND
+--       cleared by the consume site; the next decode without a
+--       fresh arm falls through to the host-bounce path.
+--   ik_llama.cpp/src/llama.cpp:5224-5237
+--     — the persist[step] bound check + tensor copy. "step >= 0
+--       && step < lctx.default_decoder.mtp_persist_n" is the only
+--       guard against reading stale persist data.
+--   ik_llama.cpp/src/llama.cpp:6064-6131
+--     — the end-of-fused-compute capture block. D2D-copies each
+--       chain_residual[k] to persist[k]; updates persist_n.
+--   ik_llama.cpp/src/llama.cpp:6088-6092
+--     — the persist allocation: 8 ggml_new_tensor_2d calls of
+--       shape [n_embd, 1]. The "8" is hard-coded;
+--       config.persist_capacity_steps mirrors it.
+--   ik_llama.cpp/src/llama.cpp:5330-5345
+--     — the stale-pointer guard. mtp_fused_chain_residuals[]
+--       (the sched-owned source tensors) are nulled when the next
+--       decode is NOT fused; persist[] is NOT touched here because
+--       it lives in a context-owned backend buffer with persist_n
+--       as its validity counter.
+--   ik_llama.cpp/examples/server/server-context.cpp:3215-3346
+--     — the per-slot mtp_collected gather loop. Slots add their
+--       (slot, input) pair to mtp_collected when ready to draft;
+--       the count of mtp_collected drives the single-slot vs
+--       multi-slot dispatch branch below.
+--   ik_llama.cpp/examples/server/server-context.cpp:3350-3409
+--     — the single-slot fast path. Reads slot.mtp_next_chain_
+--       residual_step at :3375; calls llama_set_draft_input_
+--       chain_residual(hs_ctx, step) at :3376 ONLY if the
+--       chain-residual env gate is set AND the slot's step is
+--       non-negative.
+--   ik_llama.cpp/examples/server/server-context.cpp:3410-3475
+--     — the multi-slot batched path. SKIPS the chain-residual arm
+--       entirely; the inline comment at :3427-3430 names the
+--       reason ("uses one device buffer + one chain"). Calls
+--       llama_set_draft_input_hidden_state_multi at :3426 and
+--       common_speculative_draft_batched at :3441.
+--   ik_llama.cpp/examples/server/server-context.cpp:3370-3374
+--     — the LLAMA_MTP_CHAIN_RESIDUAL_SEED + LLAMA_MTP_FULL_2 env
+--       gates. Only consulted in the single-slot branch; the
+--       multi-slot branch ignores them by construction.
+--   ik_llama.cpp/examples/server/server-context.cpp:4289
+--     — slot.mtp_next_chain_residual_step = -1 on rejection; the
+--       "any_rejected && slot.spec_ckpt.valid" branch resets the
+--       arm because mtp_accept_tokens runs an UPDATE_ACCEPTED
+--       decode that invalidates the prior fused chain.
+--   ik_llama.cpp/examples/server/server-context.cpp:4322
+--     — slot.mtp_next_chain_residual_step = ids.size() - 1 on
+--       successful accept; arms the next cycle's read at the
+--       new last-accepted-position residual index.
+--   ik_llama.cpp/common/speculative.cpp:1481-1532
+--     — common_speculative_draft_batched; the multi-slot
+--       batched primitive. Asserts all slots share ctx_tgt
+--       (BatchedMTPSharedDecoderInvariant.AllMTPSlotsShareCtxTgt)
+--       at lines 1527-1532. Falls back to per-slot serial if
+--       not.
+--
+-- Black-box helpers used inline in the system-wide invariants
+-- (not in `deferred` per project convention — they have no
+-- separate .allium spec):
+--   FusedDecoderStates, MTPDispatchTicks, Ticks, ArmingModeAt,
+--   NoSlotReadAliasesAnotherSlotWriteIn, Tier2PatchedTensorsAt,
+--   Tier2PatchedFieldsAt, PersistTensorsOf, PersistArmingFieldsOf,
+--   DecoderAt, UnifiedDispatchTicks.
+--
+-- Test infrastructure to drive from this spec via allium:propagate
+-- (P0.B.S4 in PHASE_NSTREAM_KV_PERF.md):
+--   - tests/spec/test-mtp-x-n-stream.cpp
+--     * Drives a 2-slot MTP fused tick at n_seq_max = 2; asserts
+--       (a) pending_chain_residual_step is -1 at the entry to
+--           prepare_mtp_graph_inputs for both slots'
+--           fused decodes (the host-bounce path takes over),
+--       (b) no llama_set_draft_input_chain_residual call fires
+--           from the batched-dispatch path,
+--       (c) the per-slot host-bounce hidden states supplied by
+--           llama_set_draft_input_hidden_state_multi are consumed
+--           correctly (the seed for each slot's fused decode
+--           comes from the host path).
+--     * EXPECTED TO PASS on HEAD (the opt-out is the HEAD
+--       behaviour); the test exists as a regression guard.
+--   Both the 2-slot multi-slot-path opt-out and the 1-slot
+--   single-slot-path arming behaviour land in the same file
+--   (test-mtp-x-n-stream.cpp). The originally planned 1slot
+--   variant was rolled into the single file when the test was
+--   renamed; admit_stream / retire_stream transitions inside the
+--   single test exercise both arms.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- mtp_fused_draft.allium (at repo root, not under specs/)
+--   The abstract FusedDraftStep contract. THIS spec composes on
+--   top of mtp_fused_draft.allium's FusedDraftStep: the persist
+--   buffer described here is the implementation mechanism that
+--   the Phase 37 #5 reuse branch uses to elide one host bounce
+--   per fused round. mtp_fused_draft.allium's
+--   FusedDraftRespectsStreamPartition asserts the FUSED GRAPH's
+--   KV writes are stream-local; THIS spec asserts the
+--   chain-residual-reuse PATH is stream-safe (under the opt-out
+--   or per-stream extension).
+--
+-- specs/kv-cache/n_stream_layer.allium
+--   The 4D per-stream KV layout. PerStreamAllocator,
+--   StreamPartition, NoCrossStreamLeakage live there. THIS spec's
+--   NoCrossStreamChainPoisoning is the MTP analogue of
+--   NoCrossStreamLeakage applied to the persist buffer.
+--
+-- specs/kv-cache/per_stream_read_view_patching.allium
+--   The Tier-2 read-view patching contract. THIS spec asserts
+--   (via MTPFusedReuseSurvivesStreamPatching) that Tier 2's
+--   update_cache_copies extension does NOT touch the persist
+--   buffer or the arming field — the two mechanisms are in
+--   different allocation pools and different patch loops.
+--
+-- specs/dispatch/unified_stream_dispatch.allium
+--   The Tier-3 unified-dispatch contract. Cross-referenced by
+--   Tier3UnifiedDispatchInheritsHEADOptOut: Tier 3 does NOT lift
+--   the multi-slot opt-out; multi-stream MTP fused chains
+--   continue to run through the host-bounce path until the
+--   per-stream extension (MTPChainResidualPerStream) lands.
+--
+-- specs/scheduler/batch_composition.allium
+--   The scheduler-level admission contracts (chunked-prefill
+--   admission under Tier 4). THIS spec's contracts must NOT
+--   violate the redefined BatchCompositionInvariant
+--   (TokenBudgetPerUbatch + per-token flag exclusivity). The
+--   MTP fused decode contributes is_decode tokens per
+--   DecodePriorityAdmission (per mtp_fused_draft.allium's
+--   FusedDraftRoundsRunOnPureDecodeBatches); THIS spec's
+--   multi-slot opt-out does not alter that property.
+--
+-- specs/dflash/dflash_server_cli.allium
+--   The DFlash multi-slot server-CLI contract. DFlash and MTP
+--   are alternative spec backends sharing the
+--   common_speculative_draft_batched dispatcher. The two coexist
+--   in common/speculative.cpp:1481-1574: the function tries
+--   all-MTP first, falls back to all-DFlash, then to per-slot
+--   serial. THIS spec binds the all-MTP branch; the all-DFlash
+--   branch is owned by dflash_server_cli.allium.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity MtpFusedXNStreamSystem {
+    arming_mode: ChainResidualArmingMode
+}
+
+contract ValidateMtpFusedXNStreamSystem {
+    invoke: (sys: MtpFusedXNStreamSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

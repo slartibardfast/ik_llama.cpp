@@ -1,0 +1,244 @@
+-- allium: 3
+-- tree_mtp_decode.allium
+--
+-- Scope: top-level state machine for tree-K MTP speculative decoding on
+-- Qwen 3.6 27B. Governs the cycle that runs once per "draft + verify +
+-- accept" round when the server is configured with LLAMA_MTP_TREE_K > 1.
+--
+-- Why this spec exists: Phase 40 landed tree-K=2 depth=1 end-to-end but
+-- crashes on hybrid-recurrent assert. Phase 41 unblocks the assert;
+-- Phase 42 lifts to depth=2. Both phases share this state-machine
+-- contract — what enters the cycle, what exits, and the invariants that
+-- make accept correct.
+--
+-- Includes:
+--   - External entities for the cycle's input (slot state, tree config)
+--     and output (accepted path, winning branch, next sampled token).
+--   - The TreeMtpCycle contract — cycle entry/exit and state transitions.
+--   - Invariants binding cycle progress, branch isolation, and accept
+--     correctness against the underlying drafts.
+--
+-- Excludes:
+--   - The DeltaNet ancestor-state lookup (per_step_ssm_ancestor.allium).
+--   - The branch seq_id allocation (branch_seq_id.allium).
+--   - The MTP fused draft graph itself (mtp_fused_draft.allium).
+--   - The accept-decision over verify logits (mtp_verify_accept.allium);
+--     this spec consumes that decision per-branch.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The slot whose decoding cycle is being tracked. One slot per
+-- concurrent client; tree fan-out happens within one slot.
+entity Slot {
+    id:              Integer
+    pos_next:        Integer    -- next position to write
+    seq_id_main:     Integer    -- the slot's primary seq_id
+    tree_k:          Integer    -- 1 (linear) or 2 (tree fan-out width)
+    tree_depth:      Integer    -- 1 or 2; constrained by tree_k
+}
+
+-- One candidate path through the tree. At depth=1, K candidates are
+-- siblings of the root. At depth=2, K^2 candidates are grandchildren
+-- of the root, ordered breadth-first.
+entity TreeCandidate {
+    branch_idx:        Integer    -- 0..K^depth-1, BFS order
+    parent_branch_idx: Integer    -- -1 for root, else ancestor index
+    depth:             Integer    -- 0..tree_depth
+    draft_token:       Integer
+}
+
+-- The accept output for one cycle. winning_branch_idx selects which
+-- candidate path was committed; -1 means no draft accepted (only the
+-- root verify token committed).
+entity AcceptResult {
+    winning_branch_idx:  Integer    -- -1 if no draft accepted
+    accepted_path_len:   Integer    -- 0..tree_depth+1
+    next_sampled_token:  Integer    -- always committed (the bonus)
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- Cycle states. idle → drafted → verifying → accepted → committed.
+-- Failure transitions go to error and abort the cycle.
+enum CycleState { idle | drafted | verifying | accepted | committed | error }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum tree fan-out width supported. Above this, the engine
+    -- must fall back to linear chain (tree_k = 1).
+    max_tree_k: Integer = 2
+
+    -- Maximum tree depth. d=1 is sibling-only (Phase 41); d=2 is
+    -- full tree (Phase 42).
+    max_tree_depth: Integer = 2
+
+    -- The probe-measured α(top-1) ceiling on production at long
+    -- context (X02 256K). Used for closure-criterion thresholds.
+    alpha_top1_ceiling: Float = 0.89
+
+    -- The probe-measured α(top-2) ceiling. Closure binds on
+    -- α(accept) at K=2 ≥ this minus 2pp = 0.93.
+    alpha_top2_ceiling: Float = 0.95
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The end-to-end tree-MTP decoding cycle. One invocation per "draft +
+-- verify + accept + commit" round. Begins idle, ends committed (success)
+-- or error (abort).
+contract TreeMtpCycle {
+    invoke: (slot: Slot) -> AcceptResult
+
+    @invariant TreeKOneImpliesDepthOne
+        -- slot.tree_k = 1 implies slot.tree_depth = 1. Linear chain
+        -- mode has only the root candidate.
+
+    @invariant TreeKExceedsOneImpliesDepthInRange
+        -- slot.tree_k > 1 implies slot.tree_depth in [1, max_tree_depth].
+
+    @invariant CandidateCountMatchesShape
+        -- The number of TreeCandidate produced equals
+        -- (tree_k^(tree_depth+1) - 1) / (tree_k - 1) for tree_k > 1,
+        -- and 1 for tree_k = 1.
+
+    @invariant AcceptedPathLengthBound
+        -- AcceptResult.accepted_path_len in [0, slot.tree_depth + 1].
+        -- Zero means only the verify-sampled bonus advances; depth+1
+        -- means the full tree path was accepted.
+
+    @invariant WinningBranchValidOrNegative
+        -- AcceptResult.winning_branch_idx is either -1 (no path
+        -- accepted) or in [0, tree_k^tree_depth - 1] indexing the
+        -- deepest candidates in BFS order.
+
+    @invariant NextSampledAlwaysCommitted
+        -- AcceptResult.next_sampled_token is always non-null and is
+        -- committed to slot.cache_tokens. The bonus always advances
+        -- position by one even when winning_branch_idx = -1.
+
+    @invariant LinearModeUnchangedBehavior
+        -- slot.tree_k = 1 produces accept_path_len in {0, 1} and
+        -- byte-identical output to the pre-Phase-41 linear chain
+        -- under temp=0 sampling.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- Branch isolation. No two TreeCandidate sharing a parent see each
+-- other's KV cells during verify. Sibling branches must be masked from
+-- each other; the parent's prefix is shared.
+invariant SiblingBranchIsolation {
+    for cycle in Cycles:
+        for a in TreeCandidatesOf(cycle):
+            for b in TreeCandidatesOf(cycle):
+                a != b and parent_of(a) = parent_of(b)
+                    implies kv_cells_visible_to(a) intersect kv_cells_unique_to(b) = empty
+}
+
+-- Cycle progress. Every successful TreeMtpCycle advances slot.pos_next
+-- by accepted_path_len + 1. The +1 is the verify-sampled bonus.
+invariant CycleAdvancesPosition {
+    for cycle in Cycles where cycle.state = committed:
+        slot_pos_next_after(cycle) = slot_pos_next_before(cycle)
+            + cycle.result.accepted_path_len + 1
+}
+
+-- Greedy parity at K=1. With tree_k=1 and temp=0, the cycle's
+-- output is byte-identical to the pre-Phase-41 linear-chain build.
+-- This is the foundation invariant for Phase 41 closure.
+invariant LinearGreedyParity {
+    for cycle in Cycles where cycle.slot.tree_k = 1
+        and sampling_mode(cycle) = greedy_temp_zero:
+            cycle.result.next_sampled_token
+                = pre_phase_41_linear_chain_output(cycle.slot)
+}
+
+-- Accept rate at K=2 within probe ceiling. Closure-binding for
+-- Phase 41: α(accept) at K=2 must reach within 2pp of measured probe
+-- ceiling 0.95.
+invariant AcceptRateAtKTwoMeetsProbeCeiling {
+    for window in DecodeWindows where window.tree_k = 2
+        and window.context_kind = long_context_x02
+        and window.n_samples >= 1000:
+            alpha_accept(window) >= config.alpha_top2_ceiling - 0.02
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Tree depth ≥ 3 support. Phase 41/42 binds depth ∈ {1, 2}.
+--   Higher depth needs additional state-buffer slots and would
+--   require re-measuring α₃, α₄ to confirm continued lift; deferred.
+--
+-- OQ-2: Probabilistic accept under temp > 0. mtp_verify_accept.allium
+--   OQ-1 covers the rejection-sampling rule. Tree-mode adds a
+--   per-branch rejection coordination question deferred to that spec
+--   when it expands.
+--
+-- OQ-3: Per-slot vs per-server tree shape. Currently tree_k is a
+--   process-wide env var (LLAMA_MTP_TREE_K). Per-slot dynamic shape
+--   (e.g., adaptive-K based on per-slot α) is out of scope; revisit
+--   if Phase 42 lands and per-slot adaptivity becomes the next lever.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/examples/server/server-context.cpp:29
+--     - server_tree_k() reads LLAMA_MTP_TREE_K
+--   ik_llama.cpp/examples/server/server-context.cpp:44
+--     - TREE_BRANCH_BASE (Phase 41 replaces with in-range allocation)
+--   ik_llama.cpp/common/speculative.cpp:1601
+--     - DRAFT_GEN llama_batch_init (Phase 42 lifts to batch=K)
+--   ik_llama.cpp/src/llama.cpp:745-746
+--     - qnext_state_slots formula (Phase 41 bumps via n_seq_max)
+--
+-- Black-box helpers:
+--   TreeCandidatesOf, parent_of, kv_cells_visible_to,
+--   kv_cells_unique_to, slot_pos_next_after, slot_pos_next_before,
+--   sampling_mode, pre_phase_41_linear_chain_output, alpha_accept,
+--   DecodeWindows, Cycles.
+--
+-- Test infrastructure to drive from this spec via allium:propagate:
+--   - LinearGreedyParity property: temp=0 byte-equal output at K=1
+--     against pre-Phase-41 build under fixed seed.
+--   - AcceptRateAtKTwoMeetsProbeCeiling property: accept-rate on
+--     1000-sample window at long context X02 with K=2.
+--   - SiblingBranchIsolation property: sibling branches at depth=1
+--     produce the same per-branch logits as if dispatched alone.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- and enum as a typed field, so `allium check` sees the references
+-- bound. Not a runtime object — purely structural.
+
+entity TreeMtpDecodeSystem {
+    tree_candidates: List<TreeCandidate>
+    accept_results: List<AcceptResult>
+    cycle_state: CycleState
+}
+
+contract ValidateTreeMtpDecodeSystem {
+    invoke: (sys: TreeMtpDecodeSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllDeclarations
+        -- Closes the entity- and enum-reference graph; each
+        -- otherwise-unreferenced declaration appears once as a field
+        -- above so the spec's structural reference graph is closed
+        -- under `allium check`.
+}

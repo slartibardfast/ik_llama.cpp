@@ -1,0 +1,18 @@
+# Obligations for tree_mtp_decode.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Slot => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.TreeCandidate => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.AcceptResult => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.CycleState => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_tree_k => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_tree_depth => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.alpha_top1_ceiling => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.alpha_top2_ceiling => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.TreeMtpCycle.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.SiblingBranchIsolation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CycleAdvancesPosition => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.LinearGreedyParity => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.AcceptRateAtKTwoMeetsProbeCeiling => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.TreeMtpDecodeSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateTreeMtpDecodeSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

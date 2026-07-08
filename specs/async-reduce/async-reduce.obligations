@@ -1,0 +1,23 @@
+# Obligations for async-reduce.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.ReduceStream => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ReduceEvent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.AsyncReducePath => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SyncF32Baseline => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.AsyncReducePathPair => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.F32Throughout => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DeterministicAcrossSchedule => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.BitIdenticalToSyncF32Baseline => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.EventOrderingHoldsBeforeRead => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoDataRaceOnReducedTensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.InputReadyBeforePeerCopy => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.StreamIsolation => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoCrossStreamGlobalSync => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.TerminationUnderFairScheduler => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DeadlockFreedom => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.OverlapComputeWithComm => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.NoPerfRegressionVsCastPath => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FallbackToSync => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FallbackIsBitIdentical => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateAsyncReducePair.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

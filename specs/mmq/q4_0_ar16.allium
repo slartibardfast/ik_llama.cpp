@@ -1,0 +1,352 @@
+-- allium: 3
+-- q4_0_ar16.allium
+
+-- Scope: GGML_TYPE_Q4_0_AR16 — 16-element-block 4-bit symmetric quant
+-- introduced for PHASE32 Stage 2. Differs from Q4_0 in three ways:
+--   (a) block size 16 instead of 32, so it is lossless under
+--       16-element-aligned column permutations;
+--   (b) INTERLEAVED nibble layout (byte j = code[2j] | code[2j+1]<<4)
+--       — Q4_0 packs split-halves (byte j = code[j] | code[j+QK/2]<<4);
+--   (c) symmetric scale d = absmax/8 — Q4_0 uses signed d = max/-8.
+-- The format exists to preserve Intel AutoRound INT4 W4G128 calibration
+-- through a V-col reorder where Q4_0's 32-element block straddles the
+-- 16-element permutation boundary.
+--
+-- Includes:
+--   - Block layout (10 bytes total) and the QuantizedRow wrapper.
+--   - Nibble unpack convention (interleaved per even/odd k).
+--   - Quantize + dequantize contracts (RNE codes, sym INT4).
+--   - vec_dot contract against Q8_0 query rows.
+--   - The col-perm-equivalence-16-aligned invariant (the *reason* this
+--     format exists).
+--   - AutoRound-G128 emit invariant — the upstream tooling path.
+--   - Determinism invariant.
+--
+-- Excludes:
+--   - SIMD / backend implementations (AVX2, AVX512, CUDA dispatch).
+--     SIMDEquivalence semantics are inherited from mul_mat_cpu.allium's
+--     VecDot contract — see the `deferred MulMatCpu.VecDot`
+--     declaration below.
+--   - HIP / Metal / Vulkan backends. Deliberately out of scope per
+--     PHASE32 Stage 2; co-design targets sm_75 and AVX2/AVX512 only.
+--   - Native MMA-Q4_0_AR16 CUDA kernel. Phase 1.B targets the
+--     dequant-then-mul fallback; the native HMMA m16n8k16 kernel is
+--     a follow-up perf work item, not part of correctness.
+--   - Calibration / imatrix-aware quantization. Phase 1's reference
+--     path is plain symmetric INT4 (block_max/8). Imatrix-aware paths
+--     can layer on top later; they do not change this contract.
+--   - 35B-A3B: no Intel AutoRound dump exists; the format has no
+--     application without an INT4 source. Spec applies only at 27B.
+
+-- ============================================================
+-- Deferred specifications
+-- ============================================================
+
+-- Cross-spec ref: SIMDEquivalence + scalar-reference-as-truth
+-- semantics for vec_dot live in mul_mat_cpu.allium. The VecDot
+-- contract here inherits those semantics and adds Q4_0_AR16-specific
+-- tolerance bounds.
+-- Cross-spec reference (was: `deferred MulMatCpu.VecDot` — Allium 3.2.3
+-- has no documented syntax for the location hint; see mul_mat_cpu.allium
+-- for the inherited VecDot semantics).
+
+-- ============================================================
+-- External entities — managed by ggml, not by this spec
+-- ============================================================
+
+-- A row of fp32 values awaiting quantize, or the dequantize result.
+-- Layout owned by ggml's tensor system.
+entity FloatRow {
+    data: Set<Decimal>
+    n_elements: Integer
+}
+
+-- The Q8_0 query row vec_dot expects on the b side. Layout owned by
+-- ggml's q8_0 spec; treated as opaque here.
+entity Q8_0_Row {
+    n_elements: Integer
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Block geometry. 16 elements packed into 10 bytes:
+    --   bytes 0..2  : fp16 delta `d`
+    --   bytes 2..10 : 8-byte nibble payload `qs`, code k in nibble k.
+    block_size: Integer = 16
+    type_size: Integer = 10
+
+    -- vec_dot tolerances for FP32-accumulator paths. Mixed metric
+    -- (abs OR rel) is necessary because rel_err is unstable when the
+    -- reference score is near zero. Bounds are calibrated for the
+    -- dequant-then-mul fallback on Q4_0_AR16 vs an independent
+    -- scalar reference: O(n*eps) accumulation only, no codebook
+    -- pre-quantization (codes already INT4, no LUT), so the budget
+    -- is much tighter than the mul_mat_cpu.allium per-type-neutral
+    -- defaults. Applies to: AVX2/AVX512 CPU vec_dot, CUDA dequant
+    -- followed by FP32 GEMM (cuBLAS CUBLAS_COMPUTE_32F or equivalent).
+    vec_dot_rel_tol: Decimal = 0.001
+    vec_dot_abs_tol: Decimal = 0.0001
+
+    -- vec_dot tolerance for FP16-accumulator paths (CUDA cuBLAS at
+    -- CUBLAS_COMPUTE_16F, or HMMA with FP16 accumulator). FP16
+    -- accumulator overflows / loses ULPs roughly at sqrt(K) * eps_fp16,
+    -- which is ~3e-2 at K=128 and grows with K. The dequant-then-mul
+    -- fallback on sm_75 (Phase 1.B) uses cuBLAS at FP16 accumulator
+    -- by default; native HMMA Q4_0_AR16 (deferred perf work) likewise.
+    -- Code paths that take this route must validate against this
+    -- looser bound, NOT the FP32 bound above.
+    vec_dot_fp16_gemm_rel_tol: Decimal = 0.05
+    vec_dot_fp16_gemm_abs_tol: Decimal = 0.01
+
+    -- Quantize is integer arithmetic (clamp+RNE on a scalar). The
+    -- resulting *codes* must be bit-exact across SIMD variants —
+    -- there is no rounding budget here.
+    quantize_rne_abs_tol: Decimal = 0.0
+
+    -- Dequantize is `(code - 8) * fp32(d)`: a single fp16-to-fp32
+    -- cast followed by an integer-to-fp32 multiply. No further
+    -- rounding occurs within the fp16 mantissa, so dequant of stored
+    -- codes is bit-exact across implementations.
+    dequantize_rel_tol: Decimal = 0.0
+
+    -- The col-perm invariant must hold bit-exactly on the codes.
+    -- Permuting 16-element column chunks of the source row reshuffles
+    -- whole blocks; both d and qs are carried verbatim. There is no
+    -- numerical budget here — any drift is a bug.
+    bit_exact_codes_rel_tol: Decimal = 0.0
+}
+
+-- ============================================================
+-- Block layout
+-- ============================================================
+
+entity Block_Q4_0_AR16 {
+    -- fp16 delta. Bytes 0..2 of the block.
+    d: Decimal
+
+    -- 8 bytes of nibble payload. Code k lives in the low nibble of
+    -- qs[k/2] for even k and the high nibble for odd k — INTERLEAVED.
+    -- Distinct from Q4_0's split-halves layout (where byte j packs
+    -- code[j] | code[j+QK/2]<<4); the difference matters because
+    -- both formats coexist in the same gguf-py tooling and the same
+    -- ggml dispatch.
+    qs: Set<Integer>
+
+    @invariant ByteCount
+        -- d occupies 2 bytes; qs occupies 8 bytes; total 10 bytes.
+        -- Enforced at the C side by static_assert in ggml-common.h:
+        --   sizeof(block_q4_0_ar16) == sizeof(ggml_half) + QK_AR16/2
+        -- so PBTs do not need to verify this independently — but the
+        -- contract is recorded here so any future field addition has
+        -- to update both sides.
+
+    @invariant QsLayout
+        -- qs is exactly QK_AR16 / 2 = 8 bytes. Each byte holds two
+        -- 4-bit codes; code k uses the low nibble of qs[k/2] for
+        -- even k and the high nibble for odd k.
+}
+
+entity QuantizedRow {
+    n_elements: Integer
+    blocks: Set<Block_Q4_0_AR16>
+
+    @invariant BlockAlignment
+        -- The source row must be a whole multiple of QK_AR16 = 16
+        -- elements; partial blocks are not representable. Callers
+        -- (ggml's MUL_MAT op, the gguf packer, the AutoRound emit
+        -- path) all guarantee this — Phase 1.A asserts it.
+
+    @invariant BlockCount
+        -- blocks.count = n_elements / QK_AR16. The C-side row layout
+        -- is just an array of block_q4_0_ar16 with no header; the
+        -- count is implied by the row's tensor shape.
+}
+
+-- ============================================================
+-- Rules
+-- ============================================================
+
+-- Nibble extraction. Code k (0..15) lives in nibble k of qs:
+--   even k → low nibble of qs[k/2]
+--   odd  k → high nibble of qs[k/2]
+-- Same convention as Q4_0; only the block size differs.
+rule UnpackCode {
+    when: UnpackCode(qs, k)
+
+    requires: k >= 0
+    requires: k < 16
+
+    let byte_idx = k / 2
+    let raw = nibble_at(qs, byte_idx, k)
+
+    ensures: raw >= 0
+    ensures: raw < 16
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- Per-block dequantize. Multiply-and-cast, no extra rounding within
+-- fp16. The contract binds on *every* k in 0..16, not just on the
+-- aggregate row — Phase 1.A's PBT generates per-element checks.
+contract DequantizeBlock {
+    invoke: (b: Block_Q4_0_AR16) -> FloatRow
+
+    @invariant DequantizeFormula
+        -- For all k in 0..16:
+        --   result.data[k] = fp32(UnpackCode(b.qs, k) - 8) * fp32(b.d)
+        -- Bit-exact within config.dequantize_rel_tol (0.0). The cast
+        -- chain is fp16(d) → fp32(d) → multiply against the integer
+        -- (code - 8); no extra rounding occurs because the fp16
+        -- mantissa fits inside fp32 losslessly and the integer is
+        -- representable exactly.
+
+    @invariant ResultLength
+        -- result.n_elements = 16. PBT must check the length, not
+        -- only the per-element values, to catch off-by-ones in the
+        -- nibble loop.
+}
+
+-- Per-row quantize. Symmetric INT4 with per-block scale = max_abs / 8;
+-- codes are clamped + round-nearest-even into [-8, 7] then offset by
+-- +8 to produce nibble-storable [0, 15].
+contract QuantizeRow {
+    invoke: (values: FloatRow) -> QuantizedRow
+
+    @invariant Preconditions
+        -- values.n_elements is a multiple of 16. Callers guarantee
+        -- this via the MUL_MAT op shape constraints; ggml's
+        -- quantize_row dispatch never invokes with a partial block.
+
+    @invariant QuantizeFormula
+        -- For each block i in 0..(values.n_elements / 16):
+        --   block_max = max(abs(values.data[16*i .. 16*i + 16]))
+        --   scale     = block_max / 8
+        --   For k in 0..16:
+        --     code_k = clamp(round_nearest_even(values.data[16*i+k] / scale), -8, 7) + 8
+        -- The result block has d = fp16(scale) and qs packing the
+        -- codes per UnpackCode's convention. Bit-exact on codes
+        -- within config.quantize_rne_abs_tol (0.0). max, clamp,
+        -- round_nearest_even are inline black-box helpers, not
+        -- deferred refs.
+
+    @invariant ZeroBlockHandling
+        -- If block_max = 0 (entire 16-element block is exactly zero),
+        -- scale = 0 and all codes resolve to 8 (which dequantizes to
+        -- 0.0). Implementation must handle this without dividing by
+        -- zero. Same convention as Q4_0.
+}
+
+-- vec_dot against a Q8_0 query row. Inherits the SIMD-equivalence
+-- semantics from mul_mat_cpu.allium's VecDot contract (every
+-- registered implementation must agree with the scalar reference
+-- within the mixed tolerance).
+contract VecDot {
+    invoke: (a: QuantizedRow, b: Q8_0_Row) -> Decimal
+
+    @invariant Preconditions
+        -- a.n_elements = b.n_elements. Callers (the MUL_MAT inner
+        -- loop) guarantee this; a vec_dot implementation may assume
+        -- it.
+
+    @invariant ScoreCorrectness
+        -- result equals the inner product of dequantize_row(a) and
+        -- the dequantized view of b, with the bound determined by
+        -- the implementation's accumulator precision:
+        --
+        --   FP32 accumulator path (CPU vec_dot, CUDA dequant +
+        --   CUBLAS_COMPUTE_32F):
+        --     abs(result - scalar_ref) <= config.vec_dot_abs_tol
+        --     OR rel_diff(result, scalar_ref) <= config.vec_dot_rel_tol
+        --
+        --   FP16 accumulator path (CUDA dequant + CUBLAS_COMPUTE_16F,
+        --   native HMMA Q4_0_AR16 with FP16 accumulator):
+        --     abs(result - scalar_ref) <= config.vec_dot_fp16_gemm_abs_tol
+        --     OR rel_diff(result, scalar_ref) <= config.vec_dot_fp16_gemm_rel_tol
+        --
+        -- No codebook pre-quantization is permitted (codes are
+        -- already INT4); the only error sources are O(n*eps)
+        -- accumulation across SIMD widths and the additional ~sqrt(K)
+        -- * eps_fp16 from FP16 GEMM.
+        --
+        -- See deferred MulMatCpu.VecDot for the cross-spec
+        -- SIMDEquivalence semantics that govern multi-variant
+        -- agreement. PBT must drive the production dispatch (not
+        -- call the scalar symbol directly) and compare to that
+        -- independent reference.
+}
+
+-- ============================================================
+-- Invariants — the format's reason for existing
+-- ============================================================
+
+-- THE critical lossless property. The whole point of the 16-element
+-- block size: a permutation π of 16-element column chunks of the
+-- source row reshuffles whole blocks (no straddling). Carrying the
+-- d and qs of each block verbatim into the permuted position
+-- produces a dequantize that matches permute_columns_16_aligned of
+-- the dequantize of the original row, bit-exactly.
+--
+-- This is the property Q4_0 cannot satisfy at the V-col-reorder
+-- granularity: a 32-element Q4_0 block straddles two 16-element
+-- chunks, so a 16-aligned permutation splits a block in half and
+-- forces a re-quantize step that loses calibration.
+invariant ColPermEquivalence16Aligned {
+    for row in FloatRows:
+        for perm in BlockPermutations:
+            let q = QuantizeRow(row)
+            let q_permuted = permute_blocks(q, perm)
+            let direct = DequantizeRow(q)
+            let direct_permuted = permute_columns_16_aligned(direct, perm)
+            DequantizeRow(q_permuted) = direct_permuted
+}
+
+-- AutoRound INT4 W4G128 → Q4_0_AR16 emit path. The upstream Intel
+-- AutoRound dump stores codes at INT4 with a single fp16 scale per
+-- 128-element group. To emit Q4_0_AR16 verbatim, we replicate that
+-- per-128 scale across the 8 consecutive 16-element blocks within
+-- the group. Dequant must match (code - 8) * scale_fp16 exactly —
+-- no re-rounding, no precision loss.
+invariant AutoRoundG128Lossless {
+    for ar_block in AutoRoundEmittedBlocks:
+        let block = autoround_to_q4_0_ar16(ar_block)
+        let group_scale = autoround_scale_fp16_for_block(ar_block)
+        DequantizeBlock(block) = scaled_codes(ar_block.codes, group_scale)
+}
+
+-- Identical inputs must produce bit-identical quantized rows. No
+-- thread-order non-determinism, no opportunistic SIMD-vs-scalar
+-- code-path drift. This is a hard property: any drift here means a
+-- model-build is non-reproducible.
+invariant Determinism {
+    for row in FloatRows:
+        QuantizeRow(row) = QuantizeRow(row)
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Black-box helpers used inline above (per project convention,
+-- `deferred` is for cross-`.allium` refs only):
+--   max, clamp, round_nearest_even, abs, fp32, fp16, nibble_at,
+--   permute_blocks, permute_columns_16_aligned, rel_diff,
+--   autoround_to_q4_0_ar16, autoround_scale_fp16_for_block,
+--   scaled_codes, DequantizeRow.
+--
+-- C reference (Phase 1.A):
+--   ik_llama.cpp/ggml/src/ggml-common.h    — block_q4_0_ar16 typedef
+--   ik_llama.cpp/ggml/src/ggml-quants.{h,c} — quantize / dequantize / vec_dot
+--   ik_llama.cpp/ggml/src/ggml.c           — type_traits[GGML_TYPE_Q4_0_AR16]
+--
+-- gguf-py reference (Phase 1.C):
+--   ik_llama.cpp/gguf-py/gguf/quants.py    — Q4_0_AR16 numpy class
+--
+-- Tool 1 emit path (Phase 1.D):
+--   /home/llm/yarn-agentic/scripts/autoround_to_q4_0_gguf.py
+--     — repack_w4g128_with_v_col_perm helper, analogous to the
+--       V-row-perm path that landed in Stage 1.

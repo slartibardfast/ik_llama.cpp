@@ -1,0 +1,208 @@
+-- allium: 3
+-- turbo_kv_asymmetric.allium
+
+-- Scope: asymmetric bit allocation for keys and values in the
+-- KV cache. Keys and values have different roles in attention,
+-- and community measurement consistently shows that values
+-- tolerate more aggressive quantisation than keys. Composes on
+-- top of the core TurboQuant specs (turbo-kv-4b.allium,
+-- turbo-kv-3b.allium).
+--
+-- Citable sources:
+--
+--   [PAPER]       Zandieh et al., arxiv 2504.19874. Paper §4
+--                 discusses bit-allocation trade-offs between K
+--                 and V at the generic vector-quantisation level.
+--                 Paper does not validate on specific LLM
+--                 attention heads, but the framework allows
+--                 different bit-widths per-tensor.
+--
+--   [TONBI-V3]    tonbistudio/turboquant-pytorch compressors_v3.py.
+--                 Class TurboQuantV3 constructor:
+--                     def __init__(self, ..., key_bits=4,
+--                                  value_bits=2, ...)
+--                 Default configuration is asymmetric K=4, V=2.
+--                 README measured results (Llama 3.2 needle test,
+--                 4K context):
+--                   K6/V4 rw=128:  EXACT  (~1.6x compression)
+--                   K8/V4 rw=128:  EXACT
+--                   K4/V4 rw=128:  PARTIAL ("AURORA7749" — drops
+--                                  the hyphen)
+--                 8K attention score accuracy:
+--                   V3 K4/V2 + protected layers:
+--                      cosine 0.9997, 99% top-1 agreement,
+--                      3.6x compression
+--                 Community finding the V3 compressors_v3.py file
+--                 docstring cites: "scos-lab: MSE > QJL for
+--                 attention, K/V norm asymmetry… 0xSero:
+--                 asymmetric K=3/V=2 on production vLLM".
+--
+--   [QUANT.CPP]   Does NOT implement asymmetric K/V. Our
+--                 llama.cpp port inherits this: K and V share the
+--                 same ggml type (TURBO_KV_4B), therefore the
+--                 same bit-width. Adopting asymmetric requires
+--                 at minimum a second ggml type (e.g.
+--                 TURBO_V_3B for value-side 3-bit) or a per-
+--                 tensor bit-width override.
+--
+-- Goal: specify a per-tensor bit-width configuration so that
+-- keys and values can be quantised at different precisions, and
+-- expose the trade-off measurements so deployers can pick the
+-- K/V pair that fits their quality × memory budget.
+--
+-- Includes: key_bits / value_bits config separation, per-tensor
+-- codebook binding, the measurement matrix from [TONBI-V3] for
+-- picking defaults.
+-- Excludes: layer-adaptive (separate spec), residual window
+-- (separate spec), outlier handling (separate spec).
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+entity Tensor {
+    data: Set<Decimal>
+    count: Integer
+}
+
+entity QuantizedHead {
+    norm: Decimal
+    inv_std: Decimal
+    indices: Set<Integer>
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Key-tensor bit-width. [TONBI-V3] defaults to 4; measurement
+    -- supports K ∈ {3, 4, 6, 8}. K=3 alone is listed as broken in
+    -- V3's 4K needle test; K=4 works with rw=128 but is borderline
+    -- (PARTIAL output drops characters); K=6 and K=8 are EXACT.
+    key_bits: Integer = 4
+
+    -- Value-tensor bit-width. [TONBI-V3] defaults to 2; attention-
+    -- score-accuracy table shows K4/V2 + protected layers achieves
+    -- cosine 0.9997 at 3.6x compression. V=2 alone without
+    -- protected layers / residual window is in the MISS regime.
+    value_bits: Integer = 2
+
+    -- Codebook sizes derived from bits.
+    key_codebook_size: Integer = 16  -- 2^key_bits at default 4
+    value_codebook_size: Integer = 4 -- 2^value_bits at default 2
+}
+
+-- ============================================================
+-- Open questions
+-- ============================================================
+
+open question "Key bit-width floor for symmetric configurations: [TONBI-V3] measurement shows K=3 alone breaks generation. Minimum-viable-K-bits may depend on model family and size. Default K=4 is tonbistudio's conservative choice; production deployments might go lower if combined with a larger residual window or layer-adaptive protection."
+
+open question "Value bit-width floor: [TONBI-V3] default V=2 works only in combination with protected layers. Without protection, V=2 is in the MISS regime. Spec allows any value_bits ≥ 1; deployers must pair with turbo_kv_layer_adaptive or turbo_kv_residual_window to stay in the EXACT regime."
+
+open question "Quality × compression Pareto frontier: [TONBI-V3] table gives point measurements at specific configurations. A full Pareto sweep across K ∈ {3, 4, 6, 8} × V ∈ {2, 3, 4} × rw ∈ {0, 64, 128, 256} × protected_layers ∈ {0, 2, 4, 8} has not been published at our target model sizes (Qwen3.5 9B, 35B-A3B)."
+
+open question "Codebook asymmetry: should K and V use different codebook distributions (e.g. K optimised for query-matching, V optimised for mean reconstruction)? [PAPER] and [TONBI-V3] both use the same Lloyd-Max codebook family for both; the only difference is number of centroids. Open whether role-specific codebooks would improve quality further."
+
+-- ============================================================
+-- Composite rules
+-- ============================================================
+
+-- Key-tensor quantisation uses the key codebook at key_bits.
+-- Composes with the core QuantizeHead rule from turbo-kv-4b /
+-- turbo-kv-3b, parameterised by bits = config.key_bits.
+rule QuantizeKeyHead {
+    when: QuantizeKeyHead(tensor, seed)
+
+    requires: tensor.count > 0
+
+    let key_codebook = codebook_for_bits(config.key_bits)
+    let block = QuantizeHead(tensor, seed, key_codebook, config.key_bits)
+
+    ensures: QuantizedHead.created(
+        norm: block.norm,
+        inv_std: block.inv_std,
+        indices: block.indices
+    )
+}
+
+-- Value-tensor quantisation uses the value codebook at
+-- value_bits. Same algorithmic structure as QuantizeKeyHead but
+-- a different (typically smaller) codebook.
+rule QuantizeValueHead {
+    when: QuantizeValueHead(tensor, seed)
+
+    requires: tensor.count > 0
+
+    let value_codebook = codebook_for_bits(config.value_bits)
+    let block = QuantizeHead(tensor, seed, value_codebook, config.value_bits)
+
+    ensures: QuantizedHead.created(
+        norm: block.norm,
+        inv_std: block.inv_std,
+        indices: block.indices
+    )
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- [TONBI-V3] ordering: keys should not be less precise than
+-- values in attention-critical path. Formally we require
+-- key_bits ≥ value_bits because the attention SCORE is
+-- K-dominated (query-key match drives softmax shape); V only
+-- influences the weighted sum after softmax has selected who
+-- matters. Measurement support: K4/V2 works; K2/V4 has not been
+-- measured to work.
+invariant KeyBitsAtLeastValueBits {
+    config.key_bits >= config.value_bits
+}
+
+-- Codebook sizes follow from bits.
+invariant CodebookSizesConsistent {
+    config.key_codebook_size = power_of_two(config.key_bits) and
+    config.value_codebook_size = power_of_two(config.value_bits)
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Implementing asymmetric K/V in the llama.cpp port requires
+-- either:
+--
+--   (a) Two ggml types — e.g. TURBO_K_4B for keys and
+--       TURBO_V_2B for values. The attention op would need to
+--       accept mixed types (currently FA assumes a single
+--       KV type per head). This is the more invasive change.
+--
+--   (b) Per-tensor bit-width override on a single ggml type —
+--       a field in the tensor metadata that tells the quantise
+--       and dequantise kernels which codebook to use. Less
+--       invasive but requires kernel-level dispatch on that
+--       field.
+--
+-- [TONBI-V3]'s PyTorch approach corresponds roughly to (a): it
+-- constructs two separate MSECompressor instances with
+-- different bits for the key path and value path.
+--
+-- The [QUANT.CPP] authors have discussed asymmetric
+-- configurations in project notes but have not yet shipped them.
+-- Our llama.cpp port inherits the single-type limitation.
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+
+entity TurboKvAsymmetricSystem {
+    tensors: List<Tensor>
+}
+
+contract ValidateTurboKvAsymmetricSystem {
+    invoke: (sys: TurboKvAsymmetricSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Closes the entity-reference graph.
+}

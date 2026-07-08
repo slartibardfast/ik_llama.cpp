@@ -1,0 +1,19 @@
+# Obligations for turbo_kv_asymmetric.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Tensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.QuantizedHead => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.key_bits => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.value_bits => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.key_codebook_size => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.value_codebook_size => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.QuantizeKeyHead => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.QuantizeKeyHead.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.QuantizeKeyHead.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-success.QuantizeValueHead => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-failure.QuantizeValueHead.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+rule-entity-creation.QuantizeValueHead.1 => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.KeyBitsAtLeastValueBits => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.CodebookSizesConsistent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.TurboKvAsymmetricSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateTurboKvAsymmetricSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

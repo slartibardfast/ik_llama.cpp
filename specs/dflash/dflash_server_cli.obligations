@@ -1,0 +1,19 @@
+# Obligations for dflash_server_cli.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.TargetContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DflashSidecar => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SlotSpec => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.BatchView => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.SlotVerifyIndexList => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.TensorDtype => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.SpecImplType => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_parallel_slots => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.default_draft_max => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.SidecarSharesTargetTokenizer.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.OrchestratorInvokedFromServerCLI.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.PerSlotSeqIdBinding.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.BatchedFanOutContract.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.MultiSlotSamplingContract.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.MultiSlotSEGVAbsence => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.TranslatedIndicesAreInWindow => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

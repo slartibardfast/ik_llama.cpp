@@ -1,0 +1,317 @@
+-- allium: 3
+-- specs/kv-cache/paged_kshift_defrag.allium
+--
+-- Scope: K-shift and defrag operations on the paged KV layout.
+-- Models per-block K-shift (generalising T3.6's per-(device,
+-- stream) inp_K_shift) and the block-move defrag (using the
+-- T3.6 generic CUDA Q→Q same-type cpy kernel
+-- per [[feedback_cuda_cpy_q_q_same_type_pattern]]).
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF Tier 5 must
+-- preserve K-shift and defrag semantics under paged allocation.
+-- K-shift rotates positions when context shifts; under paging
+-- the shift target is per-(seq, block) rather than per-stream.
+-- Defrag coalesces fragmented blocks; under paging the move is
+-- a block-granular Q4_0 copy via the existing T3.6 kernel.
+--
+-- The load-bearing contracts:
+--   KShiftAtTrivialMappingEquivLegacy — at identity block_table,
+--     per-block K-shift produces byte-identical position
+--     rotations to the legacy per-stream K-shift.
+--   DefragPreservesLogicalContents — for any fragmented pool
+--     state, defrag() produces a new pool where reading any
+--     seq's logical positions yields byte-identical data
+--     pre/post.
+--
+-- Includes:
+--   - External entities for KShiftPerBlock, DefragMove
+--     (refined from paged_block_allocator's DefragOp).
+--   - Contracts KShiftAtTrivialMappingEquivLegacy and
+--     DefragPreservesLogicalContents.
+--   - Composition with the T3.6 generic Q→Q cpy kernel.
+--   - High-ctx defrag-latency-cliff guidance (Risk #4).
+--
+-- Excludes:
+--   - The allocator-level defrag mechanics (block_table
+--     rewrite). Owned by paged_block_allocator::DefragMechanics.
+--   - The kernel signature change for K-shift. Owned by
+--     paged_read_path (mask addressing).
+--
+-- Composition:
+--   - K-shift composes with T3.6's per-(device, stream)
+--     inp_K_shift_per_stream pattern — see
+--     [[feedback_per_device_per_stream_input_pattern]].
+--     The inp_block_table tensor extends this pattern
+--     analogously (OpenQ-T5-H).
+--   - Defrag composes with the existing T3.6 Q→Q same-type
+--     cpy kernel at ggml/src/ggml-cuda/cpy.cu:176 — see T5.A
+--     audit findings.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- One per-block K-shift operation. Generalises the T3.6
+-- per-(device, stream) inp_K_shift to per-block: the delta
+-- applied to positions within a block is uniform across the
+-- block, but may differ between blocks (e.g. blocks not
+-- spanning the rotated region get delta = 0).
+entity KShiftPerBlock {
+    layer: Integer
+    block_id: Integer
+    position_delta: Integer
+    n_tokens_in_block: Integer
+}
+
+-- One defrag block-move operation. The Q→Q same-type cpy
+-- kernel moves block_size_tokens * n_head_kv * (head_dim Q4_0)
+-- bytes from old_block_id's region to new_block_id's region.
+-- Composition with DefragMechanics::LogicalSequencePreserved
+-- (allocator side) and DefragPreservesLogicalContents (this spec).
+entity DefragBlockMove {
+    layer: Integer
+    old_block_id: Integer
+    new_block_id: Integer
+    bytes_per_block: Integer
+}
+
+-- The inp_block_kshift tensor — per-block delta input
+-- consumed by the K-shift graph node. I32 [n_total_blocks]
+-- (one delta per block in the pool).
+entity InpBlockKShift {
+    n_total_blocks: Integer
+    deltas: List<Integer>
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    max_total_blocks: Integer = 16
+    max_n_head_kv: Integer = 8
+    max_n_layers: Integer = 4
+    block_size_tokens: Integer = 64
+    bytes_per_q40_super_block: Integer = 18  -- Q4_0 super-block (32 weights + 2 byte d)
+    super_blocks_per_token_per_head: Integer = 1
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- KShiftPerBlockBehavior — postconditions of a per-block
+-- K-shift operation.
+contract KShiftPerBlockBehavior {
+    invoke: (shifts: List<KShiftPerBlock>,
+             k_pre: List<Integer>, k_post: List<Integer>) -> Boolean
+
+    @invariant DeltaAppliedPerBlock
+        -- For every block_id b with a non-zero delta in shifts:
+        --   k_post[b * block_size_tokens + p] = rotated K-row
+        --     for original position
+        --     (pre_position - shifts[b].position_delta)
+        --   for every p in [0, n_tokens_in_block).
+
+    @invariant UnshiftedBlocksUnchanged
+        -- For every block_id b with delta = 0 (or not in
+        -- shifts at all): k_post bytes in b's region are
+        -- byte-identical to k_pre.
+
+    @invariant PerBlockDeltaIsUniform
+        -- Within one block, all n_tokens_in_block tokens
+        -- receive the SAME delta. K-shift NEVER applies
+        -- different deltas to tokens in the same block.
+        -- (Constructively: a block always contains
+        -- block_size_tokens consecutive positions of a single
+        -- seq, so a uniform delta is sufficient.)
+}
+
+-- KShiftAtTrivialMappingEquivLegacy — the load-bearing
+-- byte-equivalence contract for T5.7 K-shift rewrite. At
+-- trivial block_table mapping (= identity for single-seq), the
+-- per-block K-shift produces byte-identical results to the
+-- legacy per-stream K-shift.
+contract KShiftAtTrivialMappingEquivLegacy {
+    invoke: (shifts: List<KShiftPerBlock>,
+             block_table_is_identity: Boolean,
+             legacy_shift_target_positions: List<Integer>) -> Boolean
+
+    @invariant BlockPerStreamShiftEquivalence
+        -- If block_table_is_identity = true (seq 0 owns blocks
+        -- [0, n_blocks_in_seq) contiguously):
+        --   for every block b owned by seq 0:
+        --     if any token in block b is in the legacy rotated
+        --     region: shifts[b].position_delta =
+        --     legacy_per_stream_delta;
+        --     else shifts[b].position_delta = 0.
+        --   The post-shift K bytes are byte-identical to the
+        --   legacy per-stream K-shift output for seq 0.
+
+    @invariant FractionalBlockShiftDisallowed
+        -- The legacy per-stream K-shift may shift a contiguous
+        -- range [p0, p1) of positions; under paging, block
+        -- granularity requires that (p0, p1) align to block
+        -- boundaries.
+        -- If alignment is broken (e.g. legacy shifts positions
+        -- [50, 100) but block_size = 64): the paged
+        -- implementation MUST split into two block shifts (one
+        -- for block 0 covering positions 50-63 with the legacy
+        -- delta restricted to those tokens; one for block 1
+        -- covering positions 64-99 with full uniform delta).
+        -- This contract requires the splitting to be correct
+        -- per-token within the boundary block.
+
+    @guidance
+        -- Implementation note: when the legacy shift range
+        -- crosses a block boundary, the implementation will
+        -- need to construct TWO per-block shifts with
+        -- different effective semantics — the boundary block
+        -- gets a position-conditioned delta (delta if p >=
+        -- legacy_p0 else 0). This complicates "uniform delta
+        -- per block" (PerBlockDeltaIsUniform). Resolution:
+        -- the implementation runs a per-position scan inside
+        -- the boundary block, masking the delta. The uniform-
+        -- delta optimisation applies only to fully-shifted or
+        -- fully-unshifted blocks.
+        -- The `test-paged-kshift-byte-identity` test exercises
+        -- non-boundary AND boundary cases.
+
+    @invariant ComposesWithT36PerDeviceStreamInpKShift
+        -- The per-block delta tensor (InpBlockKShift) is
+        -- allocated per-(device, stream) following the T3.6
+        -- pattern. Under graph-split with n_stream > 1, each
+        -- (device, stream) instance is populated and pinned
+        -- via ggml_backend_sched_set_tensor_backend.
+        -- This composes with the existing K-shift closure
+        -- (see [[project-t3-6-kshift-graph-split-closure]]).
+}
+
+-- DefragPreservesLogicalContents — the load-bearing
+-- byte-equivalence contract for T5.7 defrag. For any
+-- fragmented block-pool state, defrag() produces a new pool
+-- where reading any seq's logical positions yields byte-
+-- identical data to the pre-defrag read.
+contract DefragPreservesLogicalContents {
+    invoke: (defrag_moves: List<DefragBlockMove>,
+             tables_pre: List<BlockTable>,
+             tables_post: List<BlockTable>,
+             pool_pre: List<Integer>,
+             pool_post: List<Integer>) -> Boolean
+
+    @invariant SeqLogicalReadByteIdentical
+        -- For every seq s and every logical_pos i in
+        -- [0, tokens_written[s]):
+        --   read(pool_post, tables_post[s], i) ==
+        --   read(pool_pre,  tables_pre[s],  i)
+        -- byte-for-byte.
+        -- "read" computes the physical address as
+        -- block_pool + tables[s].blocks[i / block_size_tokens]
+        --   * block_size_tokens + (i % block_size_tokens).
+
+    @invariant MoveBytesAreCopiedExactly
+        -- For every DefragBlockMove m in defrag_moves:
+        --   pool_post bytes in m.new_block_id's region
+        --     [m.new_block_id * block_size_tokens * head_bytes,
+        --      (m.new_block_id + 1) * block_size_tokens * head_bytes)
+        --   are byte-identical to pool_pre bytes in
+        --   m.old_block_id's region.
+        -- The Q→Q same-type cpy kernel does NOT requantise; it
+        -- copies Q4_0 bytes verbatim.
+
+    @invariant UnusedBlocksMayBeOverwritten
+        -- Defrag MAY overwrite bytes in free-list blocks
+        -- (their contents are semantically meaningless). The
+        -- contract makes no claim about those bytes post-
+        -- defrag.
+
+    @invariant DefragMaintainsBlockUniquelyOwned
+        -- BlockUniquelyOwned (from paged_block_allocator) holds
+        -- at every intermediate state during defrag — composing
+        -- with paged_block_allocator::DefragMechanics
+        --   ::BlockUniqueOwnershipPreserved.
+
+    @guidance
+        -- Implementation: the T3.6 generic CUDA Q→Q same-type
+        -- cpy kernel at ggml/src/ggml-cuda/cpy.cu:176
+        -- (`cpy_q_q_same_type`) is the kernel of choice.
+        -- Parameterised by qk + block_bytes (per
+        -- [[feedback_cuda_cpy_q_q_same_type_pattern]]) — covers
+        -- Q4_0 without extra integration cost.
+        --
+        -- Alternative: SET_ROWS-on-self (write block i's rows
+        -- into block j's row indices via a stage tensor). More
+        -- composable with the existing scheduler but adds an
+        -- intermediate buffer. Default: use the Q→Q kernel
+        -- directly; SET_ROWS-on-self is the OpenQ-T5-B
+        -- contingency.
+}
+
+-- ============================================================
+-- Defrag latency-cliff risk (Risk #4)
+-- ============================================================
+
+-- DefragLatencyBounded — defrag MUST NOT introduce a latency
+-- cliff at the M3 (server-driven mixed-arrival) workload.
+contract DefragLatencyBounded {
+    invoke: (defrag_op_count: Integer, mean_user_latency_ms: Integer,
+             p99_user_latency_ms: Integer) -> Boolean
+
+    @invariant LazyDefragOnly
+        -- The T5.7 implementation runs defrag LAZILY — only
+        -- when alloc_block returns OUT_OF_BLOCKS AND
+        -- fragmentation > threshold. Proactive defrag is NOT
+        -- in scope for Tier 5; it's a future workitem.
+
+    @invariant DefragDoesNotBlockDecodeTick
+        -- Defrag execution MUST be scheduled in a separate
+        -- graph build from the decode tick — it occupies its
+        -- own ggml_build_graph + ggml_graph_compute invocation
+        -- between decode ticks. NO decode tick blocks waiting
+        -- for defrag.
+
+    @invariant DefragLatencyVisible
+        -- The defrag operation's wall time IS visible to the
+        -- user as a per-tick latency spike (no hiding it).
+        -- However, the spike MUST be bounded:
+        --   defrag_p99_ms <= 100 ms at production-scale pools
+        --   (n_blocks <= 16K, mean block move count <= 8K).
+        -- A 100 ms spike per defrag event, occurring O(once per
+        -- thousand decode ticks), is acceptable.
+
+    @guidance
+        -- GP5.b binds on the M2 staggered-arrival workload, not
+        -- M3 (continuous mixed-arrival churn). M3 is "report-
+        -- only" at Tier 5 closure (PHASE doc Risk #4
+        -- mitigation). If M3 reveals defrag-induced cliffs
+        -- beyond DefragLatencyVisible, that opens a follow-on
+        -- workstream — NOT a Tier 5 regression.
+        --
+        -- Per the user's "complete sincerity": the high-ctx
+        -- workload churn pattern is yet-unknown; defrag
+        -- latency under high-ctx + high-churn is a known
+        -- unknown. The test
+        -- `test-paged-defrag-preserves-contents` exercises
+        -- correctness; perf characterisation at high churn is
+        -- T5.7 close evidence.
+}
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+-- Top-level entity that holds every otherwise-unreferenced entity
+-- as a List field so `allium check` sees the references bound.
+-- Not a runtime object — purely structural.
+
+entity PagedKshiftDefragSystem {
+    inp_block_k_shifts: List<InpBlockKShift>
+}
+
+contract ValidatePagedKshiftDefragSystem {
+    invoke: (sys: PagedKshiftDefragSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Structural composition: each List field above anchors an
+        -- entity otherwise referenced only in invariant prose, so the
+        -- spec's reference graph is closed under `allium check`.
+}

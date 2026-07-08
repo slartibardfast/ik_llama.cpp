@@ -1,0 +1,21 @@
+# Obligations for mtp_fused_draft.allium, derived by `allium plan`.
+# Dispositioned waived pending property-test authoring (call/0013).
+# Each line: <obligation-id> => <disposition>
+entity-fields.Tensor => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.ModelContext => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.KvSlot => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.DraftToken => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.SamplingMode => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+enum-comparable.MtpOpType => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.max_fused_steps => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+config-default.min_fused_steps => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.FusedDraftStep.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.ArgmaxCorrectnessIntrinsic => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.KvChopRewriteIsIdempotent => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.DeterminismUnderArgmax => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.StepCountConformsToBound => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.KvWritesAreExactlyNSteps => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FusedDraftRoundsRunOnPureDecodeBatches => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+invariant.FusedDraftRespectsStreamPartition => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+entity-fields.MtpFusedDraftSystem => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)
+contract-signature.ValidateMtpFusedDraftSystem.invoke => waived: no discharging property test authored; spec is a check+analyse-clean behavioural model (call/0013)

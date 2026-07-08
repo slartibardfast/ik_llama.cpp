@@ -1,0 +1,181 @@
+-- allium: 3
+-- specs/cuda-native-dispatch/libmgpu_subgraph_capture.allium
+--
+-- Status: LIVE as of PHASE_CUDA_NATIVE_DISPATCH commit C7.
+--
+-- Scope: libmgpu's per-device subgraphs become captured subgraphs in
+-- the outer cudaGraph_t produced by C4. Discovery in C7: libmgpu
+-- already targets the ggml-backend dispatch — it builds graph nodes
+-- (per-device matmul shards + cross-device ggml_reduce(GGML_OP_ADD))
+-- and lets the sched route them. The C1-C6 stack wraps that dispatch
+-- with outer capture + cache + CPU-prefix hoist. libmgpu requires
+-- ZERO source change.
+--
+-- Why this spec exists: to bind the behavioural invariant — libmgpu
+-- output under captured-replay equals libmgpu output under the C1
+-- eager dispatch. The captured graph's reduce nodes (memcpy-peer +
+-- add, per Phase 46 closure) are deterministic when wrapped in the
+-- C4 cross-stream event-chain.
+--
+-- Phase-46 closure sha (libmgpu CLIP encoder, production GGUF, NP=8):
+--   `fb5167dbc1e7f95b` (CLIP encode reasoning_content hash, 10×
+--    byte-identical across runs).
+--
+-- Composition:
+--   single_threaded_dispatch.allium   (C1+C2+C3+C6 — dispatch core)
+--   cross_device_event_chain.allium   (C4 — capture mechanism)
+--   multi_device_graph_cache.allium   (C5 — cache)
+--   libmgpu_subgraph_capture.allium   (C7 — libmgpu consumer; THIS FILE)
+-- C8-C11 register calibrated ops (MATMUL_STREAM_SPLIT, REDUCE_CROSS_
+-- DEVICE, PEER_COPY, GRAPH_CAPTURE) that compose with this spec
+-- through calibrated_op_equivalence.allium.
+--
+-- Verification:
+--   - C7 unit test: ik_llama.cpp/tests/test-libmgpu-subgraph-capture.cpp
+--     Drives a 2-CUDA + CPU sched with a ggml_reduce graph; asserts
+--     bit-identical output across 30 iters (covers both the multi-
+--     backend branch firing and the sequential fallback — whichever
+--     the sched picks for this graph shape).
+--   - C14 production binding: full CLIP encoder via
+--     scripts/verify-multigpu-clip.sh, comparing against the Phase-46
+--     closure hash.
+--
+-- Provenance:
+--   ik_llama.cpp/mgpu/src/tp.cpp           libmgpu transformer-parallel driver
+--   ik_llama.cpp/mgpu/src/classify.cpp     libmgpu op classifier
+--   ik_llama.cpp/ggml/src/ggml-backend.cpp dispatch path that wraps the above
+
+-- ============================================================
+-- Entities
+-- ============================================================
+
+-- A ggml_cgraph produced by libmgpu (e.g., mgpu::build_attn,
+-- mgpu::build_ffn). Characterised by:
+--   - per-device matmul shards
+--   - exactly one cross-device ggml_reduce(GGML_OP_ADD) per fused stage
+--   - n_device = number of CUDA backends in the sched.
+entity LibmgpuGraph {
+    n_device:                Integer
+    has_cross_device_reduce: Boolean
+}
+
+-- One dispatch of a LibmgpuGraph through the C1+C4+C5 pipeline.
+-- A run produces an output hash (sha256 of the reduce result) and
+-- records whether the outer-capture branch fired during that run.
+entity LibmgpuDispatchRun {
+    graph:                   LibmgpuGraph
+    iter_index:              Integer        -- 0-based position in the run sequence
+    output_hash:             String         -- sha256 hex of the reduce-stage output
+    outer_capture_fired:     Boolean        -- whether the multi-backend capture branch ran
+    outer_capture_disabled:  Boolean        -- post-dispatch state of the sched flag
+}
+
+-- A sequence of LibmgpuDispatchRuns for the same graph. Used to
+-- state the cross-iter determinism property.
+entity LibmgpuRunSequence {
+    graph:                   LibmgpuGraph
+    n_iters:                 Integer        -- length of the sequence; >= 1
+    runs:                    List<LibmgpuDispatchRun>
+}
+
+-- The libmgpu source surface that this spec asserts MUST NOT contain
+-- openmp / std::barrier / direct CUDA capture/launch primitives.
+-- Two file paths only: tp.cpp and classify.cpp.
+entity LibmgpuSourceFile {
+    path:                    String         -- in {"ik_llama.cpp/mgpu/src/tp.cpp", "ik_llama.cpp/mgpu/src/classify.cpp"}
+    contains_pragma_omp:     Boolean
+    contains_std_barrier:    Boolean
+    contains_cuda_capture:   Boolean
+    contains_cuda_launch:    Boolean
+}
+
+-- A full CLIP encoder run dispatched via the C7 captured-replay path.
+-- Bound against the Phase-46 closure baseline by verify-multigpu-clip.sh.
+entity ClipEncoderRun {
+    dispatched_via:                  String   -- "C7 captured replay" for runs after C7 ships
+    reasoning_content_sha256:        String   -- hex digest of the CLIP encode output
+    phase46_closure_baseline_sha256: String   -- frozen at "fb5167dbc1e7f95b"
+}
+
+-- The aggregate state this spec talks about: the libmgpu source
+-- surface, every captured run sequence over libmgpu graphs, and every
+-- CLIP encoder run dispatched through the C7 replay path. The
+-- contract below quantifies its invariants over an instance of this
+-- entity, which is what links the four sub-entities into one
+-- structurally-coherent spec.
+entity LibmgpuCaptureSystem {
+    source_files:   List<LibmgpuSourceFile>
+    run_sequences:  List<LibmgpuRunSequence>
+    clip_runs:      List<ClipEncoderRun>
+}
+
+-- ============================================================
+-- INVARIANTS
+-- ============================================================
+
+invariant LibmgpuNeedsNoSourceChange {
+    -- For every LibmgpuSourceFile (the two listed under `path`'s domain
+    -- in the entity): contains_pragma_omp = false, contains_std_barrier
+    -- = false, contains_cuda_capture = false, contains_cuda_launch =
+    -- false. libmgpu owns op composition; the dispatch driver is owned
+    -- by ggml-backend (compute_splits) and ggml-cuda (outer-capture
+    -- API). C7 shipped no libmgpu source change; this invariant guards
+    -- against later regression that would re-introduce manual capture
+    -- or thread-pool primitives into libmgpu itself.
+}
+
+invariant LibmgpuOutputDeterministicAcrossReplays {
+    -- For every LibmgpuRunSequence with n_iters >= 1: every
+    -- LibmgpuDispatchRun in runs has the same output_hash. The
+    -- captured-replay path is bit-deterministic across iters.
+    --
+    -- Holds regardless of whether the multi-backend branch fired or
+    -- the sequential fallback ran on any given iter: the sched picks
+    -- one path per graph shape, but the property binds across the
+    -- whole sequence.
+    --
+    -- Test binding: tests/test-libmgpu-subgraph-capture.cpp (30 iters,
+    -- assert all hashes equal).
+}
+
+invariant LibmgpuOuterCaptureStaysHealthy {
+    -- For every LibmgpuRunSequence: if any LibmgpuDispatchRun in runs
+    -- has outer_capture_fired = true, then for ALL runs in the
+    -- sequence, outer_capture_disabled = false.
+    --
+    -- A mid-sequence fallback (sched flips outer_capture_disabled to
+    -- true after one run succeeded) would indicate one of:
+    --   - cudaStreamBeginCapture failed
+    --   - cudaGraphExecCreate / Instantiate failed
+    --   - cudaGraphLaunch failed
+    -- All bugs to investigate, not normal operation.
+}
+
+invariant LibmgpuCachedReplayMatchesPhase46Closure {
+    -- For every ClipEncoderRun with dispatched_via = "C7 captured
+    -- replay": reasoning_content_sha256 = phase46_closure_baseline_
+    -- sha256. The baseline is the frozen Phase-46 closure value
+    -- "fb5167dbc1e7f95b".
+    --
+    -- This is a production-grade integration property; the C7 unit
+    -- test does NOT bind it (the test drives a synthetic 2-tensor
+    -- reduce graph, not the full CLIP encoder). C14's verification
+    -- battery binds this invariant via scripts/verify-multigpu-clip.sh.
+}
+
+-- ============================================================
+-- Contract
+-- ============================================================
+
+contract ValidateLibmgpuCaptureSystem {
+    invoke: (sys: LibmgpuCaptureSystem) -> Boolean
+
+    @invariant AllCaptureInvariantsHold
+        -- Returns true iff sys honours every invariant above: every
+        -- LibmgpuSourceFile in sys.source_files is clean of capture/
+        -- launch primitives; every LibmgpuRunSequence in sys.run_
+        -- sequences satisfies LibmgpuOutputDeterministicAcrossReplays
+        -- and LibmgpuOuterCaptureStaysHealthy; every ClipEncoderRun
+        -- in sys.clip_runs satisfies LibmgpuCachedReplayMatchesPhase46
+        -- Closure.
+}

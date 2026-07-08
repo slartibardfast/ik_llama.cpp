@@ -1,0 +1,593 @@
+-- allium: 3
+-- turbo_kv_residual_window.allium
+
+-- Scope: residual-window KV-cache overlay — maintain a separate
+-- fp16/bf16 ring-buffer copy of the K vector for the most recent
+-- N positions, alongside the core quantised K cache. Every token
+-- is still quantised into the main cache; the overlay exists
+-- in parallel.
+--
+-- Composes on top of turbo-kv-4b.allium and turbo-kv-3b.allium
+-- (and any other lossy K-cache scheme). The overlay writes do
+-- not affect the main cache's contents or correctness in any
+-- way — they are a second storage path maintained for a future
+-- attention read path that can consult them for recent tokens.
+--
+-- Citable sources:
+--
+--   [PAPER]       Zandieh et al., arxiv 2504.19874. Paper does
+--                 not model a residual window — it treats the full
+--                 sequence as a single quantisation batch.
+--
+--   [TONBI-V3]    tonbistudio/turboquant-pytorch compressors_v3.py.
+--                 Introduces residual_window as a core V3 concept.
+--                 Measured evidence (README needle-in-haystack on
+--                 Llama 3.2):
+--                   K4/V4 rw=128:  EXACT at 2K and 4K ctx
+--                   K4/V4 rw=0:    MISS (garbage output)
+--                   K4/V2 rw=0:    MISS
+--                 The rw=0 MISS result is the critical evidence:
+--                 symmetric 4-bit K quantisation without a residual
+--                 window fails the most basic retrieval task.
+--                 README: "What doesn't work: 3-4 bit compression
+--                 without a residual window produces garbage, same
+--                 as V2."
+--
+--   [QUANT.CPP]   Does NOT implement a residual window. Our
+--                 llama.cpp port addresses this gap.
+--
+-- Difference from [TONBI-V3] framing: [TONBI-V3] is an eviction
+-- model — recent tokens are held in fp16 and quantised on eviction
+-- past the window. This spec is an *overlay* model — every token
+-- is quantised into the main cache as usual, and a separate
+-- fp16/bf16 ring buffer additionally holds the last N K vectors
+-- per stream per layer. The overlay is redundant storage, not
+-- the authoritative copy.
+--
+-- The overlay is read by the attention path via a two-pass
+-- flash-attention with an online-softmax merge: Pass B reads
+-- the position-ordered overlay slice for the last
+-- residual_window positions; Pass A reads the main quantised
+-- cache for older positions; the two are merged at query
+-- granularity. Pass B requires the overlay to hold post-RoPE
+-- K, which constrains every cache type that wants to feed the
+-- overlay to store post-RoPE K (turbo_kv_4b included).
+--
+-- Still aspirational and flagged below: rewind handling on
+-- SequencePositionsRemoved (concrete callers include MTP
+-- draft rejection and prompt rewind), Vulkan port of the
+-- overlay write + read, and overlay persistence across
+-- session save/load.
+
+-- ============================================================
+-- External Entities
+-- ============================================================
+
+-- One K vector produced for a single (layer, stream, position)
+-- by the forward pass. The overlay mirrors this value at the
+-- ring-buffer slot for the position.
+entity KVector {
+    data: Set<Decimal>
+    count: Integer
+    layer: Integer
+    stream: Integer
+    position: Integer
+}
+
+-- The context in which the cache lives. Used to bound the
+-- residual window against sequence length.
+entity Context {
+    n_ctx: Integer
+    n_layer: Integer
+    n_stream: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- Runtime overlay storage dtype. The CLI may accept an "auto"
+-- sentinel, but that is resolved into one of these two values
+-- before the overlay is allocated. See ResolveOverlayDtypeAuto.
+enum OverlayDtype { f16 | bf16 }
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Size of the ring-buffer overlay, in tokens. [TONBI-V3]
+    -- default is 128. 0 disables the overlay entirely (no
+    -- allocation, no writes, no reads). Measured needle-in-
+    -- haystack evidence in [TONBI-V3] puts 128 at the knee for
+    -- 4-bit K at the 3B-parameter scale on Llama 3.2.
+    residual_window: Integer = 128
+
+    -- Runtime overlay dtype. Concrete values only; the "auto"
+    -- CLI sentinel is resolved by ResolveOverlayDtypeAuto before
+    -- reaching this parameter.
+    overlay_dtype: OverlayDtype = f16
+}
+
+-- ============================================================
+-- Rules
+-- ============================================================
+
+-- Compute the ring-buffer slot for a (stream, position) pair.
+-- Load-bearing for downstream reasoning about overwrites,
+-- rollback and the overlay read path. The overlay tensor is
+-- laid out as [n_embd_k_gqa, residual_window, n_stream]; the
+-- flat slot index is stream * residual_window + (position mod
+-- residual_window). The modulo is a black-box function since
+-- the Allium expression language does not include %.
+rule ComputeOverlaySlot {
+    when: OverlaySlotRequested(stream, position)
+
+    requires: config.residual_window > 0
+
+    let slot = stream * config.residual_window + modulo(position, config.residual_window)
+
+    ensures: OverlaySlotResolved(
+        stream: stream,
+        position: position,
+        slot: slot
+    )
+}
+
+-- On each decoded token, the K vector for that token is written
+-- into the overlay at the ring-buffer slot for (stream, position).
+-- This runs in parallel with the main cache's own append; it does
+-- not displace, gate, or depend on the main-cache write.
+--
+-- Writes overwrite any stale data at the same slot (ring wrap);
+-- at position p the slot (p mod residual_window) for that stream
+-- last held data from position (p - residual_window).
+rule AppendOverlayRow {
+    when: KVectorProduced(k)
+
+    requires: config.residual_window > 0
+    requires: k.count > 0
+
+    ensures: OverlaySlotResolved(
+        stream: k.stream,
+        position: k.position,
+        slot: k.stream * config.residual_window + modulo(k.position, config.residual_window)
+    )
+
+    ensures: OverlayWriteCommitted(
+        layer: k.layer,
+        stream: k.stream,
+        position: k.position,
+        data: k.data
+    )
+
+    @guidance
+        -- Implementation: the graph-build path calls
+        -- cpy_k_window(k_cur, k_window_idxs, il) alongside
+        -- cpy_k for the main cache. The dtype of the stored
+        -- bytes matches config.overlay_dtype after resolution.
+}
+
+-- The five rules below capture the OverlayConsistentAfterMutation
+-- obligation across the sequence-mutating operations that re-bind
+-- positions to cells. AppendOverlayRow writes are correct as long
+-- as the (cell, position) binding from the most recent write is
+-- still in effect; any operation that breaks that binding requires
+-- the overlay to be reconciled before the next read.
+--
+-- Common hazard: a single ring slot is written by multiple
+-- positions of the form p mod residual_window == slot. The most
+-- recent write displaces earlier ones. When a mutation removes
+-- the most-recent writer's position from the cache, redirects it
+-- to a different cell, or copies it without updating the
+-- destination's overlay, the slot's bytes no longer correspond
+-- to the position currently expected at that slot — silently
+-- incorrect attention for surviving positions whose slot collides.
+--
+-- Strategy selection is shared across all five rules and is
+-- recorded as an open question (RECONCILIATION STRATEGIES below
+-- on ReconcileOverlayOnSequenceRemoval).
+--
+-- Concrete callers driving each rule:
+--   ReconcileOverlayOnSequenceRemoval — MTP draft rejection,
+--     prompt rewind, kv-cache compaction.
+--   ReconcileOverlayOnSequenceShift — context-window slide once
+--     n_ctx is exhausted (positions shift left); prompt-prefix
+--     trim with re-positioning.
+--   ReconcileOverlayOnSequenceDivide — sliding-window scaled
+--     compaction; some sequence-merge schemes.
+--   ReconcileOverlayOnSequenceCopy — beam search clone; speculative
+--     decode forking; multi-sequence prompt sharing.
+--   ReconcileOverlayOnSequenceKeep — single-sequence retention
+--     after multi-sequence eval; eviction of all but one.
+
+-- Reverse of AppendOverlayRow for sequence-position removal.
+-- After SequencePositionsRemoved(stream, p_min, p_max), cells
+-- in [p_min, p_max] have been removed from `stream`'s view of
+-- the cache. Overlay slots last written by those positions
+-- still hold their bytes. The reconciliation obligation: no
+-- subsequent read returns K from a removed position.
+rule ReconcileOverlayOnSequenceRemoval {
+    when: SequencePositionsRemoved(stream, p_min, p_max)
+
+    requires: config.residual_window > 0
+    requires: p_min <= p_max
+
+    ensures: OverlayConsistentAfterMutation(stream: stream)
+
+    @guidance
+        -- RECONCILIATION STRATEGIES (shared across all five
+        -- ReconcileOverlay* rules; each correct, with different
+        -- cost profiles):
+        --
+        --   (A) RESTORE FROM MAIN: for each ring slot whose
+        --       last-effective writer position is no longer
+        --       bound to the post-mutation cache, look up the
+        --       most recent SURVIVING position whose
+        --       pos mod residual_window == slot (in the
+        --       post-mutation cache), dequant its K from main,
+        --       requantise (if overlay dtype differs) and
+        --       store into the slot. Cheap when the affected
+        --       set is small (e.g. typical MTP draft rejection
+        --       k≤8). Cost: dequant + write per affected slot.
+        --
+        --   (B) PER-SLOT VALIDITY: maintain a parallel "slot
+        --       fresh" bitmap. Reconciliation clears bits for
+        --       affected slots; AppendOverlayRow sets them on
+        --       write; the read path falls back to main-cache
+        --       K (Pass A's boundary-cut path) for slots whose
+        --       bit is clear. Cost: bitmap maintenance, more
+        --       complex Pass B mask construction.
+        --
+        --   (C) FULL REBUILD: clear the entire affected stream's
+        --       overlay; the next residual_window decodes refill
+        --       it. The attention read path must tolerate a
+        --       partial overlay (mask unfilled slots) until
+        --       refill. Cost: degraded attention quality during
+        --       refill.
+        --
+        --   (D) RESTRICT: forbid the mutation from reaching the
+        --       recent window (caller error if affected positions
+        --       overlap [seq_len - residual_window, seq_len]).
+        --       Cost: limits caller behaviour (e.g. caps MTP
+        --       draft batch size, restricts context-shift reach).
+}
+
+-- After SequencePositionsShifted(stream, p_min, p_max, delta),
+-- cells in [p_min, p_max] now hold position old_pos + delta;
+-- their K data is unchanged at the cell level. The overlay's
+-- slot↔position mapping (slot = pos mod residual_window) is
+-- stale because the slot used by old_pos is generally not the
+-- slot for old_pos + delta. The reconciliation obligation:
+-- subsequent reads return correct K for the post-shift positions.
+rule ReconcileOverlayOnSequenceShift {
+    when: SequencePositionsShifted(stream, p_min, p_max, delta)
+
+    requires: config.residual_window > 0
+    requires: p_min <= p_max
+
+    ensures: OverlayConsistentAfterMutation(stream: stream)
+
+    @guidance
+        -- See ReconcileOverlayOnSequenceRemoval for strategies.
+        -- Shift-specific note: strategy (A) requires moving K
+        -- bytes between slots (slot for old_pos → slot for
+        -- old_pos + delta) for every shifted cell whose new
+        -- position falls in the post-shift recent window. When
+        -- |delta| is a multiple of residual_window, the slot
+        -- mapping is preserved and no overlay work is needed
+        -- (rare in practice).
+}
+
+-- After SequencePositionsDivided(stream, p_min, p_max, divisor),
+-- cells in [p_min, p_max] now hold position old_pos / divisor.
+-- Multiple cells may collapse to the same target position
+-- (lossy compression of the position axis). Same staleness as
+-- shift, plus possible position collisions.
+rule ReconcileOverlayOnSequenceDivide {
+    when: SequencePositionsDivided(stream, p_min, p_max, divisor)
+
+    requires: config.residual_window > 0
+    requires: p_min <= p_max
+    requires: divisor > 0
+
+    ensures: OverlayConsistentAfterMutation(stream: stream)
+
+    @guidance
+        -- See ReconcileOverlayOnSequenceRemoval for strategies.
+        -- Divide-specific note: position collisions mean the
+        -- post-mutation cache may have fewer distinct positions
+        -- than before; slot occupancy may be sparser than the
+        -- pre-mutation overlay suggests. Strategy (A) needs to
+        -- pick a tie-breaker (e.g. last writer wins, or the
+        -- main cache's effective head wins). Strategy (C) full
+        -- rebuild side-steps the tie-breaker question.
+}
+
+-- After SequenceCopied(src_stream, dst_stream, p_min, p_max),
+-- cells in [p_min, p_max] of src_stream are now also bound to
+-- dst_stream at the same positions. dst_stream's overlay has
+-- not seen any AppendOverlayRow for those positions; reads
+-- against dst_stream's overlay would return whatever bytes
+-- the slots happen to hold (initial zero or previous wrap).
+rule ReconcileOverlayOnSequenceCopy {
+    when: SequenceCopied(src_stream, dst_stream, p_min, p_max)
+
+    requires: config.residual_window > 0
+    requires: p_min <= p_max
+
+    ensures: OverlayConsistentAfterMutation(stream: dst_stream)
+
+    @guidance
+        -- See ReconcileOverlayOnSequenceRemoval for strategies.
+        -- Copy-specific note: strategy (A) becomes "copy the
+        -- corresponding overlay slots from src_stream's overlay
+        -- to dst_stream's overlay" — cheaper than re-quantising
+        -- from main, since both overlays share the same dtype
+        -- and the source slots are already correct. Strategy
+        -- (B) per-slot validity must propagate the bitmap too.
+}
+
+-- After SequenceKept(seq_id), all sequences except seq_id are
+-- removed. Streams other than the kept seq_id's stream lose
+-- all their cells. Their overlay slots remain populated with
+-- K from removed cells, which would corrupt subsequent reads
+-- if those streams are later re-used.
+rule ReconcileOverlayOnSequenceKeep {
+    when: SequenceKept(seq_id)
+
+    requires: config.residual_window > 0
+
+    ensures: OverlayConsistentAfterKeep(kept_seq_id: seq_id)
+
+    @guidance
+        -- See ReconcileOverlayOnSequenceRemoval for strategies.
+        -- Keep-specific notes: the kept seq_id's stream is
+        -- unchanged; every other stream needs reconciliation
+        -- because all its positions are now removed. Strategy
+        -- (C) full rebuild is the natural fit for the dropped
+        -- streams since "all positions removed" leaves nothing
+        -- to restore from. The single OverlayConsistentAfterKeep
+        -- ensure covers the obligation for all streams jointly;
+        -- splitting per-dropped-stream emits would require
+        -- modelling a Streams collection in this spec, which
+        -- is currently abstracted away.
+}
+
+-- Auto-resolution of config.overlay_dtype when the CLI passes
+-- the "auto" sentinel: inspect the model's native K projection
+-- float type and pick BF16 if any model weights are BF16, F16
+-- if all float weights are F16 or F32, and BF16 as a safe
+-- upgrade when weights are quantised with no F16 fallback.
+-- Fires once at context initialisation before any overlay
+-- allocation occurs.
+rule ResolveOverlayDtypeAuto {
+    when: OverlayDtypeAutoRequested(context, model_has_bf16_weights, model_has_only_float_weights)
+
+    requires: config.residual_window > 0
+
+    ensures:
+        if model_has_bf16_weights:
+            OverlayDtypeResolved(context: context, dtype: bf16)
+        else if model_has_only_float_weights:
+            OverlayDtypeResolved(context: context, dtype: f16)
+        else:
+            OverlayDtypeResolved(context: context, dtype: bf16)
+
+    @guidance
+        -- The sentinel handling is a CLI concern; this rule
+        -- describes the observable resolution that tests can
+        -- verify. See open question on whether the rule belongs
+        -- in config defaults instead.
+}
+
+-- Attention-read rule: reconcile the main (quantised) cache
+-- with the overlay for the most recent residual_window positions.
+-- At query time, for each attended position in the last
+-- residual_window of the sequence, the attention read serves K
+-- from the overlay (lossless, fp16/bf16). Positions older than
+-- residual_window are served from the main cache only.
+rule ReadKVRecentFromOverlay {
+    when: ReadKVForAttention(query_position, attended_position, stream, seq_len)
+
+    requires: config.residual_window > 0
+    requires: attended_position > seq_len - config.residual_window
+    requires: attended_position <= seq_len
+
+    ensures: AttentionKeySource(
+        query_position: query_position,
+        attended_position: attended_position,
+        source: overlay
+    )
+
+    @guidance
+        -- Implementation direction: two-pass flash-attention
+        -- with online-softmax merge.
+        --   Pass A: FA over positions in [0, seq_len -
+        --     residual_window), K = main quantised cache, V = V
+        --     cache. Existing turbo_kv_4b FA kernel handles this
+        --     verbatim; no kernel change.
+        --   Pass B: FA over positions in [seq_len -
+        --     residual_window, seq_len), K = overlay reshaped
+        --     view, V = V cache. Existing fp16/bf16 FA kernel
+        --     handles this verbatim given correct K shape.
+        --   Merge: online-softmax combine using (M, S) per query
+        --     per head from each pass: M_new = max(M_a, M_b);
+        --     scale_a = exp(M_a - M_new); scale_b = exp(M_b -
+        --     M_new); S_new = scale_a*S_a + scale_b*S_b;
+        --     VKQ_new = (scale_a*VKQ_a + scale_b*VKQ_b); final
+        --     output = VKQ_new / S_new.
+        -- Rejected: single-pass assembled-K — would require
+        -- dequantising the whole main cache to fp16/bf16 every
+        -- decode (5+ GFLOP and 500+ MB scratch at 35B-A3B /
+        -- 32K ctx), defeating the compression.
+        -- Prerequisites: extend ggml_flash_attn_ext to emit
+        -- per-query (M, S, VKQ_unscaled) — the existing CPU
+        -- kernel already computes these internally as
+        -- chunk-partial state for its threaded reduction
+        -- (see ops.cpp around the partials write in
+        -- flash_attn_ext_f16_one_chunk). Expose via a new
+        -- ggml_flash_attn_ext_lse API that outputs shape
+        -- [DV+2, n_head, n_tokens] with the extra rows holding
+        -- M and S. Merge implementable with existing ggml ops
+        -- once LSE is exposed (no new merge op required).
+        --
+        -- RoPE state alignment: Pass B's K must arrive at the
+        -- attention kernel in the same RoPE state as Q.
+        -- AppendOverlayRow's storage policy mirrors cpy_k
+        -- verbatim, so the overlay inherits the main cache's
+        -- RoPE state per cache type:
+        --   - post-RoPE store (f16, bf16, and turbo_kv_4b): the
+        --     overlay holds post-RoPE K; Pass B reads the
+        --     position-ordered slice directly with no extra RoPE
+        --     step. This is the supported and tested two-pass
+        --     configuration.
+        --   - pre-RoPE store (split-K caches, where cpy_k stores
+        --     pre-RoPE K and the main-cache read path applies
+        --     on-the-fly RoPE): two-pass dispatch falls back to
+        --     single-pass FA. A correct two-pass + LSE merge
+        --     for pre-RoPE storage requires the rope-on-the-fly
+        --     output to compose with the merge in a way that
+        --     has not been achieved — the apparent symbolic
+        --     equivalence (rope applied per-pass produces the
+        --     same K@RoPE for matched positions) does not
+        --     translate to numerical agreement at the merge
+        --     boundary. Cache types that want overlay support
+        --     therefore standardise on post-RoPE storage; pre-
+        --     RoPE-store cache types remain on single-pass FA.
+        -- The behavioural property: overlay-served attention is
+        -- numerically equivalent to main-cache-served attention
+        -- for the same set of attended positions, modulo the
+        -- main cache's quantisation error.
+}
+
+-- Companion to ReadKVRecentFromOverlay: attended positions older
+-- than the residual window are served from the quantised main
+-- cache (Pass A in the two-pass dispatch).
+rule ReadKVTailFromMainCache {
+    when: ReadKVForAttention(query_position, attended_position, stream, seq_len)
+
+    requires: attended_position <= seq_len - config.residual_window
+
+    ensures: AttentionKeySource(
+        query_position: query_position,
+        attended_position: attended_position,
+        source: main_cache
+    )
+
+    @guidance
+        -- Implementation: Pass A's mask in the two-pass dispatch
+        -- excludes cells with pos > seq_len - residual_window via
+        -- a stream-wide boundary cut applied after the base
+        -- causal mask (set_input_kq_mask_pass_a). When
+        -- residual_window = 0, ReadKVRecentFromOverlay's
+        -- requires fails for every position and this rule covers
+        -- the whole sequence — single-pass FA on the main cache.
+}
+
+-- ============================================================
+-- Invariants
+-- ============================================================
+
+-- The residual window must fit in the context and be
+-- non-negative. Zero disables the overlay.
+invariant ResidualWindowWithinContext {
+    for c in Contexts:
+        config.residual_window >= 0 and config.residual_window <= c.n_ctx
+}
+
+-- The overlay dtype must be a concrete float type at runtime.
+-- The "auto" CLI sentinel must be resolved (by
+-- ResolveOverlayDtypeAuto) before this invariant is checked.
+invariant OverlayDtypeIsFloat {
+    config.overlay_dtype in {f16, bf16}
+}
+
+-- SWA composition: when a sliding-window-attention layer is
+-- stacked with a non-SWA base cache in a hybrid memory, the
+-- overlay is meaningful only on the non-SWA side. The SWA
+-- side runs with residual_window = 0 for its own cache. This
+-- is enforced at cache construction; the hybrid-memory spec
+-- owns the per-layer SWA flagging. Listed here as a scope
+-- note rather than an expression-bearing invariant because
+-- per-layer SWA typing lives outside this spec.
+
+-- ============================================================
+-- Actor Declarations
+-- ============================================================
+
+-- The overlay inspector is a test-boundary actor used to peek
+-- at raw overlay bytes to verify write correctness. No
+-- production caller takes this role.
+actor OverlayInspector {
+    identified_by: Context where n_layer > 0
+}
+
+-- ============================================================
+-- Surfaces
+-- ============================================================
+
+-- Introspection API for verifying overlay writes. Exposes the
+-- raw overlay bytes at a specific (layer, stream, slot) and
+-- the byte size of one slot so callers can allocate a
+-- receiving buffer. Writes are visible through this surface
+-- after AppendOverlayRow fires.
+surface OverlayPeek {
+    facing inspector: OverlayInspector
+
+    context ctx: Context
+
+    exposes:
+        ctx.n_layer
+        ctx.n_stream
+
+    provides:
+        PeekOverlaySlot(inspector, ctx, layer, stream, slot)
+        QueryOverlaySlotByteSize(inspector, ctx, layer)
+
+    @guarantee WritesObservableAfterAppend
+        -- After AppendOverlayRow has committed a write for a
+        -- given (layer, stream, position), PeekOverlaySlot at
+        -- the resolved slot returns those bytes until the
+        -- next write wraps into the same slot.
+
+    @guarantee SlotByteSizeMatchesDtype
+        -- QueryOverlaySlotByteSize returns n_embd_k_gqa
+        -- multiplied by the per-element byte size of
+        -- config.overlay_dtype (2 bytes for f16 and bf16).
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+open question "Residual window size tuning: [TONBI-V3] defaults to 128 and reports it as the knee of the quality curve at model scales around 3B. Larger models or head_dim=256 configurations (Qwen3.5 9B) may need a larger window; smaller models may tolerate less. No public measurement campaign at our target sizes."
+
+open question "Sliding vs fixed-start window: [TONBI-V3] implements the rolling-tail semantics (most recent N tokens overlaid in fp16). An alternative would be a fixed initial-tokens window (first N tokens in fp16 for the attention-sink / first-few-tokens phenomenon literature). This spec models the rolling-tail variant only."
+
+open question "Interaction with quant.cpp Variant F multi-block split: the core spec (turbo-kv-4b.allium) inherits the per-128-element sub-block split. The residual window acts at the token level (rows); it is orthogonal to the within-row quantisation granularity. Composition should be clean, but the interaction has not been empirically tested."
+
+open question "Auto-resolution placement: ResolveOverlayDtypeAuto is modelled as a rule because config defaults in Allium support only arithmetic over references and literals, and the auto-resolve logic inspects model weight types. A cleaner framing might be a dedicated config-default expression form, or a separate resolution phase. Left as a rule for now."
+
+open question "Read-path structure: should attention over a recent-overlay plus quantised-tail cache use two-pass FA with LSE merge (one pass per source, merged softmax denominators), or single-pass with an assembled-K tensor spliced at query time? Merge granularity and cross-backend portability are at stake. Not yet prototyped."
+
+open question "Reconciliation strategy selection — partially resolved per-operation. Removal: strategy (A) restore-from-main is selected (small affected set on the typical MTP rejection caller, k≤8; preserves overlay quality post-rewind). Shift / Divide / Copy / Keep: the strategy choice is deferred. Until decided, the implementation must guard those operations behind a hard error when residual_window > 0 and the operation reaches the recent window — so the gap fails loudly rather than silently corrupting attention. Lifting the guard requires either selecting a strategy per operation or generalising restore-from-main to non-removal mutations (Shift/Divide need a slot-move; Copy needs a cross-stream overlay copy; Keep is best served by full rebuild of dropped streams)."
+
+open question "Persistence across session save/load: should the overlay participate in state_write / state_read on llama_memory_i? The in-memory ring buffer is lost across session-resume and server checkpoints today. Implications for long-running server deployments and multi-turn evaluation harnesses."
+
+open question "Cross-backend equivalence: does the overlay require its own rule in turbo_kv_4b_backend.allium, or is it covered by that spec's general 'all backends produce the same output given the same inputs' invariant? Does the two-pass FA read path need its own cross-backend validation once it exists?"
+
+-- ============================================================
+-- Structural composition (closes entity-reference graph)
+-- ============================================================
+
+entity TurboKvResidualWindowSystem {
+    k_vectors: List<KVector>
+}
+
+contract ValidateTurboKvResidualWindowSystem {
+    invoke: (sys: TurboKvResidualWindowSystem) -> Boolean
+
+    @invariant SystemReferencesBindAllEntities
+        -- Closes the entity-reference graph.
+}

@@ -1,0 +1,339 @@
+-- allium: 3
+-- qnext_multislot_dispatch.allium
+
+-- Scope: the contract governing the Phase 32 per-block dispatch
+-- path inside `build_layer_attn_linear_core`
+-- (src/llama-delta-net.cpp:631-689) and the engine routing in
+-- src/llama.cpp:4702-4762. Specifically: what shapes of inputs
+-- the kernel may receive, what shape of output it must produce,
+-- and the invariants the join site (ggml_concat at delta-net.cpp:689)
+-- requires its operands to satisfy.
+--
+-- Why this spec exists: snoop-20260505T111847 captured five
+-- ABRTs in 38 minutes of real OpenCode traffic, all firing in
+-- ggml/src/ggml-cuda/concat.cu:202 (the dtype-uniformity assert)
+-- at the moment slot 1's first prompt batch entered the engine.
+-- The Phase 32 multi-slot bench (PHASE32-V-F1-T1-QQ-MULTISLOT-RESULTS.md)
+-- used uniform prompts and never tripped the path. The
+-- invariants below name what the path must promise and what
+-- the bench did not assert; `allium:propagate` against this spec
+-- generates a heterogeneous-batch property test that DOES
+-- assert them.
+--
+-- Includes:
+--   - External entities for the cgraph objects we reference
+--     (Tensor, Block, Batch).
+--   - Enumerations for the SeqPattern classifier output and the
+--     dtype tags this code path may produce.
+--   - Contracts for the per-layer linear-attention build call,
+--     the engine pattern routing, and the ggml_concat operand
+--     precondition.
+--   - System-wide invariants binding dtype uniformity across
+--     blocks, per-block slicing of `inp_out_ids`, the
+--     analyser/engine routing rules, and the SINGLE-path vs
+--     CONTIGUOUS_BLOCKS-path equivalence.
+--   - Open questions naming the choices the implementation has
+--     not yet committed to.
+--
+-- Excludes:
+--   - The numerical bound between SINGLE-path and
+--     CONTIGUOUS_BLOCKS-path outputs (per-element FP equivalence).
+--     The Phase 32 work asserts this at 99.7 % parity in
+--     scripts/test-mtp-state-isolation.sh; the spec records the
+--     contract but the FP tolerance lives there.
+--   - The conv kernel's runtime-single-seq fast path. Handled
+--     by Phase 32 Phase B; not in dispute.
+--   - MTP draft / verify graph specifics. The current production
+--     profile is nomtp; the per-block path also fires under MTP
+--     but the contract is the same.
+--   - Cache eviction, prompt cache, HTTP serving — separate
+--     concerns, separate specs.
+
+-- ============================================================
+-- External entities — cgraph objects we constrain
+-- ============================================================
+
+-- A ggml tensor flowing through the per-block dispatch path. We
+-- reference only its dtype tag and its dim-1 length (which is
+-- "tokens in this block"); the rest of the tensor's metadata is
+-- managed by ggml.
+entity Tensor {
+    name: String
+    dtype: GgmlType
+    dim1_len: Integer
+}
+
+-- One contiguous-by-seq sub-batch the engine will dispatch as a
+-- single call into build_layer_attn_linear_core. The Phase 32
+-- analyser produces these from the engine's seq_id array.
+entity Block {
+    seq_id: Integer
+    start: Integer
+    len: Integer
+}
+
+-- The full batch arriving at the linear-attention layer. Carries
+-- the full per-token seq_id array and the (possibly null)
+-- inp_out_ids the engine wants applied for output gathering.
+entity Batch {
+    n_tokens: Integer
+    seq_ids: Set<Integer>
+    inp_out_ids_present: Boolean
+    inp_out_ids_len: Integer
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- Output of qnext_analyze_seq_pattern (Phase 32 Phase A header).
+-- SINGLE: every token in the batch shares one seq_id; whole-batch
+--   path may run.
+-- CONTIGUOUS_BLOCKS: tokens partition into contiguous runs by
+--   seq_id; per-block path is required.
+-- INTERLEAVED: seq_ids are interleaved (e.g. [A, B, A, B]); the
+--   engine must fall back to a single-token loop. Out of scope
+--   for this spec; the contract here covers SINGLE and
+--   CONTIGUOUS_BLOCKS only.
+enum SeqPattern { single | contiguous_blocks | interleaved }
+
+-- The ggml dtype tags this code path can plausibly produce. The
+-- Phase 32 path is mostly F32 with F16 entering through some
+-- matmul outputs and Q* via the cached weights. The exact set
+-- the spec constrains is "uniform across all blocks of one
+-- batch" — the literal value matters less than the uniformity.
+enum GgmlType {
+    f32 | f16 | bf16 | q4_0 | q4_0_ar16 | q8_0 | other
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Maximum number of blocks per batch the contract binds. Above
+    -- this threshold, an implementation may legitimately fall back
+    -- to single-token dispatch (the prior strand's Step 4 ceiling).
+    -- The spec applies up to and including this value.
+    max_blocks_under_contract: Integer = 8
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The per-layer linear-attention build call. This is what the
+-- per-block dispatch loop invokes once per Block at
+-- src/llama-delta-net.cpp:670-689.
+contract LinearAttnLayerBuild {
+    invoke: (input: Tensor, blk: Block, batch: Batch) -> Tensor
+
+    @invariant InputDim1MatchesBlockLen
+        -- input.dim1_len = blk.len. The caller is responsible
+        -- for slicing the batch-shaped tensor down to the block
+        -- range before this call.
+
+    @invariant OutputDim1MatchesBlockLen
+        -- The returned Tensor has dim1_len = blk.len. The output
+        -- is a per-block contribution; joining blocks happens
+        -- outside this contract via ggml_concat at delta-net.cpp:689.
+
+    @invariant OutputDtypeIsBlockIndependent
+        -- The returned Tensor's dtype is determined SOLELY by the
+        -- input's dtype and the layer's parameters — NOT by
+        -- per-block conditions such as blk.start, blk.len, or
+        -- the presence of inp_out_ids. Two blocks of the same
+        -- batch produce outputs of the same dtype.
+        --
+        -- This is the invariant the current implementation
+        -- violates. The branch at src/llama-delta-net.cpp:551-557
+        -- (`if (inp_out_ids) { ... ggml_get_rows ... }`) takes
+        -- different dtypes per branch in the heterogeneous case,
+        -- so block 0 and block 1 disagree.
+
+    @invariant InpOutIdsRespectsBlockRange
+        -- If batch.inp_out_ids_present, the implementation either
+        -- (a) slices inp_out_ids to the block range
+        --     [blk.start, blk.start + blk.len) before applying it
+        --     to the per-block output, OR
+        -- (b) does not apply inp_out_ids at all in the per-block
+        --     path, deferring the gather to a single
+        --     ggml_get_rows on the joined output.
+        --
+        -- Implementations that pass the batch-global inp_out_ids
+        -- verbatim into the per-block call are out of contract:
+        -- the resulting gather indexes outside the per-block
+        -- output's row range, with undefined behaviour.
+}
+
+-- The engine's dispatch decision. Lives at
+-- src/llama.cpp:4702-4762; chooses between the SINGLE whole-batch
+-- path and the per-block path based on
+-- qnext_analyze_seq_pattern's verdict.
+contract EnginePatternRouting {
+    invoke: (batch: Batch, pattern: SeqPattern) -> Tensor
+
+    @invariant SinglePathOnSinglePattern
+        -- If pattern = single, the engine takes the whole-batch
+        -- path: one LinearAttnLayerBuild call with blk.start=0
+        -- and blk.len = batch.n_tokens. No concat is built.
+
+    @invariant BlockPathOnContiguousBlocks
+        -- If pattern = contiguous_blocks AND the block count is
+        -- at most config.max_blocks_under_contract, the engine
+        -- takes the per-block path: one LinearAttnLayerBuild call
+        -- per Block, then ggml_concat across the per-block
+        -- outputs along dim 1.
+
+    @invariant FallbackOnHighBlockCount
+        -- If the block count exceeds
+        -- config.max_blocks_under_contract OR the pattern is
+        -- interleaved, the engine falls back to the
+        -- single-token loop. Not crashing on these inputs is the
+        -- only contract for the fallback path; the per-block
+        -- contract above does not apply.
+}
+
+-- ggml_concat's operand precondition as enforced by the CUDA
+-- backend (ggml/src/ggml-cuda/concat.cu:202). The graph-building
+-- code at delta-net.cpp:689 is responsible for satisfying this;
+-- ggml_concat itself does NOT validate at construction.
+contract GgmlConcatOperands {
+    invoke: (a: Tensor, b: Tensor, dim: Integer) -> Tensor
+
+    @invariant SrcDstDtypeUniform
+        -- a.dtype = b.dtype, and the result Tensor's dtype equals
+        -- both. The CUDA backend asserts this at execution
+        -- (concat.cu:202); CPU/Metal/Vulkan backends may permit
+        -- mismatches today but the spec demands uniformity for
+        -- portability and for forward compatibility with backend
+        -- changes.
+
+    @guidance
+        -- Failing this contract aborts the entire ServerProcess
+        -- via GGML_ASSERT and triggers systemd restart. There is
+        -- no graceful degradation. Build-time guards on the
+        -- callers (e.g. an explicit ggml_cast before concat) are
+        -- the supported way to ensure satisfaction.
+}
+
+-- ============================================================
+-- System-wide invariants
+-- ============================================================
+
+-- The dtype uniformity property the per-block dispatch must
+-- maintain. Within one batch processed via the contiguous-blocks
+-- path, every block's LinearAttnLayerBuild output has the same
+-- dtype. This is the precondition the ggml_concat at
+-- delta-net.cpp:689 requires.
+invariant DtypeUniformAcrossBlocks {
+    for batch in Batches:
+        for a in BlocksOf(batch):
+            for b in BlocksOf(batch):
+                a != b implies layer_output(a, batch).dtype = layer_output(b, batch).dtype
+}
+
+-- The inp_out_ids handling property. For any batch whose
+-- inp_out_ids is non-null and whose pattern is contiguous_blocks,
+-- the implementation either slices inp_out_ids per block or
+-- defers the gather past the join. Equivalent statement: the
+-- per-block layer output is never gathered through a batch-global
+-- index that may point outside its row range.
+invariant InpOutIdsPerBlockSliceOrDeferred {
+    for batch in Batches:
+        for blk in BlocksOf(batch):
+            batch.inp_out_ids_present and pattern_of(batch) = contiguous_blocks
+                implies (gather_is_per_block_sliced(blk, batch) or gather_is_deferred(batch))
+}
+
+-- The crash-freedom property the spec exists to assert. For any
+-- batch whose pattern is SINGLE or CONTIGUOUS_BLOCKS with at most
+-- config.max_blocks_under_contract blocks, executing the per-layer
+-- build to completion does not abort the process.
+invariant NoAbortOnContractedPatterns {
+    for batch in Batches:
+        let pat = pattern_of(batch)
+        let nblk = block_count(batch)
+        (pat = single) or (pat = contiguous_blocks and nblk <= config.max_blocks_under_contract)
+            implies build_completes_without_abort(batch)
+}
+
+-- The two paths must agree on output. For any batch in
+-- single-pattern shape, dispatching via the whole-batch SINGLE
+-- path or via a contiguous-blocks path that happens to produce
+-- exactly one block must yield the same Tensor (within the
+-- numerical bound owned by the deferred per-element-equivalence
+-- contract, not this spec).
+invariant SinglePathBlockPathEquivalence {
+    for batch in Batches where pattern_of(batch) = single:
+        layer_output_via_single_path(batch) = layer_output_via_block_path(batch)
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: Which fix shape lands?
+--   A. Slice inp_out_ids per block before passing into
+--      LinearAttnLayerBuild. Cleanest; restores
+--      OutputDtypeIsBlockIndependent without a cast.
+--   B. Insert ggml_cast(out_blk, GGML_TYPE_F32) before the
+--      per-block concat at delta-net.cpp:689. Cheaper to land
+--      but adds a cast on the fast path.
+--   The spec accepts either as long as DtypeUniformAcrossBlocks
+--   and InpOutIdsPerBlockSliceOrDeferred hold; the choice is
+--   left to the implementation.
+--
+-- OQ-2: Should config.max_blocks_under_contract be 8, 4, or
+--   data-driven? The prior strand's Step 4 ceiling proposed
+--   `blocks.size() > 4 → fallback`. If the bench at np=8
+--   continues to pass post-fix, raise to 8; otherwise hold at 4.
+--   Resolve by re-running scripts/test-mtp-multislot.sh with
+--   NPS="1 2 4 8" against a fixed build.
+--
+-- OQ-3: Is the kernel-side dtype-mismatch assert in concat.cu:202
+--   the right enforcement point, or should ggml_concat at
+--   construction time validate? The latter would catch the bug
+--   before execution. Upstream concern (build_deepseek2.cpp:219
+--   comment) flags concat fragility on CUDA. Spec records the
+--   open question; resolution may belong to a separate ggml-
+--   level spec.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/qnext-seq-pattern.h
+--     — analyser; produces the SeqPattern enum (Phase 32 Phase A)
+--   ik_llama.cpp/src/llama.cpp:4702-4762
+--     — engine pattern routing (Phase 32 Phase C)
+--   ik_llama.cpp/src/llama-delta-net.cpp:332-412
+--     — build_qkv state seams; OutputDtypeIsBlockIndependent
+--       binds here
+--   ik_llama.cpp/src/llama-delta-net.cpp:551-557
+--     — the inp_out_ids branch; current divergence site for
+--       OutputDtypeIsBlockIndependent
+--   ik_llama.cpp/src/llama-delta-net.cpp:631-689
+--     — per-block dispatch loop; the join at :689 is where
+--       GgmlConcatOperands.SrcDstDtypeUniform is observed
+--   ik_llama.cpp/ggml/src/ggml-cuda/concat.cu:200-220
+--     — kernel guard; the assert that fires when the contract
+--       is violated
+--
+-- Black-box helpers used inline in the invariants above (not in
+-- `deferred` per project convention — they have no separate
+-- .allium spec):
+--   BlocksOf, layer_output, pattern_of, block_count,
+--   gather_is_per_block_sliced, gather_is_deferred,
+--   build_completes_without_abort, layer_output_via_single_path,
+--   layer_output_via_block_path.
+--
+-- Test infrastructure to drive from this spec via allium:propagate:
+--   - Property test that builds heterogeneous batches (varying
+--     block shapes within one batch) and asserts
+--     DtypeUniformAcrossBlocks and NoAbortOnContractedPatterns.
+--   - Existing scripts/test-mtp-multislot.sh asserts at the
+--     server level; the propagated test should sit at the
+--     cgraph level (test-backend-ops style) so it reproduces
+--     the bug deterministically without needing the 27B model.

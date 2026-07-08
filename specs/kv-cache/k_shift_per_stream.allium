@@ -1,0 +1,369 @@
+-- allium: 3
+-- specs/kv-cache/k_shift_per_stream.allium
+--
+-- Scope: the K-shift operation under the 4D per-stream KV layout.
+-- Models how `llama_kv_cache_seq_add` deltas applied to one
+-- stream's cells become RoPE rotations on that stream's K
+-- tensor slice — and only that stream's slice.
+--
+-- Why this spec exists: PHASE_NSTREAM_KV_PERF T3.6.A audit found
+-- two distinct constraints that interact at the K-shift site.
+--
+--   F1 (LOW-severity): the existing `inp_K_shift` populator at
+--   ik_llama.cpp/src/llama.cpp:4356-4366 writes `data[i] =
+--   cells[i].delta` per cell. Under the 4D layout cell `i` is in
+--   stream `s = i / kvps` at local pos `p = i % kvps`. The flat
+--   write already matches a per-(stream, pos) view; no change
+--   needed.
+--
+--   F2 (HIGH-severity): `ggml_rope_ext(K, b, ...)` requires `b`
+--   1D with size `a->ne[2]`. A single 4D rope on the K view
+--   `[head_dim, n_head_kv, kvps, n_stream]` would broadcast the
+--   SAME deltas across every stream. WRONG when each stream
+--   carries different per-cell positions. The fix is a per-
+--   stream loop in `build_k_shift` — one rope call per stream
+--   per layer. n_stream is small (<= 8 in production) and
+--   k_shift is rare; the overhead is bounded.
+--
+-- The current build_k_shift body in
+-- ik_llama.cpp/src/llama-build-context.cpp:170-242 carries
+-- `GGML_ASSERT(kv_self.n_stream == 1)` at line 178; T3.6.I.c1
+-- removes that assert and inserts the per-stream loop.
+--
+-- Includes:
+--   - External entities for the K-shift inputs and outputs
+--     (KShiftInput, KCells, KSlice).
+--   - Contracts for the per-cell shift application
+--     (KShiftAppliesPerCell), the cross-stream isolation
+--     property (KShiftIsolation), and the RoPE-equivalence
+--     property (KShiftRoPEEquivalent).
+--   - System-wide invariants binding the no-cross-stream
+--     mutation and the per-stream delta vector size.
+--
+-- Excludes:
+--   - The 4D K tensor layout itself. Owned by
+--     specs/kv-cache/n_stream_layer.allium (KVTensor entity).
+--   - The shared-pool single-stream K-shift path. n_stream==1 is
+--     the trivial case of this spec.
+
+-- ============================================================
+-- External entities
+-- ============================================================
+
+-- The `inp_K_shift` input tensor populated each tick when a
+-- shift is pending. Element i carries the rotation delta for
+-- cell index i under the flat enumeration. Under the 4D layout
+-- the flat index maps to (stream s = i / kvps, local pos p =
+-- i % kvps). dtype is I32. Populator lives at
+-- ik_llama.cpp/src/llama.cpp:4356-4366.
+entity KShiftInput {
+    n_kv: Integer
+    deltas: List<Integer>
+}
+
+-- One transformer layer's K tensor under the 4D per-stream
+-- layout. Logical shape [head_dim, n_head_kv, kvps, n_stream]
+-- with rope-friendly views per stream. n_stream-slice s spans
+-- byte range [s * nb[3], (s+1) * nb[3]).
+entity KSlice {
+    layer: Integer
+    stream_id: Integer
+    head_dim: Integer
+    n_head_kv: Integer
+    kvps: Integer
+}
+
+-- The metadata array tracked per stream. Cell c's `pos` is the
+-- post-shift token position; `delta` is the rotation to apply
+-- this tick (zero if unchanged). The legacy llama_kv_cell
+-- struct lives in ik_llama.cpp/src/llama-context.h:16-34.
+entity KCells {
+    stream_id: Integer
+    cells: List<KCell>
+}
+
+entity KCell {
+    cell_index: Integer
+    pos: Integer
+    delta: Integer
+    has_shift: Boolean
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- The maximum n_stream this spec exercises in TLC. Mirrors
+    -- production n_seq_max ceiling. The contracts hold for any
+    -- value in [1, max_streams].
+    max_streams: Integer = 8
+
+    -- The per-stream cell capacity bounded for TLC. Real
+    -- production kvps is in the thousands; small bounds suffice
+    -- for the property's structural validity.
+    max_kvps_per_stream: Integer = 8
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- KShiftAppliesPerCell — the flat `inp_K_shift[i]` element is
+-- the rotation delta for cell `i` in stream `s = i / kvps` at
+-- local position `p = i % kvps`. The legacy populator already
+-- writes this layout; the contract pins it as a load-bearing
+-- invariant under the 4D layout.
+contract KShiftAppliesPerCell {
+    invoke: (cells: List<KCell>, kvps: Integer, n_stream: Integer) -> KShiftInput
+
+    @invariant FlatIndexDecomposes
+        -- For every flat index i in [0, kvps * n_stream),
+        -- deltas[i] = cells_at(stream = i / kvps,
+        -- local_pos = i % kvps).delta. The populator at
+        -- ik_llama.cpp/src/llama.cpp:4356-4366 already satisfies
+        -- this. Pinning here so future refactors can't drift.
+
+    @invariant DeltaZeroForUnshifted
+        -- Cells with has_shift = false produce deltas[i] = 0.
+        -- An all-zero delta vector is a no-op rope; the
+        -- per-stream loop still runs (correct), but produces no
+        -- byte mutation.
+
+    @invariant SizeEqualsCacheCells
+        -- deltas.length = kvps * n_stream. This binds on the
+        -- rope `b` 1D requirement (size == a->ne[2] under the
+        -- per-stream view — see KShiftRoPEEquivalent below).
+}
+
+-- KShiftIsolation — applying a shift to stream `s` cells does
+-- not modify any byte of stream `s' != s`'s K tensor slice.
+-- This is the load-bearing property that resolves F2: the
+-- per-stream loop in build_k_shift must touch only
+-- K_l[il][stream=s] per iteration s.
+contract KShiftIsolation {
+    invoke: (kslice_pre: KSlice, kslice_post: KSlice, shifted_stream_id: Integer) -> Boolean
+
+    @invariant OnlyShiftedStreamMutates
+        -- For every stream s' != shifted_stream_id, every byte
+        -- of K_l[il][stream=s'] is byte-identical pre- and
+        -- post-shift. This binds at the kernel level: the rope
+        -- op writes only into its `a` tensor view, and the view
+        -- in the per-stream loop is K_view_s with offset
+        -- s * nb[3] and ne[3] = 1.
+
+    @invariant ShiftedStreamRotatesAllCells
+        -- For the shifted stream, all kvps cells under the
+        -- per-stream view receive a rope rotation; cells with
+        -- delta = 0 receive a no-op rotation (identity). No
+        -- cell in the shifted stream is skipped.
+
+    @guidance
+        -- The implementation MUST loop `for s in 0..n_stream:
+        -- rope(K_l[il], inp_K_shift_view_s, ...)`. A single 4D
+        -- rope with broadcast deltas is INCORRECT — see F2 in
+        -- PHASE_NSTREAM_KV_PERF.md T3.6.A audit.
+}
+
+-- KShiftPerDeviceInputs — under split_mode == GRAPH (CUDA_Split
+-- buffer type for the KV cache), inp_K_shift is allocated as a
+-- 2D collection of per-(device, stream) input tensors, each
+-- pinned to its consuming CUDA backend. The legacy single
+-- inp_K_shift tensor + per-stream views path is incorrect under
+-- multi-device split: ggml_backend_sched_copy_inputs leaf-copy
+-- allocation produces NULL backend assignments on freshly-built
+-- graphs under reset multi-device scheduler, leading to
+-- cudaMemcpyPeerAsync crashes.
+contract KShiftPerDeviceInputs {
+    invoke: (cache: KVCache, n_device: Integer) -> List<List<KShiftInput>>
+
+    @invariant PinnedToConsumingBackend
+        -- For every (device d, stream s) input tensor t:
+        --   t was created with ggml_set_input,
+        --   t's backend assignment via
+        --     ggml_backend_sched_set_tensor_backend(sched, t, backends[d])
+        --   matches the d-th CUDA backend in lctx.backends (which
+        --   is ordered [CUDA0, CUDA1, ..., CPU]).
+        -- This eliminates the cross-device input cpy path that
+        -- crashed cudaMemcpyPeerAsync under the legacy shared-
+        -- input pattern.
+
+    @invariant ReplicatedAcrossDevices
+        -- For every stream s, the deltas at index s*kvps + p (for
+        -- p in [0, kvps)) are written to ALL n_device input
+        -- tensors at position [d][s]. This is the populator
+        -- contract: per-stream content is identical across
+        -- devices, but per-stream-content differs from other
+        -- streams.
+
+    @invariant PopulatorUsesBackendTensorSet
+        -- llama_set_k_shift uses ggml_backend_tensor_set(t,
+        -- staging, 0, nbytes) for each per-(device, stream)
+        -- tensor — not direct t->data memcpy. The inputs may
+        -- reside on CUDA device buffers (not host-pinned) so
+        -- direct memcpy would write to host memory that the
+        -- device kernel never sees.
+
+    @guidance
+        -- Under split_mode == LAYER (or single-device), n_device
+        -- == 1 and the contract collapses to a per-stream vector.
+        -- The build_k_shift code path is unified; the per-device
+        -- outer loop runs once with d=0 and works correctly.
+}
+
+-- KShiftRoPEEquivalent — post-shift K bytes are equivalent to
+-- rebuilding K with RoPE applied at the new positions. This is
+-- the algebraic correctness statement: the shift is not just
+-- "some rotation" but the SPECIFIC rotation that takes the
+-- token at the old position to the new position under RoPE.
+contract KShiftRoPEEquivalent {
+    invoke: (kslice_pre: KSlice, kslice_post: KSlice, cells_pre: KCells, cells_post: KCells) -> Boolean
+
+    @invariant PositionDeltaMatchesRotation
+        -- For every cell c in the shifted stream:
+        --   c_post.pos = c_pre.pos + c.delta
+        --   K_post[head_dim, head, p_local, stream_id] =
+        --     RoPE(K_pre[head_dim, head, p_local, stream_id],
+        --          theta = freq_base, pos_delta = c.delta)
+        -- where RoPE here is the same rotary embedding the
+        -- original prefill applied to K. Pre = post if delta = 0.
+
+    @invariant HeadDimensionUntouchedByShift
+        -- Rope rotates pairs (x[2k], x[2k+1]) within each head.
+        -- The head_dim partition is preserved; the rotation is
+        -- internal to each (head, position). No cross-head or
+        -- cross-(head_dim) mixing.
+
+    @invariant ShiftIsIdempotentAtDeltaZero
+        -- A k_shift call with all-zero deltas produces
+        -- byte-identical K (modulo the rope kernel's
+        -- floating-point determinism). The per-stream loop runs
+        -- n_stream rope calls; each is a no-op rotation.
+}
+
+-- KShiftIntermediatePinnedToSplitDevice — under graph-split,
+-- any intermediate compute tensor in the K-shift graph (the F32
+-- cast of a quantized K view, the rotated tmp, the cpy-back
+-- destination) MUST live on the SAME device as the K split it
+-- processes. The naive "first backend supporting layer's buft"
+-- pattern always picks backends[0] under CUDA_Split (every CUDA
+-- backend reports supporting CUDA_Split), which puts tmp on
+-- CUDA0 regardless of where the K split lives. Cast/rope/cpy
+-- then crosses device boundaries on the K-cache side.
+contract KShiftIntermediatePinnedToSplitDevice {
+    invoke: (k_split: KSlice, tmp_tensor: KSlice, device_id: Integer) -> Boolean
+
+    @invariant TmpPinnedToSplitDevice
+        -- For every K split being processed on device d, the
+        -- intermediate tmp tensor produced by ggml_cast(K_view,
+        -- F32) is pinned via ggml_backend_sched_set_tensor_backend
+        -- to lctx.backends[d]. The downstream rope and cpy-back
+        -- ops inherit this device assignment from tmp.
+
+    @invariant NoBuftMatchLoop
+        -- The legacy
+        --   for (auto * backend : lctx.backends) {
+        --       if (ggml_backend_supports_buft(backend,
+        --             lctx.model.buft_layer[il].buft)) {
+        --           ggml_backend_sched_set_tensor_backend(...);
+        --           break;
+        --       }
+        --   }
+        -- is NOT used under graph-split. It would always select
+        -- backends[0] for CUDA_Split's buft. Under
+        -- non-split (LAYER), this loop is still valid (the
+        -- layer's buft is the specific device's buft).
+
+    @guidance
+        -- ik_llama.cpp/src/llama-build-context.cpp:build_k_shift
+        -- implements this via a build_one_rope lambda that takes
+        -- a backend_override parameter. The split branch passes
+        -- lctx.backends[id]; the non-split branch passes nullptr
+        -- (legacy buft-match loop is used).
+}
+
+-- ============================================================
+-- Invariants — system-wide
+-- ============================================================
+
+-- The no-cross-stream-mutation property. Lifts
+-- OnlyShiftedStreamMutates from KShiftIsolation to a
+-- system-wide property that holds for ANY composition of
+-- per-stream k_shift calls within one tick.
+invariant NoCrossStreamMutationUnderShift {
+    for s in Streams:
+        for t in Streams:
+            s != t implies KBytesOf(s).preserved_under_shift_of(t)
+}
+
+-- The per-stream delta vector size property. Binds on the
+-- ggml_rope_ext requirement that the `b` tensor's element
+-- count equals `a->ne[2]` (the position axis) for each rope
+-- call. Under the per-stream loop, a's ne[2] is `kvps`; b's
+-- view must be sized `kvps` (one stream's slice of inp_K_shift).
+invariant PerStreamRopeBSize {
+    for s in Streams:
+        let b_view = inp_K_shift_view(s)
+        b_view.size = KvpsPerStream()
+}
+
+-- The total delta vector size. Pins the populator's
+-- enumeration over cells[i] for i in [0, n_kv). Total n_kv is
+-- kvps * n_stream under the 4D layout.
+invariant TotalKShiftSize {
+    InpKShiftSize() = KvpsPerStream() * NStream()
+}
+
+-- ============================================================
+-- Open Questions
+-- ============================================================
+
+-- OQ-1: rope freq_base and freq_scale per-stream. Production
+--   uses uniform rope params across streams (one model, one
+--   set of params). If future work introduces per-seq rope
+--   scaling, the per-stream loop must pass the seq's params
+--   to each rope call. Out of scope for T3.6.
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Code-side anchors (paths from yarn-agentic root):
+--   ik_llama.cpp/src/llama.cpp:4356-4366 — `inp_K_shift`
+--     populator. Per-cell flat writes; already correct under
+--     4D layout per F1 finding.
+--   ik_llama.cpp/src/llama-build-context.cpp:170-242 —
+--     `build_k_shift`. Current body has `GGML_ASSERT(
+--     kv_self.n_stream == 1)` at line 178. T3.6.I.c1 lifts the
+--     assert and inserts the per-stream loop.
+--   ik_llama.cpp/src/llama.cpp around the
+--     `llama_kv_cache_update` call site — invokes build_k_shift
+--     when a shift is pending.
+--
+-- Test infrastructure (planned T3.6.T1):
+--   tests/spec/test-kv-shift-per-stream.cpp — n_stream=4
+--   cache; populate streams with known F32 patterns;
+--   `llama_kv_cache_seq_add(seq_id=2, p0=10, p1=30, delta=+5)`;
+--   `llama_kv_cache_update`; assert streams 0/1/3 byte-identical
+--   pre/post (KShiftIsolation), stream 2 cells [10, 30)
+--   RoPE-rotated to new positions (KShiftRoPEEquivalent).
+--   RED on T3.5 HEAD (n_stream==1 assert fires); GREEN after
+--   T3.6.I.c1.
+
+-- ============================================================
+-- Related specs
+-- ============================================================
+
+-- specs/kv-cache/n_stream_layer.allium
+--   The cache-layout spec. KSlice in this spec is the K-side
+--   view derived from KVTensor in n_stream_layer.allium.
+--
+-- specs/kv-cache/defrag_per_stream.allium
+--   The companion per-stream property at the defrag site. Both
+--   specs assert per-stream isolation for distinct ops; T3.6.T
+--   provides one synthetic test per spec.
+--
+-- specs/dispatch/graph_reuse_set_rows.allium
+--   The graph-reuse property under multi-seq dispatch. K-shift
+--   is rare and not in the steady-state hot path; the reuse
+--   property does not depend on K-shift behaviour.

@@ -1,0 +1,1103 @@
+-- allium: 3
+-- dflash_speculative.allium
+--
+-- Scope: the behavioural contract for serving Qwen3.6-27B with the
+-- DFlash drafter on the 2026-q2-next branch of yarn-agentic /
+-- ik_llama.cpp. DFlash (Chen, Liang, Liu 2026; arXiv 2602.06036) is
+-- a block-diffusion speculative-decoding method: the drafter emits
+-- a contiguous block of N candidate tokens in a single forward pass,
+-- conditioned on fused hidden features extracted from layers of the
+-- target model and on the last verified target token (the anchor).
+-- The target then verifies the block in a single multi-position
+-- forward and the longest matching prefix is committed.
+--
+-- This spec describes the BEHAVIOUR an implementation must
+-- guarantee — feature extraction, projection-and-fuse, K/V
+-- injection into draft layers, single-forward block emit, target
+-- verify, prefix accept, paired state advance. It does NOT pick an
+-- integration shape (port vs upstream vs sidecar — see
+-- PHASE_DFLASH_SCOPING.md in mtp-agentic for option A/B/C/D).
+--
+-- The spec is precision-agnostic: target may run at IQ4_KS, draft
+-- at BF16; only the relationships between tensors are constrained,
+-- not their dtypes.
+--
+-- Why this spec exists: a behavioural-level contract decouples the
+-- correctness argument from the integration choice. We will pick A,
+-- B, C, or D after running M0 (reproduce upstream's published
+-- speedup on RTX 6000 sm_75); the spec stays valid regardless.
+-- `allium:propagate` against it should generate the binding
+-- property tests for whichever integration we pick — most
+-- importantly: same-prompt determinism per-deployment under the
+-- DFlash path, given that the prior np>1 same-prompt bug remains
+-- unsolved on Qwen3.6-27B.
+--
+-- Includes:
+--   - External entities for the two models, KV caches, hidden
+--     features, anchor token, draft block, verify logits, accept
+--     decision.
+--   - Enumerations for sampler mode, accept mode, denoising
+--     schedule, feature-source policy.
+--   - Contracts for ExtractFeatures, ProjectAndFuse,
+--     DraftBlockEmit, TargetVerifyBlock, AcceptPrefixDecision,
+--     AdvanceState.
+--   - System-wide invariants binding feature dimensionality, K/V
+--     injection symmetry across draft layers, block-emit
+--     single-forward semantics, accept-prefix contiguity, paired KV
+--     advance, embed/LM-head sharing, causal-SWA mask construction,
+--     greedy-mode determinism per deployment.
+--   - Open questions naming the implementation choices that
+--     2026-q2-next must commit to before code lands.
+--
+-- Excludes:
+--   - Training-time procedures (anchor-conditioned block diffusion
+--     training loss). The drafter is a frozen artefact from z-lab;
+--     the spec covers inference only.
+--   - The DFlash drafter's internal layer composition beyond the
+--     SWA mask shape and the K/V-injection contract. Drafter
+--     weights are loaded as a GGUF; the spec does not constrain
+--     hidden_size, layer count, or attention head count beyond
+--     consistency with the loaded weights.
+--   - vLLM- and SGLang-side reference impls. They inform but do
+--     not constrain ik_llama.cpp's implementation; the
+--     PHASE_DFLASH_SCOPING.md document records their existence.
+--   - Multimodal inputs. Qwen3.6-27B is multimodal at the HF
+--     config level but the production GGUF is text-only and the
+--     DFlash drafter does not consume images. The speculative
+--     path is text-only.
+--   - The prior Qwen-provided MTP head (`--draft N` production
+--     path). DFlash is an external-draft speculative-decoding
+--     method; the on-target MTP head is dead under this spec.
+
+-- ============================================================
+-- External entities — runtime objects we constrain
+-- ============================================================
+
+-- A ggml tensor flowing through the speculative path. We
+-- reference only its existence as a typed reference; ggml manages
+-- shape and dtype.
+entity Tensor {
+    name: String
+}
+
+-- The target language model: Qwen3.6-27B in its current ik_llama.cpp
+-- representation. Hybrid attention (linear_attention + full_attention
+-- in 3:1 ratio), 64 layers, hidden 5120, 24 Q heads, 4 KV heads,
+-- vocab 248320, n_ctx_train 262144. The spec references only the
+-- properties the speculative path actually touches.
+entity TargetModel {
+    n_layers:         Integer    -- 64 for Qwen3.6-27B
+    hidden_size:      Integer    -- 5120
+    n_kv_heads:       Integer    -- 4 (GQA ratio 6 with 24 Q heads)
+    vocab_size:       Integer    -- 248320
+    n_ctx_train:      Integer    -- 262144
+    embedding:        Tensor     -- shared with drafter
+    lm_head:          Tensor     -- shared with drafter
+}
+
+-- The DFlash drafter: a small (~2B = 865M trainable + shared
+-- embed/LM head ≈ 1.73 GB BF16 on disk for Qwen3.6-27B-DFlash) DENSE
+-- Qwen3 transformer. NOT a hybrid like the target: drafter layer
+-- composition is strictly `full_attention` and `sliding_attention`,
+-- never `linear_attention` (DeltaNet). vLLM enforces this via
+-- `_DFLASH_VALID_LAYER_TYPES`; we enforce via DrafterIsDenseQwen3.
+-- Reuses the target's embedding and LM head (paper §4.2). The
+-- drafter's K/V projection inputs are augmented at every layer by
+-- the InjectedKV produced from ProjectAndFuse (see below).
+entity DraftModel {
+    n_layers:         Integer
+    hidden_size:      Integer    -- must equal TargetModel.hidden_size for shared embed/LM head
+    n_kv_heads:       Integer
+    swa_window:       Integer    -- W; causal SWA window size in tokens (per-layer; layers may differ)
+    n_param:          Integer    -- ≈ 1.73 × 10^9 for Qwen3.6-27B-DFlash drafter (BF16 file size)
+    layer_types:      List<DrafterLayerType>   -- per-layer; each element ∈ {full_attention, sliding_attention}
+}
+
+-- A single block of contiguous draft tokens emitted by the drafter
+-- in one forward pass. Block size is configurable (default 16, vLLM
+-- uses 15). Position k in the block predicts the token at
+-- anchor_pos + k + 1.
+entity DraftBlock {
+    block_size:       Integer   -- N; default 16
+    tokens:           List<Integer>   -- length N, in step order
+    anchor_pos:       Integer   -- position of the anchor token in target's sequence
+}
+
+-- The hidden-feature snapshot extracted from the target at the end
+-- of one target step. Features are pulled from a SUBSET of target
+-- layers (uniformly sampled across depth) and fused into a single
+-- compact representation via a lightweight learned projection that
+-- ships with the drafter weights.
+entity HiddenFeatures {
+    n_source_layers:  Integer   -- size of the layer subset target was probed at
+    source_indices:   List<Integer>   -- which target layer indices were sampled
+    hidden_size:      Integer   -- target's hidden_size
+    n_positions:      Integer   -- typically 1 (only the anchor position) but may extend
+}
+
+-- The output of the lightweight projection that maps HiddenFeatures
+-- → K/V-injection tensors. This is per-draft-layer: the projection
+-- emits a (K, V) pair to inject into every draft layer's attention
+-- block. Stored in the draft KV cache for re-use across drafting
+-- steps of the same anchor.
+entity InjectedKV {
+    per_draft_layer:  List<KVPair>   -- length = DraftModel.n_layers
+    anchor_pos:       Integer        -- one InjectedKV is associated with one anchor
+}
+
+-- A K/V pair injected into one draft layer. Lives in the draft's KV
+-- cache slot reserved for "fused-feature" content; coexists with
+-- the draft's normal autoregressive K/V history at the anchor and
+-- earlier accepted positions.
+entity KVPair {
+    k_dim_per_head:   Integer
+    v_dim_per_head:   Integer
+    n_kv_heads:       Integer
+    n_positions:      Integer   -- typically 1 per anchor
+}
+
+-- The last verified token at which the next draft block is
+-- conditioned. Anchors advance only when the target accepts.
+entity AnchorToken {
+    token_id:         Integer
+    pos:              Integer   -- absolute position in target's sequence
+}
+
+-- The target's KV cache state. Single-slot in our production
+-- (np=1) deployment. Advances only by the AcceptPrefix length per
+-- speculative cycle.
+entity TargetKVCache {
+    seq_id:           Integer   -- always 0 in np=1
+    n_cells:          Integer   -- = anchor_pos + 1 after each advance
+}
+
+-- The drafter's KV cache state. Holds (a) injected K/V from the
+-- current anchor's fused features and (b) the drafter's own
+-- autoregressive K/V history at the anchor and previously accepted
+-- positions. Advances paired with TargetKVCache.
+entity DraftKVCache {
+    seq_id:           Integer
+    n_cells_self:     Integer   -- drafter's own KV at accepted positions
+    n_cells_injected: Integer   -- injected KV slots (1 per active anchor)
+}
+
+-- The verify-batch: a single target forward over the drafted block.
+-- ne[1] = block_size + 1: the anchor itself plus the N drafted
+-- tokens, all in one contiguous run. The target emits one logit
+-- row per input position; row k predicts the token at
+-- anchor_pos + k + 1.
+entity VerifyBatch {
+    seq_id:           Integer
+    anchor_pos:       Integer
+    block_size:       Integer
+    tokens:           List<Integer>   -- length block_size + 1: [anchor, t_0, ..., t_{N-1}]
+}
+
+-- The per-position logits the target emits over the verify batch.
+entity VerifyLogits {
+    n_positions:      Integer   -- = VerifyBatch.block_size + 1
+    n_vocab:          Integer
+}
+
+-- The result of the accept test: how many drafts of the block are
+-- accepted by longest-prefix match (greedy) or by rejection
+-- sampling (probabilistic). bonus_token is the target's argmax (or
+-- sample) at the position immediately after the last accepted
+-- draft, always committed regardless of how many drafts were
+-- accepted.
+entity AcceptDecision {
+    n_accepted:       Integer   -- 0 .. block_size
+    bonus_token:      Integer
+    bonus_pos:        Integer   -- = anchor_pos + n_accepted + 1
+}
+
+-- ============================================================
+-- Enumerations
+-- ============================================================
+
+-- Target sampling mode at verify time. Production runs greedy
+-- (temperature=0); the contract supports probabilistic for parity
+-- with future server features but currently rejects it (see
+-- ProbabilisticVerifyOutOfScope).
+enum SamplerMode { greedy | probabilistic }
+
+-- Accept-decision algorithm. argmax_match is the byte-deterministic
+-- variant: draft k is accepted iff it equals argmax of verify
+-- logits at row k. probabilistic is the Leviathan/Chen rejection
+-- sampling variant, gated by SamplerMode = probabilistic.
+enum AcceptMode { argmax_match | probabilistic }
+
+-- DFlash block-diffusion denoising schedule. The published method
+-- uses a single denoising step; longer schedules are admissible by
+-- the architecture but not measured. The spec binds single-step
+-- and treats multi-step as a future extension (OQ-DENOISE-SCHEDULE).
+enum DenoiseSchedule { single_step | multi_step }
+
+-- Feature-source policy: which target layers HiddenFeatures is
+-- pulled from. trained_indices is the published method — 5 source
+-- layers uniformly selected between layer 2 and the third-to-last
+-- target layer, per paper §5. The drafter weights were trained
+-- against specific layer outputs; using different indices at
+-- inference is a correctness violation.
+enum FeatureSource { trained_indices | uniform_sample | custom }
+
+-- Per-layer attention type for the drafter. The drafter is dense
+-- Qwen3; only these two types are valid. Hybrid `linear_attention`
+-- is rejected at load (DrafterIsDenseQwen3).
+enum DrafterLayerType { full_attention | sliding_attention }
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- Extracts hidden-state features from the target after one target
+-- step completes. Reads the target's residual stream at a configured
+-- subset of layer indices. No effect on the target's forward path;
+-- features are a side-output snapshot.
+contract ExtractFeatures {
+    invoke: (target: TargetModel, anchor_pos: Integer, policy: FeatureSource) -> HiddenFeatures
+
+    @invariant SourceLayersWithinTarget
+        -- Every index in HiddenFeatures.source_indices is in the
+        -- range [0, target.n_layers). The implementation must
+        -- reject (or assert-fail) if a configured source index is
+        -- out of range.
+
+    @invariant UniformSampleSpacing
+        -- When policy = uniform_sample, source_indices are
+        -- approximately evenly spaced across [0, target.n_layers).
+        -- The exact subset is an implementation choice (see
+        -- OQ-SOURCE-LAYERS) but must be deterministic per
+        -- deployment.
+
+    @invariant FeatureWidthMatchesTarget
+        -- HiddenFeatures.hidden_size = target.hidden_size. The
+        -- features are residual-stream snapshots; no projection
+        -- yet.
+
+    @invariant DeterminismPerDeployment
+        -- Two ExtractFeatures invocations with identical target
+        -- state at anchor_pos and identical policy produce
+        -- byte-identical HiddenFeatures.
+}
+
+-- Projects HiddenFeatures via a small learned projection and emits
+-- per-draft-layer K/V injection tensors. The projection weights
+-- ship as part of the drafter GGUF. Result is stored in the draft
+-- KV cache, indexed by the active anchor.
+contract ProjectAndFuse {
+    invoke: (features: HiddenFeatures, draft: DraftModel) -> InjectedKV
+
+    @invariant FuseProjectionFcWeight
+        -- The drafter weights include a learned linear `fc` of shape
+        -- (num_target_layers * hidden_size, hidden_size) — 5*5120 →
+        -- 5120 for Qwen3.6-27B-DFlash. This `fc` is applied FIRST,
+        -- after concatenating the 5 target hidden states channel-wise
+        -- and BEFORE any K/V projection. Without this `fc` the
+        -- injected K/V is garbage even if every other tensor is
+        -- correct. vLLM names this `model.fc` and invokes it via
+        -- `combine_hidden_states` (qwen3_dflash.py:656).
+        --
+        -- ik_llama.cpp must load `fc` from the drafter GGUF as a
+        -- regular weight; conversion must surface it with the
+        -- correct shape and dtype (BF16 for z-lab/Qwen3.6-27B-DFlash).
+        -- The shared embedding/lm_head are reused from the target
+        -- (per SharedEmbedAndLMHead) but `fc` is drafter-exclusive.
+
+    @invariant PerLayerArity
+        -- Length of InjectedKV.per_draft_layer = draft.n_layers.
+        -- Every draft layer receives a K/V injection.
+
+    @invariant HeadShapeMatchesDraft
+        -- For every KVPair in per_draft_layer:
+        --   k_dim_per_head = v_dim_per_head = draft.hidden_size /
+        --   draft.n_kv_heads (or whatever the drafter's loaded
+        --   weights declare). The projection respects the drafter's
+        --   declared head shape; it does not rebroadcast.
+
+    @invariant KAsymmetricallyNormedVNot
+        -- vLLM precompute_and_store_context_kv (qwen3_dflash.py:441-
+        -- 468) shows K and V are treated asymmetrically:
+        --   - Both K and V come from one fused KV-projection GEMM
+        --     across all 5 drafter layers, applied to the fc-projected
+        --     context state pre-RMSNorm'd by hidden_norm.
+        --   - K is then per-layer K-normed (each layer's own k_norm
+        --     weight).
+        --   - V is NOT normed — only projected.
+        --   - K is RoPE'd; V is NOT RoPE'd.
+        -- Matches Qwen3 transformer architecture (q_norm + k_norm,
+        -- no v_norm; standard RoPE on Q+K, not V).
+
+    @invariant InjectedAnchorAlignment
+        -- InjectedKV.anchor_pos = features.position (the position
+        -- features were extracted at). The injected K/V is logically
+        -- attached to this anchor; cache eviction tied to anchor
+        -- advancement (see AdvanceState).
+
+    @invariant ReuseAcrossDenoiseSteps
+        -- When DenoiseSchedule = multi_step, the same InjectedKV is
+        -- consumed by every denoising step of the same anchor. The
+        -- projection runs once per anchor, not per denoising step.
+
+    @invariant CombineOrderFCThenHiddenNorm
+        -- The combine step that produces post-FC, post-hidden_norm
+        -- context_states applies operations in this order:
+        --   1. Channel-wise concat of the 5 source-layer hidden states.
+        --   2. Linear projection by `fc` (DFLASH_FC) — 5*5120 → 5120.
+        --   3. RMSNorm with `hidden_norm` weight (DFLASH_HIDDEN_NORM).
+        -- Reversing FC and hidden_norm changes the numerical result for
+        -- any non-trivial hidden_norm weight and is a correctness
+        -- violation. Provenance: vLLM precompute_and_store_context_kv
+        -- (qwen3_dflash.py:441-448) runs `rms_norm` on the output of
+        -- `combine_hidden_states` (qwen3_dflash.py:656), which is the
+        -- FC step. Allium-side, this fixes ordering when an
+        -- implementation considers fusing these two steps into one
+        -- kernel.
+
+    @invariant ContextStatesAnchorLevel
+        -- The combine step output (post-FC, post-hidden_norm
+        -- context_states) is per-anchor (and per-slot at np>1), NOT
+        -- per-drafter-layer. The 5 drafter layers' inject_kv steps
+        -- consume the SAME context_states[slot, anchor, :] when
+        -- producing their per-layer K/V projections. Implementations
+        -- that recompute combine per drafter layer waste 5x FC compute;
+        -- implementations that allocate context_states with a spurious
+        -- L_d dimension confuse the contract. The output shape is
+        -- [n_slots, mal_anchors, hidden_size].
+
+    @invariant InjectPerLayerLaunches
+        -- The per-drafter-layer K/V projection (K_proj + V_proj +
+        -- K_norm + RoPE + cache_write) is dispatched as one launch per
+        -- drafter layer, with each launch's grid covering (slots,
+        -- anchors) for that layer only. A single 3D launch with L_d
+        -- as the innermost or middle grid axis interleaves layers
+        -- across SMs and breaks L2 reuse of the per-layer K/V
+        -- projection weights (20 MiB/layer; TU102 L2 = 6 MiB), which
+        -- materially degrades inject bandwidth. The serialized
+        -- per-layer launch keeps the current layer's weights L2-resident
+        -- across all (slot, anchor) CTAs in that launch. Per-layer
+        -- launch overhead (~5 us each x 5 layers = 25 us) is < 0.1% of
+        -- a cycle.
+}
+
+-- Emits a block of candidate tokens in a single forward pass,
+-- conditioned on the anchor token and the injected K/V from
+-- ProjectAndFuse. Uses block diffusion: the drafter sees masked
+-- positions for t_0 .. t_{N-1} and denoises them in one forward
+-- (single-step) or in K forwards (multi-step; out of scope).
+contract DraftBlockEmit {
+    invoke: (
+        draft: DraftModel,
+        anchor: AnchorToken,
+        injected: InjectedKV,
+        draft_kv: DraftKVCache,
+        block_size: Integer,
+        schedule: DenoiseSchedule,
+    ) -> DraftBlock
+
+    @invariant SingleForwardPerStep
+        -- The drafter produces all block_size candidate tokens
+        -- from a number of forwards equal to the denoising
+        -- schedule's step count. For schedule = single_step,
+        -- exactly one forward. For multi_step, K forwards where
+        -- K is the schedule length; out of scope for the current
+        -- spec.
+        --
+        -- Provenance: vllm dflash.py:319 dummy_run docstring
+        --   "Only one forward pass due to parallel drafting"
+
+    @invariant QuerySpanIsOnePlusN
+        -- The drafter forward's query span per request is exactly
+        -- (1 + block_size) positions: 1 anchor at position 0 plus
+        -- block_size mask-token positions at positions 1..N. This
+        -- is the input shape vLLM's
+        -- copy_and_expand_dflash_inputs_kernel writes — it places
+        -- next_token_ids[i] at out_input_ids[i*(1+N)] (the anchor)
+        -- and parallel_drafting_token_id at the remaining N
+        -- positions of slot i's query span.
+        --
+        -- Implementations that emit the anchor outside the query
+        -- span, or use a different per-request shape, diverge from
+        -- the trained drafter and cannot share weights with vLLM's
+        -- impl.
+        --
+        -- Provenance: vllm dflash.py:217 (num_query_per_req =
+        --   1 + self.num_speculative_tokens), :246-275 (kernel
+        --   call site), :246 in copy_and_expand_dflash_inputs_kernel.
+
+    @invariant InjectionConsumedAtEveryLayer
+        -- The forward consumes injected.per_draft_layer[i] at
+        -- draft layer i for every i in [0, draft.n_layers). No
+        -- draft layer runs without its injected K/V. Implementations
+        -- that route K/V via cross-attention satisfy this contract
+        -- iff the cross-attention input at every layer is exactly
+        -- the projected feature for that layer.
+
+    @invariant LayerTypeDependentMask
+        -- The drafter's attention mask is per-layer-type, not a
+        -- single shape across all draft layers:
+        --
+        --   - sliding_attention layers (4 of 5 in Qwen3.6-27B-DFlash):
+        --     causal sliding-window attention. Query at position k
+        --     attends to positions [max(0, k - swa_window + 1), k]
+        --     within the union of (past context, current block).
+        --     Window = drafter config.sliding_window (= 2048 for
+        --     Qwen3.6-27B-DFlash). SWA is intrinsically causal;
+        --     "non-causal sliding window" is not a coherent mask.
+        --
+        --   - full_attention layers (the last layer in Qwen3.6-27B-
+        --     DFlash, layer index 4): bidirectional. Query at any
+        --     position k attends to ALL positions in the block AND
+        --     to the entire past context. This is where the block-
+        --     diffusion denoising's bidirectional mixing happens —
+        --     the trained model's full_attention layer sees every
+        --     mask position together and produces all block_size
+        --     candidate tokens in one forward.
+        --
+        -- Paper §4.2 (Figure 4) confirms the training-time mask:
+        --   "Tokens attend bidirectionally within the same block
+        --    and to the corresponding injected target context
+        --    features, while attention across different blocks is
+        --    disallowed."
+        --
+        -- vLLM PR #40898 enforces this split: dflash.py lines 397-444
+        -- specialise SWA layers with causal=True attention metadata
+        -- while keeping full_attention layers at causal=False.
+        -- Implementations that try to use a single mask shape across
+        -- all draft layers will diverge from the trained model.
+
+    @invariant AnchorEmbeddingFromTarget
+        -- The anchor token's embedding is fetched from the shared
+        -- target.embedding tensor, NOT from a duplicate drafter
+        -- embedding. The drafter does not own embedding weights.
+
+    @invariant BlockSizeBindsToConfig
+        -- DraftBlock.block_size = the block_size argument. The
+        -- forward emits exactly block_size masked positions plus
+        -- the anchor; downstream verify constructs a verify batch
+        -- of length block_size + 1.
+
+    @invariant AnchorPosPreserved
+        -- DraftBlock.anchor_pos = anchor.pos. The contract
+        -- preserves the anchor position so the verify path can
+        -- align its KV writes.
+
+    @invariant DeterminismPerDeployment
+        -- Two DraftBlockEmit invocations with byte-identical
+        -- (draft, anchor, injected, draft_kv, block_size, schedule)
+        -- produce byte-identical DraftBlock under
+        -- SamplerMode = greedy (i.e. argmax over draft logits at
+        -- each position). This is the per-deployment determinism
+        -- contract; cross-deployment with different block_size or
+        -- different feature sampling indices is NOT required to be
+        -- bit-stable (cf. memory entry on cross-config kernel
+        -- batch-shape sensitivity at verify (1+N) shape).
+}
+
+-- Verifies a draft block against the target. The verify batch
+-- [anchor, t_0, ..., t_{N-1}] is a single contiguous run at
+-- positions [anchor_pos, anchor_pos+1, ..., anchor_pos+block_size];
+-- the target consumes it in one forward pass and returns
+-- per-position logits used by AcceptPrefixDecision.
+--
+-- The contract takes a VerifyBatch (which records anchor +
+-- block_size + tokens together) rather than the (block, anchor)
+-- pair. Either form is computationally equivalent; VerifyBatch
+-- makes the canonical input shape explicit and is what
+-- ConstructVerifyBatch (out of scope here; trivially derivable
+-- from DraftBlock + AnchorToken) would emit.
+contract TargetVerifyBlock {
+    invoke: (
+        target: TargetModel,
+        batch: VerifyBatch,
+        target_kv: TargetKVCache,
+    ) -> VerifyLogits
+
+    @invariant VerifyBatchShape
+        -- VerifyLogits.n_positions = block.block_size + 1. The
+        -- target consumes anchor + block; it emits one logit row
+        -- per input position. Row 0 predicts next-after-anchor
+        -- (corresponds to draft t_0). Row k predicts
+        -- next-after-t_{k-1}.
+
+    @invariant SingleContiguousRun
+        -- The verify batch is one contiguous run in seq_id = block
+        -- owner's seq_id. No multi-slot batching. (Under np=1
+        -- production, this is trivially the case; np>1 with DFlash
+        -- is out of scope of this spec.)
+
+    @invariant TargetKVNotAdvancedDuringVerify
+        -- Verify runs against the target's KV state at
+        -- target_kv.n_cells = anchor_pos + 1 (the state AFTER the
+        -- anchor was committed). The verify forward does NOT mutate
+        -- target_kv; KV advancement happens later in AdvanceState
+        -- and only by the accepted prefix.
+        --
+        -- Implementations that write KV during the verify forward
+        -- must roll back the rejected suffix before AdvanceState
+        -- completes; the net mutation is exactly the accepted
+        -- prefix.
+
+    @invariant PerSlotVerifyDispatchAtMultiSlot
+        -- At n_parallel > 1, the verify forward is dispatched
+        -- per-slot (|B|=1 in every transformer compute call), NOT
+        -- as a single batched forward over all slots. Each slot's
+        -- verify runs on its own contiguous (anchor + block_size)
+        -- positions, producing its own VerifyLogits independently.
+        --
+        -- Rationale: the PHASE45 D10.e investigation
+        -- (project_mtp_multislot_determinism_investigation_failed
+        -- memory entry) could not pin down whether the
+        -- multi-slot-batched-verify divergence on Qwen 3.6 27B was
+        -- on-target-MTP-specific or a general target property. Until
+        -- empirical resolution of OQ-DFLASH-INHERITS-MTP-MULTISLOT-BUG,
+        -- per-slot verify is the only path with byte-deterministic
+        -- output across slots.
+        --
+        -- Batched verify (single forward over (1+block_size)*n_parallel
+        -- positions) is a Gate-7+ perf optimization, conditional on
+        -- the empirical result coming back GREEN. Until then, per-slot
+        -- dispatch is the only supported path.
+
+    @invariant DeterminismPerDeployment
+        -- Two TargetVerifyBlock invocations with byte-identical
+        -- (target, block, target_kv, anchor) produce byte-identical
+        -- VerifyLogits. Block-shape sensitivity is a known kernel
+        -- surface (cf. multi-slot determinism investigation memory
+        -- entry); per-deployment with fixed block_size, runs are
+        -- bit-stable.
+
+    @invariant EffectiveSeqLensSubtractsRejected
+        -- In padded-batch mode, cad.seq_lens includes positions
+        -- corresponding to rejected tokens from the previous
+        -- accept step (those positions still exist in the slot
+        -- block table even though their KV must be overwritten).
+        -- Before attention runs on the verify batch, the impl
+        -- MUST compute:
+        --   effective_seq_lens = cad.seq_lens - num_rejected_tokens
+        -- and pass effective_seq_lens (not raw cad.seq_lens) into
+        -- the attention metadata.
+        --
+        -- Otherwise the attention sees stale rejected-suffix
+        -- positions as live context and the verify logits drift
+        -- arbitrarily from the trained model's expectations.
+        --
+        -- Provenance: vllm dflash.py:283-287 explicit calc
+        --   "In padded mode, cad.seq_lens includes rejected tokens.
+        --    Subtract them so attention only sees the valid prefix
+        --    of context states."
+}
+
+-- Decides how many drafts to accept and what bonus token to commit,
+-- given verify logits over the drafted block. Pure host-side
+-- computation; no GPU state mutation.
+contract AcceptPrefixDecision {
+    invoke: (
+        block: DraftBlock,
+        logits: VerifyLogits,
+        sampler: SamplerMode,
+        mode: AcceptMode,
+    ) -> AcceptDecision
+
+    @invariant LongestPrefixMatchUnderArgmax
+        -- mode = argmax_match implies n_accepted is the largest k
+        -- in [0, block.block_size] such that for every i in [0, k):
+        -- block.tokens[i] = argmax(logits at row i). Ties in argmax
+        -- broken by lowest token id.
+
+    @invariant NAcceptedWithinBound
+        -- 0 <= n_accepted <= block.block_size.
+
+    @invariant BonusIsArgmaxAtFirstUnacceptedRow
+        -- bonus_token = argmax(logits at row n_accepted), ties
+        -- broken by lowest token id. The bonus is committed
+        -- regardless of n_accepted; if n_accepted = block_size,
+        -- the bonus comes from the last logit row (predicting
+        -- next-after-last-accepted-draft).
+
+    @invariant BonusPosIsAnchorPlusNAcceptedPlusOne
+        -- bonus_pos = block.anchor_pos + n_accepted + 1. The bonus
+        -- token occupies the position immediately after the last
+        -- accepted draft (or after the anchor if zero accepted).
+
+    @invariant DeterminismUnderFixedInputs
+        -- Pure function of inputs. Two invocations with byte-
+        -- identical (block, logits, sampler, mode) produce
+        -- byte-identical AcceptDecision.
+
+    @invariant ProbabilisticVerifyOutOfScope
+        -- mode = probabilistic and sampler = probabilistic are
+        -- rejected at the contract boundary in the initial
+        -- 2026-q2-next implementation. Greedy-only at first
+        -- landing; expand once the greedy path is shipped and
+        -- measured.
+
+    @invariant NumRejectedTokensFlowsBackToProposer
+        -- After AcceptPrefixDecision returns AcceptDecision, the
+        -- value (block.block_size - decision.n_accepted) is the
+        -- number of rejected drafts. This count MUST be passed
+        -- forward into the next DraftBlockEmit cycle's input
+        -- preparation as num_rejected_tokens, so that:
+        --   (1) draft KV slots corresponding to rejected positions
+        --       are overwritten rather than treated as live context,
+        --   (2) effective_seq_lens in the next verify can subtract
+        --       the rejected count (see
+        --       EffectiveSeqLensSubtractsRejected),
+        --   (3) the anchor for the next cycle is the bonus token at
+        --       block.anchor_pos + decision.n_accepted + 1 (see
+        --       BonusPosIsAnchorPlusNAcceptedPlusOne).
+        --
+        -- Implementations that drop the rejected-count between
+        -- cycles produce subtly wrong attention as soon as a
+        -- non-full accept occurs.
+        --
+        -- Provenance: vllm dflash.py:211 (num_rejected_tokens_gpu
+        --   parameter of set_inputs_first_pass), :262 (passed into
+        --   kernel call), :286 (used to compute effective_seq_lens).
+}
+
+-- Advances target and draft KV caches by the accepted prefix +
+-- bonus, evicts the rejected tail from the draft KV, and produces
+-- the new anchor for the next cycle. The single source of state
+-- change after one speculative cycle.
+contract AdvanceState {
+    invoke: (
+        decision: AcceptDecision,
+        block: DraftBlock,
+        target_kv: TargetKVCache,
+        draft_kv: DraftKVCache,
+    ) -> AnchorToken
+
+    @invariant TargetKVAdvancesByAcceptedPlusBonus
+        -- target_kv.n_cells (after) = target_kv.n_cells (before) +
+        -- decision.n_accepted + 1. The +1 is the bonus, which is
+        -- always committed.
+
+    @invariant DraftKVAdvancesPaired
+        -- draft_kv.n_cells_self (after) = draft_kv.n_cells_self
+        -- (before) + decision.n_accepted + 1. The drafter's own
+        -- autoregressive state advances by the same amount as the
+        -- target's: every committed token contributes a KV cell
+        -- on both sides.
+
+    @invariant DraftKVRollbackOnRejection
+        -- If the drafter's verify-time forward wrote KV cells for
+        -- the full block_size, the implementation must drop cells
+        -- (n_accepted .. block_size-1) from draft_kv before the
+        -- next cycle. The drafter never sees the rejected tail
+        -- again.
+
+    @invariant InjectedKVEvictedOnAnchorAdvance
+        -- draft_kv.n_cells_injected decreases by the number of
+        -- InjectedKV anchors whose anchor_pos < new_anchor.pos.
+        -- Stale fused features for past anchors are evicted as
+        -- soon as the anchor moves past them.
+
+    @invariant NewAnchorIsBonus
+        -- The returned AnchorToken has token_id = decision.bonus_token
+        -- and pos = decision.bonus_pos. The next cycle's
+        -- ExtractFeatures runs against the new anchor.
+
+    @invariant AtomicityPerCycle
+        -- AdvanceState is the single mutation point per
+        -- speculative cycle. Implementations must not partially
+        -- advance: either all four side-effects (target KV, draft
+        -- self KV, draft injected KV eviction, new anchor) happen
+        -- consistently, or the cycle fails and no state changes.
+        -- This is the rollback boundary if any step fails.
+}
+
+-- ============================================================
+-- System-wide invariants — cross-contract obligations
+-- ============================================================
+
+-- Targets and drafters share the embedding and LM head tensors. The
+-- drafter GGUF must declare a reference to the target's embed and
+-- head; the loader must materialise a single underlying tensor for
+-- both models. Doubling these would waste ~5 GiB at BF16 for
+-- vocab=248320 × hidden=5120 × 2 (embed + head).
+invariant SharedEmbedAndLMHead {
+    -- TargetModel.embedding === DraftModel.embedding (same
+    -- underlying memory). TargetModel.lm_head ===
+    -- DraftModel.lm_head. The convert pipeline that produces the
+    -- DFlash GGUF must encode this sharing; the runtime must honour
+    -- it.
+}
+
+-- Feature extraction layers are a fixed subset, deterministic per
+-- deployment. Changing the subset between sessions yields different
+-- drafter behaviour even with identical weights.
+invariant FeatureSourceFixedPerDeployment {
+    -- HiddenFeatures.source_indices is a deployment-time constant.
+    -- Mid-session changes are forbidden.
+}
+
+-- block_size is fixed at context creation and must match the
+-- value the drafter was trained at. vLLM allows per-KV-group
+-- runtime override via kernel_block_sizes (qwen3_dflash.py:267),
+-- but that's a perf-tuning lever for vLLM's block manager; it
+-- does not change the drafter's trained block_size, which is
+-- a model-architecture constant.
+invariant BlockSizeFixedAtContextStart {
+    -- block_size = drafter GGUF metadata dflash.block_size at
+    -- llama_set_dflash() time. It is read once and locked for
+    -- the context's lifetime. CLI override --dflash-block-size
+    -- exists for experimentation but must equal the GGUF value
+    -- or load fails with LLAMA_DFLASH_BLOCK_SIZE_MISMATCH.
+    -- Mid-session reconfiguration is forbidden — the drafter's
+    -- positional mask construction and verify-batch shape
+    -- contract both depend on block_size being constant within
+    -- the context.
+}
+
+-- Per-deployment determinism: greedy + fixed block_size + fixed
+-- feature source = byte-identical outputs across runs. Cross-
+-- deployment (different block_size, different source layers) is
+-- explicitly NOT bit-stable; the kernel batch-shape sensitivity
+-- captured in the multi-slot investigation memory entry applies to
+-- the (anchor + block_size) verify batch in the same way it
+-- applied to multi-slot verify batches.
+invariant PerDeploymentDeterminism {
+    -- Under SamplerMode = greedy and AcceptMode = argmax_match,
+    -- two runs with identical (TargetModel state, DraftModel
+    -- state, block_size, source_indices) produce byte-identical
+    -- token streams. Across runs that differ in block_size or
+    -- source_indices, outputs may differ.
+}
+
+-- Kernel-level determinism preconditions: the structural rules that
+-- DFlash CUDA kernels (combine_features, inject_kv_fused, drafter_forward,
+-- verify_attn, state_checkpoint, state_restore, argmax_match) must
+-- collectively satisfy so that DeterminismPerDeployment AND
+-- DeterminismUnderFixedInputs AND the Gate 5b np-invariance binding
+-- hold. Cross-cuts every kernel; corresponds to kernel-design.md §8.
+invariant KernelDeterminism {
+    -- (1) No floating-point atomic accumulation across blocks. In
+    --     particular: no `atomicAdd<float>` and no `atomicAdd<half>`
+    --     in any DFlash kernel's reduction path. (Integer atomics for
+    --     count-style work-stealing are admissible.)
+    -- (2) All matmul tile dimensions are compile-time constants. No
+    --     occupancy-tuned or shape-tuned heuristics that pick a
+    --     different tile based on runtime M / N / K.
+    -- (3) One CTA per output tile. No Split-K cross-block reductions
+    --     on the drafter forward, inject, or combine paths.
+    -- (4) Inner reductions use warp-shuffle; block-level reductions
+    --     use SMEM tree. No atomic-based reductions.
+    -- (5) Block-idx -> output-tile mapping is fixed at kernel design
+    --     time. SM arrival order MUST NOT affect output values.
+    -- (6) WMMA fragment shape is compile-time fixed: m16n16k16 for
+    --     drafter / combine / inject; mma.sync.m16n8k8 PTX for verify.
+    -- (7) Verify-attn uses fixed split-SIZE, not split-count.
+    --     KV_BLOCK_SIZE is a compile-time constant; each split's K
+    --     contents are determined by KV_BLOCK_SIZE alone.
+    --
+    -- Violating any of (1)-(7) breaks Gate 5b's np-invariance binding
+    -- (drafter logits bit-identical across np ∈ {1, 2, 4, 8}). At least
+    -- one of these rules has been violated in every prior batch-shape-
+    -- sensitivity bug on Turing CUDA (see project_vulkan_bi_mmv_root_cause
+    -- and project_mtp_multislot_determinism_investigation_failed memory
+    -- entries for prior incidents).
+    --
+    -- This invariant has no operational TLA+ body — it is a structural
+    -- precondition on the implementation, enforced by code review and
+    -- by the test-dflash-determinism-np-invariance and test-dflash-
+    -- determinism-ne5 byte-identity tests. Static grep-style checks
+    -- (e.g., "no `atomicAdd<float>` in ggml-cuda/dflash/dflash-*.cu") may
+    -- complement the test bindings.
+}
+
+-- The speculative cycle is atomic. Within a cycle, the order is:
+--   ExtractFeatures → ProjectAndFuse → DraftBlockEmit →
+--   TargetVerifyBlock → AcceptPrefixDecision → AdvanceState.
+-- Implementations may pipeline or overlap on-GPU, but the host-side
+-- observable state changes only at the end of AdvanceState.
+invariant SpeculativeCycleAtomicity {
+    -- A cycle either completes fully (AdvanceState commits) or
+    -- fails and reverts to the state at cycle start. No partial
+    -- KV writes, no half-committed bonus tokens.
+}
+
+-- Sync barrier — a slot's cycle counter advances only when its
+-- in-flight stream is no longer running. Prevents reading
+-- pre-completion KV state on the next cycle.
+--
+-- Provenance: lifted from specs/multislot/StreamFix.tla — equivalent
+-- to F3 (StepDoesNotAdvanceWithRunningStream) from PHASE45 work.
+-- Bound by TLA+ invariant SyncBeforeStepAdvance in
+-- specs/dflash/DFlashMultiSlot.tla.
+invariant SyncBeforeStepAdvance {
+    -- For every slot s and every cycle transition:
+    --   step[s] post-AdvanceState > step[s] pre-AdvanceState
+    --   => stream_status[s] != "running" between the two.
+    -- Implementation: server's per-slot SyncBarrier action waits
+    -- for all of that slot's in-flight CUDA streams before issuing
+    -- the next per-slot dispatch.
+}
+
+-- Cross-slot KV-write-region disjointness — at any moment in time,
+-- no two slots' in-flight KV writes share a write region. Together
+-- with PerSlotDraftKVCache this gives slot-level serialisation
+-- without locks (regions are seq_id-keyed; the per-slot stream
+-- never touches another slot's regions).
+--
+-- Provenance: lifted from specs/multislot/StreamFix.tla
+-- NoCrossStreamRace; re-verified for DFlash's three-region-per-slot
+-- layout (target_kv, draft_kv_self, draft_kv_injected). Bound by
+-- TLA+ invariant NoCrossSlotRegionOverlap in
+-- specs/dflash/DFlashMultiSlot.tla.
+invariant NoCrossSlotRegionOverlap {
+    -- For all distinct slots s, t with stream_status[s] = "running"
+    -- and stream_status[t] = "running":
+    --   in_flight_writes[s] \cap in_flight_writes[t] = {}
+    --
+    -- Modeled regions per slot: { target_kv, draft_kv_self,
+    -- draft_kv_injected }. The TLA model in DFlashMultiSlot.tla
+    -- exhaustively explores |Slots| = 2..4 and finds no
+    -- counterexample under PerSlot dispatch.
+    --
+    -- Violation symptom (per CrossSlotRace negative control): a
+    -- StartStreamWithBugD action models the bug where slot s's
+    -- stream writes into slot t's KV regions. TLC catches this
+    -- in 33 states at depth ~10. ik_llama.cpp implementation must
+    -- have the per-slot KV-region partitioning structurally
+    -- enforced (each kv_cache lives under its slot's seq_id with
+    -- no aliasing).
+}
+
+-- The drafter is implemented via KV-injection, not via T5-style
+-- cross-attention. Per-anchor target features are projected through
+-- the drafter's per-layer wk/wv weights and written to the drafter's
+-- own K/V cache; the drafter then runs plain self-attention against
+-- that cache. The encoder/decoder dual-context pattern used by
+-- upstream llama.cpp PR #22105 is explicitly rejected here.
+invariant DraftKVViaInjectionNotCrossAttention {
+    -- Rationale (see PHASE_DFLASH_DESIGN.md §"Core decision"):
+    --   - Cross-attention has graph-reuse=0 cost (cross.n_enc grows
+    --     monotonically; the encoder graph rebuilds every step).
+    --     Upstream PR #22105's own "Future Performance Work"
+    --     flags this as the dominant cost.
+    --   - At our context scales (np=8 × ctx=64k), cross-attention
+    --     storage is ~10x what KV-injection requires
+    --     (5 source layers × 5120 hidden × 2 bytes per anchor =
+    --     10 KiB per commit × 64k commits × 8 slots = 5 GiB;
+    --     KV-injection stores ~0.7 GiB at the same configuration).
+    --   - KV-injection produces a stable drafter forward shape
+    --     across cycles, CUDA-graph-cache-friendly.
+    -- The implementation enforces this at the architecture-handler
+    -- level: dflash arch builds a self-attention drafter graph with
+    -- its own KV cache, not an encoder-decoder pair.
+}
+
+-- The drafter holds n_parallel sets of K/V cache slots, one per
+-- active sequence. Each slot's cache is independently keyed by
+-- its seq_id and contains the K/V derived from that slot's anchor
+-- history.
+invariant PerSlotDraftKVCache {
+    -- DraftKVCache.seq_id partitions storage. Multi-slot serving
+    -- with shared drafter cache slots is forbidden — that would
+    -- re-introduce cross-slot KV pollution analogous to what the
+    -- D10.e investigation could not rule out for target KV.
+    -- Each per-slot drafter K/V cache is sized:
+    --   - SWA layers: window_size cells per slot (independent of ctx)
+    --   - full-attention layer: ctx-per-slot cells per slot
+    -- For Qwen3.6-27B-DFlash (4 SWA + 1 full, window=2048),
+    -- per-slot KV is dominated by the full-attention layer and
+    -- scales linearly with ctx-per-slot.
+}
+
+-- Hybrid target's recurrent state (DeltaNet / linear_attention
+-- layers) requires per-slot tracking with ping-pong buffering at
+-- n_parallel > 1 + overlap scheduling. Qwen 3.6 27B has 48 of 64
+-- layers as linear_attention; each maintains a recurrent state that
+-- must not be corrupted by interleaved draft/verify cycles across
+-- slots. SGLang's HybridReqToTokenPool (memory_pool.py:540-735)
+-- implements this via req_index_to_mamba_ping_pong_track_buffer_mapping
+-- with size 2 for overlap and size 1 for non-overlap. ik_llama.cpp's
+-- implementation must provide an equivalent at any multi-slot
+-- configuration on a hybrid target — even without overlap scheduling
+-- (size 1 is still tracked, in case rejection forces a state revert).
+invariant HybridTargetRecurrentStateTracking {
+    -- For each slot s, the target's recurrent (linear_attention /
+    -- DeltaNet) state is partitioned by seq_id and tracked through
+    -- the speculative cycle:
+    --
+    --   - Per-slot recurrent state is saved before the verify
+    --     forward (the verify may mutate the state through all
+    --     block_size positions optimistically).
+    --   - On rejection of any draft beyond accept_prefix, the
+    --     recurrent state at positions > accept_prefix MUST be
+    --     reverted before the next cycle's verify uses it as
+    --     input.
+    --
+    -- The block_size=16 verify in DFlash makes this 16x more
+    -- aggressive than np=1 MTP's --draft 3 (which only had 3 draft
+    -- positions to potentially revert). At np=8 the system handles
+    -- up to 128 simultaneous in-flight recurrent-state writes that
+    -- may need reverting.
+    --
+    -- Without this tracking, a rejected slot's recurrent state
+    -- contaminates the next cycle's draft, breaking determinism
+    -- per-deployment.
+}
+
+-- Distributed parallelism mode constraints. The target+drafter
+-- pair assumes co-located devices for KV cache sharing and
+-- attention computation order. SGLang enforces these at
+-- server_args.py:3247-3306.
+invariant DPAttentionNotSupported {
+    -- Data-parallel attention (DP) changes the attention computation
+    -- order in ways that DFlash's mask shapes don't survive.
+    -- llama_set_dflash() must reject any configuration that enables
+    -- DP attention (return LLAMA_DFLASH_DP_NOT_SUPPORTED) at bind
+    -- time. ik_llama.cpp currently doesn't have DP attention; this
+    -- invariant is forward-looking.
+}
+
+invariant PipelineParallelismRequiresPpSizeEq1 {
+    -- DFlash assumes target and drafter models are co-located on
+    -- the same device(s); pipeline parallelism (pp_size > 1)
+    -- spreads layers across devices and breaks the K/V cache
+    -- sharing contract between drafter K/V (per-anchor injected)
+    -- and target K/V (per-bonus committed). Reject at bind if
+    -- pp_size > 1.
+}
+
+-- Memory budget at multi-slot must fit the host hardware. Production
+-- 2× Quadro RTX 6000 has 48 GiB aggregate VRAM. Target weights,
+-- drafter weights, target KV (scales with np × ctx-per-slot for
+-- full-attention layers), drafter KV (mostly window-bounded),
+-- and compute scratch all share this budget.
+invariant ContextBudgetAtNp8 {
+    -- For Qwen3.6-27B target on 2× RTX 6000 at n_parallel = 8:
+    --   - Target weights (Q-loose / IQ4_KS): ~28 GiB
+    --   - Drafter weights (BF16): ~3.5 GiB
+    --   - Target KV (16 full-attention layers × KV per slot):
+    --     dominant scaling cost
+    --   - Drafter KV: ~10% of target KV at every scale
+    --   - Compute + sched + NCCL: ~3 GiB
+    -- This bounds ctx-per-slot ≤ ~64k at np=8 with q4_0+hadamard
+    -- KV; ctx=128k requires np≤4; ctx=256k requires np≤2 (and even
+    -- np=2 at 256k is tight).
+    -- The production profile for np=8 must declare
+    -- max-model-len ≤ 65536 to stay within budget.
+}
+
+-- The drafter is architecturally dense Qwen3 (not hybrid). vLLM
+-- enforces this at load (`_DFLASH_VALID_LAYER_TYPES = {full_attention,
+-- sliding_attention}` in `qwen3_dflash.py:55`). We bind the same
+-- contract: if a loaded drafter declares any `linear_attention`
+-- (DeltaNet) layer type, fail at load.
+invariant DrafterIsDenseQwen3 {
+    -- For every layer index i in [0, DraftModel.n_layers):
+    -- DraftModel.layer_types[i] ∈ {full_attention, sliding_attention}.
+    -- Reject load on any other value.
+}
+
+-- DFlash drafter and target share token-id space exactly. Anything
+-- in the target's vocab the drafter must be able to draft; anything
+-- the drafter drafts the target must verify. No extra or missing
+-- token ids. This is what makes shared embed/LM head sound.
+invariant DrafterTargetVocabIdentity {
+    -- TargetModel.vocab_size = DraftModel.vocab_size (where the
+    -- drafter inherits the target's vocab via the converter's
+    -- --target-model-dir mechanism). Verified at GGUF load.
+}
+
+-- Drafter has no vision tower. Multimodal turns (prompts containing
+-- image or video tokens) must bypass the DFlash speculative path
+-- and decode against the bare target. The drafter's logits at
+-- vision-special-token positions (e.g. Qwen3.6-27B's
+-- image_token_id=248056, video_token_id=248057) are
+-- statistical-noise quality because the drafter never saw vision
+-- attention; rejecting them at verify is wasted work; routing
+-- multimodal around the drafter is the correct shape.
+--
+-- Note: vLLM PR #40898 has a no-op _warn_if_multimodal override
+-- (dflash.py:120-124) that allows multimodal inputs without
+-- implementing actual routing. ik_llama.cpp must implement the
+-- bypass at the SERVER / caller layer, not rely on inheritance —
+-- this is a real implementation effort, not a no-op.
+invariant MultimodalTurnsRoutedAroundDrafter {
+    -- If the incoming prompt contains any of the target's vision
+    -- token ids (vision_start, vision_end, image_token_id,
+    -- video_token_id), the speculative-decoding path is bypassed
+    -- for that request. The server-level router must detect this
+    -- before the speculative loop starts and route the request
+    -- through bare-target decode. Returning
+    -- LLAMA_DFLASH_MULTIMODAL_PROMPT from llama_dflash_draft_*
+    -- if the caller failed to route is the defensive fallback.
+}
+
+-- The hidden-feature extraction count matches what the drafter
+-- was trained against. The paper (§5) uses 5 source layers
+-- uniformly selected between layer 2 and the third-to-last target
+-- layer. Both the upstream llama.cpp PR and vLLM hardcode an
+-- assumption of len(target_layer_ids) == 5; ik_llama.cpp's
+-- implementation must read this from GGUF metadata and apply
+-- without assumption.
+invariant SourceLayerCountMatchesDrafterTraining {
+    -- HiddenFeatures.n_source_layers equals the count declared
+    -- in the drafter GGUF metadata key dflash.target_layer_ids.
+    -- For Qwen3.6-27B-DFlash this is expected to be 5; the
+    -- implementation must not hardcode 5.
+}
+
+-- Cross-engine convention: dflash_config.target_layer_ids in the
+-- HF drafter config refers to "the layer whose post-output we want
+-- as a feature". The runtime extract hook fires at the residual
+-- stream entering the NEXT layer (one position later). Both
+-- llama.cpp's converter (convert_hf_to_gguf.py:4913) and vLLM's
+-- algos.py apply a `+1` shift when translating
+-- dflash_config.target_layer_ids → runtime extract indices.
+invariant TargetLayerIdsPlusOneAtRuntime {
+    -- Runtime extract index i_runtime = dflash_config_index + 1.
+    -- The GGUF metadata stored by the converter is the runtime
+    -- index (already shifted). Implementations that read the GGUF
+    -- value directly are correct; implementations that re-read the
+    -- HF config must apply +1.
+}
+
+-- DFlash does not do tree drafting. SGLang enforces num_steps==1
+-- and eagle_topk==1 (server_args.py:3272, 3281). Block emit
+-- produces ONE block at the bonus's position; no fan-out, no
+-- multi-branch.
+invariant NoTreeDraftingNoChainRollout {
+    -- One DraftBlockEmit per cycle; one block; no parallel
+    -- draft branches.
+}
+
+-- ============================================================
+-- Open questions for 2026-q2-next implementation
+-- ============================================================
+
+open question "OQ-SOURCE-LAYERS [RESOLVED 2026-05-11]: drafter config (data/dflash-27b-config/config.json) declares dflash_config.target_layer_ids = [1, 16, 31, 46, 61]. Five sources across 64 target layers per build_target_layer_ids(num_target_layers=64, num_draft_layers=5) at github.com/z-lab/dflash dflash/model.py:27 — uniform spacing on [1, num_target-3] = [1, 61]. ik_llama.cpp reads from GGUF metadata at load; no CLI override."
+
+open question "OQ-DRAFTER-CONFIG-GATED [RESOLVED 2026-05-11]: gate accepted on HF for slartibardfast0; config.json fetched and preserved at data/dflash-27b-config/config.json. Drafter confirmed: 5 hidden layers, hidden_size=5120 (matches target — SharedEmbedAndLMHead sound), head_dim=128, num_attention_heads=32, num_key_value_heads=8 (GQA ratio 4 within drafter), intermediate_size=17408, vocab_size=248320 (matches target), max_position_embeddings=262144, rope_theta=10000000 (matches target — vLLM's 1M default would be wrong), tie_word_embeddings=false, dtype=bfloat16, sliding_window=2048, use_sliding_window=true, layer_types=[sliding,sliding,sliding,sliding,full], block_size=16, mask_token_id=248070, target_layer_ids=[1,16,31,46,61]."
+
+open question "OQ-HYBRID-TARGET-EXTRACT [RESOLVED 2026-05-11]: prior concern (drafter trained against pre-DeltaNet residuals?) was unfounded. The z-lab reference impl at github.com/z-lab/dflash dflash/model.py:39-45 extracts features via hidden_states[layer_id + offset] with offset=1, where hidden_states comes from transformers' output.hidden_states (length n_layers+1, index 0 = embeddings, index k = post-layer-(k-1) output). So target_layer_ids=[1,16,31,46,61] extracts post-layer-1, post-layer-16, post-layer-31, post-layer-46, post-layer-61 outputs (post-DeltaNet-and-FFN with residual). Upstream llama.cpp's +1-shift convention places the runtime extract hook (cb(inpL,..., il)) at inpL of layer N+1, which equals post-layer-N output — same site. No silent risk."
+
+open question "OQ-DENOISE-SCHEDULE: single-step is the only schedule the published method measures. The drafter weights are trained for single-step denoising. Multi-step is admissible by the architecture but not by the trained weights; out of scope for 2026-q2-next."
+
+open question "OQ-BLOCK-SIZE-FOR-TURING [RESOLVED 2026-05-11; refined with paper finding]: ship at block_size=16 (drafter's trained value) to match training exactly. Paper §5.4.4 explicitly states: 'A model trained with a larger block size generalizes well to smaller inference-time block sizes' — so block_size=8 at inference is a *paper-blessed* fallback if Gate-5 shows FA non-determinism at ne[1]=17 on sm_75. (The reverse — trained-smaller, infer-larger — does NOT generalize, so we cannot go above 16.) Decision order: (a) ship at 16; (b) if Gate-5 binds RED at ne[1]=17, specialise FA dispatch for that shape OR fall back to block_size=8 (cite paper §5.4.4)."
+
+open question "OQ-QUANT-MIX: production target runs at IQ4_KS. The drafter ships BF16. The convert path that ik_llama.cpp eventually grows must support the cross-model SharedEmbedAndLMHead invariant when the two models declare different quants for the shared tensors. PHASE_DFLASH_DESIGN.md commits to materialising shared embed/lm_head from the target's IQ4_KS tensor; drafter never re-quantizes."
+
+open question "OQ-SWA-WINDOW [RESOLVED 2026-05-11]: drafter config declares sliding_window=2048 and layer_types=[sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention]. 4 SWA layers + 1 full attention layer (the last, layer index 4). use_sliding_window=true. ik_llama.cpp reads these per-layer from drafter GGUF metadata at load; surface via llama_dflash_swa_window(model, layer_idx) which returns 2048 for layer_idx ∈ [0,3] and -1 for layer_idx=4 (full_attention)."
+
+open question "OQ-WINDOW-CONVENTION [RESOLVED 2026-05-11 by source read of installed vLLM PR #40898]: vLLM passes sliding_window as the literal window size to FlashAttention's per-layer per_layer_sliding_window parameter (qwen3_dflash.py:172, :237). FlashAttention's documented convention for that parameter is the standard 'attend to [max(0, k-W+1), k]' interpretation. dflash.py:423-444 enforces per-layer-type mask metadata: sliding_attention layers get causal=True, all others get causal=False — assertion guards on both sides confirm the contract. Conclusion: ik_llama.cpp adopts the literal-window convention (2048 = literal window size for Qwen3.6-27B-DFlash SWA layers). SGLang's window_left = sliding_window - 1 in dflash_utils.py:321 is an SGLang-internal off-by-one transformation; vLLM and llama.cpp pass through unchanged. The training-time convention question is dissolved by the empirical fact that vLLM's source uses the literal value with no transformation and the model owner (z-lab) co-authored that PR."
+
+open question "OQ-INTRA-BLOCK-MASK [RESOLVED 2026-05-11]: confirmed via vLLM PR #40898 (vllm/v1/spec_decode/dflash.py:435-444 assertion block + lines 410, 428, 304 with causal flags and use_non_causal=True). The drafter uses a layer-type-dependent mask: sliding_attention layers run causal SWA (causal=True, asserted); full_attention layers run bidirectional (causal=False, asserted). For Qwen3.6-27B-DFlash specifically (layer_types=[sliding,sliding,sliding,sliding,full]), layers 0-3 are causal-SWA window=2048, layer 4 is bidirectional. Bidirectional mixing happens at the final layer — that is where block-diffusion denoising sees all mask positions together. The spec's prior CausalSWAMaskWithinBlock invariant was wrong and has been replaced by LayerTypeDependentMask. SGLang's custom_mask=None default-to-causal across all layers does NOT match the trained model and is a likely reason SGLang's accept rates run lower than vLLM's on the same drafter."
+
+open question "OQ-MASK-TOKEN-SEMANTICS [RESOLVED 2026-05-11]: drafter config.dflash_config.mask_token_id = 248070. Target Qwen3.6-27B tokenizer (data/dflash-27b-config/ companion) maps token 248070 to '<|audio_start|>' — a multimodal sentinel from the target's vocab that goes unused in pure-text contexts. Z-lab chose it as the drafter's mask sentinel for that reason. The drafter consumes 248070 as input only at masked positions during block-emit; if it ever emits 248070 in greedy draft logits the verify pass rejects it (the target's text-only contexts don't predict audio sentinels). No production concern."
+
+open question "OQ-BLOCK-SIZE-MISMATCH-AT-INFERENCE [RESOLVED 2026-05-11 by deciding to match training]: superseded by OQ-BLOCK-SIZE-FOR-TURING resolution to ship at block_size=16. The mismatch was a hypothetical concern about running at 8 vs trained 16; that concern is moot because we are not running at 8. The Gate-5 binding test for FA kernel determinism at ne[1]=17 absorbs the remaining uncertainty."
+
+open question "OQ-THINK-MODE-EQUIVALENT: the upstream PR records LLAMA_SPEC_NO_THINK as a significant accept-rate lever for Qwen3-family targets. Our production server uses a Jinja chat template; the equivalent control on this stack is whether the prompt enables the thinking sentinel. PHASE_DFLASH_DESIGN.md commits to a new CLI flag --dflash-think on|off with default off matching upstream's measurement."
+
+open question "OQ-MULTI-SLOT [REVISED 2026-05-11]: design supports n_parallel up to 8 from day one via per-slot dispatch (see PerSlotVerifyDispatchAtMultiSlot, PerSlotDraftKVCache, ContextBudgetAtNp8). The PHASE45 D10.e investigation could not pin down whether the multi-slot determinism gap was on-target-MTP-specific or a general target property — DFlash uses zero on-target MTP code, so the empirical test (OQ-DFLASH-INHERITS-MTP-MULTISLOT-BUG) is meaningful and cheap. Per-slot dispatch is the correctness baseline. Batched verify (single forward over (1+block_size)*n_parallel positions, reusing the multi-slot batched amortization that the abandoned MTP per-slot work also wanted) becomes a Gate-7+ optimization conditional on that empirical result coming back GREEN."
+
+open question "OQ-DFLASH-INHERITS-MTP-MULTISLOT-BUG [RESOLVED 2026-05-12 — GREEN]: Gate-3.5 ran successfully on vLLM PR #40898 + z-lab/Qwen3.6-27B-DFlash + Qwen3.6-27B target, 2× RTX 6000 (sm_75), fp16, tp=2, cpu_offload_gb=12, with 3 runtime sm_75 monkey-patches (combine_hidden_states dtype cast, FlexAttention .view→.reshape, FlexAttention BLOCK_M/N largest POW2 divisor). Same prompt, greedy decode (temperature=0, seed=42), 96 tokens each, 5 streams compared: A (np=1), B[0]+B[1] (two identical requests in np=2 batch), C[0]+C[1] (np=2 rerun for self-stability). **All 5 streams byte-identical, n_diff_pairs=0, verdict GREEN.** See data/gate35-dflash-determinism.json for raw data. DFlash with vLLM's single-batched-grid kernel dispatch (grid=(batch_size, num_blocks)) does NOT inherit the byte-level non-determinism that bit PHASE45 D10.e MTP multi-slot. The dispatch shape class that broke MTP works correctly for DFlash on this hardware/path. Caveats: result is for fp16+3-patches not yet upstream; np=2 on one prompt is not a proof of np≤8 across all shapes. PerSlotVerifyDispatchAtMultiSlot remains the spec ceiling (stronger than this single empirical result)."
+
+open question "OQ-VLLM-PR-MERGE-RISK: the reference impls (vLLM PR #40898, SGLang PR #23000, upstream llama.cpp PR #22105) are all draft. PHASE_DFLASH_DESIGN.md commits to anchoring on the published paper plus our design, not on upstream's PR; upstream PR is reference only and may pivot without affecting our work."
+
+open question "OQ-FAILURE-MODE-ON-MISSING-DRAFT: what happens if the drafter fails to emit a coherent block (e.g. the model returns NaN, or the injected K/V slot is missing for an active anchor)? At first landing the choice is hard failure with logged context, matching MTP-IR. Move to graceful fallback to non-speculative decode after the path is shipped and measured."
