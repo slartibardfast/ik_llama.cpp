@@ -1,0 +1,143 @@
+{
+  "_schema_version": 1,
+  "_comment": [
+    "Allium <-> TLA+ binding for the DeltaNet (full vanilla hybrid pipeline)",
+    "np>1 determinism workstream on production/2026-q2-next.",
+    "",
+    "Three sections:",
+    "",
+    "  tla_helpers       — TLA+ symbols that are intentionally NOT invariants:",
+    "                      types, actions, state-machine scaffolding, helper",
+    "                      functions, symmetry sets. Whitelisted so the",
+    "                      reverse-direction drift check skips them.",
+    "",
+    "  divergences       — pairs where a TLA+ INVARIANT must have a different",
+    "                      name from its source Allium invariant. Should stay",
+    "                      empty under normal use. Adding a divergence",
+    "                      requires a written rationale.",
+    "",
+    "  bindings_external — Allium invariants that are intentionally NOT",
+    "                      bound by a TLA+ invariant. Either bound by C++",
+    "                      tests, empirical capture, or static analysis.",
+    "                      Recording them here suppresses the forward-drift",
+    "                      check for that name."
+  ],
+
+  "tla_helpers": [
+    "Init",
+    "Next",
+    "Spec",
+    "TypeOK",
+    "LayerCompute",
+    "SubEpsDrift_Introduce",
+    "DriftLevels",
+    "FA_Drifts",
+    "MMQ_Amplifies",
+    "vars"
+  ],
+
+  "divergences": [],
+
+  "bindings_external": [
+    {
+      "allium": "StorageBranchInvariant",
+      "bound_by": "DFLASH_DIAG=1 stderr trace in test-deltanet-d1-capture; t->type=f32 at np=1 single-token, f16 at np>=2 multi-token",
+      "rationale": "Storage-precision branch is a property of the build graph emission path, not the kernel state machine; bound by runtime diagnostic"
+    },
+    {
+      "allium": "RepDeterminismAtSameNP",
+      "bound_by": "data/deltanet/s1-1-rep-identity.json — 128/128 byte-identical at NP=2 across two reps",
+      "rationale": "Empirical determinism property of the production kernel set; not a state-machine invariant"
+    },
+    {
+      "allium": "DispatcherTemplateUniformity_FA",
+      "bound_by": "Static analysis of fattn.cu:140 + fattn-wmma-f16.cu:81-104",
+      "rationale": "Compile-time-determined dispatch; no state machine"
+    },
+    {
+      "allium": "DispatcherTemplateUniformity_MMQ",
+      "bound_by": "Static analysis of mmq.cuh:4175-4220 mmq_x_best picker",
+      "rationale": "Compile-time-determined dispatch; no state machine"
+    },
+    {
+      "allium": "DispatcherTemplateUniformity_DeltaNet",
+      "bound_by": "Static analysis of delta-net.cu:219",
+      "rationale": "Compile-time-determined dispatch; no state machine"
+    },
+    {
+      "allium": "ProjectionGEMMSlotInvariance",
+      "bound_by": "data/deltanet/s2-3-op-level-localization.json — Qcur/Kcur/Vcur/Qcur_normed/Kcur_normed/gate/q IDENTICAL at slot 0 across NP for p3 layer 3, p1 layer 3, p0 layer 19",
+      "rationale": "Per-prompt empirical capture of CUDA kernel output equivalence; outside the TLA+ state machine which abstracts over layers"
+    },
+    {
+      "allium": "DeltaNetSlotInvariance",
+      "bound_by": "data/deltanet/s2-3-op-level-localization.json — DeltaNet outputs IDENTICAL at p3 layer 0 across NP",
+      "rationale": "Same as above; empirical kernel output equivalence"
+    },
+    {
+      "allium": "PerPromptDriftSiteVariability",
+      "bound_by": "data/deltanet/s2-1-per-prompt-first-div.json",
+      "rationale": "Per-prompt variability is captured at the model-state level (TLA+ models a single prompt's path); separate invocations of the TLA+ model with different FA_ShapeSensitive constants represent different prompts"
+    },
+    {
+      "allium": "TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity",
+      "bound_by": "data/phase_dflash_t8/gate7-token-diff-summary.json (original NP=1 vs NP=2) + PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh PASS 3/3 at NP_LIST=\"1 2 4\" (2026-06-14, after nwarps=4 MMVQ fix mmvq-templates.cuh:460 + path B GGML_CUDA_DECODE_MMVQ)",
+      "rationale": "Renamed 2026-06-14 from TokenLevelGreedyArgmaxNP1_NP2_Identity, extended np1==np2 to np1==np2==np4. Token-level property emerges from greedy argmax over cumulative drift; the TLA+ model captures per-layer drift but not token-level argmax, so bound by empirical token-diff capture"
+    },
+    {
+      "allium": "NP8TokenDeterminismNotHeld_IntermittentTPRace",
+      "bound_by": "PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh np=8 12 PASS / 1 FAIL over 13 reps at CTX_PER_SLOT=8192, clocks 1455 + power pinned (2026-06-14)",
+      "rationale": "Corrected 2026-06-14 from TokenLevelGreedyArgmaxNP4_NP8_DeterministicDrift. np=8 is an intermittent (~8%) single-slot host-timing race, NOT deterministic drift; a multi-GPU tensor-parallel determinism problem tracked under PHASE_NP8_FLAKE. Bound by the rep-distribution measurement, not a state-machine invariant"
+    },
+    {
+      "allium": "NotHeld_FA_BatchInvariance",
+      "bound_by": "Negation of WmmaFAShapeSensitiveAtSomeInputs (counterexample to the positive 'batch-invariance' invariant)",
+      "rationale": "Non-invariants are documented for spec-completeness; not separately bound"
+    },
+    {
+      "allium": "NotHeld_MMQ_BatchInvariance",
+      "bound_by": "Negation of MmqShapeSensitiveViaAmplification",
+      "rationale": "Non-invariants are documented for spec-completeness"
+    },
+    {
+      "allium": "NotHeld_LayerLevelByteIdentity_NP2_NP4",
+      "bound_by": "PerPromptDriftSiteVariability shows first-divergent layer per prompt",
+      "rationale": "Non-invariant"
+    },
+    {
+      "allium": "Falsified_NotHeld_TokenLevelDeterminism_NP4",
+      "bound_by": "PHASE_LM_DECODE_CAPTURE D1 verify-production-determinism.sh PASS 3/3 at NP_LIST=\"1 2 4\" (2026-06-14)",
+      "rationale": "Falsified 2026-06-14 (was NotHeld_TokenLevelDeterminism_NP4). NP=4 token-level determinism now HOLDS; the positive statement is TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity. Kept as a dated record of the corrected non-invariant"
+    },
+    {
+      "allium": "SystematicDivergenceWasDeltaNetFastPath",
+      "bound_by": "static:src/llama-delta-net.cpp:704-720 (all_same_seq fast/slow split, fp32-ULP from layer 6) + LLAMA_DELTA_FORCE_SLOW toggle (PHASE_LM_DECODE_CAPTURE D1, 2026-06-14)",
+      "rationale": "Localization of the systematic (now-fixed) np>1 divergence; bound by code review of the fast/slow path split plus the force-slow toggle experiment. Distinct from the np=8 timing race"
+    },
+    {
+      "allium": "MmvqSelfBatchInvariantAfterNwarps4",
+      "bound_by": "static:mmvq-templates.cuh:460 (nwarps=4) + PHASE_LM_DECODE_CAPTURE D1 cross-NP slot-0 byte-identity at NP_LIST=\"1 2 4\" (2026-06-14)",
+      "rationale": "Per-kernel self-batch-invariance of the path-B MMVQ decode matmul after the nwarps=4 fix (byte-identical across ncols 1..8); bound by code review plus the cross-NP byte-identity capture"
+    },
+    {
+      "allium": "Open_FA_SourceClass_OtherPrompts",
+      "bound_by": "PENDING — extension of S2.3 captures to p2, p4, p5 layer 3",
+      "rationale": "Open invariant; not yet bound. Tracks pending empirical work"
+    },
+    {
+      "allium": "Open_P0_EarlyFALayersByteIdentical",
+      "bound_by": "PENDING — extension of S2.3 captures to p0 layers 3, 7, 11, 15 (per-device il_cb)",
+      "rationale": "Open invariant; not yet bound"
+    },
+    {
+      "allium": "Open_FA_InternalMechanism",
+      "bound_by": "PENDING — kernel-internal reading of fattn-wmma-f16.cuh to identify the specific batch-shape-dependent computation",
+      "rationale": "Open invariant; not yet bound. The TLA+ model abstracts the FA kernel as a non-deterministic action; the internal mechanism becomes a refinement invariant once identified"
+    },
+    {
+      "allium": "Open_MMQ_InternalMechanism",
+      "bound_by": "PENDING — kernel-internal reading of mmq.cuh",
+      "rationale": "Open invariant; not yet bound"
+    }
+  ]
+}

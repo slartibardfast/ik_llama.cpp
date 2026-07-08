@@ -1,0 +1,78 @@
+{
+  "_schema_version": 1,
+  "_comment": [
+    "Allium <-> TLA+ binding for the small-batch (ne11 <= K) quantized-matmul",
+    "kernel substitution ('the M1 kernel') — PHASE_LAUNCH_FUSION_SWEEP decode lever.",
+    "Family contract: byte-identical to MMQ at EVERY real column, so the carve-out",
+    "holds across np (np1==..==npK). The TLA+ negative control M1_DIVERGENT_MULTICOL",
+    "is family-specific: correct at M=1, wrong at M>=2.",
+    "",
+    "Allium: specs/dispatch/m1_quant_matmul.allium",
+    "TLA+:   specs/dispatch/M1QuantMatmul.tla",
+    "",
+    "Same three sections as specs/deltanet/allium-tla-binding.json:",
+    "  tla_helpers       — TLA+ symbols intentionally NOT invariants (types,",
+    "                      actions, helpers, the liveness property).",
+    "  divergences       — a TLA+ INVARIANT whose name differs from its source",
+    "                      Allium invariant, with a written rationale.",
+    "  bindings_external — Allium invariants NOT bound by a TLA+ invariant;",
+    "                      bound instead by C++ byte-compare/PBT tests, code",
+    "                      review, or static analysis.",
+    "",
+    "NOTE: scripts/check-bindings.py is currently hardcoded to the dflash spec",
+    "set, so this binding is a record (and is ready for a future generalization",
+    "of that script). The CI gate (.github/workflows/spec-tla-gate.yml) gates",
+    "this pair via `allium check` (exit 0) + TLC positive-PASS + TLC",
+    "negative-control-FAIL, the same pattern as the deltanet / cuda-native",
+    "specs."
+  ],
+
+  "tla_helpers": [
+    "Init",
+    "Next",
+    "Spec",
+    "Decode",
+    "TypeOK",
+    "Mechanisms",
+    "Faithful",
+    "EmitsToken",
+    "vars",
+    "EventuallyDecodes"
+  ],
+
+  "divergences": [
+    {
+      "allium": "FaithfulByteIdentity",
+      "tla": "ObservationalEquivalence",
+      "rationale": "ObservationalEquivalence is the scheduler-level refinement of the Allium byte-identity obligation. FaithfulByteIdentity (Allium) pins the per-element kernel output (M1 == MMQ col-0, max_abs_diff=0.0); ObservationalEquivalence (TLA+) lifts that to the observable decode token stream — substituting M1 at ne11==1 leaves the argmax token stream unchanged, which is what preserves batch-invariance.allium TokenLevelGreedyArgmaxNP1_NP2_NP4_Identity. The TLA+ also carries a same-name FaithfulByteIdentity invariant (the mechanism-faithfulness premise); ObservationalEquivalence is the extra refinement invariant and so is recorded here as a divergence."
+    }
+  ],
+
+  "bindings_external": [
+    {
+      "allium": "DispatchRouting",
+      "bound_by": "static:ik_llama.cpp/ggml/src/ggml-cuda.cu:2801-2819 (the should_use_mmq(..,ne11=16) force + the src1->ne[2]*ne[3]==1 guard the M1 carve-out sits under) + cpp:test-m1-quant-matmul dispatch assertion (to be written with the kernel)",
+      "rationale": "Compile-time/shape-determined routing predicate, not a state machine. The TLA+ models the observable token stream, not the dispatch decision; routing is bound by static analysis of the dispatch site plus a dispatch unit test."
+    },
+    {
+      "allium": "ScoreCorrectness",
+      "bound_by": "cpp:test-m1-quant-matmul PBT vs an independent scalar reference (to be written); tolerance inherited from q4_0_ar16.allium VecDot.ScoreCorrectness config",
+      "rationale": "Numerical correctness within an accumulator-precision tolerance — a per-element property-based test against a scalar oracle, not a temporal/state-machine invariant. It is the weaker floor; FaithfulByteIdentity is the bar."
+    },
+    {
+      "allium": "M1MustUseMmqSrc1Quant",
+      "bound_by": "static: M1 consumes block_q8_1_mmq (quantize_mmq_q8_1, quantize.cu:86), NOT block_q8_1 (quantize_q8_1, quantize.cu:13) + cpp: byte-compare of M1 vs mmq_x=8 col-0",
+      "rationale": "Implementation constraint that makes FaithfulByteIdentity reachable on the src1 side; bound by code review of the chosen quantizer plus the byte-identity compare test."
+    },
+    {
+      "allium": "M1MustMatchMmqScaleAccumOrder",
+      "bound_by": "static: M1 k-block float-scale accumulation order == the mmq_x=8 kernel's (mmq.cuh) + cpp: byte-compare of M1 vs mmq_x=8 col-0",
+      "rationale": "Implementation constraint that makes FaithfulByteIdentity reachable on the accumulation side (int32 partials are exact/order-independent; the float reduction order is the only divergence risk). Bound by code review + the byte-identity compare test."
+    },
+    {
+      "allium": "Determinism",
+      "bound_by": "cpp: rep-identity test — M1 output byte-identical across two reps at fixed input (same convention as q4_0_ar16.allium Determinism)",
+      "rationale": "Per-rep self-determinism of the kernel; an empirical property, not a state-machine invariant. FaithfulByteIdentity additionally pins M1 to MMQ across the substitution."
+    }
+  ]
+}

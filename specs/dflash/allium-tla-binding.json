@@ -1,0 +1,246 @@
+{
+  "_schema_version": 1,
+  "_comment": [
+    "Explicit binding file for the DFlash Allium <-> TLA+ synergy contract.",
+    "",
+    "Three sections:",
+    "",
+    "  tla_helpers       — TLA+ symbols that are intentionally NOT invariants:",
+    "                      types, actions, state-machine scaffolding, helper",
+    "                      functions, symmetry sets. These are whitelisted",
+    "                      so the reverse-direction drift check skips them.",
+    "",
+    "  divergences       — pairs where a TLA+ INVARIANT must have a different",
+    "                      name from its source Allium invariant. Each entry",
+    "                      records the Allium name, the TLA+ name, and a",
+    "                      rationale. Should stay empty under normal use; the",
+    "                      naming convention prefers identical names. Adding",
+    "                      a divergence requires a justification (TLA+",
+    "                      keyword conflict, semantic split, etc.).",
+    "",
+    "  bindings_external — Allium invariants that are intentionally NOT",
+    "                      bound by a TLA+ invariant. Either bound by a C++",
+    "                      load-time test, an empirical Gate, or out-of-scope.",
+    "                      Recording them here suppresses the forward-drift",
+    "                      check for that name, with rationale."
+  ],
+
+  "tla_helpers": [
+    "Init",
+    "Next",
+    "Spec",
+    "TypeOK",
+    "BoundedStep",
+    "BlockRecord",
+    "PCValues",
+    "StreamStatus",
+    "DispatchKindValues",
+    "Tier3VerifySideRespectsPerStreamPartition",
+    "NoBlock",
+    "AllRegions",
+    "SlotSymmetry",
+    "DraftBlockEmit",
+    "TargetVerifyBlock",
+    "AcceptPrefixDecision",
+    "AdvanceState",
+    "CycleStepPerSlot",
+    "CycleStepSingleGrid",
+    "CompleteSlotStream",
+    "ResetSlot",
+    "StartStreamPerSlot",
+    "CompleteStream",
+    "DispatchSingleGrid",
+    "StartStreamWithBugD",
+    "RegionsOf"
+  ],
+
+  "divergences": [],
+
+  "bindings_external": [
+    {
+      "allium": "FuseProjectionFcWeight",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-combine-features.cpp",
+      "rationale": "The combine_features unit test loads DFLASH_FC weight from the drafter GGUF, runs both fused kernel and scalar reference, and byte-compares context_states output. Reversing FC and hidden_norm or omitting fc produces visibly different output (cosine << 1.0 vs 1.0 byte-identity)."
+    },
+    {
+      "allium": "FeatureWidthMatchesTarget",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-combine-features.cpp",
+      "rationale": "Test parameter assertion: source_hiddens.shape[-1] == 5120 == drafter.hidden_size. Kernel signature enforces D_d=5120 at compile time; runtime shape check at test setup."
+    },
+    {
+      "allium": "CombineOrderFCThenHiddenNorm",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-combine-features.cpp",
+      "rationale": "Test uses a non-identity hidden_norm_weight (random fp16) so that reversing FC and hidden_norm order produces output that fails byte-identity vs the scalar reference. Float arithmetic property; not TLA+-modelable."
+    },
+    {
+      "allium": "ContextStatesAnchorLevel",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-combine-features.cpp",
+      "rationale": "Test allocates context_states at shape [N_slots, MAL_anchors, 5120] without per-layer replication. Inject test's 5 launches all read the same buffer at the same (slot, anchor) coordinate."
+    },
+    {
+      "allium": "PerLayerArity",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-inject-fused.cpp",
+      "rationale": "Test host-side launcher runs exactly L_d=5 inject kernel launches, one per drafter layer, each reading that layer's k_weight/v_weight/k_norm_weight slice. Loop count asserted; per-layer cache writes verified."
+    },
+    {
+      "allium": "HeadShapeMatchesDraft",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-inject-fused.cpp",
+      "rationale": "Test loads real per-layer k_weight [1024, 5120] (= 8 heads × 128 dim per head), v_weight same, k_norm_weight [128] from the drafter GGUF. Scalar reference uses the same shapes; fused kernel must match byte-identically."
+    },
+    {
+      "allium": "KAsymmetricallyNormedVNot",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-inject-fused.cpp",
+      "rationale": "Scalar oracle applies k_norm + RoPE to K only; V is projected and written without normalization or rotation. Fused kernel must agree byte-identically, so any symmetry violation (e.g., normalizing V) breaks the test. Float arithmetic + structural; not TLA+-modelable."
+    },
+    {
+      "allium": "InjectedAnchorAlignment",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-inject-fused.cpp",
+      "rationale": "Test passes anchor_positions[slot, anchor] explicitly; verifies fused kernel writes to k_cache_layer[slot, anchor_pos, :, :] and v_cache_layer[slot, anchor_pos, :, :], not at any other position."
+    },
+    {
+      "allium": "InjectPerLayerLaunches",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-inject-fused.cpp + review:host launcher structure",
+      "rationale": "Host launcher is a for-loop over L_d=5 with grid (N_slots, MAL_anchors) per launch. Test exercises this exact structure (no batched 3D launch alternative). Additional perf check at Gate 6 measures L2 hit rate to detect a future regression to inner-loop layer dispatch."
+    },
+    {
+      "allium": "KernelDeterminism",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-determinism-np-invariance.cpp + cpp:test-dflash-combine-features.cpp + cpp:test-dflash-inject-fused.cpp + grep:scripts/check-dflash-kernel-determinism.sh",
+      "rationale": "Structural precondition. Multi-layer binding: (a) byte-identical fused-vs-scalar sweeps at T3 catch local determinism violations; (b) np-invariance test at T7 catches batch-shape sensitivity; (c) static grep gate at build time forbids atomicAdd<float>, Split-K patterns, and non-compile-time tile dims in ggml-cuda/dflash-*.cu. No TLA+ operational form exists for this kind of structural rule on float kernels."
+    },
+    {
+      "allium": "SingleForwardPerStep",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + review:host launcher structure",
+      "rationale": "Structural: T4 drafter forward is a single cooperative kernel launch per (slot, anchor) cycle producing all (1+BLOCK_SIZE) positions in one pass. Test asserts launch count = 1 per cycle and verifies output covers BLOCK_SIZE candidate tokens. Multi-step denoise schedules are out of contract scope per the same invariant — review-bound."
+    },
+    {
+      "allium": "QuerySpanIsOnePlusN",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp",
+      "rationale": "Test parameter shape assertion: input_tokens.shape == [N_slots, 1 + BLOCK_SIZE]. Anchor at position 0, mask-token positions at 1..BLOCK_SIZE. Output_logits.shape == [N_slots, BLOCK_SIZE, V]. Compile-time enforced via kernel signature; runtime asserted in test setup."
+    },
+    {
+      "allium": "InjectionConsumedAtEveryLayer",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + review:cooperative kernel layer loop",
+      "rationale": "Each of the 5 layer iterations inside dflash_drafter_forward reads from k_cache_layer[L] and v_cache_layer[L]. Test pre-populates all 5 layers' KV cache via dflash_inject_kv_fused and verifies that zeroing any one layer's cache produces detectable change in output_logits. Structural (kernel layer loop body) + empirical (zero-layer ablation)."
+    },
+    {
+      "allium": "LayerTypeDependentMask",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + review:layer-type K-loop bounds",
+      "rationale": "K-loop iteration bounded by sliding window for layers 0-3 (SWA, window=2048) and unbounded for layer 4 (full attention). No mask materialization. Layer-type read from drafter GGUF metadata at load time. Test exercises a SeqLen > swa_window scenario where SWA bound matters and confirms output differs from full-attention-everywhere. Structural; not TLA+-modelable as a single mask predicate."
+    },
+    {
+      "allium": "AnchorEmbeddingFromTarget",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + cpp:test-dflash-shared-embed-lm-head.cpp",
+      "rationale": "Drafter forward kernel reads anchor embedding from target's token_embd.weight (F16). Test materializes shared embedding via the drafter loader path then mutates one row and confirms drafter forward output changes for that token id — proves the drafter is reading the target's embedding tensor, not a private copy. Pointer-equality test in load-time test confirms tensor-handle sharing."
+    },
+    {
+      "allium": "AnchorPosPreserved",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp",
+      "rationale": "Test passes slot_positions[slot] = anchor_pos. Verifies drafter output's effective anchor position via SWA window bounds: position-conditioning shows up in RoPE phase and K-loop bound for SWA layers. anchor_pos value flows through the kernel without mutation."
+    },
+    {
+      "allium": "BlockSizeBindsToConfig",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp",
+      "rationale": "BLOCK_SIZE is a kernel template parameter. T4 instantiates {4,5,6,8}; drafter wrapper picks at dispatch from drafter GGUF dflash.block_size metadata. Test sweeps all four BLOCK_SIZE values; each instantiation produces exactly BLOCK_SIZE output positions. Mismatch between requested and template-instantiated BLOCK_SIZE is a build-time failure (no matching template)."
+    },
+    {
+      "allium": "DeterminismPerDeployment",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + cpp:test-dflash-determinism-np-invariance.cpp",
+      "rationale": "Three-run byte-identity sweep: same (weights, anchor, injected, slot_pos, BLOCK_SIZE) inputs across three drafter-forward launches must produce byte-identical output_logits. Validated at T4 unit test + T7 np-invariance test (cross-slot determinism). WMMA-mimicking scalar oracle provides per-run byte-identity binding."
+    },
+    {
+      "allium": "LongestPrefixMatchUnderArgmax",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp",
+      "rationale": "argmax_match kernel computes n_accepted = max k in [0, BLOCK_SIZE] such that drafter argmax matches target argmax for all i < k. Test constructs synthetic logits with planted match/mismatch patterns and asserts n_accepted matches the planted boundary. Ties broken by lowest token id — test exercises tie cases."
+    },
+    {
+      "allium": "NAcceptedWithinBound",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp",
+      "rationale": "Range assertion: 0 <= n_accepted <= BLOCK_SIZE. Test verifies kernel-emitted n_accepted is in range for full-accept, zero-accept, and partial-accept synthetic logit patterns."
+    },
+    {
+      "allium": "BonusIsArgmaxAtFirstUnacceptedRow",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp",
+      "rationale": "bonus_token = argmax(target_logits[n_accepted, :]) for n_accepted < BLOCK_SIZE; for n_accepted == BLOCK_SIZE the bonus is at row BLOCK_SIZE (the extra post-block row). Test plants known argmax values at each row and verifies bonus selection matches the planted target_argmax at row n_accepted."
+    },
+    {
+      "allium": "BonusPosIsAnchorPlusNAcceptedPlusOne",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp",
+      "rationale": "Test passes anchor_pos and asserts emitted bonus_pos == anchor_pos + n_accepted + 1. Pure positional bookkeeping; not a float-arithmetic check."
+    },
+    {
+      "allium": "DeterminismUnderFixedInputs",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp",
+      "rationale": "argmax_match is a pure function of (DraftBlock, VerifyLogits). Test runs three kernel invocations with identical inputs and asserts byte-identical AcceptDecision output (n_accepted + bonus_token + bonus_pos)."
+    },
+    {
+      "allium": "ProbabilisticVerifyOutOfScope",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-argmax-match.cpp + review:src/llama-context.cpp llama_set_dflash",
+      "rationale": "Greedy-only at contract boundary. T4 argmax_match kernel implements argmax_match only; no probabilistic path exists. llama_set_dflash() rejects non-greedy sampler parameters. Test confirms argmax_match is the only entry point and that calling with probabilistic mode flags a hard error (LLAMA_DFLASH_PROBABILISTIC_OUT_OF_SCOPE)."
+    },
+    {
+      "allium": "SharedEmbedAndLMHead",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-shared-embed-lm-head.cpp + review:src/llama-model.cpp drafter loader",
+      "rationale": "Load-time test: load production target GGUF and drafter GGUF in the same context; assert drafter.token_embd_handle == target.token_embd_handle (pointer equality), drafter.output_handle == target.output_handle. Then mutate a target token_embd row at runtime and confirm drafter sees the change on its next forward (proves shared memory, not just copied values). Wastes ~5 GiB BF16 if not shared per @SharedEmbedAndLMHead — material correctness gate."
+    },
+    {
+      "allium": "FeatureSourceFixedPerDeployment",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-drafter-forward.cpp + review:src/llama-context.cpp llama_set_dflash",
+      "rationale": "target_layer_ids are read once from drafter GGUF metadata at llama_set_dflash() time and stored as a compile-time-derivable constant array per the DFlash context. Test verifies that runtime mutation of the stored target_layer_ids produces no effect on drafter forward output for the current context (the kernel's loop bound is locked at init). Mid-session changes hard-blocked at the C API boundary."
+    },
+    {
+      "allium": "VerifyBatchShape",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Production verify decode call uses ne[1] = 1 + BLOCK_SIZE. Test drives one DFlash cycle through llama_set_dflash + the cycle orchestration C API; intercepts the target verify ubatch and asserts ubatch.n_tokens == 1 + drafter.block_size. The +1 row is the anchor (extra post-block row carrying the unconditional bonus argmax)."
+    },
+    {
+      "allium": "SingleContiguousRun",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Verify decode is dispatched as a single contiguous run of 1+BS positions, not split across multiple decodes. Test asserts the production loop issues exactly one llama_decode for the verify step per cycle (instrumented via a decode-counter hook on the target context)."
+    },
+    {
+      "allium": "TargetKVNotAdvancedDuringVerify",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Target's KV cache n_past is observed before verify, after verify-decode, and after the accept-prefix decision. Between verify-decode and accept the cache must remain at the pre-verify n_past — the decode populates KV at positions [n_past, n_past+BS] but the seq's effective n_past is only advanced by the accept step (TargetKVAdvancesByAcceptedPlusBonus). Test asserts cache state across the three observation points."
+    },
+    {
+      "allium": "EffectiveSeqLensSubtractsRejected",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp + cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-spec-ckpt-flow.cpp",
+      "rationale": "T5: on partial accept (n_accepted < BS), target's seq_len reverts to anchor_pos + n_accepted + 1 (accepted prefix + bonus row). T6 extends the witness to drafter-side state: same partial accept, asserts the drafter's extract buffer length AND the DeltaNet recurrent state position counter both equal anchor_pos + n_accepted + 1 — the FULL effective seq_len rollback, not just target KV."
+    },
+    {
+      "allium": "NumRejectedTokensFlowsBackToProposer",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "After verify + accept, the n_rejected count (= BLOCK_SIZE - n_accepted) is observable in the DFlash state struct and is used by the next cycle's drafter forward setup (e.g., adjusting anchor or surfacing accept-rate stats). Test asserts the value is correctly populated each cycle and consumed at the start of the next cycle."
+    },
+    {
+      "allium": "TargetKVAdvancesByAcceptedPlusBonus",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Per-cycle target seq_len advances by exactly n_accepted + 1 (the +1 is the bonus row). Test runs N cycles with controlled accept patterns (1, 2, 3, 4 accepted across cycles) and asserts cumulative seq_len growth = sum(n_accepted_per_cycle + 1)."
+    },
+    {
+      "allium": "DraftKVAdvancesPaired",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Drafter KV cache state advances in lockstep with target. After each cycle's accept decision, the drafter's anchor_pos for the next cycle = target's new seq_len - 1 (the bonus token position). Test asserts drafter's anchor_pos matches target's effective seq_len across N cycles."
+    },
+    {
+      "allium": "NewAnchorIsBonus",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "Next cycle's drafter input anchor = current cycle's bonus token. Test captures the bonus token emitted at cycle K and asserts it appears as the anchor input embedding lookup at cycle K+1. Critical for cycle linkage — used to fail in pre-T4 versions where last_prompt_token was incorrectly used as anchor."
+    },
+    {
+      "allium": "AtomicityPerCycle",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-cycle-orchestration.cpp",
+      "rationale": "A DFlash cycle is all-or-nothing: combine_features + inject_kv (×5) + drafter_forward + drafter_lm_head + verify_decode + argmax_match + accept all complete before any externally-observable state mutates (target seq_len, emitted tokens). Test asserts no observable target/drafter state mutation occurs mid-cycle by polling state at sub-step boundaries via a deferred-mutation invariant check. If any kernel fails (e.g., a NaN cascade), the cycle aborts cleanly without partially advancing state."
+    },
+    {
+      "allium": "DraftKVRollbackOnRejection",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-spec-ckpt-flow.cpp",
+      "rationale": "On partial accept, the drafter-side state (including DeltaNet recurrent state at hybrid linear_attn layers AND the cb_eval extract buffer rows for positions beyond anchor_pos) must roll back to match target's effective seq_len. Test: drive two cycles, force a partial accept at cycle 1, snapshot drafter state pre-rollback and post-rollback, assert post-rollback state == target's expected state at the new anchor_pos. T6 wires `dflash_state_checkpoint`/`_restore` for the DeltaNet half and a hook trim API for the extract buffer half."
+    },
+    {
+      "allium": "InjectedKVEvictedOnAnchorAdvance",
+      "bound_by": "cpp:ik_llama.cpp/tests/dflash-speculative/test-dflash-spec-ckpt-flow.cpp",
+      "rationale": "When the cycle's anchor advances to a new position (bonus or accepted run), drafter cache entries from the prior cycle's inject pass at the OLD anchor positions must be evicted (overwritten) — not left as stale residue. Test: drive cycle N with anchor at P, accept zero (drafter cache populated at P..P+BS); drive cycle N+1 with anchor at bonus_pos; assert drafter cache at positions [P, bonus_pos) reflect the NEW cycle's inject pass, not the old one. T6 enforces this through the ping-pong scratch + the explicit re-inject every cycle."
+    }
+  ]
+}
